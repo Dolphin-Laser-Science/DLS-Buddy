@@ -1,0 +1,37 @@
+﻿Date/Time,5/31/2026 3:22:23 PM
+Sample ID,PnVP (40k) in Water
+Operator ID,Esam A
+Sample Liquid,Water
+Refractive Index of Sample Liquid,1.334
+Refractive Index of Sample Cell,1.5
+Refractive Index of Vat Liquid,1.474
+Refractive Index Inc. (dn/dc) (mL/g),0.17
+Depolarization Ratio,0
+Calibration Constant,1.443E-10
+Calibration Liquid,Toluene
+Refractive Index of Calibration Liquid,1.5
+Rayleigh Ratio of Calibration Liquid,2.803E-05
+Polarization Analyzer,No
+Polarization Analyzer Position,None
+Chain Model,random coil
+Wavelength (nm),532
+'A' Dark Count Rate,2050
+'B' Dark Count Rate,0
+Pinhole Size (mm),3
+Interference Filter,Out
+Reflective Corrections Applied,Yes
+Number of Angles Measured,1
+Angle 1 (degrees),90
+Number of Concentrations Measured,6
+Concentration 1 (mg/mL),0
+Concentration 2 (mg/mL),0.464
+Concentration 3 (mg/mL),0.928
+Concentration 4 (mg/mL),1.392
+Concentration 5 (mg/mL),1.856
+Concentration 6 (mg/mL),2.32
+Intensity - Concentration 1 - Angle 1,20358.61
+Intensity - Concentration 2 - Angle 1,106948.9
+Intensity - Concentration 3 - Angle 1,189692.8
+Intensity - Concentration 4 - Angle 1,257600.6
+Intensity - Concentration 5 - Angle 1,334961.3
+Intensity - Concentration 6 - Angle 1,403562.8

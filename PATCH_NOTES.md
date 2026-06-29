@@ -1,0 +1,294 @@
+# Patch Notes
+
+User-facing summary of what each release changed, plus a running list of known
+issues. For the full session-by-session development history see the internal
+`DEVELOPMENT_LOG.md` (tracked in the private repo; stripped from the public release).
+
+Versioning is pre-1.0 `0.MINOR.PATCH`: MINOR for new user-facing capability,
+PATCH for fixes/polish. The version is set in `version.py` and shown in the GUI
+window title.
+
+---
+
+## 0.8.2 — In-program help system + tooltip toggle (2026-06-29)
+
+Makes the program more self-explanatory (owner feedback Section B). **No change to the
+analysis math.**
+
+- **"?" help buttons.** Key sections now have a small circular **?** you can click (or
+  hover) for concise, plain-language help — Workspace, Data parameters, the DLS fit /
+  distribution methods, SLS calibration and analysis, and Cross-Sample. They explain
+  *how to use* the section and point to the Advanced Guide for the underlying maths.
+- **Show/hide tooltips.** **Settings → Tooltips → "Show tooltips on hover"** turns all
+  passive hover tooltips on or off (the "?" buttons still work on click when off).
+- **Clearer method guidance.** Hovering a method selector now briefly explains and
+  compares the options (Cumulant vs distribution; Zimm vs Berry; CONTIN vs NNLS vs
+  Lognormal), and the help spells out **thermodynamic vs apparent** results.
+- **Less repetition.** A freshly launched app no longer tells you to "load data" in
+  three different places.
+- **Fixed: the SLS control panel could clip on the right.** A long checkbox label was
+  forcing the panel too wide, so part of the calibration controls were cut off and
+  unreachable on a narrow panel. The panel now fits (the checkbox is now
+  **"Per-sample calibration"** with the explanation moved to its tooltip), and any
+  control panel that is genuinely too wide now gets a horizontal scrollbar instead of
+  clipping.
+
+---
+
+## 0.8.1 — UI/UX batch: bugfixes, Undo/Reset, results panel, resizable plots (2026-06-29)
+
+Fixes and usability polish from owner feedback. **No change to the analysis math.**
+
+- **Fixed: the delay-window upper marker looked "capped at 1 µs."** The green τ-window
+  and baseline markers on the Correlogram now sit at the correct positions (they were
+  being drawn in seconds on a microsecond axis); dragging them works correctly too.
+  The actual fit window and results were always correct — only the on-plot markers were
+  misplaced.
+- **Fixed: an SLS sample's "Mw fraction" row showed a stray "mPa·s" unit.** That row now
+  correctly has no unit (it's a text label like "1M").
+- **Undo now does what you'd expect.** "Undo" steps back to the **previously applied**
+  parameters. If you have un-applied edits showing, the first Undo discards those; press
+  it again to step back through earlier Updates. It's disabled when there's nothing to undo.
+- **New "Reset" button** (next to Update/Undo) clears all entered parameters for the
+  sample so you can start fresh. It keeps the instrument-supplied scattering angle, asks
+  for confirmation, and is **undoable** (nothing is applied until you press Update).
+- **DLS results are in one place.** The Correlogram tab now has a single results table that
+  shows the selected method's results (Cumulant / Single / Double / Stretched Exponential),
+  with **Export CSV** directly beneath it — replacing the two stacked tables.
+- **Plots fit the screen and resize.** Plots no longer overflow so the whole page scrolls;
+  the control panel beside a plot scrolls on its own instead. **Drag the gap between a fit
+  and its residual** to resize the residual — it stays perfectly aligned under the fit. On
+  the Utilities Traces tab, the trace and its diagnostic plot sit in a **draggable vertical
+  splitter**.
+- **Renames/cleanup.** "Depolarized (DDLS)" → **DPLS**; "Update (commit)" → **Update**;
+  "Undo to committed" → **Undo**; "KWW (stretched)" → **Stretched Exponential (KWW)**.
+  Removed in-program literature citations (they live in the guides instead).
+- **SLS tab polish.** Clearer sample names in the header (no more "?|?|…"), a shorter
+  "no SLS data yet" message, and calibration labels that wrap instead of getting cut off.
+
+---
+
+## 0.8.0 — UI polish batch: workspace, traces, plot units (2026-06-26)
+
+A broad usability pass across the GUI (no change to the analysis math).
+
+- **Workspace management.** Right-click a **header** to remove in bulk: the sample
+  header removes the whole sample, the **DLS** header removes only its DLS
+  measurements, the **SLS** header only its SLS. **Left-click a header** selects
+  every measurement under it (for a one-shot parameter edit + commit).
+- **Selecting ≠ analysing.** Picking a measurement in the workspace no longer
+  auto-adds it to the DLS analysis. The **“Measurements to plot”** checklist is now
+  the only thing that decides what is fit/overlaid — tick what you want.
+- **Intensity traces are first-class.** Traces now appear under a **Traces** node in
+  the main workspace (load / remove there), and the Traces tab has the same
+  multi-select checklist as the correlogram tab, so you can **overlay several
+  traces**. Traces from the **Brookhaven** count-rate export now load via
+  auto-detection (drop the file on *Load trace…*, no format picking).
+- **Mw fraction** is applied like any other per-measurement parameter — set it on the
+  row (or several highlighted rows) and press **Update**. The old
+  apply-to-all-and-commit pop-up is gone.
+- **Distributions** default to **CONTIN** (was NNLS).
+- **Reset the delay window + baseline** to the defaults (full lag range; last 25 %)
+  with one button on the Correlogram tab.
+- **Remove outlier points and recompute** on **Γ vs q²**, **D vs c**, and **DDLS**:
+  click a point to grey it out and exclude it from the fit; **Reset** brings them all
+  back.
+- **Human-centric plot units, configurable.** Plots now default to readable units —
+  delay time in **µs**, count rate in **kcps**, q² in **nm⁻²**, D in **µm²/s**,
+  concentration in **mg/mL** — and **Settings → Plot axis units** lets you choose the
+  default unit for each axis. (Analysis still runs in canonical units; only the
+  display converts.)
+- **Resizable plots.** Plots grow with the window instead of being pinned to a fixed
+  size, and the intensity-trace plots are taller by default.
+- **Define ‘k’** (the shot-noise band multiplier) on the trace tab, and a new
+  **running-average window** control (points; 0 = auto).
+- **Synthetic generator** now lets you enter temperature and viscosity in your own
+  units (defaults **°C** and **mPa·s**), and its β / noise / points defaults live on
+  the tab itself.
+- **Settings de-cluttered:** the synthetic-generator and intensity-trace defaults
+  moved out of Settings into their own tabs; **cP** was dropped as a viscosity unit
+  (identical to mPa·s).
+- **Docs:** square-root symbols now render correctly in the PDFs, and vendor names
+  were generalised out of the guides except where a specific parser/format is being
+  described.
+
+## 0.7.0 — Nonlinear (Frisken) cumulant, now the default (2026-06-25)
+
+- **New cumulant fitting method: nonlinear (Frisken 2001), and it is now the
+  default.** It fits the correlation function `g₂−1` *directly* with a **floating
+  baseline**, rather than the classic linear fit to `ln(g₂−1)` (Koppel 1972, still
+  available). Because the baseline and coherence are fitted instead of assumed, it
+  is more robust to baseline drift and noisy/low-count data, and it uses the whole
+  fit window (no amplitude cutoff). On a clean sample the two methods agree; the
+  table shows which method produced each result and its fitted baseline.
+- **Choose the method in Settings → Cumulant method** (Nonlinear / Linear). It is a
+  **global** choice that applies to every cumulant-based analysis — the per-measurement
+  cumulant, Γ vs q², and replicate averaging — so your whole DLS pipeline uses one
+  method consistently.
+- **Switching the method clears existing cumulant-based results** (cumulant fits,
+  Γ vs q², replicate averages) so the workspace can't show a mix of methods. You are
+  **asked to confirm first**, and only if such results exist; **distributions, SLS,
+  and any hand-entered Rh are always kept**.
+- Robustness: the nonlinear fit constrains the baseline to genuine drift (it cannot
+  absorb the decay), and **falls back to the linear fit (flagged) if it fails to
+  converge**, so you always get a result. Like the linear method it reports **no ±
+  from a single correlogram** (uncertainty still comes from replicate averaging).
+- **Known limitation:** a corrupted *first* channel (afterpulsing) is still best
+  removed with *Skip initial lag channels* (v0.6.0); the nonlinear method handles
+  drift and tail noise, not a short-lag spike — on such a detector it falls back to
+  linear and flags it.
+
+## 0.6.0 — DLS cumulant/distribution: skip leading lag channels (2026-06-25)
+
+- **New Settings option: "Skip initial lag channels".** Drops the first *N*
+  correlator channels (the shortest lags) from **every** DLS fit — cumulant,
+  single/double/KWW, and NNLS/CONTIN/lognormal alike. The first few channels of a
+  multi-τ correlator carry detector **afterpulsing** and dead-time artefacts that
+  are not diffusion; a noisy first channel can drag a fit to a falsely *small*
+  size. Setting the skip to your correlator's artefact count removes that bias.
+  Default is **0 (no skip)**, so existing results are unchanged.
+  - It **composes with the delay-window minimum**: the first fitted point is the
+    later of "channel *N*" and "first lag ≥ the window minimum". The skip (by
+    channel index) and the window (by time) are complementary.
+  - Validated against the SMALS reference platform: on a deliberately noisy latex
+    dataset a skip of 9 recovered detectors that the un-skipped cumulant misread
+    (e.g. one angle 5.9 nm → 22 nm), matching the size the clean angles give.
+  - **Use it sparingly with distribution methods (NNLS/CONTIN):** the short lags
+    constrain the *small/fast* end of the size distribution, so an over-aggressive
+    skip can erase a genuine small-particle population (a cumulant *mean* would only
+    shift slightly). Keep it to the genuinely artefact-contaminated leading channels.
+
+## 0.5.1 — UI polish: selection UX, plot sizing, scroll behaviour, Label field (2026-06-23)
+
+Nine UI improvements from owner feedback:
+
+- **Measurement selection lists now use click-to-highlight** (Shift / Ctrl supported)
+  instead of checkboxes in the DLS overlay checklist and the Cross-Sample
+  include/exclude list. The DLS checklist also groups measurements under bold
+  **sample headers** so you can tell at a glance which sample each measurement
+  belongs to.
+- **Select all / Select none buttons** added to both selection lists.
+- **Label field** added to the Data tab (top row of the parameter table). A
+  cosmetic per-measurement name: once committed it replaces the source filename
+  everywhere the measurement is displayed — sidebar tree, DLS selection list.
+  Does not affect analysis or sample grouping.
+- **All plot areas are ~15% smaller by default** across the DLS, SLS,
+  Cross-Sample, and Utilities modules. DLS and SLS already had draggable
+  splitters; the Utilities **Traces** tab now has one too (drag the divider
+  between the trace list and the plots).
+- **Scroll wheel no longer changes dropdown values or cycles tabs.** An
+  application-level event filter now suppresses wheel events on every
+  QComboBox and tab bar — scroll wheel scrolls only.
+- **"Load data to begin"** replaces the old "Load a correlogram to begin"
+  status-bar message (the app handles more than correlograms).
+- **"Solute name"** replaces "Sample name" in the Data tab parameter table
+  (the field describes the polymer/molecule, not the sample group).
+- **Right-click → Remove sample** added to the sidebar workspace tree.
+  Removes the entire sample (all DLS, SLS, and solvent-reference measurements)
+  with a confirmation dialog; source files on disk are untouched.
+
+## 0.5.0 — DLS Summary tab + averaged-results persistence (2026-06-22)
+
+- **New DLS "Summary" sub-tab.** A workspace-wide, exportable results table that
+  persists across save/reload, replacing the one-time pop-up for averaged results
+  and the hard-to-read sequential peak list on the Distribution tab. Two stacked
+  tables:
+  - **Per-measurement results** (one row per measurement): cumulant Rh + PDI,
+    single/KWW Rh, and NNLS/CONTIN peaks shown as `Rh (Int %)` — where **Int %** is
+    the intensity-weighted peak area (NOT a mass/weight percent).
+  - **Sample-level Rh**: replicate averages, Γ–q² (q→0, *apparent*) and D–c (c→0,
+    *thermodynamic*), with an **Rh Type** column making that distinction explicit and
+    a **From** column listing the contributing measurements.
+  - The left panel shares the same measurement checklist as the Correlogram and
+    Distribution tabs and doubles as a **"Ticked only"** filter.
+- **Averaged derived results now persist.** Running *Average derived results* still
+  shows its summary, but the outcome is also recorded durably in the Summary table
+  (and in the session file), clearly distinguished from an averaged-correlogram
+  measurement. Per-measurement fit results populate the table as you run them.
+- **Distribution tab: peak labels + a residuals panel.** Resolved peaks are now
+  labelled on the size/rate distribution plot, and a residuals panel (data −
+  reconstructed g₂−1 vs delay time) sits beneath it, like the Correlogram tab.
+- **Controls moved next to the fit they drive.** The **cumulant order** lives on the
+  Correlogram tab and the **Rh grid (min/max/points)** and **CONTIN L-curve α** range
+  on the Distribution tab — both still seeded from Settings (the per-run value wins).
+  These no longer appear under the Settings tab.
+- CSV exports are now written as **UTF-8** (so labels like "Γ vs q²" export cleanly);
+  pure-ASCII exports are unchanged.
+
+## 0.4.0 — Malvern multi-measurement parsers + repo tidy-up (2026-06-21)
+
+- **Malvern Zetasizer clipboard** loading now accepts files with **many records** —
+  every record column in the pasted text loads as its own DLS measurement (a
+  single-record copy still loads as one). Backward compatible.
+- **New Malvern Zetasizer *export* parser** for the software's structured export
+  (comma-separated, one measurement per row). Unlike the clipboard format it also
+  pre-fills the parameters the file carries — refractive index, temperature,
+  viscosity, and the sample/material/dispersant names — which you confirm or edit at
+  the Data tab. Columns are matched by header name, so any column order from the
+  configurable exporter works. The expected export template is documented in the
+  Quickstart (§2.2).
+- **Fixed a crash** when loading a correlogram that has no scattering angle yet
+  (e.g. any freshly loaded Zetasizer file): selecting it no longer errors in the
+  depolarized-DLS summary.
+- **Repository tidy-up** (no effect on using the program): `code_map.md` and
+  `code_references.md` now live in `docs/`; the version file moved to `app/`; the
+  owner-only `setup-links.ps1` junction-bootstrap script is no longer shipped in the
+  repo (forkers never needed it).
+
+## 0.3.0 — Documentation overhaul (2026-06-21)
+
+- Split the user guide into a **Quickstart** (how to use the program) and an
+  **Advanced Guide** (theory, numbered equations, bibliography), both shipped as
+  PDFs in `docs/`.
+- Added **`code_map.md`** (directory + per-file tour for anyone reading/forking the
+  code) and renamed the citation index to **`code_references.md`** (each source now
+  maps to where it is used in the code and guide).
+- Added this **`PATCH_NOTES.md`** and a project **version** (`version.py`, shown in
+  the window title).
+- Reworked **`README.md`** into a concise front door.
+- Renamed the `Test Data` folder to `test-data`.
+- Internal docs (the long development log, editable markdown sources) moved out of
+  the tracked repo; the repo now ships only the user-facing artifacts.
+
+## 0.2 and earlier — Engine + GUI build-out (pre-versioning)
+
+The analysis engine and application were built and validated module by module
+before formal version numbers existed. Capabilities as of this release:
+
+- **Data model + parsers**: Brookhaven (DLS/SLS/trace), generic (DLS/SLS/trace),
+  Malvern Zetasizer clipboard, ALV `.ASC` multi-angle. Loading is
+  instrument-agnostic with auto-detection and a generic fallback.
+- **DLS**: cumulants, single/double/KWW exponentials, NNLS, CONTIN, lognormal;
+  Gamma-q^2 and concentration extrapolation; multi-measurement co-plotting;
+  replicate averaging (correlogram average + mean +/- SD/sqrt(N), ISO 22412).
+- **SLS**: unified calibration from a single calibrant point, Debye, Zimm/Berry,
+  Guinier, single-angle, calibration-free A2, with data masking and a manual-Mw
+  override.
+- **Cross-Sample**: rho = Rg/Rh table and Rg-Mw / A2-Mw scaling plots with
+  provenance-aware source pickers.
+- **Utilities**: count-rate trace diagnostics, I*sin(theta) check, synthetic data
+  generator.
+- **Settings**: seed defaults for every module, light/dark theme, plot palette,
+  input/display units.
+- **DPLS/DDLS**: static depolarization geometry plumbing and a depolarized-DLS
+  analysis path for rotational diffusion (see Known issues).
+- Origin-compatible CSV export; matplotlib plotting layer; self-contained JSON
+  sessions.
+
+---
+
+## Known issues / outstanding
+
+- **DPLS/DDLS not yet tested on real depolarized data** — validated only against
+  synthetic ground truth so far.
+- **`divide by zero` RuntimeWarning** from `analysis/utilities.fit_count_rate_histogram`
+  when a histogram bin is empty (chi-squared term). Harmless but noisy; guard pending.
+- **Visual peak picker** in the DLS distribution view is planned (peaks are already
+  offered as Rh sources elsewhere, but not click-selectable in the plot).
+- **A2 source picker** in the Cross-Sample tab is planned.
+- **Threading is designed-for but not enabled** — long analyses run on the GUI
+  thread for now.
+- **Session JSON is not yet schema-versioned** — old sessions may not load after a
+  data-model change.
+- A few library PDFs are **citation "promotion candidates"** not yet formally cited
+  (see `references/_library_index.md`).

@@ -1,0 +1,196 @@
+# Code Map
+
+A tour of the codebase for anyone reading, modifying, or forking DLS Buddy. It
+describes the directory structure, what each Python module does, and how the
+modules depend on one another. For *how to use* the program see the Quickstart
+(`docs/`); for the science see the Advanced Guide (`docs/`); for where each
+literature source is used see `code_references.md`.
+
+## The big picture
+
+The code is layered, and dependencies point in one direction only:
+
+```
+parsers ──► core (data model) ◄── analysis ──► physics
+                  ▲                   ▲
+                  │                   │
+              app/controller ─────────┘──► exporting
+                  ▲
+                  │
+                gui ──► plotting
+```
+
+- **`core`** defines the common internal data model. Everything else is built on it.
+- **`parsers`** turn instrument files into `core` objects. Adding a new instrument
+  is one new parser file; nothing downstream changes.
+- **`analysis`** consumes `core` objects and returns result objects. Pure functions:
+  no GUI, no file I/O, no plotting, no input mutation. Leans on **`physics`** for
+  every physically-meaningful number.
+- **`app/controller`** is the framework-agnostic brain between the GUI and the
+  engine. It owns the workspace, mediates parameter commits, runs analyses, and
+  handles sessions. No Qt imports — so the GUI framework could be swapped by
+  rewriting only `gui/`.
+- **`gui`** is PySide6 widgets only. Widgets call controller methods; they contain
+  no analysis or physics. Plots come from **`plotting`**.
+- **`exporting`** writes result objects to Origin-compatible CSV.
+
+Two architectural rules worth knowing before you change anything: (1) analysis
+functions stay pure, and (2) all analysis/GUI code operates only on the `core`
+data model, never on a vendor file format.
+
+## Directory structure
+
+```
+<repo root>/
+├── README.md              # front door
+├── PATCH_NOTES.md         # per-release changes + known issues
+├── CLAUDE.md              # contributor/agent orientation + invariants
+├── requirements.txt       # pinned dependencies (Python 3.13 venv)
+├── test-data/             # tracked datasets (Brookhaven, Malvern, ALV, Synthetic *)
+├── docs/                  # committed user-facing docs:
+│                          #   Quickstart.pdf, Advanced-Guide.pdf,
+│                          #   code_map.md (this file),
+│                          #   code_references.md (citation index: each source -> where used)
+├── core/                  # data model + workspace
+├── parsers/               # instrument-specific + generic file parsers
+├── physics/               # constants and physical formulas
+├── analysis/              # pure analysis engines (DLS, SLS, DPLS, utilities)
+├── exporting/             # CSV export
+├── plotting/              # matplotlib layer
+├── app/                   # controller + settings + units + version (framework-agnostic)
+├── gui/                   # PySide6 widgets
+└── internal/              # private dev content (stripped from the public release)
+```
+
+Some folders won't be in a forked/public clone. `references/` (literature sources)
+and `feedback/` (working notes) are gitignored. `internal/` — the long
+`DEVELOPMENT_LOG.md`, the editable Markdown doc sources, `refs.bib`, build config,
+and the build/generator scripts — is tracked in the maintainer's *private* repo but
+stripped from the public release, so a fork won't have it either. The tracked files
+above are everything needed to run, read, and build.
+
+## Modules
+
+### `core/` — the data model (start here)
+- **`data_models.py`** — the shared internal structures. The most important file in
+  the project: every parser produces these objects and every analysis function
+  consumes them (`SampleKey`, `DLSMeasurement`, `SLSMeasurement`, solvent vocab).
+- **`workspace.py`** — the framework-agnostic state the controller manages and the
+  GUI displays: loaded measurements/traces, samples, grouping, `SampleResult`, and
+  session JSON. Plain Python (no Qt, no matplotlib) so it is headless-testable.
+
+### `parsers/` — files in, `core` objects out
+- **`base_parser.py`** — abstract parser base + the preview dataclasses that carry
+  extracted parameters to the user-confirmation step + unit converters.
+- **`brookhaven_dls.py`** — Brookhaven Particle Explorer correlation `.CSV`
+  (`BrookhavenDLSParser`) and count-rate trace `.CSV` (`BrookhavenTraceParser`).
+- **`brookhaven_sls.py`** — Brookhaven intensity-vs-angle `.CSV` (one preview per
+  concentration).
+- **`alv_asc.py`** — ALV correlator `.ASC` (multi-angle): a DLS correlogram and a
+  count-rate trace per angle. NB lag time is in ms.
+- **`zetasizer_clipboard.py`** — Malvern Zetasizer clipboard correlation text
+  (tab-separated, g2-1, microsecond lag); one record column per measurement.
+- **`zetasizer_export.py`** — Malvern Zetasizer structured *export* (comma-separated,
+  one measurement per row); also pre-fills the parameters the file carries
+  (refractive index, temperature, viscosity, sample/material/dispersant names).
+- **`generic_dls.py` / `generic_sls.py` / `generic_trace.py`** — plain-text
+  fallbacks (two-column tables) for any instrument/simulation. Kept OUT of
+  auto-detection (they match almost anything); used as the explicit fallback.
+
+### `physics/` — the numbers
+- **`constants.py`** — every physically-meaningful constant and formula lives here
+  and nowhere else: kB, NA, scattering vector q, Stokes-Einstein, optical constant
+  K, and the geometry-aware (VU/VV/VH) toluene Rayleigh ratio. Analysis modules
+  call these; they never re-implement them.
+
+### `analysis/` — pure engines
+- **`dls/`** — DLS correlation-function analysis, split into a package by method
+  family (public API re-exported from `dls/__init__.py`, so `from analysis.dls
+  import …` is unchanged): `_common.py` (shared helpers), `cumulants.py` (linear +
+  Frisken nonlinear), `exponentials.py` (single/double/KWW), `distributions.py`
+  (NNLS, CONTIN, lognormal, peaks, Rh↔Gamma axis), `angular.py` (Gamma-q^2,
+  concentration extrapolation, Rh↔Gamma converters), `replicate.py`
+  (replicate-correlogram averaging).
+- **`sls.py`** — SLS: Mw, Rg, A2 from angle/concentration intensity; unified
+  calibration, Debye, Zimm/Berry, Guinier, single-angle, calibration-free A2.
+- **`depolarization.py`** — static DPLS: depolarization ratio, Cabannes
+  isotropic/anisotropic split, optical anisotropy, from paired VV/VH intensities.
+- **`uncertainty.py`** — the statistical-uncertainty toolkit (HC3 covariance,
+  delta-method propagation, `format_pm`, replicate mean/SE). Where the rest of the
+  engine reports a `±`, it comes from here.
+- **`trace_analysis.py`** — intensity-trace signal-analysis diagnostics: trace
+  statistics, robust baseline, shot-noise outlier flagging, baseline normalisation,
+  running average, block-variance (SE vs block size), count-rate histogram with
+  Gaussian/Poisson fits + Fano factor, and the ADF stationarity test.
+- **`utilities.py`** — the remaining cross-cutting helpers: the i*sin(theta) check,
+  rho = Rg/Rh, the Rg/Mw/A2 scaling power-law, the provenance-aware result-candidate
+  picker, and the synthetic correlogram generator.
+- **`synthetic_dataset.py`** — the reusable synthetic-data engine behind both the
+  `internal/` test-data generator and the in-app Utilities generator (pure forward
+  models + loadable-file writers; no plotting).
+
+### `exporting/` — results out
+- **`export.py`** — Origin-compatible CSV writer (Long Name / Units / Comments /
+  Parameters header rows) for the DLS and SLS result objects.
+
+### `plotting/` — the matplotlib layer
+- **`plots.py`** — ax-accepting, handle-returning plot functions with no blocking
+  `show()`; built independently of the GUI and designed to drop into it. Owns the
+  color palette (`set_palette`).
+
+### `app/` — the framework-agnostic brain
+- **`controller.py`** — the layer between the GUI and the engine: owns the
+  `Workspace`, mediates parameter edits (commit/working state), orchestrates
+  analysis runs, and reads/writes sessions. No Qt.
+- **`settings.py`** — global user preferences as a dataclass (`SettingsState`).
+  Rule: settings *seed* a module's controls, never silently override a per-run value.
+- **`units.py`** — the input/display unit boundary. The engine always works in
+  canonical/SI units; this converts at the GUI edge (g/mL, K, Pa·s, s, cps).
+- **`version.py`** — the single source of truth for `__version__` (shown in the GUI
+  window title and the generated guide PDFs).
+
+### `gui/` — PySide6 widgets (no analysis/physics)
+- **`main.py`** — entry point (`python -m gui.main`): sets the Qt/matplotlib
+  backend and runs the event loop.
+- **`main_window.py`** — the shell: sidebar navigator + the six module tabs over one
+  shared controller; owns format auto-detection on load.
+- **`data_module.py`** — Data tab: the parse -> confirm -> commit parameter step
+  (the only tab that edits parameters).
+- **`dls_module.py`** — DLS tab: analysis-only sub-tabs over committed parameters,
+  with multi-measurement co-plotting.
+- **`sls_module.py`** — SLS tab: per-sample static-scattering analysis (calibration
+  panel + Zimm/Berry/Debye/Guinier/... + data masking).
+- **`cross_module.py`** — Cross-Sample tab: the aggregate-scope module (rho = Rg/Rh
+  table + Rg-Mw / A2-Mw scaling) with provenance-aware source pickers.
+- **`utilities_module.py`** — Utilities tab: trace diagnostics, the i*sin(theta)
+  check, and the synthetic-data generator.
+- **`settings_module.py`** — Settings tab: edits and persists `SettingsState`.
+- **`plot_controls.py`** — reusable per-axis scale/min/max/autoscale widget placed
+  next to a plot.
+- **`export_helper.py`** — tiny shared helper behind the tabs' "Export CSV..." buttons.
+- **`stub_module.py`** — placeholder widget (no longer used now all six tabs exist).
+
+### `internal/` — private dev content (not in the public release)
+The maintainer's build-time material: `DEVELOPMENT_LOG.md`, the editable Markdown doc
+sources (`quickstart.md` / `advanced_guide.md`), `refs.bib` + the Pandoc/Tectonic build
+config, and the developer scripts (formerly `tools/`). A public/forked clone won't have
+this folder; the built artifacts it produces (`docs/*.pdf`, `docs/code_references.md`,
+`test-data/`) are tracked, so you can run and read the program without it. The scripts:
+- **`generate_synthetic_test_data.py`** — regenerates `test-data/Synthetic *` (a thin
+  wrapper over `analysis/synthetic_dataset.py` plus expected-picture rendering).
+- **`generate_synthetic_dpls_data.py`** — generates the synthetic DDLS test set
+  (`test-data/Synthetic DPLS/`) for the depolarized analysis path.
+- **`gen_code_references.py`** — regenerates `docs/code_references.md` from `refs.bib`.
+- **`build_docs.ps1`** — rebuilds `docs/code_references.md` + the guide PDFs (Pandoc +
+  Tectonic).
+- **`validate_*.py`** — headless numeric validators for the DLS analysis package.
+
+## Running it
+
+From the repo root, with the dependencies in `requirements.txt` installed:
+
+```
+python -m gui.main
+```
+
+See the Quickstart PDF in `docs/` for the workflow, and `README.md` for setup.

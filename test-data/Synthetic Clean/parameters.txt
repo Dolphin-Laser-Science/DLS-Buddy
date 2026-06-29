@@ -1,0 +1,49 @@
+DLS Buddy — Synthetic Clean test data
+==================================================
+
+System: PEG in water, calibrated against a toluene standard.
+
+GLOBAL PARAMETERS (enter these at the Data-tab confirmation step):
+  Solvent                 : water
+  Solvent refractive index: 1.33
+  Viscosity               : 0.89 cP   (= 0.00089 Pa.s)
+  Temperature             : 25.0 C  (298.15 K)
+  Wavelength              : 532 nm
+  dn/dc                   : 0.135 mL/g
+
+SLS CALIBRATION (enter in the SLS tab calibration panel):
+  Standard                : toluene   (geometry VU)
+  Standard refractive index: 1.496
+  Calibrant intensity     : 100000  at 90 deg
+  Dark count rate         : 0
+  (the program then computes k_c = 3.1496e-10)
+
+Notes:
+  - DLS files are ALV .ASC: all angles + a count-rate trace are in one file.
+    Enter polymer name, solvent (water), and the concentration (in the file
+    name) for each. Temperature/viscosity/n/wavelength are read from the file.
+  - SLS files are Brookhaven .csv (a full Zimm set: solvent reference at c=0
+    plus 5 concentrations x 12 angles). Enter polymer name + temperature.
+  - To pair rho = Rg/Rh for a sample, give its DLS and SLS files the SAME
+    polymer name + solvent + temperature so they group into one sample.
+  - The two-column trace loads via the Utilities > Traces tab (time = s,
+    count rate = kcps).
+
+This is the CLEAN set: low noise (good, not perfect). Fits
+should recover the ground-truth values below closely.
+
+GROUND TRUTH (what the analyses should recover):
+
+  Sample          Mw (g/mol)   Rg (nm)   Rh (nm)   A2 (mol mL/g^2)
+  PEG 100k          1.00e+05      14.0       9.5          1.50e-04
+  PEG 300k          3.00e+05      27.0      18.0          1.20e-04
+  PEG 1M            1.00e+06      55.0      37.0          9.50e-05
+  PEG 3M            3.00e+06     105.0      70.0          7.00e-05
+
+  Bimodal DLS sample: two populations at Rh = 20 nm and 200 nm
+    (intensity weights ~1 : 2). Use CONTIN or NNLS to resolve them.
+
+  rho = Rg/Rh ~ 1.5 for every series sample (good-solvent coil).
+  Rg-Mw scaling exponent nu ~ 0.585; A2-Mw exponent ~ -0.2.
+  DLS shows a mild concentration dependence (kD ~ +30 mL/g), so the
+  D-vs-c extrapolation has a small positive slope (PEG 1M has 3 concs).
