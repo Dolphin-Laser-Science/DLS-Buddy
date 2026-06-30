@@ -66,6 +66,8 @@ from gui.cross_module import CrossSampleModule
 from gui.utilities_module import UtilitiesModule
 from gui.settings_module import SettingsModule
 from gui.help import install_tooltip_gate, set_tooltips_enabled, section_header
+from gui.theme import ThemedLabel, color as theme_color, retheme
+from gui.widgets import roomy_tabs
 from plotting.plots import set_palette, set_plot_units
 
 
@@ -154,13 +156,12 @@ class MainWindow(QtWidgets.QMainWindow):
         del_shortcut.activated.connect(self._on_delete_key)
         side.addWidget(self.tree, 1)
 
-        self.sidebar_note = QtWidgets.QLabel('')
+        self.sidebar_note = ThemedLabel('', role='hint', size=11)
         self.sidebar_note.setWordWrap(True)
-        self.sidebar_note.setStyleSheet('color:#777; font-size: 11px;')
         side.addWidget(self.sidebar_note)
 
         # ---- module tabs ---------------------------------------------------
-        self.tabs = QtWidgets.QTabWidget()
+        self.tabs = roomy_tabs(QtWidgets.QTabWidget())   # roomier tabs so labels don't clip (#3)
 
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         self.splitter.addWidget(side_widget)
@@ -446,7 +447,7 @@ class MainWindow(QtWidgets.QMainWindow):
         font = node.font(0)
         font.setBold(True)
         node.setFont(0, font)
-        node.setForeground(0, QtGui.QColor('#888'))
+        node.setForeground(0, theme_color(self.tree, 'marker_group'))
         parent.addChild(node)
         node.setExpanded(True)
         return node
@@ -486,7 +487,7 @@ class MainWindow(QtWidgets.QMainWindow):
         item.setToolTip(0, text)                       # full name if clipped
         item.setData(0, QtCore.Qt.ItemDataRole.UserRole, item_id)
         if is_avg:                                     # muted, to read as derived
-            item.setForeground(0, QtGui.QColor('#0a7'))
+            item.setForeground(0, theme_color(self.tree, 'marker_active'))
         parent.addChild(item)
         return item
 
@@ -503,7 +504,7 @@ class MainWindow(QtWidgets.QMainWindow):
         font = node.font(0)
         font.setBold(True)
         node.setFont(0, font)
-        node.setForeground(0, QtGui.QColor('#888'))
+        node.setForeground(0, theme_color(self.tree, 'marker_group'))
         self.tree.addTopLevelItem(node)
         node.setExpanded(True)
         for t in traces:
@@ -906,9 +907,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if dark:
             base, alt, win, txt = C(35, 35, 38), C(45, 45, 48), C(53, 53, 53), C(220, 220, 220)
             disabled = C(120, 120, 120)
+            mid, midlight, darkc = C(120, 120, 120), C(90, 90, 90), C(25, 25, 28)
         else:
             base, alt, win, txt = C(255, 255, 255), C(233, 233, 233), C(240, 240, 240), C(20, 20, 20)
             disabled = C(160, 160, 160)
+            mid, midlight, darkc = C(150, 150, 150), C(200, 200, 200), C(120, 120, 120)
         pal.setColor(R.Window, win)
         pal.setColor(R.WindowText, txt)
         pal.setColor(R.Base, base)
@@ -918,6 +921,11 @@ class MainWindow(QtWidgets.QMainWindow):
         pal.setColor(R.ButtonText, txt)
         pal.setColor(R.ToolTipBase, base)
         pal.setColor(R.ToolTipText, txt)
+        # Mid/Midlight/Dark were previously unset, so Fusion fell back to OS defaults
+        # (e.g. a low-contrast mid-grey the "?" badge relied on). Set them per theme.
+        pal.setColor(R.Mid, mid)
+        pal.setColor(R.Midlight, midlight)
+        pal.setColor(R.Dark, darkc)
         pal.setColor(R.Highlight, C(38, 110, 180))
         pal.setColor(R.HighlightedText, C(255, 255, 255))
         for role in (R.WindowText, R.Text, R.ButtonText):
@@ -944,6 +952,9 @@ class MainWindow(QtWidgets.QMainWindow):
             app.setPalette(self._build_palette(dark=False))
         else:  # 'system' — follow the OS / Qt default
             app.setPalette(app.style().standardPalette())
+        # Deterministically re-apply token colours to themed labels + "?" badges (they
+        # don't reliably auto-refresh from a stylesheet — see gui.theme.retheme).
+        retheme(self)
 
     @QtCore.Slot()
     def _on_settings_applied(self) -> None:
@@ -954,6 +965,7 @@ class MainWindow(QtWidgets.QMainWindow):
         set_palette(self.controller.settings.plot_palette)
         set_plot_units(self.controller.settings.plot_units)     # plot-axis units (#8)
         set_tooltips_enabled(self.controller.settings.show_tooltips)
+        self._refresh_sidebar()      # re-pick tree marker colours for the new theme
         self.dls_module.reseed_from_settings()
         self.utilities_module.reseed_from_settings()
         self.cross_module.refresh()                             # redraw scaling axes

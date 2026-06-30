@@ -177,8 +177,10 @@ Python's standard-library `io` and breaks imports. Use `exporting/`.
 - Runtime: `numpy`, `scipy` (optimize/nnls/curve_fit), `statsmodels` (ADF test in
   utilities), `matplotlib`, `PySide6`. Pinned in `requirements.txt`.
 - Recreate the venv with `py -3.13 -m venv .venv` then `pip install -r requirements.txt`;
-  point your interpreter at `.venv\Scripts\python.exe`. (`.venv/` is gitignored.) On
-  Windows, `Launch DLS Buddy.bat` bootstraps the venv on first run and launches the app.
+  point your interpreter at `.venv\Scripts\python.exe` (Windows) or `.venv/bin/python`
+  (macOS). (`.venv/` is gitignored.) The double-click launchers bootstrap the venv on
+  first run and launch the app: `Launch DLS Buddy (Windows).bat` and
+  `Launch DLS Buddy (MacOS).command`.
 
 ## How to run / validate
 

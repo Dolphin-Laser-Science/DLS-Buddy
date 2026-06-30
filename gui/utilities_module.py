@@ -33,6 +33,8 @@ from app import units as U
 from gui.plot_controls import (
     make_split_panels, make_canvas_expanding, make_vertical_plot_stack,
 )
+from gui.theme import ThemedLabel
+from gui.widgets import roomy_tabs
 
 from plotting.plots import (
     plot_i_sin_theta, plot_synthetic_correlogram, plot_intensity_trace,
@@ -137,7 +139,7 @@ class UtilitiesModule(QtWidgets.QWidget):
     # ------------------------------------------------------------------ UI ---
     def _build_ui(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
-        self.inner = QtWidgets.QTabWidget()
+        self.inner = roomy_tabs(QtWidgets.QTabWidget())   # roomier tabs so labels don't clip (#3)
         self.inner.setMovable(True)              # drag to reorder sub-tabs (A4)
         outer.addWidget(self.inner)
         self.inner.addTab(self._build_traces_tab(), 'Traces')
@@ -171,9 +173,8 @@ class UtilitiesModule(QtWidgets.QWidget):
         v.addWidget(NavigationToolbar(self.isin_canvas, w))
         v.addWidget(self.isin_canvas, 1)
 
-        self.isin_note = QtWidgets.QLabel('')
+        self.isin_note = ThemedLabel('', role='hint', size=11)
         self.isin_note.setWordWrap(True)
-        self.isin_note.setStyleSheet('color:#777; font-size: 11px;')
         v.addWidget(self.isin_note)
         return w
 
@@ -277,10 +278,10 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.trace_ax = self.trace_fig.add_subplot(111)
         tlay.addWidget(NavigationToolbar(self.trace_canvas, w))
         tlay.addWidget(self.trace_canvas, 1)
-        self.trace_stats = QtWidgets.QLabel(
-            'Load a count-rate trace (ALV .ASC, or a two-column CSV).')
+        self.trace_stats = ThemedLabel(
+            'Load a count-rate trace (ALV .ASC, or a two-column CSV).',
+            role='muted', size=11)
         self.trace_stats.setWordWrap(True)
-        self.trace_stats.setStyleSheet('color:#555; font-size: 11px;')
         tlay.addWidget(self.trace_stats)
 
         bottom = QtWidgets.QWidget()
@@ -716,11 +717,10 @@ class UtilitiesModule(QtWidgets.QWidget):
                 self.syn_save[key] = cb
                 gl.addWidget(cb, r, 2, alignment=centre)
         self.syn_preview['correlogram'].setChecked(True)   # a sensible default
-        note = QtWidgets.QLabel(
+        note = ThemedLabel(
             'Ticking Preview or Save generates that artifact; the workspace toggle '
-            'below then adds the generated data too.')
+            'below then adds the generated data too.', role='hint', size=10)
         note.setWordWrap(True)
-        note.setStyleSheet('color:#777; font-size: 10px;')
         gl.addWidget(note, len(_SYNTH_ARTIFACTS) + 1, 0, 1, 3)
         left.addWidget(gen_box)
 
@@ -770,9 +770,9 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.syn_ax = self.syn_fig.add_subplot(111)
         right.addWidget(NavigationToolbar(self.syn_canvas, w))
         right.addWidget(self.syn_canvas, 1)
-        self.syn_truth = QtWidgets.QLabel('Choose artifacts and Generate.')
+        self.syn_truth = ThemedLabel('Choose artifacts and Generate.',
+                                     role='muted', size=11)
         self.syn_truth.setWordWrap(True)
-        self.syn_truth.setStyleSheet('color:#555; font-size: 11px;')
         right.addWidget(self.syn_truth)
 
         self._syn_built = {}        # key -> built artifact object

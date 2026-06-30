@@ -28,6 +28,7 @@ from core.workspace import _DLS_PARAM_KEYS, _SLS_PARAM_KEYS
 from app.controller import _SHARED_PARAM_KEYS
 from app import units as U
 from gui.help import section_header
+from gui.theme import ThemedLabel
 
 
 # Unit labels now live in the dedicated Unit column, so the parameter names here
@@ -81,6 +82,22 @@ _DIRTY_BG = QtCore.Qt.GlobalColor.yellow
 _DIRTY_FG = QtCore.Qt.GlobalColor.black
 
 
+class _EnterAdvanceDelegate(QtWidgets.QStyledItemDelegate):
+    """Value-cell editor delegate that fires `enter_pressed` when the user commits a
+    cell with Return/Enter, so the table can advance focus to the next field
+    (feedback 2026-06-30 #6). The open editor is a child QLineEdit that consumes the
+    key, so a table-level keyPressEvent wouldn't see it — hooking the editor's
+    `returnPressed` is the reliable signal."""
+
+    enter_pressed = QtCore.Signal()
+
+    def createEditor(self, parent, option, index):
+        editor = super().createEditor(parent, option, index)
+        if isinstance(editor, QtWidgets.QLineEdit):
+            editor.returnPressed.connect(self.enter_pressed)
+        return editor
+
+
 class DataModule(QtWidgets.QWidget):
     """Parameter confirmation surface for the selected measurement."""
 
@@ -120,6 +137,7 @@ class DataModule(QtWidgets.QWidget):
                 '<b>SLS (Mw, A₂):</b> + dn/dc, concentration, and a calibration.',
                 'Identity &amp; optics are shared across the sample (enter once); '
                 'concentration and angle are per-measurement.',
+                'Tip: press <b>Enter</b> in a value to jump to the next field.',
             ]))
         self.table = QtWidgets.QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(['Parameter', 'Value', 'Unit'])
@@ -140,6 +158,13 @@ class DataModule(QtWidgets.QWidget):
         # Value column is editable, so navigating Parameter/Unit cells is harmless.
         self.table.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.AllEditTriggers)
+        # Enter in a Value cell commits and jumps to the next field (feedback #6). The
+        # delegate (on the Value column only) reports the Return; we advance deferred so
+        # the editor finishes committing through _on_cell_changed first.
+        self._enter_delegate = _EnterAdvanceDelegate(self.table)
+        self.table.setItemDelegateForColumn(1, self._enter_delegate)
+        self._enter_delegate.enter_pressed.connect(
+            lambda: QtCore.QTimer.singleShot(0, self._advance_to_next_field))
         self.table.itemChanged.connect(self._on_cell_changed)
         layout.addWidget(self.table, 1)
         # (The shared-vs-per-measurement note now lives in the section's "?" help,
@@ -162,8 +187,7 @@ class DataModule(QtWidgets.QWidget):
         row.addWidget(self.update_button)
         row.addWidget(self.undo_button)
         row.addWidget(self.reset_button)
-        self.pending = QtWidgets.QLabel('')
-        self.pending.setStyleSheet('color:#b06000;')
+        self.pending = ThemedLabel('', role='pending')
         row.addWidget(self.pending, 1)
         layout.addLayout(row)
 
@@ -336,6 +360,26 @@ class DataModule(QtWidgets.QWidget):
             self.controller.set_param(self.item_id, key, value)
         self._refresh_dirty()
         self._refresh_pending()
+
+    def _advance_to_next_field(self) -> None:
+        """Move focus to the next editable Value cell after Enter (feedback #6). Skips to
+        the next row whose Value is an editable item and opens its editor so the user can
+        keep typing; if that row's Value is a widget (the geometry dropdown) it is focused
+        instead. Stops at the last field (no wrap)."""
+        start = self.table.currentRow()
+        if start < 0:
+            return
+        for r in range(start + 1, self.table.rowCount()):
+            item = self.table.item(r, 1)
+            if item is not None and (item.flags() & QtCore.Qt.ItemFlag.ItemIsEditable):
+                self.table.setCurrentCell(r, 1)
+                self.table.editItem(item)
+                return
+            widget = self.table.cellWidget(r, 1)
+            if widget is not None:                    # e.g. the geometry dropdown
+                self.table.setCurrentCell(r, 1)
+                widget.setFocus(QtCore.Qt.FocusReason.TabFocusReason)
+                return
 
     def _on_geometry_changed(self, text: str) -> None:
         """Polarisation dropdown changed: store the per-measurement geometry."""

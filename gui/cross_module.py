@@ -45,6 +45,8 @@ from plotting.plots import plot_scaling
 from gui.plot_controls import make_canvas_expanding
 from gui.export_helper import export_to_csv
 from gui.help import section_header
+from gui.theme import ThemedLabel
+from gui.widgets import roomy_tabs
 from analysis.utilities import interpret_scaling_exponent
 from analysis.uncertainty import format_pm
 
@@ -117,16 +119,15 @@ class CrossSampleModule(QtWidgets.QWidget):
         left.addLayout(sel_row)
         btn_sel_all.clicked.connect(self._select_all_samples)
         btn_sel_none.clicked.connect(self._select_none_samples)
-        self.left_note = QtWidgets.QLabel('')
+        self.left_note = ThemedLabel('', role='hint', size=11)
         self.left_note.setWordWrap(True)
-        self.left_note.setStyleSheet('color:#777; font-size: 11px;')
         left.addWidget(self.left_note)
 
         # ---- right: inner tabs (rho | scaling) + a shared source panel -----
         right = QtWidgets.QVBoxLayout()
         outer.addLayout(right, 1)
 
-        self.inner = QtWidgets.QTabWidget()
+        self.inner = roomy_tabs(QtWidgets.QTabWidget())   # roomier tabs so labels don't clip (#3)
         self.inner.setMovable(True)              # drag to reorder sub-tabs (A4)
         right.addWidget(self.inner, 1)
 
@@ -144,9 +145,8 @@ class CrossSampleModule(QtWidgets.QWidget):
             QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.itemSelectionChanged.connect(self._on_row_selected)
         rl.addWidget(self.table, 1)
-        self.interp = QtWidgets.QLabel('')
+        self.interp = ThemedLabel('', role='muted', size=11)
         self.interp.setWordWrap(True)
-        self.interp.setStyleSheet('color:#555; font-size: 11px;')
         rl.addWidget(self.interp)
         self.inner.addTab(rho_tab, 'ρ = Rg/Rh')
 
@@ -172,9 +172,8 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.ax_rg = self.scaling_fig.add_subplot(2, 1, 1)
         self.ax_a2 = self.scaling_fig.add_subplot(2, 1, 2)
         sl.addWidget(self.scaling_canvas, 1)
-        self.scaling_note = QtWidgets.QLabel('')
+        self.scaling_note = ThemedLabel('', role='muted', size=11)
         self.scaling_note.setWordWrap(True)
-        self.scaling_note.setStyleSheet('color:#555; font-size: 11px;')
         sl.addWidget(self.scaling_note)
         self.inner.addTab(scaling_tab, 'Scaling (Rg–Mw, A₂–Mw)')
         self.inner.currentChanged.connect(lambda _i: self._refresh_scaling())

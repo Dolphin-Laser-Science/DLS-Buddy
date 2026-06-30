@@ -39,6 +39,7 @@ from matplotlib.figure import Figure
 from plotting.plots import (
     plot_correlogram_scaled, plot_distribution,
     plot_gamma_q2, plot_concentration_extrapolation, plot_ddls, _CYCLE,
+    annotate_decollided,
     display_factor as _disp_factor, display_unit as _disp_unit,
 )
 from app import units as U
@@ -48,6 +49,8 @@ from gui.plot_controls import (
 )
 from gui.export_helper import export_to_csv
 from gui.help import add_help_to_groupbox
+from gui.theme import ThemedLabel, span, token
+from gui.widgets import roomy_tabs
 from analysis.uncertainty import format_pm
 
 
@@ -124,6 +127,27 @@ def _fmt(x: Optional[float], sig: int = 3) -> str:
     return f'{x:.{sig}g}'
 
 
+def _ordinal_peak(i: int) -> str:
+    """'1st peak', '2nd peak', … for a 0-based index (positional-peak row labels,
+    matching the replicate-averaging peak language)."""
+    n = i + 1
+    suffix = ('th' if 11 <= (n % 100) <= 13
+              else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th'))
+    return f'{n}{suffix} peak'
+
+
+def _widen_row_gap(figure, hspace: float = 0.06) -> None:
+    """Add a little extra vertical space between stacked subplots so the draggable
+    residual grip line (feedback #5) sits in clear space and doesn't touch a plot.
+    Tolerant of matplotlib layout-engine API differences."""
+    try:
+        engine = figure.get_layout_engine()
+        if engine is not None and hasattr(engine, 'set'):
+            engine.set(hspace=hspace)
+    except Exception:
+        pass
+
+
 def _tau_window_kwargs(min_edit: QtWidgets.QLineEdit, max_edit: QtWidgets.QLineEdit,
                        unit_combo: QtWidgets.QComboBox) -> Dict[str, float]:
     """Read a min/max delay window in the selected unit, converted to seconds.
@@ -173,6 +197,22 @@ def _vtable(rows: List[str]) -> QtWidgets.QTableWidget:
         t.setItem(r, 1, QtWidgets.QTableWidgetItem('—'))
     t.setMaximumHeight(28 + 22 * len(rows))
     return t
+
+
+def _fill_vtable(table, values) -> None:
+    """Set the value column (col 1) of a `_vtable` from a list of strings."""
+    for r, v in enumerate(values):
+        it = table.item(r, 1)
+        if it is not None:
+            it.setText(v)
+
+
+def _reset_vtable(table) -> None:
+    """Reset a `_vtable`'s value column to '—'."""
+    for r in range(table.rowCount()):
+        it = table.item(r, 1)
+        if it is not None:
+            it.setText('—')
 
 
 # ===========================================================================
@@ -361,7 +401,9 @@ class _MeasurementChecklist(QtWidgets.QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.addWidget(QtWidgets.QLabel('Measurements to plot'))
         self.list = QtWidgets.QListWidget()
-        self.list.setMaximumHeight(160)
+        # Min (not max) height so the list grows to fill its resizable splitter pane
+        # (feedback #9) instead of being capped.
+        self.list.setMinimumHeight(80)
         self.list.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list.itemSelectionChanged.connect(self._on_selection_changed)
@@ -454,6 +496,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self._run_failures: Dict[str, str] = {} # iid -> reason (last run)
         self._scales = list(_SCALE_MODES)       # [main, side0, side1, side2]
         self._markers: Dict[str, object] = {}   # handle name -> Line2D on main_ax
+        self._handle_glyphs: Dict[str, object] = {}  # handle name -> caret Line2D
         self._base_span = None                  # baseline shaded region (Polygon)
         self._drag: Optional[str] = None        # handle being dragged, or None
         self._suppress_fields = False
@@ -464,14 +507,15 @@ class _CorrelogramTab(QtWidgets.QWidget):
 
         self.checklist = _MeasurementChecklist(self.controller, self.selection)
         self.checklist.changed.connect(self._on_selection_changed)
-        left.addWidget(self.checklist)
 
         box = QtWidgets.QGroupBox('Parametric fit')
         add_help_to_groupbox(box, 'Fit the correlogram to get a size (Rh).', bullets=[
             'Pick a <b>method</b>, set the <b>delay window</b> (the τ range fitted), '
             'then <b>Run fit</b>.',
-            'Drag the dotted (window) and dashed (baseline) markers on the plot, or '
-            'type values.',
+            'Drag the markers on the plot, or type values. The <b>window</b> handles '
+            '(green carets) sit at the <b>top</b>; the <b>baseline</b> handles (grey '
+            'carets) at the <b>bottom</b> — so grab the top or bottom half to pick one '
+            'when they overlap.',
             'The <b>baseline region</b> sets where g₂−1 → 0 is estimated (used by the '
             'distribution methods).',
         ])
@@ -496,16 +540,16 @@ class _CorrelogramTab(QtWidgets.QWidget):
         form.addRow('Delay window:', win)
         # Baseline region (used by distribution fits): mean g2-1 over this τ range.
         brow = QtWidgets.QHBoxLayout(); brow.setContentsMargins(0, 0, 0, 0)
-        self.base_lo = QtWidgets.QLineEdit(); self.base_lo.setPlaceholderText('lo')
-        self.base_hi = QtWidgets.QLineEdit(); self.base_hi.setPlaceholderText('hi')
+        self.base_lo = QtWidgets.QLineEdit(); self.base_lo.setPlaceholderText('low')
+        self.base_hi = QtWidgets.QLineEdit(); self.base_hi.setPlaceholderText('high')
         brow.addWidget(self.base_lo); brow.addWidget(self.base_hi)
         bwidget = QtWidgets.QWidget(); bwidget.setLayout(brow)
         form.addRow('Baseline region:', bwidget)
-        hint = QtWidgets.QLabel('Drag the dotted (window) and dashed (baseline) '
-                                'markers on the plot, or type values; same unit as '
-                                'the delay window. One window applies to every ticked '
-                                'measurement.')
-        hint.setWordWrap(True); hint.setStyleSheet('color:#777; font-size: 10px;')
+        hint = ThemedLabel('Drag the markers on the plot (window carets on top, '
+                           'baseline carets on the bottom), or type values; same unit '
+                           'as the delay window. One window applies to every ticked '
+                           'measurement.', role='hint', size=10)
+        hint.setWordWrap(True)
         form.addRow(hint)
         # Reset the window + baseline back to the defaults (full lag range; baseline
         # = last 25 %) — handy after dragging/zooming (feedback 2026-06-26 #7).
@@ -519,29 +563,37 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self.run_button = QtWidgets.QPushButton('Run fit')
         self.run_button.clicked.connect(self._on_run)
         form.addRow(self.run_button)
-        left.addWidget(box)
 
         # One results area for the selected method (feedback 2026-06-29 #12): a single
         # table rebuilt with that method's rows, with Export directly beneath it.
+        results_section = QtWidgets.QWidget()
+        rlay = QtWidgets.QVBoxLayout(results_section)
+        rlay.setContentsMargins(0, 0, 0, 0)
         self.results_label = QtWidgets.QLabel('Results')
-        left.addWidget(self.results_label)
+        rlay.addWidget(self.results_label)
         self.result_table = _vtable(_RESULT_ROWS['cumulant'])
-        left.addWidget(self.result_table)
+        rlay.addWidget(self.result_table)
         self.export_button = QtWidgets.QPushButton('Export CSV…')
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._on_export)
-        left.addWidget(self.export_button)
+        rlay.addWidget(self.export_button)
+        rlay.addStretch(1)
+        # Vertically resizable control column (feedback #9): drag the grips to size the
+        # checklist / fit controls / results panes against each other.
+        vstack = make_vertical_plot_stack(
+            [self.checklist, box, results_section], sizes=[160, 360, 150],
+            min_heights=[80, max(box.sizeHint().height(), 200), 60])
+        left.addWidget(vstack, 1)
 
         self.status = QtWidgets.QLabel('')
         self.status.setWordWrap(True)
         left.addWidget(self.status)
-        self.flag_label = QtWidgets.QLabel('')
+        self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
-        self.flag_label.setStyleSheet('color:#c00; font-weight: bold;')
         left.addWidget(self.flag_label)
-        left.addStretch(1)
 
         self.figure = Figure(figsize=(5.5, 4.6), constrained_layout=True)
+        _widen_row_gap(self.figure)              # room for the residual grip line (#5)
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
         # Flat 4×2 gridspec (constrained_layout handles a flat grid robustly; a nested
         # subgridspec trips its tick-bbox pass on degenerate log axes). The fit spans
@@ -781,14 +833,32 @@ class _CorrelogramTab(QtWidgets.QWidget):
             return
         self._drag = self._nearest_handle(event)
 
+    # Which handles live in which half of the plot (feedback #7): window markers carry
+    # their carets at the top, baseline markers at the bottom, so a press is disambiguated
+    # by y-band even when two markers share an x.
+    _TOP_HANDLES = ('tau_min', 'tau_max')
+    _BOTTOM_HANDLES = ('base_lo', 'base_hi')
+
     def _nearest_handle(self, event) -> Optional[str]:
         # The region stores τ in seconds, but the axis is drawn in display units
         # (µs by default), so handle positions are scaled by _disp_factor('time')
         # before being mapped to pixels.
         tfac = _disp_factor('time')
+        if event.x is None or event.y is None:
+            return None
+        # Pick the candidate kind by which half of the axes the press is in: the top half
+        # grabs the window markers, the bottom half the baseline markers. This is what
+        # lets the user target the right marker when window + baseline overlap in τ.
+        try:
+            yf = self.main_ax.transAxes.inverted().transform((event.x, event.y))[1]
+        except Exception:
+            return None
+        wanted = self._TOP_HANDLES if yf >= 0.5 else self._BOTTOM_HANDLES
         y_mid = sum(self.main_ax.get_ylim()) / 2.0
-        best, best_px = None, 8.0                 # 8-pixel grab tolerance
+        best, best_px = None, 8.0                 # 8-pixel grab tolerance (within the band)
         for name, attr in self._HANDLES:
+            if name not in wanted:
+                continue
             x = getattr(self.region, attr)
             if x is None:
                 continue
@@ -801,6 +871,9 @@ class _CorrelogramTab(QtWidgets.QWidget):
         return best
 
     def _on_motion(self, event) -> None:
+        # (No hover-cursor cue here: the residual resizer manages the canvas cursor on
+        # the same motion signal and would override it. The offset carets are the
+        # affordance instead.)
         if (self._drag is None or event.inaxes is not self.main_ax
                 or event.xdata is None):
             return
@@ -812,7 +885,10 @@ class _CorrelogramTab(QtWidgets.QWidget):
         line = self._markers.get(self._drag)
         if line is not None:
             line.set_xdata([x * tfac, x * tfac])   # draw in display units
-            self.canvas.draw_idle()             # move only the line (cheap)
+        glyph = self._handle_glyphs.get(self._drag)
+        if glyph is not None:
+            glyph.set_xdata([x * tfac])            # caret tracks its line
+        self.canvas.draw_idle()                    # move only the line + caret (cheap)
 
     def _clamp_handle(self, name: str, x: float) -> float:
         if self._union_tau is not None:           # clamp to the union of all ticked
@@ -836,9 +912,19 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self._fields_from_region()
         self._redraw()                           # recreate markers + baseline span
 
+    # Marker styling + offset-handle geometry (feedback #7). Window markers carry a
+    # downward caret at the TOP; baseline markers an upward caret at the BOTTOM, so the
+    # two kinds are told apart (and grabbed) by which half of the plot you click — even
+    # when they overlap in τ. _BASE_HANDLE_Y is kept a touch above the bottom so the
+    # caret never lands in the residual-resize gap band below main_ax.
+    _WIN_COLOUR, _BASE_COLOUR = '#2ca02c', '#888'
+    _WIN_HANDLE_Y, _BASE_HANDLE_Y = 0.96, 0.05
+
     def _draw_markers(self) -> None:
-        """Draw the window (dotted) + baseline (dashed, shaded) handles on main_ax."""
+        """Draw the window (dotted, top carets) + baseline (dashed + shaded, bottom
+        carets) markers on main_ax, each a full-height line plus an offset grab handle."""
         self._markers = {}
+        self._handle_glyphs = {}
         self._base_span = None
         r = self.region
         # The region stores τ in canonical seconds, but the correlogram x-axis is
@@ -847,23 +933,39 @@ class _CorrelogramTab(QtWidgets.QWidget):
         # markers land at the raw-seconds value on a µs axis (e.g. τ_max ≈ 1 s draws
         # at the "1 µs" tick, the "capped at 1 µs" bug).
         tfac = _disp_factor('time')
+        # Carets use a blended transform: x in data units, y in axes fraction.
+        htrans = self.main_ax.get_xaxis_transform()
+
+        def _caret(x, marker, colour, y):
+            return self.main_ax.plot(
+                [x], [y], marker=marker, color=colour, markersize=10,
+                markeredgewidth=0, transform=htrans, clip_on=False, zorder=6)[0]
+
         # Only the first line of each kind carries a legend label, so the legend
         # shows one "τ window" and one "baseline region" entry (feedback B4).
         if r.tau_min_s is not None:
             self._markers['tau_min'] = self.main_ax.axvline(
-                r.tau_min_s * tfac, color='#2ca02c', ls=':', lw=1.4,
+                r.tau_min_s * tfac, color=self._WIN_COLOUR, ls=':', lw=1.4,
                 label='τ window (fit range)')
+            self._handle_glyphs['tau_min'] = _caret(
+                r.tau_min_s * tfac, 'v', self._WIN_COLOUR, self._WIN_HANDLE_Y)
         if r.tau_max_s is not None:
             self._markers['tau_max'] = self.main_ax.axvline(
-                r.tau_max_s * tfac, color='#2ca02c', ls=':', lw=1.4)
+                r.tau_max_s * tfac, color=self._WIN_COLOUR, ls=':', lw=1.4)
+            self._handle_glyphs['tau_max'] = _caret(
+                r.tau_max_s * tfac, 'v', self._WIN_COLOUR, self._WIN_HANDLE_Y)
         if r.base_lo_s is not None and r.base_hi_s is not None:
             lo, hi = sorted((r.base_lo_s * tfac, r.base_hi_s * tfac))
             self._base_span = self.main_ax.axvspan(lo, hi, color='#999', alpha=0.12,
                                                    label='baseline region')
             self._markers['base_lo'] = self.main_ax.axvline(
-                r.base_lo_s * tfac, color='#888', ls='--', lw=1.2)
+                r.base_lo_s * tfac, color=self._BASE_COLOUR, ls='--', lw=1.2)
+            self._handle_glyphs['base_lo'] = _caret(
+                r.base_lo_s * tfac, '^', self._BASE_COLOUR, self._BASE_HANDLE_Y)
             self._markers['base_hi'] = self.main_ax.axvline(
-                r.base_hi_s * tfac, color='#888', ls='--', lw=1.2)
+                r.base_hi_s * tfac, color=self._BASE_COLOUR, ls='--', lw=1.2)
+            self._handle_glyphs['base_hi'] = _caret(
+                r.base_hi_s * tfac, '^', self._BASE_COLOUR, self._BASE_HANDLE_Y)
 
     def _redraw(self) -> None:
         for ax in (self.main_ax, self.resid_ax, *self.side_axes):
@@ -1063,7 +1165,6 @@ class _DistributionTab(QtWidgets.QWidget):
 
         self.checklist = _MeasurementChecklist(self.controller, self.selection)
         self.checklist.changed.connect(self._on_selection_changed)
-        left.addWidget(self.checklist)
 
         box = QtWidgets.QGroupBox('Distribution')
         add_help_to_groupbox(box, 'Recover a full size distribution (not just one '
@@ -1113,10 +1214,10 @@ class _DistributionTab(QtWidgets.QWidget):
         aholder = QtWidgets.QWidget(); aholder.setLayout(arow)
         form.addRow('CONTIN α (min / max):', aholder)
         self.reseed_from_settings()
-        note = QtWidgets.QLabel('Delay window + baseline region are set on the '
-                                'Correlogram tab (shared). Each ticked method runs on '
-                                'every ticked measurement.')
-        note.setWordWrap(True); note.setStyleSheet('color:#777; font-size: 10px;')
+        note = ThemedLabel('Delay window + baseline region are set on the '
+                           'Correlogram tab (shared). Each ticked method runs on '
+                           'every ticked measurement.', role='hint', size=10)
+        note.setWordWrap(True)
         form.addRow(note)
         self.run_button = QtWidgets.QPushButton('Run')
         self.run_button.clicked.connect(self._on_run)
@@ -1125,13 +1226,34 @@ class _DistributionTab(QtWidgets.QWidget):
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._on_export)
         form.addRow(self.export_button)
-        left.addWidget(box)
+        # Per-measurement peak results for the ticked curves (feedback #10), mirroring
+        # the Correlogram tab's results panel: one coloured column per (measurement ·
+        # method), positional-peak rows. Populated in _draw, cleared on selection change.
+        results_section = QtWidgets.QWidget()
+        rlay = QtWidgets.QVBoxLayout(results_section)
+        rlay.setContentsMargins(0, 0, 0, 0)
+        self.results_label = QtWidgets.QLabel('Peak results')
+        rlay.addWidget(self.results_label)
+        self.result_table = QtWidgets.QTableWidget(0, 0)
+        self.result_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.result_table.verticalHeader().setVisible(False)
+        rlay.addWidget(self.result_table, 1)
+        # Vertically resizable control column (feedback #9): drag the grips to size the
+        # checklist / controls / results panes against each other.
+        vstack = make_vertical_plot_stack(
+            [self.checklist, box, results_section], sizes=[170, 300, 150],
+            min_heights=[90, max(box.sizeHint().height(), 160), 70])
+        left.addWidget(vstack, 1)
         self.status = QtWidgets.QLabel('')
         self.status.setWordWrap(True)
         left.addWidget(self.status)
-        left.addStretch(1)
 
         self.figure = Figure(figsize=(5.3, 4.4), constrained_layout=True)
+        # The distribution + residual do NOT share x (both carry their own x-label), so a
+        # generous gap is needed for the grip line to clear the main plot's "Rh (nm)"
+        # label (feedback #5: the indicator must not overlap the plots).
+        _widen_row_gap(self.figure, hspace=0.20)
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
         # Main distribution panel + a residual panel below (like the Correlogram
         # tab). The residual x-axis is the delay time τ, NOT the Rh/Γ axis, so the
@@ -1288,18 +1410,22 @@ class _DistributionTab(QtWidgets.QWidget):
         axis = self.axis_combo.currentData()
         ws = self.controller.workspace.measurements
         single = len(self._results) == 1
+        peak_items = []          # (x, y, text, colour) collected across all curves
         for iid, key, res in self._results:
             d = self._as_distribution(res)
             colour = self.selection.colour_for(iid)
             label = f'{_meas_short(ws[iid])} · {d.method.upper()}'
             plot_distribution(d, ax=self.ax, axis=axis, label=label,
                               colour=colour, fill=single)
-            self._annotate_peaks(d, res, axis, colour)
+            peak_items.extend(self._collect_peak_labels(d, res, axis, colour))
             # Residuals (data - reconstructed g2-1) vs delay time, per curve. Plot in
             # display units (× factor) so the τ axis matches the rest of the app.
             tau = np.asarray(d.fit_tau_s, dtype=float) * _disp_factor('time')
             self.resid_ax.plot(tau, np.asarray(d.residuals, dtype=float),
                                '-', color=colour, lw=1.0)
+        # One de-collided pass so peaks that coincide across curves stagger (capped at
+        # 6 + "+N more") instead of piling into an unreadable blob (feedback #8).
+        annotate_decollided(self.ax, peak_items)
         self.ax.set_title('DLS size / rate distribution')
         self.resid_ax.axhline(0.0, color='0.6', lw=0.8)
         self.resid_ax.set_xscale('log')
@@ -1316,26 +1442,68 @@ class _DistributionTab(QtWidgets.QWidget):
             notes.append('⚠ skipped: ' + '; '.join(self._failures))
         if self.controller.is_dirty() and self._results:
             notes.append('(ran on last committed values)')
-        notes.append('Peak values are tabulated in the Summary tab.')
+        notes.append('Peak values are also in the Summary tab.')
         self.status.setText('   '.join(notes))
+        self._refresh_results()
 
-    def _annotate_peaks(self, dist, res, axis: str, colour: str) -> None:
-        """Label each resolved peak on the distribution plot (GUI overlay; kept on
-        saved images too, like the Correlogram τ markers). Uses the controller's
-        peak finder so the analysis layer is not imported here. The label sits at
-        the curve's height at the peak, found from the distribution grid."""
+    def _refresh_results(self) -> None:
+        """Fill the peak-results panel from the ticked results — one coloured column per
+        (measurement · method), positional-peak rows (feedback #10). Mirrors the
+        Correlogram results panel; reuses the same peak source as the plot labels."""
+        ws = self.controller.workspace.measurements
+        cols = [(iid, key, res) for iid, key, res in self._results if iid in ws]
+        peaks_per = [self.controller.distribution_peaks(res) for _i, _k, res in cols]
+        max_peaks = max((len(p) for p in peaks_per), default=0)
+        n_rows = max(max_peaks, 1)
+        table = self.result_table
+        table.clear()
+        table.setColumnCount(1 + len(cols))
+        table.setRowCount(n_rows)
+        table.horizontalHeader().setVisible(True)
+        table.setHorizontalHeaderLabels(
+            ['', *[f'{_meas_short(ws[iid])} · {key.upper()}' for iid, key, _r in cols]])
+        for col, (iid, _k, _r) in enumerate(cols, start=1):
+            hi = table.horizontalHeaderItem(col)
+            if hi is not None:
+                hi.setForeground(QtGui.QColor(self.selection.colour_for(iid)))
+        table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        for col in range(1, 1 + len(cols)):
+            table.horizontalHeader().setSectionResizeMode(
+                col, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for r in range(n_rows):
+            table.setItem(r, 0, QtWidgets.QTableWidgetItem(_ordinal_peak(r)))
+            for col, peaks in enumerate(peaks_per, start=1):
+                if r < len(peaks):
+                    rh_nm, _gamma, weight = peaks[r]
+                    txt = f'{_fmt(rh_nm)} nm · {weight * 100:.0f}%'
+                else:
+                    txt = '—'
+                table.setItem(r, col, QtWidgets.QTableWidgetItem(txt))
+        table.setMaximumHeight(34 + 22 * n_rows)
+
+    def _clear_results(self) -> None:
+        self.result_table.clear()
+        self.result_table.setRowCount(0)
+        self.result_table.setColumnCount(0)
+
+    def _collect_peak_labels(self, dist, res, axis: str, colour: str) -> list:
+        """Collect this curve's peak labels as (x, y, text, colour) tuples for the
+        shared de-collision pass (GUI overlay; kept on saved images too, like the
+        Correlogram τ markers). Uses the controller's peak finder so the analysis layer
+        is not imported here. y is the curve's height at the peak, from the grid."""
         grid = np.asarray(dist.rh_grid_nm if axis == 'rh'
                           else dist.gamma_grid_s_inv, dtype=float)
         w = np.asarray(dist.weights, dtype=float)
+        items = []
         for rh_nm, gamma_s_inv, _weight in self.controller.distribution_peaks(res):
             x = rh_nm if axis == 'rh' else gamma_s_inv
             if x is None or not math.isfinite(x) or grid.size == 0:
                 continue
             y = float(w[int(np.argmin(np.abs(grid - x)))])
             txt = f'{_fmt(rh_nm)} nm' if axis == 'rh' else f'{_fmt(gamma_s_inv)} s⁻¹'
-            self.ax.annotate(txt, xy=(x, y),
-                             xytext=(0, 4), textcoords='offset points',
-                             ha='center', fontsize=8, color=colour)
+            items.append((x, y, txt, colour))
+        return items
 
     def _clear(self, message: str) -> None:
         self.ax.clear()
@@ -1343,6 +1511,7 @@ class _DistributionTab(QtWidgets.QWidget):
         self.ax.set_title(message)
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)
+        self._clear_results()
 
 
 # ===========================================================================
@@ -1358,57 +1527,99 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self.kind = kind                       # 'gamma_q2' or 'conc_extrap'
         self.item_id: Optional[str] = None
         self._runnable = False
-        self._cache: Dict[str, object] = {}     # sample_id -> fitted result (subset)
-        self._full: Dict[str, object] = {}      # sample_id -> all-points result (greying)
-        self._excluded: Dict[str, set] = {}     # sample_id -> excluded keys (#9)
+        self._cache: Dict[str, object] = {}      # sample_id -> fitted result (subset)
+        self._points: Dict[str, list] = {}       # sample_id -> dls_sample_points rows
+        self._included: Dict[str, set] = {}      # sample_id -> ticked item_ids (#11/#12)
+        self._suppress_table = False             # re-entrancy guard for checkbox edits
+        self._last_sid: Optional[str] = None     # last DLS sample shown (keep-last, #15)
         self._build_ui()
 
     def _build_ui(self) -> None:
         _, left, right = make_split_panels(self)
+
+        # ---- controls section ----
+        controls = QtWidgets.QWidget()
+        cl = QtWidgets.QVBoxLayout(controls); cl.setContentsMargins(0, 0, 0, 0)
         note = ('Fits Γ = D q² across the sample\'s DLS angles (current Mw '
                 'fraction).' if self.kind == 'gamma_q2' else
                 'Extrapolates D(c) → c→0 across the sample\'s DLS concentrations '
                 '(current Mw fraction).')
-        lbl = QtWidgets.QLabel(note)
-        lbl.setWordWrap(True)
-        lbl.setStyleSheet('color:#777; font-size: 11px;')
-        left.addWidget(lbl)
+        lbl = ThemedLabel(note, role='hint', size=11); lbl.setWordWrap(True)
+        cl.addWidget(lbl)
+        # Item 13: make the data source explicit.
+        src = ThemedLabel(
+            'Γ at each angle (and D = Γ/q²) comes from an internal 2nd-order cumulant '
+            'fit of each correlogram — independent of any saved Correlogram/Distribution '
+            'result — using the global skip-channels + cumulant method (Settings).',
+            role='hint', size=10)
+        src.setWordWrap(True); cl.addWidget(src)
         self.run_button = QtWidgets.QPushButton('Run')
         self.run_button.clicked.connect(self._on_run)
-        left.addWidget(self.run_button)
+        cl.addWidget(self.run_button)
         self.export_button = QtWidgets.QPushButton('Export CSV…')
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._on_export)
-        left.addWidget(self.export_button)
-        # Outlier removal (feedback 2026-06-26 #9): click a point to exclude it from
-        # the fit; excluded points are greyed and the fit recomputes on the rest.
-        excl_hint = QtWidgets.QLabel(
-            'Click a point on the plot to exclude it from the fit and recompute; '
-            'excluded points are greyed.')
-        excl_hint.setWordWrap(True)
-        excl_hint.setStyleSheet('color:#777; font-size: 10px;')
-        left.addWidget(excl_hint)
-        self.reset_excl_button = QtWidgets.QPushButton('Reset excluded points')
-        self.reset_excl_button.clicked.connect(self._on_reset_exclusions)
-        left.addWidget(self.reset_excl_button)
+        cl.addWidget(self.export_button)
         self.status = QtWidgets.QLabel('')
         self.status.setWordWrap(True)
-        left.addWidget(self.status)
-        self.flag_label = QtWidgets.QLabel('')
+        cl.addWidget(self.status)
+
+        # ---- per-measurement table section (tick to include — #11/#12) ----
+        tsec = QtWidgets.QWidget()
+        tl = QtWidgets.QVBoxLayout(tsec); tl.setContentsMargins(0, 0, 0, 0)
+        tl.addWidget(QtWidgets.QLabel('Measurements (tick to include in the fit)'))
+        self.table = QtWidgets.QTableWidget(0, 0)
+        self.table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.itemChanged.connect(self._on_table_changed)
+        tl.addWidget(self.table, 1)
+
+        # ---- results section (#14) ----
+        rsec = QtWidgets.QWidget()
+        rl = QtWidgets.QVBoxLayout(rsec); rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(QtWidgets.QLabel('Results'))
+        self.result_table = _vtable([lbl for lbl, _ in self._result_spec()])
+        rl.addWidget(self.result_table)
+        self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
-        self.flag_label.setStyleSheet('color:#c00; font-weight: bold;')
-        left.addWidget(self.flag_label)
-        left.addStretch(1)
+        rl.addWidget(self.flag_label)
+
+        vstack = make_vertical_plot_stack(
+            [controls, tsec, rsec], sizes=[200, 220, 160],
+            min_heights=[max(controls.sizeHint().height(), 150), 90, 90])
+        left.addWidget(vstack, 1)
 
         self.figure = Figure(figsize=(5.2, 4.3), constrained_layout=True)
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
         self.ax = self.figure.add_subplot(111)
         self._nav = NavigationToolbar(self.canvas, self)
-        self.canvas.mpl_connect('button_press_event', self._on_click)
         right.addWidget(self._nav)
         right.addWidget(self.canvas, 1)
         self.axis_bar = AxisControlBar(self.canvas)
         right.addWidget(self.axis_bar)
+
+    def _result_spec(self):
+        """(label, value-fn) per result row, for the results _vtable (#14)."""
+        df, du = _disp_factor('diffusion'), _disp_unit('diffusion')
+
+        def pm(v, se):
+            return format_pm(v * df, (se * df) if se is not None else None)
+        if self.kind == 'gamma_q2':
+            return [
+                (f'D ({du})', lambda r: pm(r.d_m2_s, r.d_se)),
+                ('Rh (nm)', lambda r: format_pm(r.rh_nm, r.rh_se)),
+                ('R²', lambda r: _fmt(r.r_squared)),
+                ('Diffusive?', lambda r: '✓' if r.is_diffusive else '⚠ no'),
+                ('angles fitted', lambda r: str(r.q2_m2.size)),
+            ]
+        return [
+            (f'D₀ ({du})', lambda r: pm(r.d0_m2_s, r.d0_se)),
+            ('Rh₀ (nm)', lambda r: format_pm(r.rh0_nm, r.rh0_se)),
+            ('k_D (mL/g)', lambda r: format_pm(r.kd_mL_per_g, r.kd_se)),
+            ('R²', lambda r: _fmt(r.r_squared)),
+            ('concs fitted', lambda r: str(r.n_concentrations)),
+        ]
 
     def _sample_id(self) -> Optional[str]:
         if self.item_id is None:
@@ -1420,26 +1631,138 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             'mw_fraction')
 
     def set_measurement(self, item_id: Optional[str], runnable: bool) -> None:
+        # Keep-last (#15): a non-DLS selection shouldn't blank a populated sample view —
+        # leave the current display (item_id, table, plot, run/export) untouched.
+        if item_id is not None and not runnable and self._last_sid is not None:
+            return
         self.item_id = item_id
         self._runnable = runnable
-        self.run_button.setEnabled(runnable)
-        self.status.clear()
         self.flag_label.clear()
         sid = self._sample_id()
-        self.export_button.setEnabled(runnable and sid is not None and sid in self._cache)
-        if runnable and sid is not None and sid in self._cache:
+        if not (runnable and sid is not None):
+            self.table.setRowCount(0)
+            self.run_button.setEnabled(False)
+            self.export_button.setEnabled(False)
+            self._clear_results()
+            self._clear('Select a DLS measurement.')
+            self.status.clear()
+            return
+        # Enumerate the sample's per-measurement points (cumulant Γ/D) for the table.
+        self._points[sid] = self.controller.dls_sample_points(
+            sid, self.kind, self._fraction())
+        fresh = {r['item_id'] for r in self._points[sid] if r['ok']}
+        prev = self._included.get(sid)
+        self._included[sid] = (prev & fresh) if prev is not None else set(fresh)
+        self._refresh_table(sid)
+        self._update_run_enabled(sid)
+        self.export_button.setEnabled(sid in self._cache)
+        self._last_sid = sid                      # remember for keep-last (#15)
+        if sid in self._cache:
+            self._fill_results(self._cache[sid])
             self._draw(self._cache[sid])
         else:
-            self._clear('Run to compute over this sample\'s DLS measurements.'
-                        if runnable else 'Select a DLS measurement.')
+            self._clear_results()
+            self._clear('Tick measurements, then Run.')
 
-    def _run_engine(self, sid: str, frac, exclude):
-        """Run the underlying fit for this tab's kind with `exclude` applied."""
+    # ---- per-measurement table (tick to include — #11/#12) ----
+    def _refresh_table(self, sid: str) -> None:
+        pts = self._points.get(sid, [])
+        inc = self._included.get(sid, set())
+        cu = _disp_unit('concentration')
+        if self.kind == 'gamma_q2':
+            headers = ['', 'Angle (°)', f'c ({cu})',
+                       f'Γ ({_disp_unit("decay_rate")})',
+                       f'D_app ({_disp_unit("diffusion")})']
+        else:
+            headers = ['', f'c ({cu})', 'Angle (°)',
+                       f'D_app ({_disp_unit("diffusion")})']
+        dfc, dfg, dfd = (_disp_factor('concentration'), _disp_factor('decay_rate'),
+                         _disp_factor('diffusion'))
+        Flag = QtCore.Qt.ItemFlag
+        self._suppress_table = True
+        try:
+            t = self.table
+            t.setColumnCount(len(headers))
+            t.setHorizontalHeaderLabels(headers)
+            t.setRowCount(len(pts))
+            for r, row in enumerate(pts):
+                chk = QtWidgets.QTableWidgetItem()
+                chk.setData(QtCore.Qt.ItemDataRole.UserRole, row['item_id'])
+                chk.setFlags(Flag.ItemIsUserCheckable | Flag.ItemIsEnabled
+                             if row['ok'] else Flag.ItemIsUserCheckable)
+                chk.setCheckState(QtCore.Qt.CheckState.Checked
+                                  if (row['ok'] and row['item_id'] in inc)
+                                  else QtCore.Qt.CheckState.Unchecked)
+                t.setItem(r, 0, chk)
+                ang = '—' if row['angle_deg'] is None else f"{row['angle_deg']:g}"
+                conc = ('—' if row['concentration_g_per_mL'] is None
+                        else f"{row['concentration_g_per_mL'] * dfc:g}")
+                gtxt = _fmt(row['gamma_s_inv'] * dfg) if row['ok'] else '—'
+                dtxt = _fmt(row['d_app_m2_s'] * dfd) if row['ok'] else '—'
+                vals = ([ang, conc, gtxt, dtxt] if self.kind == 'gamma_q2'
+                        else [conc, ang, dtxt])
+                for c, v in enumerate(vals, start=1):
+                    it = QtWidgets.QTableWidgetItem(v)
+                    it.setFlags(Flag.ItemIsEnabled)
+                    t.setItem(r, c, it)
+            t.resizeColumnsToContents()
+        finally:
+            self._suppress_table = False
+
+    def _on_table_changed(self, item) -> None:
+        if self._suppress_table or item.column() != 0:
+            return
+        sid = self._sample_id()
+        if sid is None:
+            return
+        iid = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        inc = self._included.setdefault(sid, set())
+        if item.checkState() == QtCore.Qt.CheckState.Checked:
+            inc.add(iid)
+        else:
+            inc.discard(iid)
+        enough = self._update_run_enabled(sid)
+        if sid in self._cache:
+            if enough:
+                self._recompute(sid)            # live refit on the new subset
+            else:
+                self._cache.pop(sid, None)
+                self.export_button.setEnabled(False)
+                self._clear_results()
+                self._clear('Tick at least two — then Run.')
+
+    def _distinct_keys(self, sid: str) -> int:
+        """Distinct angles (Γq²) / concentrations (D-vs-c) among the ticked ok points
+        (the engine needs ≥2 unique to fit)."""
+        inc = self._included.get(sid, set())
+        by_id = {r['item_id']: r for r in self._points.get(sid, [])}
+        keys = set()
+        for iid in inc:
+            r = by_id.get(iid)
+            if not (r and r['ok']):
+                continue
+            k = (r['angle_deg'] if self.kind == 'gamma_q2'
+                 else r['concentration_g_per_mL'])
+            if k is not None:
+                keys.add(round(float(k), 9))
+        return len(keys)
+
+    def _update_run_enabled(self, sid: str) -> bool:
+        enough = self._distinct_keys(sid) >= 2
+        self.run_button.setEnabled(bool(self._runnable) and enough)
+        if not enough:
+            word = 'angles' if self.kind == 'gamma_q2' else 'concentrations'
+            self.status.setText(f'Tick at least two distinct {word} to run.')
+        else:
+            self.status.clear()
+        return enough
+
+    def _run_engine(self, sid: str, frac, include_ids):
         if self.kind == 'gamma_q2':
             return self.controller.run_gamma_q2(
-                sid, fraction=frac, exclude_angles=exclude)
+                sid, fraction=frac, include_ids=include_ids)
         return self.controller.run_concentration_extrapolation(
-            sid, fraction=frac, exclude_concentrations=exclude)
+            sid, fraction=frac, include_ids=include_ids)
 
     @QtCore.Slot()
     def _on_run(self) -> None:
@@ -1450,74 +1773,41 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, 'No sample',
                                           'This measurement is not assigned to a sample.')
             return
-        self._recompute(sid)
+        if self._update_run_enabled(sid):
+            self._recompute(sid)
 
     def _recompute(self, sid: str) -> None:
-        """(Re)run the fit with the current exclusions and refresh the plot. The
-        all-points result is cached separately so excluded points can be greyed."""
-        frac = self._fraction()
-        excl = self._excluded.get(sid, set())
+        """Fit over the ticked subset and refresh the plot + results table."""
         try:
-            res = self._run_engine(sid, frac, excl)
-            full = self._run_engine(sid, frac, ()) if excl else res
+            res = self._run_engine(sid, self._fraction(),
+                                   set(self._included.get(sid, set())))
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
-                self, 'Analysis failed',
-                f'Could not run this analysis.\n\n{exc}\n\nIt needs at least two '
-                + ('angles' if self.kind == 'gamma_q2' else 'concentrations')
-                + ' in the sample (current Mw fraction), with parameters confirmed.')
+                self, 'Analysis failed', f'Could not run this analysis.\n\n{exc}')
             self.status.setText('Analysis failed — see dialog.')
             return
         self._cache[sid] = res
-        self._full[sid] = full
         self.export_button.setEnabled(True)
+        self._fill_results(res)
         self._draw(res)
+        self.status.clear()
 
-    # ---- outlier point exclusion (#9) ----
-    @staticmethod
-    def _points(res, kind):
-        """(xs, ys, keys) for a result: plotted x/y in DISPLAY units (so they line up
-        with the converted plot for click-hit-testing and greying) plus the canonical
-        exclusion key per point (angle for Γ-q², concentration g/mL for D-vs-c)."""
-        if kind == 'gamma_q2':
-            return (np.asarray(res.q2_m2, float) * _disp_factor('scattering_q2'),
-                    np.asarray(res.gamma_s_inv, float) * _disp_factor('decay_rate'),
-                    np.asarray(res.angles_deg, float))
-        return (np.asarray(res.concentrations_g_per_mL, float)
-                * _disp_factor('concentration'),
-                np.asarray(res.d_values_m2_s, float) * _disp_factor('diffusion'),
-                np.asarray(res.concentrations_g_per_mL, float))
+    def _fill_results(self, res) -> None:
+        for r, (_label, fn) in enumerate(self._result_spec()):
+            try:
+                txt = fn(res)
+            except Exception:
+                txt = '—'
+            it = self.result_table.item(r, 1)
+            if it is not None:
+                it.setText(txt)
 
-    def _key_label(self, key: float) -> str:
-        return (f'{key:g}°' if self.kind == 'gamma_q2'
-                else f'{key * 1e3:g} mg/mL')
-
-    def _on_click(self, event) -> None:
-        """Toggle the nearest point's exclusion (left-click on a data point)."""
-        if event.inaxes is not self.ax or event.xdata is None:
-            return
-        if getattr(self._nav, 'mode', ''):          # ignore while pan/zoom is active
-            return
-        sid = self._sample_id()
-        if sid is None or sid not in self._full:
-            return
-        xs, ys, keys = self._points(self._full[sid], self.kind)
-        if xs.size == 0:
-            return
-        # nearest point in pixel space (handles differing axis scales/units)
-        px = self.ax.transData.transform(np.column_stack([xs, ys]))
-        d = np.hypot(px[:, 0] - event.x, px[:, 1] - event.y)
-        i = int(np.argmin(d))
-        if d[i] > 18.0:                              # too far from any point — ignore
-            return
-        excl = self._excluded.setdefault(sid, set())
-        key = float(keys[i])
-        matched = {e for e in excl if np.isclose(e, key)}
-        if matched:
-            excl -= matched                          # re-include
-        else:
-            excl.add(key)
-        self._recompute(sid)
+    def _clear_results(self) -> None:
+        for r in range(self.result_table.rowCount()):
+            it = self.result_table.item(r, 1)
+            if it is not None:
+                it.setText('—')
+        self.flag_label.clear()
 
     @QtCore.Slot()
     def _on_export(self) -> None:
@@ -1535,35 +1825,12 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         if status:
             self.status.setText(status)
 
-    @QtCore.Slot()
-    def _on_reset_exclusions(self) -> None:
-        sid = self._sample_id()
-        if sid is None or not self._excluded.get(sid):
-            return
-        self._excluded[sid] = set()
-        self._recompute(sid)
-
-    def _draw_excluded(self, sid: str) -> None:
-        """Grey out the excluded points using the all-points result (#9)."""
-        excl = self._excluded.get(sid)
-        if not excl or sid not in self._full:
-            return
-        xs, ys, keys = self._points(self._full[sid], self.kind)
-        for x, y, k in zip(xs, ys, keys):
-            if any(np.isclose(k, e) for e in excl):
-                self.ax.plot([x], [y], 'x', color='#999999', ms=9, mew=2,
-                             zorder=4)
-
     def _draw(self, res) -> None:
         self.ax.clear()
         sid = self._sample_id()
-        excl = self._excluded.get(sid) if sid else None
         if self.kind == 'gamma_q2':
             plot_gamma_q2(res, ax=self.ax)
             self.ax.set_title('Γ vs q² (multi-angle)')
-            status = (f'Γ vs q²: D = {format_pm(res.d_m2_s, res.d_se)} m²/s   '
-                      f'Rh = {format_pm(res.rh_nm, res.rh_se)} nm   '
-                      f'over {res.q2_m2.size} angles   R² = {_fmt(res.r_squared)}')
             flag = ('' if res.is_diffusive else
                     '⚠ not purely diffusive: Γ is not linear through the origin in q² '
                     '— Rh is apparent; check for a slow mode or internal motion (qRg>1).')
@@ -1572,21 +1839,30 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         else:
             plot_concentration_extrapolation(res, ax=self.ax)
             self.ax.set_title('D vs c → infinite dilution')
-            status = (f'D vs c → c→0: D₀ = {format_pm(res.d0_m2_s, res.d0_se)} m²/s   '
-                      f'Rh₀ = {format_pm(res.rh0_nm, res.rh0_se)} nm   '
-                      f'k_D = {format_pm(res.kd_mL_per_g, res.kd_se)} mL/g   '
-                      f'over {res.n_concentrations} concentrations   '
-                      f'R² = {_fmt(res.r_squared)}   (thermodynamic Rh)')
             flag = ('(± statistical only)'
                     if (res.d0_se is not None or res.kd_se is not None) else '')
-        if excl:
-            self._draw_excluded(sid)
-            status += ('   ·   excluded: '
-                       + ', '.join(self._key_label(k) for k in sorted(excl)))
+        if sid is not None:
+            self._grey_points(sid)        # grey the unticked (excluded) ok points
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)
-        self.status.setText(status)
         self.flag_label.setText(flag)
+
+    def _grey_points(self, sid: str) -> None:
+        """Grey × the ok points that are NOT ticked, from the per-measurement
+        enumeration (by item_id, so replicates are disambiguated)."""
+        inc = self._included.get(sid, set())
+        if self.kind == 'gamma_q2':
+            xf, yf, xk, yk = (_disp_factor('scattering_q2'),
+                              _disp_factor('decay_rate'), 'q2_m2', 'gamma_s_inv')
+        else:
+            xf, yf, xk, yk = (_disp_factor('concentration'),
+                              _disp_factor('diffusion'),
+                              'concentration_g_per_mL', 'd_app_m2_s')
+        for row in self._points.get(sid, []):
+            if not row['ok'] or row['item_id'] in inc or row[xk] is None:
+                continue
+            self.ax.plot([row[xk] * xf], [row[yk] * yf], 'x', color='#999999',
+                         ms=9, mew=2, zorder=4)
 
     def _clear(self, message: str) -> None:
         self.ax.clear()
@@ -1601,6 +1877,9 @@ class _DDLSTab(QtWidgets.QWidget):
     polarisation (VV/VH) in the Data tab; this pairs them by angle and extracts
     D_r = (Γ_VH − Γ_VV)/6, with D_t from the VV channel."""
 
+    _RESULT_ROWS = ['D_r (rad²/s)', 'τ_rot (µs)', 'D_t (m²/s)', 'R_h,t (nm)',
+                    'paired angles', 'single-exp (qL)']
+
     def __init__(self, controller, parent=None) -> None:
         super().__init__(parent)
         self.controller = controller
@@ -1609,17 +1888,17 @@ class _DDLSTab(QtWidgets.QWidget):
         self._cache: Dict[str, tuple] = {}      # sample_id -> (result, info) fitted
         self._full: Dict[str, tuple] = {}       # sample_id -> (result, info) all angles
         self._excluded: Dict[str, set] = {}     # sample_id -> excluded angles (#9)
+        self._last_sid: Optional[str] = None    # last DLS sample shown (keep-last, #15)
         self._build_ui()
 
     def _build_ui(self) -> None:
         _, left, right = make_split_panels(self)
-        note = QtWidgets.QLabel(
+        note = ThemedLabel(
             'Pairs the sample\'s VV (polarized) and VH (depolarized) correlograms '
             'by angle and extracts the rotational diffusion coefficient '
             'D_r = (Γ_VH − Γ_VV)/6 (D_t from the VV channel). Tag each correlogram\'s '
-            'polarization in the Data tab.')
+            'polarization in the Data tab.', role='hint', size=11)
         note.setWordWrap(True)
-        note.setStyleSheet('color:#777; font-size: 11px;')
         left.addWidget(note)
 
         # Read-only summary of the sample's correlograms + pairing status.
@@ -1650,23 +1929,23 @@ class _DDLSTab(QtWidgets.QWidget):
         self.export_button.clicked.connect(self._on_export)
         left.addWidget(self.export_button)
         # Outlier removal (#9): click an angle's point to exclude it and recompute.
-        excl_hint = QtWidgets.QLabel(
+        excl_hint = ThemedLabel(
             'Click a point to exclude that angle from the D_r/D_t fit; excluded '
-            'angles are greyed.')
+            'angles are greyed.', role='hint', size=10)
         excl_hint.setWordWrap(True)
-        excl_hint.setStyleSheet('color:#777; font-size: 10px;')
         left.addWidget(excl_hint)
         self.reset_excl_button = QtWidgets.QPushButton('Reset excluded angles')
         self.reset_excl_button.clicked.connect(self._on_reset_exclusions)
         left.addWidget(self.reset_excl_button)
 
-        self.results = QtWidgets.QLabel('')
-        self.results.setWordWrap(True)
-        self.results.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        left.addWidget(QtWidgets.QLabel('Results'))
+        self.results = _vtable(self._RESULT_ROWS)
         left.addWidget(self.results)
-        self.flag_label = QtWidgets.QLabel('')
+        self.status = ThemedLabel('', role='muted', size=11)
+        self.status.setWordWrap(True)
+        left.addWidget(self.status)
+        self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
-        self.flag_label.setStyleSheet('color:#c00; font-weight: bold;')
         left.addWidget(self.flag_label)
 
         # Shape models (model-dependent dimensions). Framed + captioned so the
@@ -1674,10 +1953,12 @@ class _DDLSTab(QtWidgets.QWidget):
         self.shape_box = QtWidgets.QGroupBox(
             'Shape models (assumed geometry — not measured)')
         shape_layout = QtWidgets.QVBoxLayout(self.shape_box)
-        self.shape_label = QtWidgets.QLabel('')
-        self.shape_label.setWordWrap(True)
-        self.shape_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        shape_layout.addWidget(self.shape_label)
+        self.shape_table = _readonly_table(
+            ['Model', 'Dimensions', 'Aspect / ratio', 'OK?'], [])
+        shape_layout.addWidget(self.shape_table)
+        self.shape_caveat = ThemedLabel('', role='hint', size=11)
+        self.shape_caveat.setWordWrap(True)
+        shape_layout.addWidget(self.shape_caveat)
         left.addWidget(self.shape_box)
         self.shape_box.setVisible(False)
         left.addStretch(1)
@@ -1698,6 +1979,9 @@ class _DDLSTab(QtWidgets.QWidget):
         return self.controller.sample_id_of(self.item_id)
 
     def set_measurement(self, item_id: Optional[str], runnable: bool) -> None:
+        # Keep-last (#15): a non-DLS selection shouldn't blank a populated DDLS view.
+        if item_id is not None and not runnable and self._last_sid is not None:
+            return
         self.item_id = item_id
         self._runnable = runnable
         self.run_button.setEnabled(runnable)
@@ -1706,16 +1990,25 @@ class _DDLSTab(QtWidgets.QWidget):
         self.export_button.setEnabled(runnable and sid is not None and sid in self._cache)
         if runnable and sid is not None:
             self._refresh_table(sid)
+            self._last_sid = sid                  # remember for keep-last (#15)
             if sid in self._cache:
                 self._draw(*self._cache[sid])
             else:
-                self.results.clear()
+                self._clear_results()
                 self._clear("Run DDLS to pair this sample's VV/VH correlograms.")
         else:
             self.table.setRowCount(0)
-            self.results.clear()
+            self._clear_results()
             self._clear('Select a DLS measurement.' if not runnable
                         else 'No sample for this measurement.')
+
+    def _clear_results(self) -> None:
+        _reset_vtable(self.results)
+        self.status.clear()
+        self.flag_label.clear()
+        self.shape_table.setRowCount(0)
+        self.shape_caveat.clear()
+        self.shape_box.setVisible(False)
 
     def _refresh_table(self, sid: str) -> None:
         rows = self.controller.ddls_correlogram_summary(sid)
@@ -1761,7 +2054,7 @@ class _DDLSTab(QtWidgets.QWidget):
                 f'Could not run DDLS.\n\n{exc}\n\nTag at least one angle with BOTH a '
                 'VV and a VH correlogram (Data tab → Polarization), then confirm '
                 'parameters.')
-            self.results.setText('DDLS failed — see dialog.')
+            self.status.setText('DDLS failed — see dialog.')
             return
         self._cache[sid] = (res, info)
         self._full[sid] = full
@@ -1829,8 +2122,7 @@ class _DDLSTab(QtWidgets.QWidget):
             self, f'{sid}_ddls.csv',
             lambda p: self.controller.export_ddls(res, p, shapes=shapes))
         if status:
-            self.results.setText(self.results.text() + f'<br><span style="color:#777;'
-                                 f'font-size:11px;">{status}</span>')
+            self.status.setText(status)
 
     def _draw(self, res, info) -> None:
         self.ax.clear()
@@ -1851,24 +2143,23 @@ class _DDLSTab(QtWidgets.QWidget):
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)
 
-        rh = (f' &nbsp; R<sub>h,t</sub> = {_fmt(res.rh_t_nm)} nm'
-              if math.isfinite(res.rh_t_nm) else
-              ' &nbsp; R<sub>h,t</sub> = n/a (needs viscosity)')
-        paired_line = f'paired {len(info["paired_angles"])} angle(s) · {res.method}'
+        rh = (_fmt(res.rh_t_nm) if math.isfinite(res.rh_t_nm)
+              else 'n/a (needs viscosity)')
+        paired = f'{len(info["paired_angles"])} · {res.method}'
         if info.get('n_replicate_angles'):
-            paired_line += (f' · {info["n_replicate_angles"]} angle(s) '
-                            'replicate-averaged')
-        lines = [
-            f'<b>D<sub>r</sub></b> = {format_pm(res.d_r_rad2_s, res.d_r_se)} rad²/s'
-            f' &nbsp; τ<sub>rot</sub> = {_fmt(res.rotational_time_s * 1e6)} µs',
-            f'<b>D<sub>t</sub></b> = {format_pm(res.d_t_m2_s, res.d_t_se)} m²/s{rh}',
-            paired_line,
-        ]
+            paired += f' · {info["n_replicate_angles"]} replicate-avg'
         if res.single_exponential_valid is True:
-            lines.append('qL &lt; 3 ✓ single-exponential regime')
+            ql = 'qL < 3 ✓'
         elif res.single_exponential_valid is False:
-            lines.append('<span style="color:#c00;">qL ≥ 3 ⚠ (see below)</span>')
-        self.results.setText('<br>'.join(lines))
+            ql = 'qL ≥ 3 ⚠ (see shape models)'
+        else:
+            ql = '—'
+        _fill_vtable(self.results, [
+            format_pm(res.d_r_rad2_s, res.d_r_se),
+            _fmt(res.rotational_time_s * 1e6),
+            format_pm(res.d_t_m2_s, res.d_t_se),
+            rh, paired, ql])
+        self.status.clear()
 
         bits = []
         if res.notes:
@@ -1895,40 +2186,39 @@ class _DDLSTab(QtWidgets.QWidget):
         try:
             shapes = self.controller.ddls_shape(sid, model='both')
         except Exception as exc:
-            self.shape_label.setText(
-                f'<span style="color:#777;">Shape models unavailable: {exc}</span>')
+            self.shape_table.setRowCount(0)
+            self.shape_caveat.setText(f'Shape models unavailable: {exc}')
             self.shape_box.setVisible(True)
             return
-        rod = shapes['rod']
-        sph = shapes['sphere']
+        rod, sph = shapes['rod'], shapes['sphere']
 
-        # Rod model
         if not rod.converged:
-            rod_line = '<b>Rod:</b> no rigid rod reproduces both D_t and D_r.'
+            rod_cells = ['Rod', 'no rigid rod reproduces both D_t and D_r', '', '✗']
         else:
-            p_txt = f'{rod.aspect_ratio_p:.2f}'
-            rng = ('' if rod.in_valid_range else
-                   ' <span style="color:#c00;">(p outside 2–30; extrapolated)</span>')
-            rod_line = (
-                f'<b>Rod:</b> L = {format_pm(rod.length_nm, rod.length_se)} nm, '
-                f'd = {format_pm(rod.diameter_nm, rod.diameter_se)} nm, '
-                f'p = {p_txt}{rng}')
-
-        # Sphere model
-        sgn = '✓' if sph.is_consistent else '✗'
-        sph_colour = '' if sph.is_consistent else ' style="color:#c00;"'
-        sph_line = (
-            f'<b>Sphere:</b> R(D<sub>r</sub>) = {format_pm(sph.radius_rot_nm, sph.radius_rot_se)} nm '
-            f'vs R(D<sub>t</sub>)=R<sub>h</sub> = {_fmt(sph.radius_trans_nm)} nm '
-            f'<span{sph_colour}>(ratio {sph.sphericity_ratio:.2f} {sgn})</span>')
+            ok = '✓ in range' if rod.in_valid_range else '⚠ p outside 2–30'
+            rod_cells = [
+                'Rod',
+                f'L = {format_pm(rod.length_nm, rod.length_se)} nm,  '
+                f'd = {format_pm(rod.diameter_nm, rod.diameter_se)} nm',
+                f'p = {rod.aspect_ratio_p:.2f}', ok]
+        sph_cells = [
+            'Sphere',
+            f'R(D_r) = {format_pm(sph.radius_rot_nm, sph.radius_rot_se)} nm  '
+            f'vs  R(D_t)=Rh = {_fmt(sph.radius_trans_nm)} nm',
+            f'ratio {sph.sphericity_ratio:.2f}',
+            '✓' if sph.is_consistent else '✗']
+        t = self.shape_table
+        t.setRowCount(2)
+        for r, cells in enumerate((rod_cells, sph_cells)):
+            for c, txt in enumerate(cells):
+                t.setItem(r, c, QtWidgets.QTableWidgetItem(txt))
+        t.resizeColumnsToContents()
 
         verdict = ('Sphere consistent — a near-spherical particle.'
                    if sph.is_consistent else
                    'Sphere inconsistent (ratio ≠ 1) → the rod model is the relevant one.')
-        self.shape_label.setText(
-            rod_line + '<br>' + sph_line +
-            f'<br><span style="color:#777; font-size:11px;">{verdict} '
-            'Dimensions assume the stated shape — not a direct measurement.</span>')
+        self.shape_caveat.setText(
+            verdict + ' Dimensions assume the stated shape — not a direct measurement.')
         self.shape_box.setVisible(True)
 
     def _clear(self, message: str) -> None:
@@ -2129,7 +2419,7 @@ class DLSModule(QtWidgets.QWidget):
         self.header.setWordWrap(True)
         layout.addWidget(self.header)
 
-        self.tabs = QtWidgets.QTabWidget()
+        self.tabs = roomy_tabs(QtWidgets.QTabWidget())   # roomier tabs so labels don't clip (#3)
         # Shared DLS analysis region (fit window + baseline) AND the shared set of
         # measurements ticked for co-plotting — both used by the Correlogram and
         # Distribution tabs so the two stay consistent.

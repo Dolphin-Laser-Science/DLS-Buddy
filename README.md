@@ -24,15 +24,30 @@ uncalibrated) results are always distinguished.
 
 ## Running it
 
-Double-click **`Launch DLS Buddy.bat`** in the project folder. On the first run it
-creates a virtual environment and installs dependencies automatically; subsequent
-launches go straight to the app. **Requires [Python 3.13](https://www.python.org/downloads/) to be installed.**
+Double-click the launcher for your OS in the project folder:
+
+- **Windows** — **`Launch DLS Buddy (Windows).bat`**
+- **macOS** — **`Launch DLS Buddy (MacOS).command`** (the first time, you may need to
+  right-click → **Open** once to get past macOS Gatekeeper)
+
+On the first run the launcher creates a virtual environment and installs dependencies
+automatically; subsequent launches go straight to the app. **Requires
+[Python 3.13](https://www.python.org/downloads/) to be installed.**
 
 Alternatively, from a terminal in the project root:
 
-```bash
+```powershell
+# Windows (PowerShell)
 py -3.13 -m venv .venv
 .\.venv\Scripts\activate
+pip install -r requirements.txt
+python -m gui.main
+```
+
+```bash
+# macOS
+python3.13 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python -m gui.main
 ```

@@ -9,6 +9,68 @@ window title.
 
 ---
 
+## 0.9.0 — Usability batch (2026-06-30)
+
+Readability and theme polish from user feedback. **No change to the analysis math.**
+First of several themed batches from this feedback round.
+
+- **The dark theme is easier to read.** The small **"?"** help buttons are no longer
+  faint on the dark theme, and several greyed notes/labels that were tuned for the light
+  theme now have proper contrast on dark.
+- **Settings section headers are readable on the light theme.** They previously rendered
+  in a near-invisible light grey; they now use a clear, theme-aware colour (and switch
+  correctly whenever you change the theme).
+- **Colours now follow a theme switch immediately.** Changing **Settings → Theme** retints
+  the headers, notes, flags, and "?" badges live, instead of leaving some stuck in the
+  previous theme's colours.
+- Tidy-up: the Settings intro no longer SHOUTS the word "seed" in all caps.
+- **Tab labels no longer clip.** Tabs are sized with a little more room, so labels like
+  "Settings" and the DLS sub-tabs aren't cut off on the right.
+- **Overlapping plot labels are readable.** When several curves peak at nearly the same
+  size, the peak labels (e.g. "0.33 nm") now stack neatly instead of piling into a blob;
+  a crowded stack caps at six labels and shows "+N more" rather than becoming a mess. The
+  same applies to sample-name labels on the Cross-Sample scaling plots.
+- Tidy-up: the Correlogram baseline-region boxes now read "low"/"high" instead of
+  "lo"/"hi".
+- **macOS launcher.** The app can now be started on a Mac by double-clicking
+  **`Launch DLS Buddy (MacOS).command`** (the Windows launcher is renamed to
+  **`Launch DLS Buddy (Windows).bat`**). Like the Windows one, the first run sets up the
+  environment automatically.
+- **Data tab: Enter jumps to the next field.** After typing a value, pressing Enter now
+  moves to the next parameter so you can keep entering values without reaching for the
+  mouse.
+- **Distribution tab: a peak-results panel.** The Distribution sub-tab now shows a results
+  table for the ticked measurements (peak size + weight per method), like the Correlogram
+  tab — colour-matched to the plotted curves.
+- **Draggable boundaries are now visible.** Splitter dividers (control panel ↔ plot, and
+  between stacked plots) show a small grip so you can tell they're draggable, and the
+  fit/residual boundary now has a visible handle line in a clearer gap.
+- **Resizable control columns.** On the DLS Correlogram/Distribution and SLS tabs you can
+  drag the grips in the left column to resize the measurement list, controls, results
+  table, and mask lists against each other.
+- **Correlogram markers are easier to grab.** The delay-window and baseline-region markers
+  now have offset handles — window carets at the top of the plot, baseline carets at the
+  bottom — so you can pick and drag the one you want even when they sit at the same delay
+  time.
+- **Γ vs q² and D vs c tabs reworked.** Each now shows a table of the sample's
+  measurements with **tick boxes** — you can see exactly which points are in scope and
+  choose/exclude any subset (e.g. one concentration's angles), instead of every point
+  being mixed into one line. The per-point Γ / D and the fit results (D, Rh, R², …) are
+  shown in tables, and a note explains that Γ/D come from an internal cumulant fit of each
+  correlogram (so you don't need to run the Correlogram tab first). Run is enabled only
+  once at least two distinct angles/concentrations are ticked.
+- **DPLS and SLS results shown as tables.** The depolarized (DDLS) results, shape models,
+  and every SLS analysis (Zimm/Berry, Debye, Guinier, single-angle, calibration-free A₂,
+  depolarization) now appear in tidy tables instead of run-together text.
+- **Plots no longer disappear when switching measurements.** Selecting a measurement that
+  belongs to a different analysis (e.g. clicking an SLS measurement while viewing a DPLS
+  plot) no longer blanks the other tab's plot — each tab keeps its last view.
+- **Quickstart: a "workflow at a glance" overview.** The Quickstart guide now opens with a
+  short, step-by-step overview of a basic DLS/SLS analysis (Load → confirm parameters →
+  run a method → export) so new users can see the whole flow before the details.
+
+---
+
 ## 0.8.2 — In-program help system + tooltip toggle (2026-06-29)
 
 Makes the program more self-explanatory (user feedback). **No change to the

@@ -21,6 +21,15 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6 import QtCore, QtWidgets
+from matplotlib.lines import Line2D
+
+from gui.widgets import GripSplitter
+
+# Colour of the drawn residual-resize grip line. Plots render on a white background
+# (plot-background theming is deferred), so a fixed mid-grey reads on both themes.
+_GRIP_COLOUR = '#888888'
+
+from gui.theme import ThemedLabel
 
 
 def make_canvas_expanding(canvas, min_height: int = 170,
@@ -50,8 +59,7 @@ def make_split_panels(parent, left_min_width: Optional[int] = None,
     """
     outer = QtWidgets.QHBoxLayout(parent)
     outer.setContentsMargins(0, 0, 0, 0)
-    splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-    splitter.setChildrenCollapsible(False)
+    splitter = GripSplitter(QtCore.Qt.Orientation.Horizontal)   # visible drag grip (#5/#9)
     outer.addWidget(splitter)
 
     left_widget = QtWidgets.QWidget()
@@ -86,14 +94,16 @@ def make_split_panels(parent, left_min_width: Optional[int] = None,
 
 
 def make_vertical_plot_stack(widgets, sizes=None, min_heights=None):
-    """Stack several plot widgets (canvases, or toolbar+canvas containers) in a
-    draggable vertical QSplitter so each can be resized independently (feedback
-    2026-06-29 #9). Use this only for genuinely INDEPENDENT plots with different
-    x-axes (e.g. the Utilities trace vs its histogram diagnostic) — a fit and its
-    residual stay on one canvas (see attach_residual_resizer) so they stay aligned.
+    """Stack several widgets in a draggable vertical QSplitter (with a visible grip
+    handle) so each can be resized independently (feedback 2026-06-29 #9, 2026-06-30 #5/#9).
+
+    Two uses: (1) genuinely INDEPENDENT plots with different x-axes (e.g. the Utilities
+    trace vs its histogram diagnostic) — NOT a fit + its residual, which stay on one
+    canvas via `attach_residual_resizer` so they keep their shared-x alignment; and (2)
+    the stacked sections of a control column, so the user can resize the checklist /
+    results table / etc. against each other. `min_heights` keeps each pane usable.
     Returns the splitter."""
-    splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-    splitter.setChildrenCollapsible(False)
+    splitter = GripSplitter(QtCore.Qt.Orientation.Vertical)     # visible drag grip (#5/#9)
     for i, w in enumerate(widgets):
         splitter.addWidget(w)
         if min_heights is not None and i < len(min_heights):
@@ -137,9 +147,36 @@ class _ResidualResizer:
         self.mb = margin_bottom
         self.mt = margin_top
         self._drag = False
+        # A visible grip line drawn in the gap so users can tell the boundary is
+        # draggable (feedback 2026-06-30 #5). It is `animated` (excluded from the normal
+        # draw) and painted on top in the draw_event via blitting, so it always tracks
+        # the current gap position without triggering a redraw.
+        self._grip = Line2D([0.45, 0.55], [0.5, 0.5], transform=fig.transFigure,
+                            color=_GRIP_COLOUR, lw=3.0, solid_capstyle='round',
+                            zorder=12, animated=True, visible=False)
+        fig.add_artist(self._grip)
         canvas.mpl_connect('button_press_event', self._press)
         canvas.mpl_connect('motion_notify_event', self._motion)
         canvas.mpl_connect('button_release_event', self._release)
+        canvas.mpl_connect('draw_event', self._on_draw)
+
+    def _on_draw(self, _event) -> None:
+        """Draw the grip line on top of the finished frame, centered in the fit/residual
+        gap. Uses draw_artist + blit (not draw_idle) so it never recurses."""
+        info = self._gap_y_px()
+        if info is None:
+            return
+        y_px, x0_px, x1_px = info
+        w = self.fig.bbox.width
+        h = self.fig.bbox.height
+        if not (w and h):
+            return
+        cx = 0.5 * (x0_px + x1_px) / w
+        half = 0.035
+        self._grip.set_data([cx - half, cx + half], [y_px / h, y_px / h])
+        self._grip.set_visible(True)
+        self.fig.draw_artist(self._grip)
+        self.canvas.blit(self.fig.bbox)
 
     def _gap_y_px(self):
         """Pixel y of the gap centre (between residual top and fit bottom) and the
@@ -221,8 +258,7 @@ class AxisControlBar(QtWidgets.QWidget):
         row.addWidget(self.y_min); row.addWidget(self.y_max)
         row.addStretch(1)
         row.addWidget(auto)
-        self.note = QtWidgets.QLabel('')
-        self.note.setStyleSheet('color:#c00; font-size: 11px;')
+        self.note = ThemedLabel('', role='error', size=11)
         row.addWidget(self.note)
         self.setEnabled(False)
 

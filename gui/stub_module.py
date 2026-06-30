@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
 
+from gui.theme import ThemedLabel
+
 
 class StubModule(QtWidgets.QWidget):
     """A titled placeholder describing a module's planned contents."""
@@ -23,13 +25,12 @@ class StubModule(QtWidgets.QWidget):
         heading = QtWidgets.QLabel(f'<h2>{title}</h2>')
         layout.addWidget(heading)
 
-        tag = QtWidgets.QLabel('Planned module — not yet implemented.')
-        tag.setStyleSheet('color:#b06000; font-style: italic;')
+        tag = ThemedLabel('Planned module — not yet implemented.',
+                          role='pending', extra='font-style:italic;')
         layout.addWidget(tag)
 
-        body = QtWidgets.QLabel(planned)
+        body = ThemedLabel(planned, role='muted')
         body.setWordWrap(True)
-        body.setStyleSheet('color:#444;')
         layout.addWidget(body)
 
         layout.addStretch(1)

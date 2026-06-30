@@ -9,4 +9,4 @@ Import it from the app package: ``from app.version import __version__``.
 
 from __future__ import annotations
 
-__version__ = "0.8.2"
+__version__ = "0.9.0"

@@ -1,0 +1,7 @@
+# Pin line endings for the double-click launchers so they work regardless of each
+# machine's git autocrlf setting. A shell script with CRLF endings fails on macOS
+# (bash chokes on the trailing \r), so the .command/.sh must always check out as LF;
+# the Windows .bat wants CRLF.
+*.command text eol=lf
+*.sh      text eol=lf
+*.bat     text eol=crlf

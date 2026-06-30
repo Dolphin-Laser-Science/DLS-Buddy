@@ -27,6 +27,8 @@ from typing import Optional, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from gui.theme import token
+
 
 # ---------------------------------------------------------------------------
 # Global "show passive tooltips" gate
@@ -103,14 +105,32 @@ class HelpBadge(QtWidgets.QToolButton):
         self.setAutoRaise(True)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.setAccessibleName('Help')
-        # A subtle, theme-following look: use the palette's mid/text colours.
-        pal = self.palette()
-        fg = pal.color(QtGui.QPalette.ColorRole.Mid).name()
-        bg = pal.color(QtGui.QPalette.ColorRole.Base).name()
-        self.setStyleSheet(self._QSS.format(fg=fg, bg=bg))
+        self._applying = False
+        # A subtle, theme-following look. The colour is re-applied on every theme switch
+        # (see changeEvent) rather than captured once — the old code read the palette in
+        # __init__ and froze, leaving the badge faint on the dark theme.
+        self._apply_palette()
         # Hover preview via the normal tooltip system (so it honours the global gate).
         self.setToolTip(self._html)
         self.clicked.connect(self._popup)
+
+    def _apply_palette(self) -> None:
+        """(Re)compute the badge colours from the live theme and apply the QSS."""
+        if self._applying:        # guard: setStyleSheet re-enters changeEvent (see ThemedLabel)
+            return
+        self._applying = True
+        try:
+            fg = token(self, 'badge')   # guaranteed-contrast token, not the old unset Mid role
+            bg = self.palette().color(QtGui.QPalette.ColorRole.Base).name()
+            self.setStyleSheet(self._QSS.format(fg=fg, bg=bg))
+        finally:
+            self._applying = False
+
+    def changeEvent(self, ev: QtCore.QEvent) -> None:
+        # A theme switch delivers PaletteChange; recolour so the badge never freezes.
+        if ev.type() == QtCore.QEvent.Type.PaletteChange:
+            self._apply_palette()
+        super().changeEvent(ev)
 
     def setHelp(self, text: str = '', *, bullets: Optional[Sequence[str]] = None) -> None:
         html = text or ''

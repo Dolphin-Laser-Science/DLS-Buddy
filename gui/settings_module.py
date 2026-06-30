@@ -21,6 +21,7 @@ from PySide6 import QtCore, QtWidgets
 
 from app import units as U
 from app.settings import SettingsState
+from gui.theme import ThemedLabel
 
 # Plot-axis display-unit choices surfaced in Settings (feedback 2026-06-26 #8):
 # (quantity, label). The combo for each offers U.unit_options(quantity).
@@ -50,13 +51,12 @@ class SettingsModule(QtWidgets.QWidget):
     # ------------------------------------------------------------------ UI ---
     def _build_ui(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
-        note = QtWidgets.QLabel(
-            'These are starting defaults that SEED each module’s per-run controls. '
+        note = ThemedLabel(
+            'These are starting defaults that seed each module’s per-run controls. '
             'You can still change a value per run, and that per-run value (not the '
             'setting) is what is used and recorded. Saved to settings.json at the '
-            'program root.')
+            'program root.', role='muted')
         note.setWordWrap(True)
-        note.setStyleSheet('color:#555;')
         outer.addWidget(note)
 
         host = QtWidgets.QWidget()
@@ -108,11 +108,11 @@ class SettingsModule(QtWidgets.QWidget):
         # this global tab.
 
         form.addRow(self._header('Plot axis units'))
-        plot_note = QtWidgets.QLabel(
+        plot_note = ThemedLabel(
             'Default display units for plot axes. Plots store data in canonical units '
-            'and only convert for display; changing a unit redraws the plots.')
+            'and only convert for display; changing a unit redraws the plots.',
+            role='hint', size=11)
         plot_note.setWordWrap(True)
-        plot_note.setStyleSheet('color:#777; font-size: 11px;')
         form.addRow(plot_note)
         self.plot_unit_combos = {}
         for q, label in _PLOT_UNIT_ROWS:
@@ -151,9 +151,10 @@ class SettingsModule(QtWidgets.QWidget):
 
     @staticmethod
     def _header(text: str) -> QtWidgets.QLabel:
-        lbl = QtWidgets.QLabel(text)
-        lbl.setStyleSheet('font-weight: bold; margin-top: 8px;')
-        return lbl
+        # ThemedLabel so the header follows the theme (a plain stylesheet without a
+        # `color` froze to the build-time palette → unreadable light-grey on the light
+        # theme). Kept sentence-case + bold; no all-caps (feedback 2026-06-30 #2).
+        return ThemedLabel(text, role='header', bold=True, extra='margin-top:8px;')
 
     # ----------------------------------------------------------- transfer ---
     def _load_from(self, s: SettingsState) -> None:

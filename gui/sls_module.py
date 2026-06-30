@@ -35,9 +35,11 @@ from plotting.plots import (
     plot_zimm, plot_debye, plot_guinier, plot_rayleigh_ratio,
     plot_calibration_free_a2,
 )
-from gui.plot_controls import AxisControlBar, make_split_panels, make_canvas_expanding
+from gui.plot_controls import (
+    AxisControlBar, make_split_panels, make_canvas_expanding, make_vertical_plot_stack)
 from gui.export_helper import export_to_csv
 from gui.help import add_help_to_groupbox
+from gui.theme import ThemedLabel, span, token
 from analysis.uncertainty import format_pm
 
 # Reminder appended where a calibration-dependent quantity (Mw, absolute A₂) is
@@ -145,19 +147,39 @@ class SLSModule(QtWidgets.QWidget):
         self.header.setWordWrap(True)
         left.addWidget(self.header)
 
-        left.addWidget(self._build_calibration_group())
-        left.addWidget(self._build_analysis_group())
-        left.addWidget(self._build_mask_group())
-        left.addWidget(self._build_depolarization_group())
+        # The calibration / analysis / mask / depolarization groups stack in a vertically
+        # resizable splitter (feedback #9): drag the grips to size them against each other
+        # (e.g. enlarge the mask lists). Min heights keep each group from being clipped.
+        cal = self._build_calibration_group()
+        ana = self._build_analysis_group()
+        mask = self._build_mask_group()
+        depol = self._build_depolarization_group()
+        vstack = make_vertical_plot_stack(
+            [cal, ana, mask, depol], sizes=[210, 230, 200, 160],
+            min_heights=[max(cal.sizeHint().height(), 120),
+                         max(ana.sizeHint().height(), 120),
+                         150,
+                         max(depol.sizeHint().height(), 100)])
+        left.addWidget(vstack, 1)
 
-        self.status = QtWidgets.QLabel('')
+        # Analysis results as a table (feedback 2026-06-30 #14), rebuilt per method.
+        left.addWidget(QtWidgets.QLabel('Results'))
+        self.result_table = QtWidgets.QTableWidget(0, 2)
+        self.result_table.horizontalHeader().setVisible(False)
+        self.result_table.verticalHeader().setVisible(False)
+        self.result_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.result_table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.result_table.horizontalHeader().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        left.addWidget(self.result_table)
+        self.status = QtWidgets.QLabel('')        # one-line notes (e.g. Rayleigh series)
         self.status.setWordWrap(True)
         left.addWidget(self.status)
-        self.flag_label = QtWidgets.QLabel('')
+        self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
-        self.flag_label.setStyleSheet('color:#c00; font-weight: bold;')
         left.addWidget(self.flag_label)
-        left.addStretch(1)
 
         self.figure = Figure(figsize=(5.5, 4.6))
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
@@ -285,8 +307,7 @@ class SLSModule(QtWidgets.QWidget):
         mw_widget = QtWidgets.QWidget()
         mw_widget.setLayout(mw_row)
         form.addRow('Manual Mw:', mw_widget)
-        self.mw_display = QtWidgets.QLabel('')
-        self.mw_display.setStyleSheet('color:#555;')
+        self.mw_display = ThemedLabel('', role='muted')
         form.addRow('', self.mw_display)
 
         self.run_button = QtWidgets.QPushButton('Run analysis')
@@ -307,13 +328,13 @@ class SLSModule(QtWidgets.QWidget):
         acol = QtWidgets.QVBoxLayout()
         acol.addWidget(QtWidgets.QLabel('Angles'))
         self.angle_list = QtWidgets.QListWidget()
-        self.angle_list.setMaximumHeight(120)
+        self.angle_list.setMinimumHeight(80)     # grows with its resizable pane (#9)
         self.angle_list.itemChanged.connect(self._on_angle_item_changed)
         acol.addWidget(self.angle_list)
         ccol = QtWidgets.QVBoxLayout()
         ccol.addWidget(QtWidgets.QLabel('Concentrations'))
         self.conc_list = QtWidgets.QListWidget()
-        self.conc_list.setMaximumHeight(120)
+        self.conc_list.setMinimumHeight(80)      # grows with its resizable pane (#9)
         self.conc_list.itemChanged.connect(self._on_conc_item_changed)
         ccol.addWidget(self.conc_list)
         lists.addLayout(acol)
@@ -322,11 +343,10 @@ class SLSModule(QtWidgets.QWidget):
         self.clear_mask_button = QtWidgets.QPushButton('Show all (clear mask)')
         self.clear_mask_button.clicked.connect(self._on_clear_masks)
         v.addWidget(self.clear_mask_button)
-        hint = QtWidgets.QLabel('Untick an angle or concentration to hide it; the '
-                                'analysis re-runs on the shown points (hidden ones '
-                                'are greyed). Or click a point on the plot to '
-                                'hide/show just that point.')
-        hint.setStyleSheet('color:#777; font-size: 11px;')
+        hint = ThemedLabel('Untick an angle or concentration to hide it; the '
+                           'analysis re-runs on the shown points (hidden ones '
+                           'are greyed). Or click a point on the plot to '
+                           'hide/show just that point.', role='hint', size=11)
         hint.setWordWrap(True)
         v.addWidget(hint)
         return box
@@ -391,15 +411,25 @@ class SLSModule(QtWidgets.QWidget):
         self.depol_compute_button.clicked.connect(self._on_compute_depol)
         form.addRow(self.depol_compute_button)
 
-        self.depol_readout = QtWidgets.QLabel('')
-        self.depol_readout.setWordWrap(True)
-        self.depol_readout.setTextFormat(QtCore.Qt.RichText)
-        form.addRow(self.depol_readout)
+        self.depol_table = QtWidgets.QTableWidget(0, 2)
+        self.depol_table.horizontalHeader().setVisible(False)
+        self.depol_table.verticalHeader().setVisible(False)
+        self.depol_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.depol_table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.depol_table.horizontalHeader().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        form.addRow(self.depol_table)
+        self.depol_note = ThemedLabel('', role='hint', size=11)
+        self.depol_note.setWordWrap(True)
+        form.addRow(self.depol_note)
         return box
 
     def _on_depol_mode_changed(self) -> None:
         self.depol_stack.setCurrentIndex(self.depol_mode_combo.currentIndex())
-        self.depol_readout.setText('')
+        self.depol_table.setRowCount(0)
+        self.depol_note.clear()
 
     def _on_compute_depol(self) -> None:
         mode = self.depol_mode_combo.currentData()
@@ -415,23 +445,25 @@ class SLSModule(QtWidgets.QWidget):
                 res = self.controller.compute_depolarization(
                     i_vv=i_vv, i_vh=i_vh, dark_count=dark)
         except ValueError as exc:
-            self.depol_readout.setText(
-                f'<span style="color:#c00;">Invalid input: {exc}</span>')
+            self.depol_table.setRowCount(0)
+            self.depol_note.setRole('error')
+            self.depol_note.setText(f'Invalid input: {exc}')
             return
         self._show_depol_result(res)
 
     def _show_depol_result(self, res) -> None:
-        lines = []
-        rho_v_txt = _fmt(res.rho_v, 4)
+        rv = _fmt(res.rho_v, 4)
         if res.rho_v_se is not None:
-            rho_v_txt += f' ± {_fmt(res.rho_v_se, 2)}'
-        lines.append(f'ρ<sub>v</sub> = {rho_v_txt} &nbsp;&nbsp; '
-                     f'ρ<sub>u</sub> = {_fmt(res.rho_u, 4)}')
-        lines.append(f'δ² = {_fmt(res.optical_anisotropy_sq, 4)} &nbsp;&nbsp; '
-                     f'Cabannes <i>f</i> = {_fmt(res.cabannes_isotropic_factor, 4)} '
-                     f'(anisotropic {_fmt(res.anisotropic_fraction * 100, 3)}%)')
+            rv += f' ± {_fmt(res.rho_v_se, 2)}'
+        rows = [
+            ('ρ_v', rv),
+            ('ρ_u', _fmt(res.rho_u, 4)),
+            ('δ²', _fmt(res.optical_anisotropy_sq, 4)),
+            ('Cabannes f', _fmt(res.cabannes_isotropic_factor, 4)),
+            ('anisotropic %', _fmt(res.anisotropic_fraction * 100, 3)),
+        ]
         if not res.physically_valid:
-            lines.append(f'<span style="color:#c00;">⚠ {res.note}</span>')
+            note_role, note_text = 'error', f'⚠ {res.note}'
         else:
             # Show the Mw correction when the current sample has an analysed Mw.
             if self.sample_id is not None:
@@ -439,15 +471,20 @@ class SLSModule(QtWidgets.QWidget):
                     self.sample_id, self._fraction, res.cabannes_isotropic_factor)
                 if corr is not None:
                     mw_app, mw_corr, src = corr
-                    lines.append(
-                        f'Isotropic-corrected M<sub>w</sub> = <i>f</i>·M<sub>w</sub> = '
-                        f'<b>{_fmt(mw_corr, 4)}</b> g/mol '
-                        f'(from {_fmt(mw_app, 4)} g/mol, {src})')
-            lines.append(
-                '<span style="color:#777;font-size:11px;">R<sub>iso</sub> = '
-                'R<sub>VV</sub>(1 − 4ρ<sub>v</sub>/3) — apply to the Zimm/Debye '
-                'M<sub>w</sub>. Display only; not written to the sample.</span>')
-        self.depol_readout.setText('<br>'.join(lines))
+                    rows.append(('Isotropic-corrected Mw (g/mol)',
+                                 f'{_fmt(mw_corr, 4)} (from {_fmt(mw_app, 4)}, {src})'))
+            note_role, note_text = 'hint', (
+                'R_iso = R_VV(1 − 4ρv/3) — apply to the Zimm/Debye Mw. '
+                'Display only; not written to the sample.')
+        t = self.depol_table
+        t.setRowCount(len(rows))
+        for r, (label, value) in enumerate(rows):
+            t.setItem(r, 0, QtWidgets.QTableWidgetItem(label))
+            t.setItem(r, 1, QtWidgets.QTableWidgetItem(value))
+        t.setMaximumHeight(28 + 22 * max(len(rows), 1))
+        t.resizeColumnsToContents()
+        self.depol_note.setRole(note_role)
+        self.depol_note.setText(note_text)
 
     def _zimm_spacing(self, rr) -> float:
         """The k in q^2 + k*c that plot_zimm uses (replicated so the greyed overlay
@@ -463,7 +500,15 @@ class SLSModule(QtWidgets.QWidget):
     # ---------------------------------------------------------- selection ---
     def set_measurement(self, item_id: Optional[str]) -> None:
         """Resolve the measurement's SAMPLE and operate on it (SLS is per-sample)."""
+        # Keep-last (#15): selecting a DLS-only measurement shouldn't blank the SLS plot.
+        # If the new pick has no SLS data and an SLS sample is already shown, keep it.
+        if item_id is not None and self.sample_id is not None:
+            _sid = self.controller.sample_id_of(item_id)
+            _sample = self.controller.workspace.samples.get(_sid) if _sid else None
+            if _sample is None or not _sample.has_sls:
+                return
         self.sample_id = None
+        self._clear_result_table()       # stale result clears on a sample switch (#14)
         runnable = False
         if item_id is None:
             header = 'Select an SLS sample in the sidebar.'
@@ -678,7 +723,7 @@ class SLSModule(QtWidgets.QWidget):
         try:
             preview = self.controller.preview_k_c(sid)
         except Exception as exc:
-            self.kc_label.setText(f'<span style="color:#c00">cannot compute: {exc}</span>')
+            self.kc_label.setText(span(self, 'error', f'cannot compute: {exc}'))
             return
         committed = self.controller.committed_k_c(sid)
         if preview is None:
@@ -833,11 +878,13 @@ class SLSModule(QtWidgets.QWidget):
             self._setup_axes()
             plot_debye(res, ax=self.ax)
             self.ax.set_title('Debye plot (single concentration)')
-            self.status.setText(
-                f'Debye (apparent): '
-                f'Mw_app = {format_pm(res.mw_apparent_g_per_mol, getattr(res, "mw_apparent_se", None))} g/mol, '
-                f'Rg_app = {format_pm(res.rg_apparent_nm, getattr(res, "rg_apparent_se", None))} nm, '
-                f'R² = {_fmt(res.r_squared)}')
+            self._fill_result_table([
+                ('Mw_app (g/mol)', format_pm(res.mw_apparent_g_per_mol,
+                                             getattr(res, 'mw_apparent_se', None))),
+                ('Rg_app (nm)', format_pm(res.rg_apparent_nm,
+                                          getattr(res, 'rg_apparent_se', None))),
+                ('R²', _fmt(res.r_squared)),
+            ])
             self.flag_label.setText(self._apparent_flag(res.calibrated) + _STAT_CAVEAT)
         elif method == 'guinier':
             res = c.run_guinier(sid, self.conc_combo.currentData(), fraction=frac)
@@ -845,10 +892,11 @@ class SLSModule(QtWidgets.QWidget):
             self._setup_axes()
             plot_guinier(res, ax=self.ax)
             self.ax.set_title('Guinier plot (single concentration)')
-            self.status.setText(
-                f'Guinier (apparent): '
-                f'Rg_app = {format_pm(res.rg_nm, getattr(res, "rg_se", None))} nm,   '
-                f'qRg(max) = {_fmt(res.qrg_max, 2)},   R² = {_fmt(res.r_squared)}')
+            self._fill_result_table([
+                ('Rg_app (nm)', format_pm(res.rg_nm, getattr(res, 'rg_se', None))),
+                ('qRg(max)', _fmt(res.qrg_max, 2)),
+                ('R²', _fmt(res.r_squared)),
+            ])
             flag = ('⚠ apparent (single concentration): Rg still contains '
                     'concentration effects — extrapolate over c for the '
                     'thermodynamic Rg.')
@@ -863,10 +911,11 @@ class SLSModule(QtWidgets.QWidget):
             self._export = (f'{sid}_single_angle.csv',
                             lambda p: c.export_single_angle(res, p))
             self._clear_plot()
-            self.status.setText(
-                f'Single-angle (apparent): Mw_app = '
-                f'{_fmt(res.mw_apparent_g_per_mol)} g/mol at '
-                f'{res.angle_deg:.0f}°, c = {res.concentration_g_per_mL*1000:.3g} mg/mL')
+            self._fill_result_table([
+                ('Mw_app (g/mol)', _fmt(res.mw_apparent_g_per_mol)),
+                ('Angle', f'{res.angle_deg:.0f}°'),
+                ('c (mg/mL)', f'{res.concentration_g_per_mL * 1000:.3g}'),
+            ])
             self.flag_label.setText(
                 '⚠ apparent: single angle + single concentration (contains the '
                 'form factor and the 2A₂c term).')
@@ -878,12 +927,13 @@ class SLSModule(QtWidgets.QWidget):
             self._setup_axes()
             plot_calibration_free_a2(res, ax=self.ax)
             self.ax.set_title('Calibration-free A₂')
-            a2 = (f', A₂ = {format_pm(res.a2_mol_mL_per_g2, getattr(res, "a2_se", None))} mol·mL/g²'
-                  if res.a2_mol_mL_per_g2 is not None else
-                  ' (set a manual Mw to get A₂)')
-            self.status.setText(
-                f'2·A₂·Mw = {format_pm(res.two_a2_mw, getattr(res, "two_a2_mw_se", None))}'
-                f'{a2}   (scale-independent)')
+            a2 = (format_pm(res.a2_mol_mL_per_g2, getattr(res, 'a2_se', None))
+                  if res.a2_mol_mL_per_g2 is not None else 'set a manual Mw to get A₂')
+            self._fill_result_table([
+                ('2·A₂·Mw (scale-independent)',
+                 format_pm(res.two_a2_mw, getattr(res, 'two_a2_mw_se', None))),
+                ('A₂ (mol·mL/g²)', a2),
+            ])
             self.flag_label.setText(
                 '(± statistical only)'
                 if getattr(res, 'two_a2_mw_se', None) is not None else '')
@@ -899,6 +949,7 @@ class SLSModule(QtWidgets.QWidget):
                                     label=f'{r.concentration_g_per_mL*1000:.3g} mg/mL')
             self.ax.set_title('Excess Rayleigh ratio')
             calibrated = all(r.calibrated for r in rr)
+            self._clear_result_table()           # a per-c series, not a scalar result
             self.status.setText(f'Excess Rayleigh ratio for {len(rr)} concentrations.')
             self.flag_label.setText(
                 '' if calibrated else
@@ -1041,17 +1092,32 @@ class SLSModule(QtWidgets.QWidget):
             self.controller.mask_point(self.sample_id, cc, ang, frac)
         self._on_run()
 
+    def _fill_result_table(self, rows) -> None:
+        """Rebuild the per-method results table from (label, value) pairs (#14)."""
+        t = self.result_table
+        t.setRowCount(len(rows))
+        for r, (label, value) in enumerate(rows):
+            t.setItem(r, 0, QtWidgets.QTableWidgetItem(label))
+            t.setItem(r, 1, QtWidgets.QTableWidgetItem(value))
+        t.setMaximumHeight(28 + 22 * max(len(rows), 1))
+        t.resizeColumnsToContents()
+        self.status.clear()
+
+    def _clear_result_table(self) -> None:
+        self.result_table.setRowCount(0)
+
     def _summarize_zimm(self, res) -> None:
         mw_mark = '' if res.mw_reliable else '  [unreliable — uncalibrated]'
         mw_se = getattr(res, 'mw_se', None)
         rg_se = getattr(res, 'rg_se', None)
         a2_se = getattr(res, 'a2_se', None)
-        self.status.setText(
-            f'{res.method.capitalize()}: '
-            f'Mw = {format_pm(res.mw_g_per_mol, mw_se)} g/mol{mw_mark},   '
-            f'Rg = {format_pm(res.rg_nm, rg_se)} nm,   '
-            f'A₂ = {format_pm(res.a2_mol_mL_per_g2, a2_se)} mol·mL/g²,   '
-            f'R² = {_fmt(res.r_squared)}')
+        self._fill_result_table([
+            ('Method', res.method.capitalize()),
+            ('Mw (g/mol)', format_pm(res.mw_g_per_mol, mw_se) + mw_mark),
+            ('Rg (nm)', format_pm(res.rg_nm, rg_se)),
+            ('A₂ (mol·mL/g²)', format_pm(res.a2_mol_mL_per_g2, a2_se)),
+            ('R²', _fmt(res.r_squared)),
+        ])
         flag = (
             '' if res.calibrated else
             '⚠ uncalibrated: Mw and absolute A₂ are unreliable; Rg and the '

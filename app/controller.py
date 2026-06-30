@@ -800,15 +800,76 @@ class Controller:
         self._snapshot_distribution(item_id, method, res)
         return res
 
+    def dls_sample_points(self, sample_id: str, kind: str,
+                          fraction: Optional[str] = None):
+        """Per-measurement breakdown for the Γ vs q² / D vs c tables (feedback
+        2026-06-30 #11/#13): one dict per DLS measurement of the sample (optionally one
+        Mw fraction), each with its cumulant-derived Γ and q via the SAME path the fits
+        use (`gamma_per_measurement`), so the table values match the fitted points.
+
+        `kind` is 'gamma_q2' (rows sorted by q²) or 'conc_extrap' (sorted by
+        concentration). Each dict: item_id, angle_deg, concentration_g_per_mL,
+        gamma_s_inv, q2_m2, d_app_m2_s (= γ/q²), ok. A measurement whose parameters
+        aren't confirmed (build fails) or whose fit/q is non-finite gets ok=False (NaN
+        scalars) and sorts last.
+        """
+        lms = [lm for lm in self.workspace.sample_measurements(sample_id, 'dls')
+               if fraction is None
+               or lm.committed_params.get('mw_fraction') == fraction]
+        # Build the measurements that can be built (unconfirmed params -> skip, ok=False).
+        gamma_by_idx = {}
+        built, built_idx = [], []
+        for i, lm in enumerate(lms):
+            try:
+                built.append(lm.build())
+                built_idx.append(i)
+            except Exception:
+                pass
+        if built:
+            g, q = dls_engine.gamma_per_measurement(
+                built,
+                skip_initial_channels=self.settings.skip_initial_channels,
+                cumulant_method=self.settings.cumulant_method)
+            for j, i in enumerate(built_idx):
+                gamma_by_idx[i] = (float(g[j]), float(q[j]))
+
+        rows = []
+        for i, lm in enumerate(lms):
+            p = lm.committed_params
+            gamma, q = gamma_by_idx.get(i, (float('nan'), float('nan')))
+            ok = (math.isfinite(gamma) and math.isfinite(q) and q > 0.0)
+            q2 = q * q if ok else float('nan')
+            d_app = gamma / q2 if ok else float('nan')
+            rows.append({
+                'item_id': lm.item_id,
+                'angle_deg': p.get('angle_deg'),
+                'concentration_g_per_mL': p.get('concentration_g_per_mL'),
+                'gamma_s_inv': gamma if ok else float('nan'),
+                'q2_m2': q2,
+                'd_app_m2_s': d_app,
+                'ok': ok,
+            })
+
+        def _sort_key(r):
+            if not r['ok']:
+                return (1, float('inf'))
+            if kind == 'gamma_q2':
+                return (0, r['q2_m2'])
+            c = r['concentration_g_per_mL']
+            return (0, c if c is not None else float('inf'))
+        rows.sort(key=_sort_key)
+        return rows
+
     def run_gamma_q2(self, sample_id: str, fraction: Optional[str] = None,
-                     exclude_angles=(), **kw):
+                     include_ids=None, **kw):
         """Gamma vs q^2 across the DLS angles of a sample (optionally one fraction).
 
-        `exclude_angles` drops the named angles (degrees) from the fit so the user
-        can remove outlier points and recompute (feedback 2026-06-26 #9)."""
+        `include_ids` (a set of measurement item_ids) restricts the fit to the ticked
+        measurements, so the user can choose a subset / drop outliers and recompute
+        (feedback 2026-06-30 #11/#12). `None` = every eligible measurement."""
         meas = [lm.build() for lm in self.workspace.sample_measurements(sample_id, 'dls')
                 if (fraction is None or lm.committed_params.get('mw_fraction') == fraction)
-                and not _value_in(lm.committed_params.get('angle_deg'), exclude_angles)]
+                and (include_ids is None or lm.item_id in include_ids)]
         kw.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
         kw.setdefault('cumulant_method', self.settings.cumulant_method)
         res = dls_engine.analyze_gamma_q2(meas, **kw)
@@ -823,16 +884,16 @@ class Controller:
 
     def run_concentration_extrapolation(self, sample_id: str,
                                         fraction: Optional[str] = None,
-                                        exclude_concentrations=(), **kw):
+                                        include_ids=None, **kw):
         """D vs c -> c->0 across the DLS concentrations of a sample (apparent D per
         measurement is angle-independent, so a multi-angle set still extrapolates).
 
-        `exclude_concentrations` drops the named concentrations (g/mL) from the fit
-        so the user can remove outlier points and recompute (feedback 2026-06-26 #9)."""
+        `include_ids` (a set of measurement item_ids) restricts the fit to the ticked
+        measurements, so the user can choose a subset / drop outliers and recompute
+        (feedback 2026-06-30 #11/#12). `None` = every eligible measurement."""
         meas = [lm.build() for lm in self.workspace.sample_measurements(sample_id, 'dls')
                 if (fraction is None or lm.committed_params.get('mw_fraction') == fraction)
-                and not _value_in(lm.committed_params.get('concentration_g_per_mL'),
-                                  exclude_concentrations)]
+                and (include_ids is None or lm.item_id in include_ids)]
         kw.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
         kw.setdefault('cumulant_method', self.settings.cumulant_method)
         res = dls_engine.extrapolate_diffusion_vs_concentration(meas, **kw)

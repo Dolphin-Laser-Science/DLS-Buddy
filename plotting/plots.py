@@ -145,6 +145,73 @@ class PlotHandles:
     artists: Dict[str, Any] = field(default_factory=dict)
 
 
+def annotate_decollided(ax, items, *, max_stack: int = 6, fontsize: int = 8,
+                        gap_pts: float = 11.0, base_offset_pts: float = 4.0,
+                        cluster_px: float = 20.0, overflow_color: str = '#888'):
+    """Annotate data points with text, staggering labels that would otherwise overlap.
+
+    `items` is an iterable of ``(x, y, text, color)`` in DATA coordinates. Labels whose
+    anchor points land within `cluster_px` pixels of one another are treated as a single
+    cluster and **stacked vertically** (upward, `gap_pts` apart) above the cluster's
+    highest point, so they don't pile into an unreadable blob (usability feedback
+    2026-06-30 item 8). At most `max_stack` labels are drawn per cluster; any beyond that
+    are replaced by one muted **"+N more"** marker so a dense cluster stays readable
+    instead of either disappearing or becoming a mess. Non-overlapping labels are drawn
+    singly in place, so the common single-label case is unchanged.
+
+    De-collision is computed in DISPLAY (pixel) space, so it is independent of the axis
+    scale (callers use log axes). Call this AFTER the data and axis limits are set on
+    `ax`, since it reads ``ax.transData``. Returns the list of Text artists.
+    """
+    pts_data = [it for it in items
+                if it[0] is not None and it[1] is not None
+                and np.isfinite(it[0]) and np.isfinite(it[1])]
+    if not pts_data:
+        return []
+    trans = ax.transData
+    disp = [trans.transform((x, y)) for (x, y, _t, _c) in pts_data]  # display px
+    n = len(pts_data)
+
+    # Greedy single-link clustering by display-space proximity.
+    clusters: list = []
+    thresh_sq = cluster_px * cluster_px
+    for i in range(n):
+        joined = None
+        for members in clusters:
+            if any((disp[i][0] - disp[j][0]) ** 2 + (disp[i][1] - disp[j][1]) ** 2
+                   <= thresh_sq for j in members):
+                joined = members
+                break
+        if joined is None:
+            clusters.append([i])
+        else:
+            joined.append(i)
+
+    texts = []
+    for members in clusters:
+        # Stack from the cluster's highest point (largest display y) upward; centre the
+        # column on the members' mean x so it reads as one tidy stack.
+        order = sorted(members, key=lambda j: disp[j][1], reverse=True)
+        anchor_x = float(np.mean([pts_data[j][0] for j in members]))
+        anchor_y = pts_data[order[0]][1]
+        shown = order[:max_stack]
+        for rank, j in enumerate(shown):
+            _x, _y, txt, col = pts_data[j]
+            texts.append(ax.annotate(
+                txt, xy=(anchor_x, anchor_y),
+                xytext=(0, base_offset_pts + rank * gap_pts),
+                textcoords='offset points', ha='center', fontsize=fontsize,
+                color=col, clip_on=False))
+        extra = len(order) - len(shown)
+        if extra > 0:
+            texts.append(ax.annotate(
+                f'+{extra} more', xy=(anchor_x, anchor_y),
+                xytext=(0, base_offset_pts + max_stack * gap_pts),
+                textcoords='offset points', ha='center',
+                fontsize=max(fontsize - 1, 6), color=overflow_color, clip_on=False))
+    return texts
+
+
 def _get_ax(ax: Optional[Any], figsize=(6.0, 4.5)):
     """Return (figure, axes, created). Create a figure only if ax is None."""
     if ax is None:
@@ -802,10 +869,6 @@ def plot_scaling(result, quantity: str = 'rg', labels: Optional[Sequence[str]] =
     artists = {}
     artists['data'] = ax.scatter(x * mfac, y * yfac, s=42, color=PALETTE['blue'],
                                  zorder=3)
-    if labels is not None:
-        for xi, yi, lb in zip(x, y, labels):
-            ax.annotate(lb, (xi * mfac, yi * yfac), fontsize=7, color='#555',
-                        xytext=(4, 4), textcoords='offset points')
     if result.fit_valid and x.size:
         xline = np.geomspace(x.min(), x.max(), 50)
         sym = r'\nu' if quantity in ('rg', 'rh') else '-a'
@@ -828,6 +891,13 @@ def plot_scaling(result, quantity: str = 'rg', labels: Optional[Sequence[str]] =
     ax.set_xlabel(rf'$M_w$ ({mw_unit})')
     ax.set_ylabel({'rg': rf'$R_g$ ({r_unit})', 'rh': rf'$R_h$ ({r_unit})'}.get(
         quantity, r'$A_2$ (mol·mL/g$^2$)'))
+    if labels is not None:
+        # Stagger sample-name labels so close points don't collide (feedback #8); a
+        # crowded corner caps at "+N more" rather than piling up. Done LAST, after the
+        # log scales + limits are set, so the de-collision sees the final transData.
+        annotate_decollided(
+            ax, [(xi * mfac, yi * yfac, lb, '#555') for xi, yi, lb in zip(x, y, labels)],
+            fontsize=7)
     return PlotHandles(fig, ax, artists)
 
 
