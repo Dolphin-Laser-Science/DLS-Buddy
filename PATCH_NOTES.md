@@ -1,8 +1,7 @@
 # Patch Notes
 
 User-facing summary of what each release changed, plus a running list of known
-issues. For the full session-by-session development history see the internal
-`DEVELOPMENT_LOG.md` (tracked in the private repo; stripped from the public release).
+issues.
 
 Versioning is pre-1.0 `0.MINOR.PATCH`: MINOR for new user-facing capability,
 PATCH for fixes/polish. The version is set in `version.py` and shown in the GUI
@@ -12,7 +11,7 @@ window title.
 
 ## 0.8.2 — In-program help system + tooltip toggle (2026-06-29)
 
-Makes the program more self-explanatory (owner feedback Section B). **No change to the
+Makes the program more self-explanatory (user feedback). **No change to the
 analysis math.**
 
 - **"?" help buttons.** Key sections now have a small circular **?** you can click (or
@@ -37,7 +36,7 @@ analysis math.**
 
 ## 0.8.1 — UI/UX batch: bugfixes, Undo/Reset, results panel, resizable plots (2026-06-29)
 
-Fixes and usability polish from owner feedback. **No change to the analysis math.**
+Fixes and usability polish from user feedback. **No change to the analysis math.**
 
 - **Fixed: the delay-window upper marker looked "capped at 1 µs."** The green τ-window
   and baseline markers on the Correlogram now sit at the correct positions (they were
@@ -160,7 +159,7 @@ A broad usability pass across the GUI (no change to the analysis math).
 
 ## 0.5.1 — UI polish: selection UX, plot sizing, scroll behaviour, Label field (2026-06-23)
 
-Nine UI improvements from owner feedback:
+Nine UI improvements from user feedback:
 
 - **Measurement selection lists now use click-to-highlight** (Shift / Ctrl supported)
   instead of checkboxes in the DLS overlay checklist and the Cross-Sample
@@ -231,9 +230,9 @@ Nine UI improvements from owner feedback:
   (e.g. any freshly loaded Zetasizer file): selecting it no longer errors in the
   depolarized-DLS summary.
 - **Repository tidy-up** (no effect on using the program): `code_map.md` and
-  `code_references.md` now live in `docs/`; the version file moved to `app/`; the
-  owner-only `setup-links.ps1` junction-bootstrap script is no longer shipped in the
-  repo (forkers never needed it).
+  `code_references.md` now live in `docs/`; the version file moved to `app/`; a
+  maintainer-only setup script is no longer shipped in the repo (forkers never
+  needed it).
 
 ## 0.3.0 — Documentation overhaul (2026-06-21)
 
@@ -290,5 +289,4 @@ before formal version numbers existed. Capabilities as of this release:
   thread for now.
 - **Session JSON is not yet schema-versioned** — old sessions may not load after a
   data-model change.
-- A few library PDFs are **citation "promotion candidates"** not yet formally cited
-  (see `references/_library_index.md`).
+- A few library PDFs are **citation "promotion candidates"** not yet formally cited.

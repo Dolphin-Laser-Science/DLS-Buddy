@@ -58,16 +58,10 @@ data model, never on a vendor file format.
 ├── exporting/             # CSV export
 ├── plotting/              # matplotlib layer
 ├── app/                   # controller + settings + units + version (framework-agnostic)
-├── gui/                   # PySide6 widgets
-└── internal/              # private dev content (stripped from the public release)
+└── gui/                   # PySide6 widgets
 ```
 
-Some folders won't be in a forked/public clone. `references/` (literature sources)
-and `feedback/` (working notes) are gitignored. `internal/` — the long
-`DEVELOPMENT_LOG.md`, the editable Markdown doc sources, `refs.bib`, build config,
-and the build/generator scripts — is tracked in the maintainer's *private* repo but
-stripped from the public release, so a fork won't have it either. The tracked files
-above are everything needed to run, read, and build.
+The tracked files above are everything needed to run, read, and build the program.
 
 ## Modules
 
@@ -125,9 +119,9 @@ above are everything needed to run, read, and build.
 - **`utilities.py`** — the remaining cross-cutting helpers: the i*sin(theta) check,
   rho = Rg/Rh, the Rg/Mw/A2 scaling power-law, the provenance-aware result-candidate
   picker, and the synthetic correlogram generator.
-- **`synthetic_dataset.py`** — the reusable synthetic-data engine behind both the
-  `internal/` test-data generator and the in-app Utilities generator (pure forward
-  models + loadable-file writers; no plotting).
+- **`synthetic_dataset.py`** — the reusable synthetic-data engine behind the in-app
+  Utilities synthetic-data generator (pure forward models + loadable-file writers;
+  no plotting).
 
 ### `exporting/` — results out
 - **`export.py`** — Origin-compatible CSV writer (Long Name / Units / Comments /
@@ -169,21 +163,6 @@ above are everything needed to run, read, and build.
   next to a plot.
 - **`export_helper.py`** — tiny shared helper behind the tabs' "Export CSV..." buttons.
 - **`stub_module.py`** — placeholder widget (no longer used now all six tabs exist).
-
-### `internal/` — private dev content (not in the public release)
-The maintainer's build-time material: `DEVELOPMENT_LOG.md`, the editable Markdown doc
-sources (`quickstart.md` / `advanced_guide.md`), `refs.bib` + the Pandoc/Tectonic build
-config, and the developer scripts (formerly `tools/`). A public/forked clone won't have
-this folder; the built artifacts it produces (`docs/*.pdf`, `docs/code_references.md`,
-`test-data/`) are tracked, so you can run and read the program without it. The scripts:
-- **`generate_synthetic_test_data.py`** — regenerates `test-data/Synthetic *` (a thin
-  wrapper over `analysis/synthetic_dataset.py` plus expected-picture rendering).
-- **`generate_synthetic_dpls_data.py`** — generates the synthetic DDLS test set
-  (`test-data/Synthetic DPLS/`) for the depolarized analysis path.
-- **`gen_code_references.py`** — regenerates `docs/code_references.md` from `refs.bib`.
-- **`build_docs.ps1`** — rebuilds `docs/code_references.md` + the guide PDFs (Pandoc +
-  Tectonic).
-- **`validate_*.py`** — headless numeric validators for the DLS analysis package.
 
 ## Running it
 

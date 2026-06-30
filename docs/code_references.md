@@ -5,9 +5,7 @@ Advanced Guide), mapped to **where it is used** — `path:line` for code, a
 `§section`/equation for the guide. Use it to trace any physical claim back
 to its literature, or to find which papers a given module relies on.
 
-> Generated from `internal/refs.bib` by `internal/gen_code_references.py`.
-> Do not edit by hand. Verification status and provenance corrections are
-> tracked separately in the maintainer's local notes.
+> Generated from the project bibliography; do not edit by hand.
 
 ---
 
@@ -47,11 +45,11 @@ to its literature, or to find which papers a given module relies on.
 ### Depolarized light scattering (dynamic / DDLS)
 
 - Pecora, Robert (1964). Doppler Shifts in Light Scattering from Pure Liquids and Polymer Solutions. *Journal of Chemical Physics* **40**(6), 1604–1614. https://doi.org/10.1063/1.1725368
-  - Used in: analysis/depolarization.py (analyze_ddls, rotational_diffusion_from_rates); app/controller.py (run_ddls); Advanced Guide §10.4, Eqs. (42)–(43); internal/generate_synthetic_dpls_data.py
+  - Used in: analysis/depolarization.py (analyze_ddls, rotational_diffusion_from_rates); app/controller.py (run_ddls); Advanced Guide §10.4, Eqs. (42)–(43)
 - Zero, Kenneth; Pecora, Robert (1982). Rotational and Translational Diffusion in Semidilute Solutions of Rigid-Rod Macromolecules. *Macromolecules* **15**(1), 87–93. https://doi.org/10.1021/ma00229a018
-  - Used in: analysis/depolarization.py (analyze_ddls, the qL guard); Advanced Guide §10.4, Eq. (42); internal/generate_synthetic_dpls_data.py
+  - Used in: analysis/depolarization.py (analyze_ddls, the qL guard); Advanced Guide §10.4, Eq. (42)
 - Tirado, María M.; López Martínez, Carmen; García de la Torre, José (1984). Comparison of Theories for the Translational and Rotational Diffusion Coefficients of Rod-Like Macromolecules. Application to Short DNA Fragments. *Journal of Chemical Physics* **81**(4), 2047–2052. https://doi.org/10.1063/1.447827
-  - Used in: physics/constants.py (rod_translational_diffusion, rod_rotational_diffusion, rod_end_corrections, rod_length_from_translational_diffusion); analysis/depolarization.py (rod_dimensions_from_diffusion); Advanced Guide §10.5, Eqs. (45)–(46); internal/generate_synthetic_dpls_data.py (tirado_rod_diffusion)
+  - Used in: physics/constants.py (rod_translational_diffusion, rod_rotational_diffusion, rod_end_corrections, rod_length_from_translational_diffusion); analysis/depolarization.py (rod_dimensions_from_diffusion); Advanced Guide §10.5, Eqs. (45)–(46)
 - Balog, Sandor; Rodriguez-Lorenzo, Laura; Monnier, Christophe A.; Obiols-Rabasa, Marc; Rothen-Rutishauser, Barbara; Schurtenberger, Peter; Petri-Fink, Alke (2015). Characterizing Nanoparticles in Complex Biological Media and Physiological Fluids with Depolarized Dynamic Light Scattering. *Nanoscale* **7**(14), 5991–5997. https://doi.org/10.1039/c4nr06538g
   - Used in: physics/constants.py (sphere_rotational_diffusion, sphere_radius_from_rotational_diffusion); analysis/depolarization.py (sphere_dimensions_from_diffusion); Advanced Guide §10.5, Eq. (44)
 

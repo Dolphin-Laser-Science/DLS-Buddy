@@ -4,7 +4,7 @@ analysis/uncertainty.py
 
 Statistical-uncertainty toolkit for the analysis layer.
 
-Scope and philosophy (see USER_GUIDE "Uncertainty estimates" and DEVELOPMENT_LOG):
+Scope and philosophy (see the Advanced Guide, "Uncertainty estimates"):
 we report the **statistical** (regression) uncertainty of a fit, and only where the
 fitted points are genuinely independent measurements (SLS angle/concentration series,
 Gamma-vs-q^2 over angles, D-vs-c over concentrations, the cross-sample scaling fit).

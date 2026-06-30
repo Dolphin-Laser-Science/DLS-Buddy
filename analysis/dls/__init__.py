@@ -157,6 +157,6 @@ __all__ = [
     # replicate averaging
     'AveragedCorrelogramResult',
     'average_replicate_correlograms',
-    # private helper imported by internal/validate_channel_skip.py
+    # private helper used by the headless DLS validators
     '_apply_tau_window',
 ]

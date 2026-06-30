@@ -433,7 +433,7 @@ class IntensityTrace:
         )
 
     def __repr__(self) -> str:
-        # A compact repr keeps the PyCharm console and debugger readable
+        # A compact repr keeps the console and debugger readable
         # instead of dumping the full arrays.
         label = self.sample_label if self.sample_label is not None else "unlabelled"
         return (

@@ -275,7 +275,7 @@ def plot_correlogram_scaled(
             # formatter (round(inf)). g2-1 is a normalised correlation with ~1e-3–1e-4
             # precision, so a 1e-12 floor sits far below any meaningful value and
             # never clips real data — it only trims an already-off-screen fit tail.
-            # FUTURE: see feedback/ideas.md — generalise this log-axis floor.
+            # FUTURE: generalise this log-axis floor.
             m &= yy >= _LOG_Y_FLOOR
         return xx[m], yy[m]
 

@@ -45,7 +45,7 @@ user to supply at the confirmation step (the Zetasizer file carries none of them
 
 Zetasizer export template (document for the user)
 -------------------------------------------------
-The export is configurable; this parser targets the template the owner uses:
+The export is configurable; this parser targets a common export template:
 
     Settings : include header row; use commas as separators.
     Parameters (in order): Sample Name, Material Name, Dispersant Name,

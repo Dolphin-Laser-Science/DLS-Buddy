@@ -3,8 +3,8 @@ analysis/synthetic_dataset.py
 =============================
 
 Synthetic light-scattering **dataset** generation: the reusable engine behind
-both the developer test-data tool (``internal/generate_synthetic_test_data.py``) and
-the in-app *Utilities ▸ Synthetic data* generator.
+both the developer test-data generator and the in-app *Utilities ▸ Synthetic data*
+generator.
 
 What lives here
 ---------------
@@ -24,7 +24,7 @@ What lives here
 * **Full-dataset orchestrator** :func:`generate_full_dataset`: regenerate a whole
   ``test-data/Synthetic *`` folder (the homologous Mw series + bimodal sample +
   trace + ``parameters.txt``). Picture rendering is intentionally *not* here (it
-  needs the plotting layer); the ``internal/`` wrapper adds it.
+  needs the plotting layer); a separate developer wrapper adds it.
 
 Deliberately **no plotting and no analysis-engine imports** — preview figures are
 drawn by the plotting layer from the GUI, and the ground-truth round-trip is
@@ -454,7 +454,7 @@ def generate_full_dataset(out_dir: str, profile_name: str, *,
     concentration series for one sample, a single concentration for the rest), a
     bimodal DLS sample, a standalone trace, and ``parameters.txt``. Returns the list
     of file paths written. ``profile_name`` keys into :data:`PROFILES`. Picture
-    rendering is added by the ``internal/`` wrapper, which may import the plotting layer.
+    rendering is added by a separate developer wrapper, which may import the plotting layer.
     """
     import os
     prof = PROFILES[profile_name]

@@ -9,7 +9,7 @@ dist/
 venv/
 env/
 
-# PyCharm
+# JetBrains IDE
 .idea/
 
 # OS
@@ -25,26 +25,5 @@ Thumbs.db
 # can be committed. Re-enable the line below if stray test renders become noise.
 # *.png
 
-# References — local-only source material (kept outside version control).
-# Everything inside references/ is gitignored. The user-facing citation index
-# lives in docs/ as code_references.md (tracked), outside this folder.
-references/*
-
-# NOTE: internal/ is TRACKED in this private repo. It holds DEVELOPMENT_LOG.md,
-# the editable markdown doc sources (quickstart/advanced), refs.bib, build config,
-# and the build/generator scripts (formerly tools/). It is stripped from the
-# downstream/public release. references/ and feedback/ stay gitignored below.
-
 # Global user preferences written by the Settings tab (per-user, not code).
-# Anchored to the repo root so it does NOT also ignore .claude/settings.json
-# (the committed Claude Code hook config).
 /settings.json
-
-# Tectonic/Pandoc scratch dirs left in the repo root by the docs build.
-media-*/
-
-# Feedback drops (screenshots + working notes) — local-only, never committed.
-feedback/
-
-# docs/ holds the committed, user-facing PDFs (Quickstart, Advanced Guide).
-# These ARE tracked — do not ignore them.
