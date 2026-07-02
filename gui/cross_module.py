@@ -4,8 +4,8 @@ gui/cross_module.py
 
 The Cross-Sample tab: the first AGGREGATE-scope module. Where the sample-scoped
 tabs (Data/DLS/SLS) operate on the one measurement picked in the shell sidebar,
-this tab reads results ACROSS samples. Step 1b implements the ρ = Rg/Rh pairing;
-the log–log scaling plots (Rg–Mw, A₂–Mw) come in a later step.
+this tab reads results ACROSS samples: the ρ = Rg/Rh pairing and the log–log
+scaling plots (Rg–Mw, A₂–Mw) are both built here.
 
 Layout
 ------
@@ -47,6 +47,7 @@ from gui.export_helper import export_to_csv
 from gui.help import section_header
 from gui.theme import ThemedLabel
 from gui.widgets import roomy_tabs
+from gui.worker import busy_notice, run_when_idle, runner
 from analysis.utilities import interpret_scaling_exponent
 from analysis.uncertainty import format_pm
 
@@ -81,6 +82,9 @@ class CrossSampleModule(QtWidgets.QWidget):
         self._current_unit: Optional[Tuple[str, Optional[str]]] = None
         self._size_quantity = 'rg'               # top scaling plot: 'rg' or 'rh'
         self._suppress = False                   # guard signal storms on rebuild
+        # Hand-entered Rg/Rh/Mw typed while the worker was busy, keyed by which,
+        # applied (re-checking) once it frees — a precious value is never dropped.
+        self._pending_manual: Dict[str, tuple] = {}
         self._build_ui()
         self.refresh()
 
@@ -236,6 +240,12 @@ class CrossSampleModule(QtWidgets.QWidget):
     def refresh(self) -> None:
         """Rebuild from the workspace. Called by the shell when this tab is shown
         or after a commit (the sample set or its results may have changed)."""
+        # refresh() runs the labelled Rg/Rh/Mw/A2 auto-picks, which WRITE
+        # SampleResult fields — so it must not run while a background fit is
+        # writing them too (invariant 4). Defer until the worker frees.
+        if runner().is_busy:
+            run_when_idle(self.refresh)
+            return
         universe = self.controller.samples_with_sls()
         # default: every SLS sample is included; remember prior choices.
         self._included = {sid: self._included.get(sid, True) for sid in universe}
@@ -475,6 +485,12 @@ class CrossSampleModule(QtWidgets.QWidget):
     def _fill_combo(self, combo: QtWidgets.QComboBox, candidates, *,
                     current_label: str, current_source: str,
                     unit: str = 'nm') -> None:
+        """Rebuild a source-picker combo. Each item's UserRole data is a sentinel
+        that `_on_source_chosen` dispatches on: a ResultCandidate object (a real
+        result to select), the string 'USER' (keep the existing hand-entered
+        value), or None (the trailing "Manual entry…" item). Signals are blocked
+        during the rebuild so clearing/adding items does not fire currentIndexChanged
+        (which would re-enter selection handling mid-rebuild)."""
         combo.blockSignals(True)
         combo.clear()
         select_index = -1
@@ -520,6 +536,10 @@ class CrossSampleModule(QtWidgets.QWidget):
             return
         if data == 'USER':               # keep the existing hand-entered value
             return
+        if runner().is_busy:             # set_sample_* writes SampleResult a fit reads
+            busy_notice(self)
+            self._populate_source_panel(sid, frac)   # revert the combo to committed
+            return
         setter = {'rg': self.controller.set_sample_rg,
                   'rh': self.controller.set_sample_rh,
                   'mw': self.controller.set_sample_mw}[which]
@@ -537,17 +557,44 @@ class CrossSampleModule(QtWidgets.QWidget):
             return
         try:
             value = float(text)
-            if which == 'mw':
-                self.controller.set_manual_mw(sid, value, frac)
-            else:
-                apparent = (self.rg_manual_apparent if which == 'rg'
-                            else self.rh_manual_apparent).isChecked()
-                setter = (self.controller.set_manual_rg if which == 'rg'
-                          else self.controller.set_manual_rh)
-                setter(sid, value, is_apparent=apparent, fraction=frac)
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, 'Invalid value', str(exc))
             return
+        apparent = (None if which == 'mw' else
+                    (self.rg_manual_apparent if which == 'rg'
+                     else self.rh_manual_apparent).isChecked())
+        if runner().is_busy:
+            # set_manual_* writes SampleResult, which a background fit is reading —
+            # but a hand-entered value is precious and must not be dropped. Queue
+            # it and apply once the worker frees (re-checking, never concurrently).
+            self._pending_manual[which] = (sid, frac, value, apparent)
+            run_when_idle(self._flush_manual)
+            self.interp.setText(
+                'Entry queued — it will apply when the running analysis finishes.')
+            return
+        self._apply_manual(which, sid, frac, value, apparent)
         edit.clear()
+
+    def _apply_manual(self, which, sid, frac, value, apparent) -> None:
+        if which == 'mw':
+            self.controller.set_manual_mw(sid, value, frac)
+        else:
+            setter = (self.controller.set_manual_rg if which == 'rg'
+                      else self.controller.set_manual_rh)
+            setter(sid, value, is_apparent=apparent, fraction=frac)
         self._recompute()
         self._populate_source_panel(sid, frac)
+
+    def _flush_manual(self) -> None:
+        """Apply queued hand-entered values once the worker frees. Re-checks busy
+        (a job started mid-drain pushes it to the next completion)."""
+        if not self._pending_manual:
+            return
+        if runner().is_busy:
+            run_when_idle(self._flush_manual)
+            return
+        pending, self._pending_manual = self._pending_manual, {}
+        edits = {'rg': self.rg_manual, 'rh': self.rh_manual, 'mw': self.mw_manual}
+        for which, (sid, frac, value, apparent) in pending.items():
+            self._apply_manual(which, sid, frac, value, apparent)
+            edits[which].clear()

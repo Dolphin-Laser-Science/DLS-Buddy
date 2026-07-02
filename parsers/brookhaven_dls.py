@@ -70,7 +70,6 @@ from typing import List
 
 import numpy as np
 
-from core.data_models import DLSMeasurement, IntensityTrace
 from parsers.base_parser import (
     BaseDLSParser,
     BaseTraceParser,
@@ -279,7 +278,7 @@ class BrookhavenDLSParser(BaseDLSParser):
         n_padding = 0
         n_bad = 0
 
-        for row_idx, line in enumerate(lines[_CORR_DATA_START_ROW:], start=_CORR_DATA_START_ROW + 1):
+        for _row_idx, line in enumerate(lines[_CORR_DATA_START_ROW:], start=_CORR_DATA_START_ROW + 1):
             line = line.strip()
             if not line:
                 continue   # skip blank lines
@@ -410,7 +409,7 @@ class BrookhavenTraceParser(BaseTraceParser):
         count_rates_cps: List[float] = []
         n_bad = 0
 
-        for row_idx, line in enumerate(lines[_TRACE_DATA_START_ROW:], start=_TRACE_DATA_START_ROW + 1):
+        for _row_idx, line in enumerate(lines[_TRACE_DATA_START_ROW:], start=_TRACE_DATA_START_ROW + 1):
             line = line.strip()
             if not line:
                 continue
@@ -423,13 +422,12 @@ class BrookhavenTraceParser(BaseTraceParser):
             try:
                 t_s = _parse_elapsed_seconds(parts[0])
                 rate_kcps = float(parts[1].strip())
-            except ValueError as exc:
+            except ValueError:
                 n_bad += 1
                 continue
 
-            # Convert kcps -> cps
             times_s.append(t_s)
-            count_rates_cps.append(rate_kcps * _KCPS_TO_CPS)
+            count_rates_cps.append(rate_kcps * _KCPS_TO_CPS)   # kcps -> cps
 
         if len(times_s) == 0:
             raise ParseError(

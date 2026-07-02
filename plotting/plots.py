@@ -300,8 +300,35 @@ def plot_correlogram_fit(
     return PlotHandles(fig, ax, artists)
 
 
-# Smallest g2-1 value drawn on a log y-axis; see _mask in plot_correlogram_scaled.
-_LOG_Y_FLOOR = 1e-12
+# Smallest value any log axis will plot. A computed curve (e.g. a correlogram fit
+# evaluated over the full tau-range) can underflow toward 0, leaving a tail of
+# sub-normal positives spanning ~300 decades; on a log axis that sends autoscale
+# and the tick formatter (round(inf)) haywire under constrained_layout. This floor
+# trims such a tail. It sits far below any physically meaningful plotted quantity
+# (a normalised g2-1 has ~1e-3-1e-4 precision), so it never clips real data.
+_LOG_FLOOR = 1e-12
+
+
+def mask_log_axes(x, y, *, xlog: bool, ylog: bool, floor: float = _LOG_FLOOR):
+    """Drop points a log axis cannot render, returning filtered float arrays.
+
+    Removes any non-finite point, and on a log axis any value below `floor` --
+    which discards both non-positive values and an underflowing computed-curve
+    tail (see `_LOG_FLOOR`). Shared sanitiser for log-scale plots; use it wherever
+    a *computed* curve is drawn on a log axis and could underflow. NOTE it filters
+    x and y together, so it is not suitable where a separate index must stay
+    aligned to the unfiltered arrays (e.g. the L-curve's optimal-point marker),
+    nor where a non-positive point is itself meaningful and should surface rather
+    than vanish (e.g. a negative A2 on the scaling plot).
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = np.isfinite(x) & np.isfinite(y)
+    if xlog:
+        m &= x >= floor
+    if ylog:
+        m &= y >= floor
+    return x[m], y[m]
 
 
 def plot_correlogram_scaled(
@@ -331,29 +358,17 @@ def plot_correlogram_scaled(
     g2 = np.asarray(g2m1, dtype=float)
     c = colour or PALETTE['blue']
 
-    def _mask(xx, yy):
-        m = np.isfinite(xx) & np.isfinite(yy)
-        if xscale == 'log':
-            m &= xx > 0
-        if yscale == 'log':
-            # Drop values below a tiny positive floor. A fit tail that underflows
-            # toward 0 leaves sub-normal/near-zero positives spanning ~300 decades,
-            # which sends log autoscale haywire and overflows matplotlib's tick
-            # formatter (round(inf)). g2-1 is a normalised correlation with ~1e-3–1e-4
-            # precision, so a 1e-12 floor sits far below any meaningful value and
-            # never clips real data — it only trims an already-off-screen fit tail.
-            # FUTURE: generalise this log-axis floor.
-            m &= yy >= _LOG_Y_FLOOR
-        return xx[m], yy[m]
+    xlog, ylog = xscale == 'log', yscale == 'log'
 
     artists = {}
-    dx, dy = _mask(tau, g2)
+    dx, dy = mask_log_axes(tau, g2, xlog=xlog, ylog=ylog)
     artists['data'] = ax.scatter(dx, dy, s=(7 if compact else 18),
                                  facecolors='none', edgecolors=c, alpha=0.7,
                                  label=(label or 'data'))
     if fit_tau is not None and fit_g2m1 is not None:
-        fx, fy = _mask(np.asarray(fit_tau, dtype=float) * tfac,
-                       np.asarray(fit_g2m1, dtype=float))
+        fx, fy = mask_log_axes(np.asarray(fit_tau, dtype=float) * tfac,
+                               np.asarray(fit_g2m1, dtype=float),
+                               xlog=xlog, ylog=ylog)
         # When an explicit colour is given (multi-measurement overlay) the fit line
         # matches its data colour so each measurement reads as one colour; with no
         # colour (single-measurement view) the fit keeps the vermilion default.
@@ -896,7 +911,7 @@ def plot_scaling(result, quantity: str = 'rg', labels: Optional[Sequence[str]] =
         # crowded corner caps at "+N more" rather than piling up. Done LAST, after the
         # log scales + limits are set, so the de-collision sees the final transData.
         annotate_decollided(
-            ax, [(xi * mfac, yi * yfac, lb, '#555') for xi, yi, lb in zip(x, y, labels)],
+            ax, [(xi * mfac, yi * yfac, lb, '#555') for xi, yi, lb in zip(x, y, labels, strict=True)],
             fontsize=7)
     return PlotHandles(fig, ax, artists)
 

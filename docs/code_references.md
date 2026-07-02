@@ -20,7 +20,9 @@ to its literature, or to find which papers a given module relies on.
 - Provencher, Stephen W. (1982). CONTIN: A General Purpose Constrained Regularization Program for Inverting Noisy Linear Algebraic and Integral Equations. *Computer Physics Communications* **27**(3), 229–242. https://doi.org/10.1016/0010-4655(82)90174-6
   - Used in: analysis/dls/distributions.py (fit_contin); analysis/dls/__init__.py (module docstring)
 - Salazar, Marcos; Srivastav, Harsh; Srivastava, Abhishek; Srivastava, Samanvaya (2023). A User-Friendly Graphical User Interface for Dynamic Light Scattering Data Analysis. *Soft Matter* **19**(35), 6535–6544. https://doi.org/10.1039/d3sm00469d
-  - Used in: analysis/dls/distributions.py (_lcurve_corner); analysis/dls/cumulants.py; analysis/dls/__init__.py (module docstring)
+  - Used in: analysis/dls/distributions.py (_lcurve_corner); analysis/dls/__init__.py (module docstring)
+- Liénard, François; Freyssingeas, Éric; Borgnat, Pierre (2022). A Multiscale Time-Laplace Method to Extract Relaxation Times from Non-Stationary Dynamic Light Scattering Signals. *Journal of Chemical Physics* **156**(22), 224901. https://doi.org/10.1063/5.0088005
+  - Used in: analysis/dls/distributions.py:13 (cross-terms-negligible approximation, Eq. 11)
 
 ### Static light scattering
 
@@ -34,11 +36,13 @@ to its literature, or to find which papers a given module relies on.
   - Used in: analysis/sls.py:43; analysis/sls.py:66
 - Guinier, André (1939). La diffraction des rayons X aux très petits angles: application à l'étude de phénomènes ultramicroscopiques. *Annales de Physique (Paris)* **11**(12), 161–237. https://doi.org/10.1051/anphys/193911120161
   - Used in: analysis/sls.py (guinier_analysis); Advanced Guide §11.5, Eq. (27)
+- Russo, Paul S.; Streletzky, Kiril A.; Huberty, Wayne; Zhang, Xujun; Edwin, Nadia (2021). Characterization of Polymers by Static Light Scattering. Ch. 13 in Molecular Characterization of Polymers: A Fundamental Guide, eds. Malik, Mays & Shah (Elsevier). ISBN 9780128197684; accessible derivation of the Guinier plot (static light scattering chapter).
+  - Used in: analysis/sls.py (guinier_analysis); Advanced Guide §11.5 (Guinier plot)
 
 ### Depolarized light scattering (static)
 
 - Chu, Benjamin (1991). Laser Light Scattering: Basic Principles and Practice. 2 ed. Academic Press. Section 8.4.1.A, pp. 290–291, Eqs. 8.4.7–8.4.10.
-  - Used in: physics/constants.py:639; physics/constants.py:730; analysis/depolarization.py; Advanced Guide §11.6, Eqs. (39)–(40)
+  - Used in: physics/constants.py:639; physics/constants.py:730; physics/constants.py (scattering_vector_q, stokes_einstein_rh; the scattering vector q and Stokes-Einstein relation); analysis/depolarization.py; analysis/utilities.py (_interpret_rho, rho_shape_label; rho=Rg/Rh reference values); analysis/sls.py (guinier_analysis; the Guinier plot); analysis/dls/exponentials.py + analysis/dls/distributions.py (the Siegert relation; historical origin A. J. F. Siegert, Report No. 465, Radiation Laboratory, MIT, 1943); Advanced Guide §7.1 (Eq. 3), §7.2 (Eq. 4), §9.4 (Eq. 10), §10 (Eq. 2), §11.5, and §11.6 (Eqs. 39–40)
 - Coumou, D. J.; Mackor, E. L.; Hijmans, J. (1964). Isotropic Light Scattering in Pure Liquids. *Transactions of the Faraday Society* **60**, 1539–1547. https://doi.org/10.1039/TF9646001539
   - Used in: physics/constants.py:689; Advanced Guide §11.6, Eq. (41)
 
@@ -77,8 +81,8 @@ to its literature, or to find which papers a given module relies on.
 
 ### Fundamental constants
 
-- CODATA / SI (2019). 2019 Redefinition of the SI Base Units (exact Boltzmann constant and Avogadro number). SI Brochure, 9th ed.
-  - Used in: physics/constants.py:57–61 (k_B = 1.380649e-23 J/K; N_A = 6.02214076e23 /mol)
+- CODATA / NIST (2024). CODATA Recommended Values of the Fundamental Physical Constants: 2022. NIST SP 961 (May 2024), National Institute of Standards and Technology. k_B and N_A are exact values fixed by the 2019 SI redefinition.
+  - Used in: physics/constants.py:70; physics/constants.py:73 (k_B = 1.380649e-23 J/K; N_A = 6.02214076e23 /mol)
 
 ### Instrument manuals
 
@@ -98,8 +102,8 @@ in-source; listed so a forker can find where each lives.
 
 | Method / relation | Where used | Note |
 |---|---|---|
-| **Stokes–Einstein** relation | `physics/constants.py:144–239` | `Rh = k_B T / (6πηD)` |
-| **Siegert** relation | `analysis/dls/` (cumulants, exponentials, distributions); `analysis/utilities.py` (`generate_synthetic_correlogram`); `parsers/generic_dls.py:36,176` | `g₂−1 = β\|g₁\|²` |
+| **Stokes–Einstein** relation | `physics/constants.py:144–239` | `Rh = k_B T / (6πηD)` (Chu 1991) |
+| **Siegert** relation | `analysis/dls/` (cumulants, exponentials, distributions); `analysis/utilities.py` (`generate_synthetic_correlogram`); `parsers/generic_dls.py:36,176` | `g₂−1 = β\|g₁\|²` (Chu 1991; orig. Siegert 1943) |
 | **Zimm / Berry / Debye** plots | `analysis/sls.py` (Zimm/Berry `:497–664`, Debye `:404–445`) | Berry = √-ordinate variant for high `qRg` |
 | **Guinier** plot | `analysis/sls.py` (`guinier_analysis`) | ln(ΔR) vs q²; Rg from slope (Guinier 1939) |
 | **Kohlrausch–Williams–Watts (KWW)** | `analysis/dls/exponentials.py` (`fit_kww`) | stretched exponential |

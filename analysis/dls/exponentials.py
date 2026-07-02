@@ -3,7 +3,8 @@ analysis/dls/exponentials.py
 ============================
 
 Parametric exponential fits of g2(tau) - 1, all carrying the Siegert factor of 2
-explicitly and reporting Gamma as the physical g1 decay rate:
+explicitly (the Siegert relation g2 - 1 = beta |g1|^2; Chu 1991) and reporting
+Gamma as the physical g1 decay rate:
 
   - fit_single_exponential : g2 - 1 = beta exp(-2 Gamma tau)  (monodisperse)
   - fit_double_exponential : two discrete modes via the full Siegert relation

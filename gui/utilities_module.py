@@ -5,11 +5,15 @@ gui/utilities_module.py
 The Utilities tab: data-quality diagnostics and tools. **Sample-scoped** — the
 shell's sidebar navigator selects the sample, exactly like the DLS and SLS tabs.
 
-Inner tabs (built up over several steps):
+Inner tabs (all built):
+  * **Traces** — intensity-trace diagnostics (a separate trace store; Absolute /
+    Relative scale, outlier + running-average overlays, a histogram+Fano /
+    block-variance sub-plot, ADF stationarity in the summary line).
   * **I·sin θ** — an optical-quality / alignment check over a sample's SLS
     measurements, with an Absolute / Relative (normalised) scale toggle. For an
     ideal isotropic, dust-free scattering volume the curve is flat across angle.
-  * *(Synthetic generator and intensity-trace diagnostics arrive in later steps.)*
+  * **Synthetic data** — the synthetic-dataset generator (correlogram / trace /
+    multi-angle DLS / SLS slices) with per-artifact Preview + Save.
 
 All analysis lives in the controller/engine; this widget only drives the controller
 and displays what comes back.
@@ -35,6 +39,7 @@ from gui.plot_controls import (
 )
 from gui.theme import ThemedLabel
 from gui.widgets import roomy_tabs
+from gui.worker import BUSY_NOTICE, busy_notice, run_when_idle, runner
 
 from plotting.plots import (
     plot_i_sin_theta, plot_synthetic_correlogram, plot_intensity_trace,
@@ -133,6 +138,10 @@ class UtilitiesModule(QtWidgets.QWidget):
         super().__init__(parent)
         self.controller = controller
         self.sample_id: Optional[str] = None
+        # Staleness token for the backgrounded ADF stationarity test (the sole
+        # slow call on the trace path); bumped whenever the trace view refreshes.
+        self._adf_epoch = 0
+        self._isin_refresh_pending = False   # dedup deferred I·sinθ refreshes
         self._build_ui()
         self.set_measurement(None)
 
@@ -347,6 +356,8 @@ class UtilitiesModule(QtWidgets.QWidget):
         return max(3, n_points // 20) if w == 0 else max(3, w)
 
     def _update_trace(self) -> None:
+        # A refresh supersedes any in-flight ADF from a previous view.
+        self._adf_epoch += 1
         self.trace_ax.clear()
         tids = self._selected_trace_ids()
         focus = self._current_trace_id()
@@ -441,7 +452,10 @@ class UtilitiesModule(QtWidgets.QWidget):
                 pass
 
     def _set_diag_text(self, tid: str, stats, prefix: str = '') -> None:
-        """One-line summary: trace stats + Fano factor + correlation + ADF verdicts."""
+        """One-line summary: trace stats + Fano factor + correlation + ADF verdict.
+        The fast parts render immediately; the ADF stationarity test (the one slow
+        call) runs on the worker thread and fills in when it finishes, so a long
+        trace never freezes the window."""
         parts = [
             f'{stats.n_points} pts/{stats.duration_s:.1f}s',
             f'mean {stats.mean_cps:,.0f} cps', f'CV {stats.cv:.3f}',
@@ -456,13 +470,39 @@ class UtilitiesModule(QtWidgets.QWidget):
             parts.append('correlated' if bv.correlations_detected else 'uncorrelated')
         except Exception:
             pass
-        try:
-            adf = self.controller.trace_stationarity(tid)
-            parts.append(f"{'stationary' if adf.is_stationary else 'non-stationary'} "
-                         f"(ADF p={adf.p_value:.3f})")
-        except Exception:
-            parts.append('ADF n/a')
-        self.trace_stats.setText(prefix + '   ·   '.join(parts))
+        base = prefix + '   ·   '.join(parts)
+        self._dispatch_adf(tid, base)
+
+    def _dispatch_adf(self, tid: str, base: str) -> None:
+        """Run the ADF stationarity test in the background and append its verdict
+        to the stats line `base`. Superseded (epoch) if the view changes first."""
+        epoch = self._adf_epoch
+        controller = self.controller
+
+        def verdict_text(adf) -> str:
+            return (f"{'stationary' if adf.is_stationary else 'non-stationary'} "
+                    f"(ADF p={adf.p_value:.3f})")
+
+        def done(adf) -> None:
+            if epoch != self._adf_epoch:
+                return
+            self.trace_stats.setText(base + '   ·   ' + verdict_text(adf))
+
+        def fail(_exc) -> None:
+            if epoch != self._adf_epoch:
+                return
+            self.trace_stats.setText(base + '   ·   ADF n/a')
+
+        if runner().try_submit(lambda: controller.trace_stationarity(tid),
+                               done, fail, description='trace stationarity (ADF)'):
+            self.trace_stats.setText(base + '   ·   ADF: computing…')
+        else:
+            # A fit (or another ADF) holds the worker: show the fast line now and
+            # retry the ADF once the worker frees, unless the view changed by then.
+            self.trace_stats.setText(base + '   ·   ADF: pending…')
+            run_when_idle(
+                lambda: self._dispatch_adf(tid, base)
+                if epoch == self._adf_epoch else None)
 
     def _update_diag(self) -> None:
         self.diag_ax.clear()
@@ -488,6 +528,9 @@ class UtilitiesModule(QtWidgets.QWidget):
         auto-detected (ALV, Brookhaven), falling back to the plain two-column generic
         parser with a units prompt (feedback 2026-06-26 #3). Public so the sidebar's
         Traces node can trigger it too (#4)."""
+        if runner().is_busy:                 # add mutates the workspace store
+            busy_notice(self)
+            return
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, 'Load count-rate trace(s)', '',
             'Trace files (*.ASC *.asc *.csv *.txt);;All files (*.*)')
@@ -571,6 +614,9 @@ class UtilitiesModule(QtWidgets.QWidget):
         return None
 
     def _remove_trace(self) -> None:
+        if runner().is_busy:
+            busy_notice(self)
+            return
         tids = self._selected_trace_ids() or (
             [self._current_trace_id()] if self._current_trace_id() else [])
         if not tids:
@@ -582,6 +628,9 @@ class UtilitiesModule(QtWidgets.QWidget):
 
     def remove_traces(self, tids) -> None:
         """Remove the given traces (used by the sidebar's trace context menu)."""
+        if runner().is_busy:
+            busy_notice(self)
+            return
         for tid in tids:
             self.controller.remove_trace(tid)
         self.refresh_traces()
@@ -747,9 +796,12 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.syn_seed.setMaximumWidth(90)
         srow.addWidget(self.syn_seed)
         srow.addStretch(1)
-        gen = QtWidgets.QPushButton('Generate')
-        gen.clicked.connect(self._synth_generate)
-        srow.addWidget(gen)
+        self.syn_gen_button = QtWidgets.QPushButton('Generate')
+        self.syn_gen_button.setToolTip(
+            'Builds (and optionally saves/adds) in the background — the window '
+            'stays usable and the preview appears when it finishes. One task at a time.')
+        self.syn_gen_button.clicked.connect(self._synth_generate)
+        srow.addWidget(self.syn_gen_button)
         ov.addLayout(srow)
         left.addWidget(out_box)
         left.addStretch(1)
@@ -792,7 +844,7 @@ class UtilitiesModule(QtWidgets.QWidget):
     def _read_pop_specs(self) -> List[dict]:
         specs = []
         for r in range(self.pop_table.rowCount()):
-            def cell(c):
+            def cell(c, r=r):
                 it = self.pop_table.item(r, c)
                 return it.text().strip() if it is not None else ''
             rh, weight, cv = cell(0), cell(1), cell(2)
@@ -867,48 +919,82 @@ class UtilitiesModule(QtWidgets.QWidget):
                 'Tick Preview or Save for at least one artifact.')
             return
 
-        built = {}
-        try:
+        # Everything below runs on the worker (building a full multi-angle set or
+        # a full test set is the slow part). Hoist every widget read here first;
+        # the thunk touches only the controller + plain values.
+        save_keys = [k for k in active
+                     if k in self.syn_save and self.syn_save[k].isChecked()]
+        folder = self.syn_folder.text().strip()
+        eta_cp = self._synth_viscosity_Pa_s() * 1e3
+        do_inject = self.syn_ws_check.isChecked()
+        inj_concs = self._synth_floats(self.syn_concs.text())
+        inj_conc0 = (inj_concs[0] if inj_concs else 0.6) * 1e-3
+        inj_T = self._synth_temperature_K()
+        inj_eta = self._synth_viscosity_Pa_s()
+        preview_keys = [k for k in active
+                        if k in self.syn_preview and self.syn_preview[k].isChecked()]
+
+        def work():
+            # Build (the slow part) + save (file I/O) run on the worker. The
+            # inject is deliberately NOT here: it mutates workspace.measurements +
+            # regroups, structural changes the main thread iterates — so it runs
+            # in done() on the main thread instead.
+            built = {}
             for key in active:
                 if key == 'full_set':
                     continue            # written directly at save time
                 built[key] = self._synth_build_one(key, specs, ctx, poly, solv)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, 'Generate failed', str(exc))
-            return
-        self._syn_built = built
-
-        saved = []
-        try:
-            saved = self._synth_save(active, built)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, 'Save failed', str(exc))
-
-        injected = ''
-        if self.syn_ws_check.isChecked():
+            out = {'built': built}
             try:
-                injected = self._synth_inject(built, ctx['calibrated'], poly, solv)
-            except Exception as exc:
-                QtWidgets.QMessageBox.warning(self, 'Add to workspace failed', str(exc))
+                out['saved'] = self._synth_save(save_keys, built, folder, eta_cp)
+            except Exception as exc:                         # noqa: BLE001
+                out['save_exc'] = exc
+            return out
 
-        # populate the preview dropdown with the preview-ticked, built artifacts
-        labels = {k: l for (k, l, _p, _s) in _SYNTH_ARTIFACTS}
-        self.syn_show_combo.blockSignals(True)
-        self.syn_show_combo.clear()
-        for key in active:
-            if (key in self.syn_preview and self.syn_preview[key].isChecked()
-                    and key in built):
-                self.syn_show_combo.addItem(labels[key], key)
-        self.syn_show_combo.blockSignals(False)
-        self._synth_show_changed()
+        def done(out) -> None:
+            built = out['built']
+            self._syn_built = built
+            if 'save_exc' in out:
+                QtWidgets.QMessageBox.warning(self, 'Save failed', str(out['save_exc']))
+            saved = out.get('saved', [])
+            injected = ''
+            if do_inject:                          # workspace mutation: main thread
+                try:
+                    injected = self._synth_inject(
+                        built, ctx['calibrated'], poly, solv,
+                        inj_conc0, inj_T, inj_eta)
+                except Exception as exc:           # noqa: BLE001
+                    QtWidgets.QMessageBox.warning(
+                        self, 'Add to workspace failed', str(exc))
+                    injected = ''
+                if injected:
+                    self.workspaceChanged.emit()   # sidebar/Data rebuild
+                    self.refresh_traces()          # pick up any injected trace
 
-        extra = []
-        if saved:
-            extra.append(f'saved {len(saved)} file(s)')
-        if injected:
-            extra.append(injected)
-        if extra:
-            self.syn_truth.setText(self.syn_truth.text() + '   —   ' + '; '.join(extra))
+            labels = {k: l for (k, l, _p, _s) in _SYNTH_ARTIFACTS}
+            self.syn_show_combo.blockSignals(True)
+            self.syn_show_combo.clear()
+            for key in preview_keys:
+                if key in built:
+                    self.syn_show_combo.addItem(labels[key], key)
+            self.syn_show_combo.blockSignals(False)
+            self._synth_show_changed()
+
+            extra = []
+            if saved:
+                extra.append(f'saved {len(saved)} file(s)')
+            if injected:
+                extra.append(injected)
+            if extra:
+                self.syn_truth.setText(self.syn_truth.text() + '   —   ' + '; '.join(extra))
+
+        def fail(exc: BaseException) -> None:
+            QtWidgets.QMessageBox.warning(self, 'Generate failed', str(exc))
+
+        if not runner().try_submit(work, done, fail,
+                                   description='synthetic data generation',
+                                   busy_widgets=(self.syn_gen_button,)):
+            QtWidgets.QMessageBox.information(self, 'Busy', BUSY_NOTICE)
 
     def _synth_build_one(self, key, specs, ctx, poly, solv):
         c = self.controller
@@ -954,17 +1040,15 @@ class UtilitiesModule(QtWidgets.QWidget):
                 solvent_name=solv, label=f'{poly} in {solv}', kind=kind)
         raise ValueError(f'Unknown artifact {key!r}.')
 
-    def _synth_save(self, active, built) -> List[str]:
-        save_keys = [k for k in active
-                     if k in self.syn_save and self.syn_save[k].isChecked()]
+    def _synth_save(self, save_keys, built, folder: str, eta_cp: float) -> List[str]:
+        """Write the save-ticked artifacts. Takes plain values (no widget reads) so
+        it can run on the worker thread; the caller hoists the folder/viscosity."""
         if not save_keys:
             return []
-        folder = self.syn_folder.text().strip()
         if not folder:
             raise ValueError('Choose a "Save to" folder first.')
         os.makedirs(folder, exist_ok=True)
         c = self.controller
-        eta_cp = self._synth_viscosity_Pa_s() * 1e3
         saved = []
         for key in save_keys:
             if key == 'full_set':
@@ -985,21 +1069,22 @@ class UtilitiesModule(QtWidgets.QWidget):
             saved.append(os.path.basename(path))
         return saved
 
-    def _synth_inject(self, built, calibrated, poly, solv) -> str:
+    def _synth_inject(self, built, calibrated, poly, solv, conc0, T, eta) -> str:
         """Inject a coherent single sample: the primary DLS artifact (multi-angle
         preferred), the primary SLS artifact (Zimm preferred), and any trace.
         Injecting every SLS slice would pile duplicate concentrations into one
-        sample, so only the primary of each kind is added."""
+        sample, so only the primary of each kind is added.
+
+        Takes plain values (no widget reads) so it runs on the worker; the caller
+        emits workspaceChanged + refreshes the trace list on the main thread once
+        this returns (mutating the workspace here is safe under the single-flight
+        guard)."""
         c = self.controller
         parts = []
         if 'multi_dls' in built:
             c.inject_multi_angle_dls(built['multi_dls'], polymer_name=poly, solvent_name=solv)
             parts.append('multi-angle DLS')
         elif 'correlogram' in built:
-            T = self._synth_temperature_K()
-            eta = self._synth_viscosity_Pa_s()
-            concs = self._synth_floats(self.syn_concs.text())
-            conc0 = (concs[0] if concs else 0.6) * 1e-3
             c.inject_correlogram(built['correlogram'], polymer_name=poly, solvent_name=solv,
                                  concentration_g_per_mL=conc0, temperature_K=T,
                                  viscosity_Pa_s=eta)
@@ -1017,8 +1102,6 @@ class UtilitiesModule(QtWidgets.QWidget):
             parts.append('trace')
         if not parts:
             return ''
-        self.workspaceChanged.emit()
-        self.refresh_traces()
         cal_note = ' (session calibration set)' if (calibrated and sls_added) else ''
         return f'added to workspace as “{poly} / {solv}”: ' + ', '.join(parts) + cal_note
 
@@ -1087,6 +1170,17 @@ class UtilitiesModule(QtWidgets.QWidget):
         self._update_isin()
 
     def _update_isin(self) -> None:
+        # run_i_sin_theta writes the shared controller.results dict, so it must
+        # not run while a background fit is writing it too (invariant 4). Defer
+        # the whole refresh until the worker frees rather than race it — and dedup
+        # (a single pending flag) so a burst of abs/rel toggles doesn't queue N
+        # identical redraws that all fire on drain.
+        if runner().is_busy:
+            if not self._isin_refresh_pending:
+                self._isin_refresh_pending = True
+                run_when_idle(self._flush_isin)
+            return
+        self._isin_refresh_pending = False
         self.isin_ax.clear()
         if self.sample_id is None:
             self.isin_note.setText(
@@ -1107,3 +1201,9 @@ class UtilitiesModule(QtWidgets.QWidget):
             f'{len(res.curves)} curve(s). Flat across angle = clean isotropic '
             'scattering; curvature or asymmetry about 90° flags alignment, stray '
             'light, or dust.')
+
+    def _flush_isin(self) -> None:
+        """Deferred I·sinθ refresh once the worker frees (re-checks busy, so a
+        job started mid-drain pushes it to the next completion)."""
+        self._isin_refresh_pending = False
+        self._update_isin()

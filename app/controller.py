@@ -34,9 +34,12 @@ update indicator from these queries; the analysis itself only runs on commit.
 
 Threading
 ---------
-Not enabled, but designed for: every expensive call is a single controller method
-with no widget interaction, so it can later be dispatched to a worker thread
-without touching the analysis or the widgets.
+Enabled (2026-07): the GUI dispatches every heavy `run_*` call to a single worker
+thread via `gui/worker.py`, so a CONTIN sweep / DDLS Monte-Carlo / replicate
+average no longer freezes the window. The controller itself stays thread-agnostic
+and Qt-free — each expensive call is one method with no widget interaction — and
+the GUI enforces one analysis in flight at a time (it never reads the mutated
+result state until the worker hands it back on the main thread).
 
 Change history
 --------------
@@ -55,8 +58,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from core.workspace import (
-    Workspace, LoadedMeasurement, LoadedTrace, Sample, SampleResult,
-    MeasurementResultRow, SampleRhRow,
+    Workspace, LoadedMeasurement, LoadedTrace, Sample, MeasurementResultRow, SampleRhRow,
     _DLS_PARAM_KEYS, _SLS_PARAM_KEYS,
 )
 from app.settings import SettingsState

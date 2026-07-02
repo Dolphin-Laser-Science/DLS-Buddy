@@ -189,9 +189,9 @@ def i_sin_theta(
 def _interpret_rho(rho: float) -> str:
     """Return a short textual interpretation of a rho value.
 
-    These are well-known reference values for common architectures. They are
-    guides, not hard boundaries -- real systems span ranges and depend on
-    solvent quality and polydispersity.
+    These are well-known reference values for common architectures (Chu 1991).
+    They are guides, not hard boundaries -- real systems span ranges and depend
+    on solvent quality and polydispersity.
     """
     if not math.isfinite(rho) or rho <= 0:
         return "rho is not a positive finite number; check the inputs."
@@ -668,15 +668,19 @@ def generate_synthetic_correlogram(
             radii = np.array([p.rh_nm], dtype=float)
             a = np.array([p.weight], dtype=float)
         else:
+            # Lognormal population: convert the coefficient of variation to the
+            # log-space width (sigma_ln; exact for a lognormal), treat rh_nm as the
+            # median so mu_ln = ln(rh_nm), and sample the lognormal pdf on a
+            # geometric grid spanning +/-3 sigma_ln (covers ~99.7% of the mass).
             sigma_ln = math.sqrt(math.log(1.0 + p.spread_cv ** 2))
-            mu_ln = math.log(p.rh_nm)   # treat rh_nm as the median
+            mu_ln = math.log(p.rh_nm)
             lo = p.rh_nm * math.exp(-3.0 * sigma_ln)
             hi = p.rh_nm * math.exp(3.0 * sigma_ln)
             radii = np.geomspace(lo, hi, n_grid_per_population)
             pdf = (1.0 / (radii * sigma_ln * math.sqrt(2.0 * math.pi))) * \
                   np.exp(-(np.log(radii) - mu_ln) ** 2 / (2.0 * sigma_ln ** 2))
-            a = pdf / pdf.sum() * p.weight
-        for r, amp in zip(radii, a):
+            a = pdf / pdf.sum() * p.weight   # normalise to the population weight
+        for r, amp in zip(radii, a, strict=True):
             d = stokes_einstein_diffusion_coefficient(r * 1e-9, temperature_K, viscosity_Pa_s)
             gammas.append(d * q ** 2)
             amps.append(float(amp))
@@ -783,7 +787,7 @@ def export_synthetic_correlogram_csv(
     delays_out = result.delay_times_s * factor
 
     with open(file_path, 'w', newline='') as fh:
-        for t, v in zip(delays_out, result.signal):
+        for t, v in zip(delays_out, result.signal, strict=True):
             fh.write(f"{t:.10e}{delimiter}{v:.10e}\n")
 
     return file_path

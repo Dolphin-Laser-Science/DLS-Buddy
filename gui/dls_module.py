@@ -49,8 +49,9 @@ from gui.plot_controls import (
 )
 from gui.export_helper import export_to_csv
 from gui.help import add_help_to_groupbox
-from gui.theme import ThemedLabel, span, token
+from gui.theme import ThemedLabel
 from gui.widgets import roomy_tabs
+from gui.worker import BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, run_when_idle, runner
 from analysis.uncertainty import format_pm
 
 
@@ -161,7 +162,7 @@ def _tau_window_kwargs(min_edit: QtWidgets.QLineEdit, max_edit: QtWidgets.QLineE
         try:
             kw[name] = U.to_canonical('time', float(text), unit)
         except ValueError:
-            raise ValueError(f'"{text}" is not a valid delay time.')
+            raise ValueError(f'"{text}" is not a valid delay time.') from None
     if ('tau_min_s' in kw and 'tau_max_s' in kw
             and kw['tau_min_s'] >= kw['tau_max_s']):
         raise ValueError('Delay-window min must be less than max.')
@@ -715,6 +716,13 @@ class _CorrelogramTab(QtWidgets.QWidget):
         ids = list(self._raw.keys())
         if not ids:
             return
+        # Cumulant/exp/KWW fits are fast enough to stay synchronous, but they
+        # still write the shared controller.results dict — so they must not run
+        # while a background fit is writing it too (invariant 4). Refuse rather
+        # than race; the fit is a click away once the worker frees.
+        if runner().is_busy:
+            self.status.setText(BUSY_NOTICE)
+            return
         kw = self.region.window_kwargs()        # the shared window (seconds)
         key = self.method_combo.currentData()
         c = self.controller
@@ -769,7 +777,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self._suppress_fields = True
         for edit, (_, attr) in zip(
                 (self.tau_min, self.tau_max, self.base_lo, self.base_hi),
-                self._HANDLES):
+                self._HANDLES, strict=True):
             x = getattr(self.region, attr)
             edit.setText('' if x is None
                          else f'{U.from_canonical("time", x, unit):.4g}')
@@ -790,7 +798,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
                 return 'ERR'
 
         vals = {attr: parse(edit) for edit, (_, attr) in zip(
-            (self.tau_min, self.tau_max, self.base_lo, self.base_hi), self._HANDLES)}
+            (self.tau_min, self.tau_max, self.base_lo, self.base_hi), self._HANDLES, strict=True)}
         if 'ERR' in vals.values():
             self._fields_from_region()           # revert bad input
             return
@@ -846,9 +854,8 @@ class _CorrelogramTab(QtWidgets.QWidget):
         tfac = _disp_factor('time')
         if event.x is None or event.y is None:
             return None
-        # Pick the candidate kind by which half of the axes the press is in: the top half
-        # grabs the window markers, the bottom half the baseline markers. This is what
-        # lets the user target the right marker when window + baseline overlap in τ.
+        # Pick the candidate kind by which half of the axes the press is in
+        # (top -> window, bottom -> baseline; see _TOP_HANDLES above).
         try:
             yf = self.main_ax.transAxes.inverted().transform((event.x, event.y))[1]
         except Exception:
@@ -912,11 +919,10 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self._fields_from_region()
         self._redraw()                           # recreate markers + baseline span
 
-    # Marker styling + offset-handle geometry (feedback #7). Window markers carry a
-    # downward caret at the TOP; baseline markers an upward caret at the BOTTOM, so the
-    # two kinds are told apart (and grabbed) by which half of the plot you click — even
-    # when they overlap in τ. _BASE_HANDLE_Y is kept a touch above the bottom so the
-    # caret never lands in the residual-resize gap band below main_ax.
+    # Marker styling + offset-handle geometry (feedback #7): window carets at the
+    # top, baseline carets at the bottom (the disambiguation described above).
+    # _BASE_HANDLE_Y is kept a touch above the bottom so the caret never lands in
+    # the residual-resize gap band below main_ax.
     _WIN_COLOUR, _BASE_COLOUR = '#2ca02c', '#888'
     _WIN_HANDLE_Y, _BASE_HANDLE_Y = 0.96, 0.05
 
@@ -974,7 +980,6 @@ class _CorrelogramTab(QtWidgets.QWidget):
             self.main_ax.set_title('Select or tick a DLS measurement')
             self.canvas.draw_idle()
             return
-        key = self.method_combo.currentData()
         ws = self.controller.workspace.measurements
         xs, ys = _SCALE_XY[self._scales[0]]
         # main view: overlay every ticked measurement (data + its fit, same colour)
@@ -1158,6 +1163,10 @@ class _DistributionTab(QtWidgets.QWidget):
         self.item_id: Optional[str] = None
         self._runnable = False
         self._results: List[Tuple] = []         # [(iid, method, result), ...] last run
+        self._failures: List[str] = []
+        # Staleness token for async runs: bumped when the ticked set changes, so
+        # a background fit whose inputs are outdated is dropped, not drawn.
+        self._run_epoch = 0
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1220,6 +1229,7 @@ class _DistributionTab(QtWidgets.QWidget):
         note.setWordWrap(True)
         form.addRow(note)
         self.run_button = QtWidgets.QPushButton('Run')
+        self.run_button.setToolTip(BACKGROUND_RUN_TOOLTIP)
         self.run_button.clicked.connect(self._on_run)
         form.addRow(self.run_button)
         self.export_button = QtWidgets.QPushButton('Export CSV…')
@@ -1332,7 +1342,11 @@ class _DistributionTab(QtWidgets.QWidget):
     @QtCore.Slot()
     def _on_selection_changed(self) -> None:
         # The checked set changed → previous curves are stale; require a re-Run.
+        # Any in-flight background fit is also stale: bump the epoch so its
+        # result is discarded on arrival.
+        self._run_epoch += 1
         self._results = []
+        self._failures = []
         self.export_button.setEnabled(False)
         self.run_button.setEnabled(self._has_checked())
         self._clear('Selection changed — press Run.')
@@ -1366,19 +1380,38 @@ class _DistributionTab(QtWidgets.QWidget):
             self.status.setText('Tick at least one measurement.'); return
         if not methods:
             self.status.setText('Tick at least one distribution method.'); return
-        self._results = []
-        self._failures: List[str] = []
-        for iid in ids:
-            base = self._baseline_kwargs(iid)
-            for _label, key in methods:
-                kw = {**base, **self._grid_kwargs(key)}
+        # Everything the fit needs is read from the widgets HERE, on the main
+        # thread; the thunk below runs on the worker and touches only the
+        # controller (the whole method is dispatched regardless of `key`, so a
+        # future distribution method inherits background execution for free).
+        jobs = [(iid, key, {**self._baseline_kwargs(iid), **self._grid_kwargs(key)})
+                for iid in ids for _label, key in methods]
+        labels = {iid: _meas_short(ws[iid]) for iid in ids}
+        controller = self.controller
+        epoch = self._run_epoch
+
+        def work():
+            results, failures = [], []
+            for iid, key, kw in jobs:
                 try:
-                    res = self.controller.run_distribution(iid, key, **kw)
-                    self._results.append((iid, key, res))
+                    res = controller.run_distribution(iid, key, **kw)
+                    results.append((iid, key, res))
                 except Exception as exc:           # per (measurement, method)
-                    self._failures.append(f'{_meas_short(ws[iid])}·{key.upper()}: {exc}')
-        self.export_button.setEnabled(bool(self._results))
-        self._draw()
+                    failures.append(f'{labels[iid]}·{key.upper()}: {exc}')
+            return results, failures
+
+        def done(payload) -> None:
+            if epoch != self._run_epoch:
+                return          # selection changed while the fit ran — stale
+            self._results, self._failures = payload
+            self.export_button.setEnabled(bool(self._results))
+            self._draw()
+
+        if runner().try_submit(work, done, description='distribution fit',
+                               busy_widgets=(self.run_button,)):
+            self.status.setText('Fitting in the background…')
+        else:
+            self.status.setText(BUSY_NOTICE)
 
     @staticmethod
     def _as_distribution(result):
@@ -1411,7 +1444,7 @@ class _DistributionTab(QtWidgets.QWidget):
         ws = self.controller.workspace.measurements
         single = len(self._results) == 1
         peak_items = []          # (x, y, text, colour) collected across all curves
-        for iid, key, res in self._results:
+        for iid, _key, res in self._results:
             d = self._as_distribution(res)
             colour = self.selection.colour_for(iid)
             label = f'{_meas_short(ws[iid])} · {d.method.upper()}'
@@ -1532,6 +1565,8 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self._included: Dict[str, set] = {}      # sample_id -> ticked item_ids (#11/#12)
         self._suppress_table = False             # re-entrancy guard for checkbox edits
         self._last_sid: Optional[str] = None     # last DLS sample shown (keep-last, #15)
+        self._run_epoch = 0                      # async staleness token (sample/tick set)
+        self._recompute_pending = False          # a refit is queued for when idle
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1554,6 +1589,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             role='hint', size=10)
         src.setWordWrap(True); cl.addWidget(src)
         self.run_button = QtWidgets.QPushButton('Run')
+        self.run_button.setToolTip(BACKGROUND_RUN_TOOLTIP)
         self.run_button.clicked.connect(self._on_run)
         cl.addWidget(self.run_button)
         self.export_button = QtWidgets.QPushButton('Export CSV…')
@@ -1639,6 +1675,8 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self._runnable = runnable
         self.flag_label.clear()
         sid = self._sample_id()
+        if sid != self._last_sid:
+            self._run_epoch += 1     # re-pointed: drop any in-flight run's result
         if not (runnable and sid is not None):
             self.table.setRowCount(0)
             self.run_button.setEnabled(False)
@@ -1721,6 +1759,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             inc.add(iid)
         else:
             inc.discard(iid)
+        self._run_epoch += 1         # ticked set changed: in-flight run is stale
         enough = self._update_run_enabled(sid)
         if sid in self._cache:
             if enough:
@@ -1777,20 +1816,51 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             self._recompute(sid)
 
     def _recompute(self, sid: str) -> None:
-        """Fit over the ticked subset and refresh the plot + results table."""
-        try:
-            res = self._run_engine(sid, self._fraction(),
-                                   set(self._included.get(sid, set())))
-        except Exception as exc:
+        """Fit over the ticked subset (on the worker thread — it builds + fits
+        every included measurement) and refresh the plot + results table."""
+        if runner().is_busy:
+            # Can't dispatch now. Do NOT bump the epoch (that would drop the
+            # in-flight fit with nothing to replace it); instead retry once the
+            # worker frees, with whatever the ticked set is by then.
+            if not self._recompute_pending:
+                self._recompute_pending = True
+                run_when_idle(self._flush_recompute)
+            self.status.setText(BUSY_NOTICE)
+            return
+        frac = self._fraction()
+        include_ids = set(self._included.get(sid, set()))
+        self._run_epoch += 1                # this run supersedes any in flight
+        epoch = self._run_epoch
+
+        def done(res) -> None:
+            if epoch != self._run_epoch:
+                return                      # sample/tick set changed — stale
+            self._cache[sid] = res
+            self.export_button.setEnabled(True)
+            self._fill_results(res)
+            self._draw(res)
+            self.status.clear()
+
+        def fail(exc: BaseException) -> None:
             QtWidgets.QMessageBox.critical(
                 self, 'Analysis failed', f'Could not run this analysis.\n\n{exc}')
             self.status.setText('Analysis failed — see dialog.')
-            return
-        self._cache[sid] = res
-        self.export_button.setEnabled(True)
-        self._fill_results(res)
-        self._draw(res)
-        self.status.clear()
+
+        description = ('Γ vs q² fit' if self.kind == 'gamma_q2'
+                       else 'D vs c extrapolation')
+        runner().try_submit(
+            lambda: self._run_engine(sid, frac, include_ids),
+            done, fail, description=description,
+            busy_widgets=(self.run_button,))
+        self.status.setText('Fitting in the background…')
+
+    def _flush_recompute(self) -> None:
+        """Deferred retry of a recompute that was refused while the worker was
+        busy — re-runs with the current sample + ticked set (if still valid)."""
+        self._recompute_pending = False
+        sid = self._sample_id()
+        if sid is not None and self._runnable and self._distinct_keys(sid) >= 2:
+            self._recompute(sid)
 
     def _fill_results(self, res) -> None:
         for r, (_label, fn) in enumerate(self._result_spec()):
@@ -1889,6 +1959,8 @@ class _DDLSTab(QtWidgets.QWidget):
         self._full: Dict[str, tuple] = {}       # sample_id -> (result, info) all angles
         self._excluded: Dict[str, set] = {}     # sample_id -> excluded angles (#9)
         self._last_sid: Optional[str] = None    # last DLS sample shown (keep-last, #15)
+        self._run_epoch = 0                     # async staleness token
+        self._recompute_pending = False         # a refit is queued for when idle
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1922,6 +1994,7 @@ class _DDLSTab(QtWidgets.QWidget):
         left.addWidget(rod_w)
 
         self.run_button = QtWidgets.QPushButton('Run DDLS')
+        self.run_button.setToolTip(BACKGROUND_RUN_TOOLTIP)
         self.run_button.clicked.connect(self._on_run)
         left.addWidget(self.run_button)
         self.export_button = QtWidgets.QPushButton('Export CSV…')
@@ -1987,6 +2060,8 @@ class _DDLSTab(QtWidgets.QWidget):
         self.run_button.setEnabled(runnable)
         self.flag_label.clear()
         sid = self._sample_id()
+        if sid != self._last_sid:
+            self._run_epoch += 1     # re-pointed: drop any in-flight run's result
         self.export_button.setEnabled(runnable and sid is not None and sid in self._cache)
         if runnable and sid is not None:
             self._refresh_table(sid)
@@ -2038,29 +2113,64 @@ class _DDLSTab(QtWidgets.QWidget):
                     'Rod length must be a number in nm, or blank.')
                 return
         self._rod_nm = rod
+        self._run_epoch += 1     # rod length is a fit input: drop any in-flight fit
         self._recompute(sid)
 
     def _recompute(self, sid: str) -> None:
+        if runner().is_busy:
+            # Can't dispatch now; retry when the worker frees (do NOT bump the
+            # epoch here — that would drop the in-flight fit with no replacement).
+            if not self._recompute_pending:
+                self._recompute_pending = True
+                run_when_idle(self._flush_recompute)
+            self.status.setText(BUSY_NOTICE)
+            return
         rod = getattr(self, '_rod_nm', None)
-        excl = self._excluded.get(sid, set())
-        try:
-            res, info = self.controller.run_ddls(
+        excl = set(self._excluded.get(sid, set()))
+        controller = self.controller
+        self._run_epoch += 1                # this run supersedes any in flight
+        epoch = self._run_epoch
+
+        def work():
+            # ONE thunk for both calls, in this order: the second (full) call
+            # overwrites results[('ddls', sid)], which ddls_shape reads lazily
+            # on the main thread when drawing — running full last keeps that
+            # cache warm so no Monte-Carlo re-run happens on the GUI thread.
+            res, info = controller.run_ddls(
                 sid, rod_length_nm=rod, exclude_angles=excl)
-            full = (self.controller.run_ddls(sid, rod_length_nm=rod)
+            full = (controller.run_ddls(sid, rod_length_nm=rod)
                     if excl else (res, info))
-        except Exception as exc:
+            return (res, info), full
+
+        def done(payload) -> None:
+            if epoch != self._run_epoch:
+                return                      # sample/exclusions changed — stale
+            (res, info), full = payload
+            self._cache[sid] = (res, info)
+            self._full[sid] = full
+            self.export_button.setEnabled(True)
+            self._refresh_table(sid)
+            self._draw(res, info)
+
+        def fail(exc: BaseException) -> None:
             QtWidgets.QMessageBox.critical(
                 self, 'DDLS failed',
                 f'Could not run DDLS.\n\n{exc}\n\nTag at least one angle with BOTH a '
                 'VV and a VH correlogram (Data tab → Polarization), then confirm '
                 'parameters.')
             self.status.setText('DDLS failed — see dialog.')
-            return
-        self._cache[sid] = (res, info)
-        self._full[sid] = full
-        self.export_button.setEnabled(True)
-        self._refresh_table(sid)
-        self._draw(res, info)
+
+        runner().try_submit(work, done, fail,
+                            description='DDLS rotational-diffusion fit',
+                            busy_widgets=(self.run_button,))
+        self.status.setText('Fitting in the background…')
+
+    def _flush_recompute(self) -> None:
+        """Deferred retry of a recompute refused while the worker was busy."""
+        self._recompute_pending = False
+        sid = self._sample_id()
+        if sid is not None and self._runnable:
+            self._recompute(sid)
 
     def _on_click(self, event) -> None:
         """Toggle the nearest angle's exclusion from the DDLS fit (#9)."""
@@ -2094,6 +2204,7 @@ class _DDLSTab(QtWidgets.QWidget):
             excl -= matched
         else:
             excl.add(key)
+        self._run_epoch += 1     # exclusions changed: drop any in-flight fit
         self._recompute(sid)
 
     @QtCore.Slot()
@@ -2102,6 +2213,7 @@ class _DDLSTab(QtWidgets.QWidget):
         if sid is None or not self._excluded.get(sid):
             return
         self._excluded[sid] = set()
+        self._run_epoch += 1     # exclusions changed: drop any in-flight fit
         self._recompute(sid)
 
     @QtCore.Slot()
@@ -2136,7 +2248,7 @@ class _DDLSTab(QtWidgets.QWidget):
             ang = np.asarray(full.angles_deg, float)
             for arr in (full.gamma_vv_s_inv, full.gamma_vh_s_inv):
                 ys = np.asarray(arr, float) * gf
-                for x, y, a in zip(q2, ys, ang):
+                for x, y, a in zip(q2, ys, ang, strict=True):
                     if any(np.isclose(a, e) for e in excl):
                         self.ax.plot([x], [y], 'x', color='#999999', ms=9, mew=2,
                                      zorder=5)
@@ -2438,7 +2550,7 @@ class DLSModule(QtWidgets.QWidget):
         self.tabs.addTab(self.distribution_tab, 'Distribution')
         self.tabs.addTab(self.gamma_q2_tab, 'Γ vs q²')
         self.tabs.addTab(self.conc_tab, 'D vs c')
-        self.tabs.addTab(self.ddls_tab, 'DPLS')
+        self.tabs.addTab(self.ddls_tab, 'DDLS')
         self.tabs.addTab(self.summary_tab, 'Summary')
         self.tabs.setMovable(True)               # drag to reorder sub-tabs (A4)
         layout.addWidget(self.tabs, 1)

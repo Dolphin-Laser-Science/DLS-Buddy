@@ -185,13 +185,20 @@ Python's standard-library `io` and breaks imports. Use `exporting/`.
 ## How to run / validate
 
 - The GUI runs with `python -m gui.main` from the repo root.
-- Modules are validated **headless** by wiring them together and checking against ground
-  truth — the DLS engine against the synthetic correlogram generator and a real
-  correlogram; the SLS engine and controller against a real polystyrene/toluene Zimm set
-  (reproduces Mw ≈ 1.01e6 / Rg ≈ 40.5 nm). Sessions round-trip to 1e-9.
-- The GUI is validated headless too: drive the real widgets under Qt's offscreen platform
-  (`QT_QPA_PLATFORM=offscreen`), fake the file dialog, assert on controller state and the
-  drawn artists, and render the embedded figure to PNG to eyeball.
+- **Tests live in `tests/` (pytest).** Run everything from the repo root with
+  `python -m pytest`; the fast inner loop is `python -m pytest -m "not slow and not gui"`.
+  pytest is a dev-only dependency (`requirements-dev.txt`), not needed to run the app.
+  Markers: `slow` (Monte-Carlo/CONTIN), `gui` (needs PySide6, runs offscreen), `realdata`
+  (reads a committed `test-data/` file).
+- Everything is checked against **ground truth**: the program's own forward model (a closed
+  round-trip; shared builders in `tests/fixtures/`) and the committed real datasets — the
+  DLS engine against a real correlogram + the ALV replicate set, the SLS engine + controller
+  against the real polystyrene/toluene Zimm set (reproduces Mw ≈ 1.01e6 / Rg ≈ 40.5 nm);
+  physics constants asserted analytically. Sessions round-trip to 1e-9.
+- The GUI is validated headless in `tests/test_gui_smoke.py`: the real widgets under Qt's
+  offscreen platform (`QT_QPA_PLATFORM=offscreen`), file dialogs faked, asserting on
+  controller state and drawn artists. For visual review (which offscreen can't show), run
+  `python tests/screenshots/capture.py [--tab dls]` to grab each tab to a PNG to eyeball.
 - Plotting is validated by rendering to PNG and inspecting, never by a blocking `show()`.
 
 ---
@@ -199,7 +206,7 @@ Python's standard-library `io` and breaks imports. Use `exporting/`.
 ## Current state
 
 **Complete and validated:** data model; all parsers (Brookhaven DLS/SLS/trace, generic
-DLS/SLS/trace, Zetasizer clipboard, ALV .ASC multi-angle); physics constants
+DLS/SLS/trace, Zetasizer clipboard, ALV .ASC multi-angle + single-angle); physics constants
 (geometry-aware Rayleigh); utilities + synthetic generator; DLS engine; SLS engine
 (unified calibration, Debye, Zimm/Berry, calibration-free A₂); Origin export; matplotlib
 plotting; workspace + controller (grouping, commit/working state, sessions).

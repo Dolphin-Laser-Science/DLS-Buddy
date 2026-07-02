@@ -39,7 +39,9 @@ from gui.plot_controls import (
     AxisControlBar, make_split_panels, make_canvas_expanding, make_vertical_plot_stack)
 from gui.export_helper import export_to_csv
 from gui.help import add_help_to_groupbox
-from gui.theme import ThemedLabel, span, token
+from gui.theme import ThemedLabel, span
+from gui.worker import (
+    BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, busy_notice, run_when_idle, runner)
 from analysis.uncertainty import format_pm
 
 # Reminder appended where a calibration-dependent quantity (Mw, absolute A₂) is
@@ -123,6 +125,12 @@ class SLSModule(QtWidgets.QWidget):
         # one export button serve every method without the handler re-deriving state.
         self._export: Optional[Tuple[str, object]] = None
         self._zimm_k = 1.0              # Zimm grid spacing, shared with the overlay
+        # Unmasked Rayleigh series from the last run, keyed by (sample, fraction):
+        # the masked-point overlay and click hit-testing read this instead of
+        # recomputing on every draw (which would call the controller off the run
+        # path and could race a background fit).
+        self._full_rr: Dict[tuple, list] = {}
+        self._run_epoch = 0            # async staleness token (bumped on sample switch)
         # The active molecular-weight fraction (None = unfractioned / whole sample).
         self._fraction: Optional[str] = None
         self._suppress_fraction = False
@@ -311,6 +319,7 @@ class SLSModule(QtWidgets.QWidget):
         form.addRow('', self.mw_display)
 
         self.run_button = QtWidgets.QPushButton('Run analysis')
+        self.run_button.setToolTip(BACKGROUND_RUN_TOOLTIP)
         self.run_button.clicked.connect(self._on_run)
         form.addRow(self.run_button)
         self.export_button = QtWidgets.QPushButton('Export CSV…')
@@ -508,6 +517,7 @@ class SLSModule(QtWidgets.QWidget):
             if _sample is None or not _sample.has_sls:
                 return
         self.sample_id = None
+        self._run_epoch += 1             # drop any in-flight fit for the old sample
         self._clear_result_table()       # stale result clears on a sample switch (#14)
         runnable = False
         if item_id is None:
@@ -575,6 +585,10 @@ class SLSModule(QtWidgets.QWidget):
     def _on_angle_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
         if self._suppress_mask or self.sample_id is None:
             return
+        if runner().is_busy:              # mask edits change what a running fit reads
+            busy_notice(self)
+            self._populate_mask_lists()   # revert the checkbox to committed state
+            return
         a = item.data(QtCore.Qt.ItemDataRole.UserRole)
         if item.checkState() == QtCore.Qt.CheckState.Checked:
             self.controller.unmask_angle(self.sample_id, a, self._fraction)
@@ -586,6 +600,10 @@ class SLSModule(QtWidgets.QWidget):
     def _on_conc_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
         if self._suppress_mask or self.sample_id is None:
             return
+        if runner().is_busy:
+            busy_notice(self)
+            self._populate_mask_lists()   # revert the checkbox to committed state
+            return
         cc = item.data(QtCore.Qt.ItemDataRole.UserRole)
         if item.checkState() == QtCore.Qt.CheckState.Checked:
             self.controller.unmask_concentration(self.sample_id, cc, self._fraction)
@@ -596,6 +614,9 @@ class SLSModule(QtWidgets.QWidget):
     @QtCore.Slot()
     def _on_clear_masks(self) -> None:
         if self.sample_id is None:
+            return
+        if runner().is_busy:
+            busy_notice(self)
             return
         self.controller.clear_sls_mask(self.sample_id, self._fraction)
         self._populate_mask_lists()
@@ -643,6 +664,7 @@ class SLSModule(QtWidgets.QWidget):
             return
         self._fraction = self.fraction_combo.currentData()
         self._ran = False
+        self._run_epoch += 1             # drop any in-flight fit for the old fraction
         self._populate_axis_selectors()
         self._populate_mask_lists()
         self._refresh_mw_display()
@@ -739,6 +761,9 @@ class SLSModule(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def _on_apply(self) -> None:
+        if runner().is_busy:              # commit changes committed calibration a
+            busy_notice(self)             # background fit is reading (invariant 4)
+            return
         self.controller.commit()
         self._populate_calibration()
         self._refresh_calibration_display()
@@ -750,6 +775,9 @@ class SLSModule(QtWidgets.QWidget):
     @QtCore.Slot()
     def _on_set_mw(self) -> None:
         if self.sample_id is None:
+            return
+        if runner().is_busy:              # writes SampleResult.mw a fit may read
+            busy_notice(self)
             return
         text = self.mw_edit.text().strip()
         if not text:
@@ -799,6 +827,9 @@ class SLSModule(QtWidgets.QWidget):
     def _on_suggest_k(self) -> None:
         if self.sample_id is None:
             return
+        if runner().is_busy:              # builds a Rayleigh series off the run path
+            busy_notice(self)
+            return
         try:
             rr = self.controller.masked_rayleigh(self.sample_id, self._fraction)
         except Exception:
@@ -817,22 +848,73 @@ class SLSModule(QtWidgets.QWidget):
                 'This sample has no c = 0 solvent reference. SLS calibration and '
                 'the excess Rayleigh ratio require one.')
             return
+        # Read everything the fit needs on the main thread; the compute phase
+        # runs on the worker (the SLS fits build + fit every angle/concentration),
+        # then the present phase plots + fills tables back on the main thread.
         method = self.method_combo.currentData()
-        try:
-            self._run_method(method, sid)
-            self._ran = True
-            self.export_button.setEnabled(self._export is not None)
-            self._last_run_by_sample[(sid, self._fraction)] = {
-                'method': method,
-                'conc': self.conc_combo.currentData(),
-                'angle': self.angle_combo.currentData()}
-        except Exception as exc:
+        method_text = self.method_combo.currentText()
+        frac = self._fraction
+        conc = self.conc_combo.currentData()
+        angle = self.angle_combo.currentData()
+        self._run_epoch += 1
+        epoch = self._run_epoch
+
+        def fail(exc: BaseException) -> None:
             self.export_button.setEnabled(False)
             QtWidgets.QMessageBox.critical(
                 self, 'Analysis failed',
-                f'Could not run {self.method_combo.currentText()!r}.\n\n{exc}\n\n'
+                f'Could not run {method_text!r}.\n\n{exc}\n\n'
                 'Confirm parameters (Data tab) and the calibration, then Apply.')
             self.status.setText('Analysis failed — see dialog.')
+
+        def done(payload) -> None:
+            if epoch != self._run_epoch:
+                return                       # sample/fraction changed — stale
+            # Only the current view's series is ever read (by the overlay/click
+            # hit-test), so keep a single entry rather than accumulating one per
+            # (sample, fraction) for the life of the session.
+            self._full_rr = {(sid, frac): payload['full_rr']}
+            # The present phase (plot + tables) can also raise on a degenerate
+            # result; route it through the same 'Analysis failed' path the old
+            # single try/except gave, so a plotting edge case never escapes as an
+            # uncaught slot exception with the UI half-updated.
+            try:
+                self._present_method(method, sid, conc, payload)
+            except Exception as exc:         # noqa: BLE001
+                fail(exc)
+                return
+            self._ran = True
+            self.export_button.setEnabled(self._export is not None)
+            self._last_run_by_sample[(sid, frac)] = {
+                'method': method, 'conc': conc, 'angle': angle}
+
+        if runner().try_submit(
+                lambda: self._compute_method(method, sid, frac, conc, angle),
+                done, fail, description=f'{method_text} fit',
+                busy_widgets=(self.run_button,)):
+            self.status.setText('Running in the background…')
+        else:
+            self.status.setText(BUSY_NOTICE)
+
+    def _compute_method(self, method: str, sid: str, frac, conc, angle) -> Dict:
+        """Worker phase: every controller call the chosen method needs, plus the
+        unmasked Rayleigh series for the overlay/click cache. No Qt, no plotting."""
+        c = self.controller
+        payload: Dict = {'full_rr': c.run_rayleigh(sid, frac)}
+        if method in ('zimm', 'berry'):
+            payload['rr'] = c.masked_rayleigh(sid, frac)
+            payload['res'] = c.run_zimm(sid, method, frac)
+        elif method == 'debye':
+            payload['res'] = c.run_debye(sid, conc, frac)
+        elif method == 'guinier':
+            payload['res'] = c.run_guinier(sid, conc, fraction=frac)
+        elif method == 'single':
+            payload['res'] = c.run_single_angle(sid, conc, angle, frac)
+        elif method == 'calfree':
+            payload['res'] = c.run_calibration_free_a2(sid, angle, fraction=frac)
+        else:  # rayleigh
+            payload['rr'] = c.masked_rayleigh(sid, frac)
+        return payload
 
     @QtCore.Slot()
     def _on_export(self) -> None:
@@ -856,15 +938,19 @@ class SLSModule(QtWidgets.QWidget):
         self._set_combo_data(self.method_combo, last['method'])
         self._set_combo_data(self.conc_combo, last['conc'])
         self._set_combo_data(self.angle_combo, last['angle'])
-        self._on_run()        # re-runs from committed state + persisted masks
+        # Re-run from committed state + persisted masks. Deferred if a fit is in
+        # flight (switching samples during a run replays once the worker frees).
+        run_when_idle(self._on_run)
 
-    def _run_method(self, method: str, sid: str) -> None:
+    def _present_method(self, method: str, sid: str, conc, payload: Dict) -> None:
+        """Main-thread phase: plot + fill tables from the worker's payload. Reads
+        precomputed results (payload['rr'] / ['res']); makes no controller fit
+        calls itself (the masked-point overlay reads the cached full series)."""
         c = self.controller
-        frac = self._fraction
         self._export = None
         if method in ('zimm', 'berry'):
-            rr = c.masked_rayleigh(sid, frac)
-            res = c.run_zimm(sid, method, frac)
+            rr = payload['rr']
+            res = payload['res']
             self._setup_axes()
             self._zimm_k = self._current_zimm_k(rr)
             plot_zimm(rr, res, ax=self.ax, spacing_constant=self._zimm_k)
@@ -873,7 +959,7 @@ class SLSModule(QtWidgets.QWidget):
             self._summarize_zimm(res)
             self._export = (f'{sid}_{method}.csv', lambda p: c.export_zimm(rr, res, p))
         elif method == 'debye':
-            res = c.run_debye(sid, self.conc_combo.currentData(), frac)
+            res = payload['res']
             self._export = (f'{sid}_debye.csv', lambda p: c.export_debye(res, p))
             self._setup_axes()
             plot_debye(res, ax=self.ax)
@@ -887,7 +973,7 @@ class SLSModule(QtWidgets.QWidget):
             ])
             self.flag_label.setText(self._apparent_flag(res.calibrated) + _STAT_CAVEAT)
         elif method == 'guinier':
-            res = c.run_guinier(sid, self.conc_combo.currentData(), fraction=frac)
+            res = payload['res']
             self._export = (f'{sid}_guinier.csv', lambda p: c.export_guinier(res, p))
             self._setup_axes()
             plot_guinier(res, ax=self.ax)
@@ -906,8 +992,7 @@ class SLSModule(QtWidgets.QWidget):
                          'linearise the high-qRg regime better).')
             self.flag_label.setText(flag)
         elif method == 'single':
-            res = c.run_single_angle(sid, self.conc_combo.currentData(),
-                                     self.angle_combo.currentData(), frac)
+            res = payload['res']
             self._export = (f'{sid}_single_angle.csv',
                             lambda p: c.export_single_angle(res, p))
             self._clear_plot()
@@ -920,8 +1005,7 @@ class SLSModule(QtWidgets.QWidget):
                 '⚠ apparent: single angle + single concentration (contains the '
                 'form factor and the 2A₂c term).')
         elif method == 'calfree':
-            res = c.run_calibration_free_a2(sid, self.angle_combo.currentData(),
-                                            fraction=frac)
+            res = payload['res']
             self._export = (f'{sid}_calibration_free_a2.csv',
                             lambda p: c.export_calibration_free_a2(res, p))
             self._setup_axes()
@@ -938,7 +1022,7 @@ class SLSModule(QtWidgets.QWidget):
                 '(± statistical only)'
                 if getattr(res, 'two_a2_mw_se', None) is not None else '')
         else:  # rayleigh
-            rr = c.masked_rayleigh(sid, frac)
+            rr = payload['rr']
             self._export = (f'{sid}_rayleigh.csv',
                             lambda p: c.export_rayleigh_series(rr, p))
             self._setup_axes()
@@ -967,7 +1051,11 @@ class SLSModule(QtWidgets.QWidget):
         mask = self.controller.sls_mask(sid, self._fraction)
         if mask.is_empty():
             return
-        full = self.controller.run_rayleigh(sid, self._fraction)   # unmasked, all points
+        # Unmasked series from the last run (cached in _on_run.done), not a fresh
+        # controller call — the draw path stays off the analysis engine.
+        full = self._full_rr.get((sid, self._fraction))
+        if full is None:
+            return
         xs: List[float] = []
         ys: List[float] = []
         if method in ('zimm', 'berry'):
@@ -1023,8 +1111,11 @@ class SLSModule(QtWidgets.QWidget):
 
     def _point_coords(self, method: str, sid: str):
         """Every data point for the current method as (c, angle, x_data, y_data),
-        for click hit-testing. Masked and unmasked points are both included."""
-        full = self.controller.run_rayleigh(sid, self._fraction)
+        for click hit-testing. Masked and unmasked points are both included. Reads
+        the cached unmasked series (as of the last run) — no controller call."""
+        full = self._full_rr.get((sid, self._fraction))
+        if full is None:
+            return []
         pts = []
         if method in ('zimm', 'berry'):
             berry = (method == 'berry')
@@ -1069,6 +1160,9 @@ class SLSModule(QtWidgets.QWidget):
                 or event.inaxes is not self.ax or event.button != 1):
             return
         if getattr(self.nav_toolbar, 'mode', ''):   # pan/zoom active -> ignore
+            return
+        if runner().is_busy:                 # click masks a point then re-runs
+            busy_notice(self)
             return
         method = self.method_combo.currentData()
         if method not in self._CLICKABLE:

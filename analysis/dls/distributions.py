@@ -10,7 +10,7 @@ hydrodynamic radii Rh_n):
 
     |g1(tau_m)|^2  ~  sum_n  x_n exp(-2 Gamma_n tau_m)        (A x)_m
 
-(the factor of 2 follows the Siegert relation; the cross-terms-negligible
+(the factor of 2 follows the Siegert relation, Chu 1991; the cross-terms-negligible
 approximation, Liénard et al. 2022 Eq. 11, lets |g1|^2 be written as a single sum
 of exponentials in 2 Gamma). The transfer matrix is A[m, n] = exp(-2 Gamma_n
 tau_m). We solve for the non-negative weights x_n.
@@ -567,7 +567,7 @@ def find_distribution_peaks(
 
     # lobe boundaries: the local minimum between each pair of adjacent maxima
     bounds = [0]
-    for a, b in zip(maxima[:-1], maxima[1:]):
+    for a, b in zip(maxima[:-1], maxima[1:], strict=True):
         bounds.append(a + int(np.argmin(w[a:b + 1])))
     bounds.append(n)
 

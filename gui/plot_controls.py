@@ -331,7 +331,7 @@ class AxisControlBar(QtWidgets.QWidget):
         try:
             return float(text)
         except ValueError:
-            raise ValueError('limits must be numbers')
+            raise ValueError('limits must be numbers') from None
 
     def _autoscale(self) -> None:
         if self._ax is None:

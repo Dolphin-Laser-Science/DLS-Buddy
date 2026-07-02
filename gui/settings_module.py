@@ -22,6 +22,7 @@ from PySide6 import QtCore, QtWidgets
 from app import units as U
 from app.settings import SettingsState
 from gui.theme import ThemedLabel
+from gui.worker import busy_notice, runner
 
 # Plot-axis display-unit choices surfaced in Settings (feedback 2026-06-26 #8):
 # (quantity, label). The combo for each offers U.unit_options(quantity).
@@ -196,6 +197,11 @@ class SettingsModule(QtWidgets.QWidget):
     # ----------------------------------------------------------- actions ---
     @QtCore.Slot()
     def _apply(self) -> None:
+        # Settings values seed the analysis defaults a background run reads
+        # mid-flight — applying under it could change its numbers (invariant 4).
+        if runner().is_busy:
+            busy_notice(self)
+            return
         new = self._collect()
         # Switching the cumulant method makes existing cumulant-based results stale.
         # Warn + clear them (only if any exist); Cancel reverts the dropdown.
@@ -223,5 +229,8 @@ class SettingsModule(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def _restore(self) -> None:
+        if runner().is_busy:      # before _load_from, so the widgets aren't
+            busy_notice(self)     # reset to values that then fail to apply
+            return
         self._load_from(SettingsState())                  # factory defaults
         self._apply()

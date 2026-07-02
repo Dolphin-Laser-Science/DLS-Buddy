@@ -83,8 +83,8 @@ from __future__ import annotations
 
 import math
 import warnings
-from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -92,9 +92,7 @@ from core.data_models import SLSMeasurement
 from analysis import uncertainty as unc
 from physics.constants import (
     scattering_vector_q,
-    scattering_vector_q_m,
     optical_constant_K,
-    rayleigh_ratio_toluene,
     refractive_index_correction,
 )
 
@@ -183,7 +181,9 @@ def compute_calibration_constant(
     Raises
     ------
     ValueError
-        If the net intensity or sin(angle) is non-positive.
+        If the net intensity is non-positive, or the calibrant angle is not
+        strictly between 0 and 180 deg (where the sin-theta scattering-volume
+        factor degenerates to zero).
     """
     I_net = calibrant_intensity - dark_count_rate
     if I_net <= 0:
@@ -191,12 +191,16 @@ def compute_calibration_constant(
             f"Net calibrant intensity must be positive, got {I_net} "
             f"(intensity {calibrant_intensity} - dark {dark_count_rate})."
         )
-    s = math.sin(math.radians(calibrant_angle_deg))
-    if s <= 0:
+    # Guard on the angle directly, not on sin(theta): at exactly 180 deg
+    # math.sin(math.radians(180)) is ~1.2e-16 (float round-off), not 0, so a
+    # `sin <= 0` test would let the degenerate back-scatter geometry through.
+    if not (0.0 < calibrant_angle_deg < 180.0):
         raise ValueError(
-            f"sin(calibrant_angle) must be positive, got angle "
+            f"calibrant_angle must be strictly between 0 and 180 deg (the "
+            f"sin-theta factor degenerates to 0 at 0 and 180 deg), got "
             f"{calibrant_angle_deg} deg."
         )
+    s = math.sin(math.radians(calibrant_angle_deg))
     return standard_rayleigh_ratio / (I_net * s)
 
 
@@ -544,6 +548,9 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
     the apparent Mw comes from the intercept (dR(0) = K c Mw) and needs
     calibration. Only angles with a finite, POSITIVE excess Rayleigh ratio are
     used (ln requires dR > 0).
+
+    The Guinier approximation is due to Guinier (1939); see Chu (1991) and
+    Russo et al. (2021, Ch. 13) for accessible derivations of the plot.
 
     Parameters
     ----------

@@ -34,7 +34,7 @@ Dynamic light scattering
     stokes_einstein_diffusion_coefficient   D from Rh, T, eta (inverse)
 
 Static light scattering
-    rayleigh_ratio_toluene      Toluene R_theta (Sivokhin & Kazantsev 2021)
+    rayleigh_ratio_toluene      Toluene R_theta (Takahashi 2019 @532; S&K 2021 @660)
     refractive_index_correction Correction factor when solvent != standard
     optical_constant_K          K = 4pi^2 n^2 (dn/dc)^2 / (Na lambda^4)
 
@@ -68,10 +68,10 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 BOLTZMANN_K: float = 1.380649e-23
-"""Boltzmann constant in J/K (SI 2019 exact definition)."""
+"""Boltzmann constant in J/K (exact; 2019 SI redefinition, CODATA 2022 / NIST SP 961)."""
 
 AVOGADRO_NA: float = 6.02214076e23
-"""Avogadro's number in mol^-1 (SI 2019 exact definition)."""
+"""Avogadro's number in mol^-1 (exact; 2019 SI redefinition, CODATA 2022 / NIST SP 961)."""
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +92,9 @@ def scattering_vector_q(
     index at that wavelength and temperature. Both are always user-supplied;
     nothing is assumed.
 
-    This form of q is the standard definition for solution scattering. The
-    factor of n converts the vacuum wavelength to the in-medium wavelength.
+    This form of q is the standard definition for solution scattering
+    (Chu 1991). The factor of n converts the vacuum wavelength to the
+    in-medium wavelength.
 
     Parameters
     ----------
@@ -163,6 +164,8 @@ def stokes_einstein_rh(
 
     Definition:
         Rh = k_B * T / (6 * pi * eta * D)
+
+    Standard result (the Stokes-Einstein relation); see Chu (1991).
 
     Parameters
     ----------
@@ -253,10 +256,6 @@ def stokes_einstein_diffusion_coefficient(
 
 
 # ---------------------------------------------------------------------------
-# Static light scattering — toluene Rayleigh ratio
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Static light scattering — toluene Rayleigh ratio (geometry-aware)
 # ---------------------------------------------------------------------------
 #
@@ -302,7 +301,7 @@ _TOLUENE_RVV_TEMP_COEFFICIENT: float = 0.0043   # per °C  (relative, positive)
 _TOLUENE_DEPOL_V_25C: float = 0.346
 _TOLUENE_DEPOL_V_TEMP_COEFFICIENT: float = -0.00135   # per °C  (absolute)
 
-_TOLUENE_RAYLEIGH_REF_TEMP_C: float = 25.0  # °C, reference temperature
+_TOLUENE_RAYLEIGH_REF_TEMP_C: float = 25.0
 _WAVELENGTH_MATCH_TOLERANCE_NM: float = 2.0
 
 _RAYLEIGH_GEOMETRIES = ('VV', 'VU', 'VH')

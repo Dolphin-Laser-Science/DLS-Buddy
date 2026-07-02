@@ -68,7 +68,7 @@ def unit_options(quantity: str) -> List[str]:
     try:
         return list(_LINEAR[quantity].keys())
     except KeyError:
-        raise ValueError(f"Unknown quantity {quantity!r}.")
+        raise ValueError(f"Unknown quantity {quantity!r}.") from None
 
 
 def default_unit(quantity: str) -> str:
@@ -81,7 +81,7 @@ def canonical_unit(quantity: str) -> str:
     try:
         return _CANONICAL_UNIT[quantity]
     except KeyError:
-        raise ValueError(f"Unknown quantity {quantity!r}.")
+        raise ValueError(f"Unknown quantity {quantity!r}.") from None
 
 
 def to_canonical(quantity: str, value: float, unit: str) -> float:
@@ -97,7 +97,7 @@ def to_canonical(quantity: str, value: float, unit: str) -> float:
     try:
         return value * _LINEAR[quantity][unit]
     except KeyError:
-        raise ValueError(f"Unknown unit {unit!r} for quantity {quantity!r}.")
+        raise ValueError(f"Unknown unit {unit!r} for quantity {quantity!r}.") from None
 
 
 def from_canonical(quantity: str, value: float, unit: str) -> float:
@@ -113,4 +113,4 @@ def from_canonical(quantity: str, value: float, unit: str) -> float:
     try:
         return value / _LINEAR[quantity][unit]
     except KeyError:
-        raise ValueError(f"Unknown unit {unit!r} for quantity {quantity!r}.")
+        raise ValueError(f"Unknown unit {unit!r} for quantity {quantity!r}.") from None

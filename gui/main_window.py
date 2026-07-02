@@ -21,10 +21,9 @@ Design (settled with the user, Session 19)
   parameters and never edit them. Committing can change a sample's identity, so
   the Data module signals the shell to re-group and refresh the sidebar.
 
-Only Data and DLS are implemented; SLS / Cross-Sample / Utilities / Settings are
-StubModules describing what will live there. This is the structural skeleton:
-the navigation and the load -> confirm -> analyse loop work end to end through the
-controller before any further breadth is added.
+All six modules are built and wired here (the old StubModule placeholders in
+gui/stub_module.py are no longer used). The navigation and the
+load -> confirm -> analyse loop run end to end through the controller.
 """
 
 from __future__ import annotations
@@ -68,6 +67,7 @@ from gui.settings_module import SettingsModule
 from gui.help import install_tooltip_gate, set_tooltips_enabled, section_header
 from gui.theme import ThemedLabel, color as theme_color, retheme
 from gui.widgets import roomy_tabs
+from gui.worker import runner, run_when_idle
 from plotting.plots import set_palette, set_plot_units
 
 
@@ -195,7 +195,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # module is resolved by WIDGET, not tab index — tabs are user-reorderable
         # (feedback A4), so index order is no longer fixed.
         self._module_by_wrapper: Dict[QtWidgets.QWidget, QtWidgets.QWidget] = {}
-        for module, title in zip(self._tab_modules, titles):
+        for module, title in zip(self._tab_modules, titles, strict=True):
             wrapper = self._scrollable(module)
             self._module_by_wrapper[wrapper] = module
             self.tabs.addTab(wrapper, title)
@@ -210,6 +210,32 @@ class MainWindow(QtWidgets.QMainWindow):
         set_tooltips_enabled(self.controller.settings.show_tooltips)
 
         self.statusBar().showMessage('Load data to begin.')
+        # Global busy affordance: while a background analysis runs, show a busy
+        # cursor (BusyCursor, not WaitCursor — the window stays interactive) and
+        # a status-bar message. One analysis in flight app-wide (invariant 4).
+        runner().busy_changed.connect(self._on_busy_changed)
+
+    @QtCore.Slot(bool, str)
+    def _on_busy_changed(self, busy: bool, description: str) -> None:
+        app = QtWidgets.QApplication.instance()
+        if busy:
+            app.setOverrideCursor(QtCore.Qt.CursorShape.BusyCursor)
+            self.statusBar().showMessage(
+                f'Running {description} in the background — the window stays '
+                'usable; results appear when it finishes.')
+        else:
+            app.restoreOverrideCursor()
+            self.statusBar().showMessage(f'Finished: {description}.', 4000)
+
+    def _busy_guard(self) -> bool:
+        """True (with a status notice) when an analysis is in flight. Workspace-
+        mutating actions call this first and back off, because the worker reads
+        committed parameters, settings, and workspace rows mid-computation."""
+        if runner().is_busy:
+            self.statusBar().showMessage(
+                'Busy — wait for the running analysis to finish.', 3000)
+            return True
+        return False
 
     def _show_module(self, module: QtWidgets.QWidget) -> None:
         """Make the tab holding `module` current (by widget, since tabs reorder)."""
@@ -314,6 +340,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _on_load_dls(self) -> None:
+        if self._busy_guard():
+            return
         # Multiple files may be selected at once; each is auto-detected independently.
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, 'Open DLS correlogram(s)', '',
@@ -346,6 +374,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _on_load_sls(self) -> None:
+        if self._busy_guard():
+            return
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, 'Open SLS intensities', '',
             'SLS intensity files (*.csv *.txt *.dat);;All files (*.*)')
@@ -394,6 +424,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------- sidebar ---
     def _refresh_sidebar(self) -> None:
         """Rebuild the samples/measurements tree from the workspace."""
+        # Block signals during the rebuild so clear()/add don't fire
+        # itemSelectionChanged and re-enter _set_current mid-rebuild.
         self.tree.blockSignals(True)
         self.tree.clear()
         id_to_item: Dict[str, QtWidgets.QTreeWidgetItem] = {}
@@ -743,23 +775,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cross_module.refresh()
 
     def _move_to_new_sample(self, ids: list) -> None:
+        if self._busy_guard():
+            return
         sid = self.controller.new_sample_id()
         for iid in ids:
             self.controller.assign_to_sample(iid, sid)
         self._regroup_refresh()
 
     def _move_to_sample(self, ids: list, sample_id: str) -> None:
+        if self._busy_guard():
+            return
         for iid in ids:
             self.controller.assign_to_sample(iid, sample_id)
         self._regroup_refresh()
 
     def _return_to_auto(self, ids: list) -> None:
+        if self._busy_guard():
+            return
         for iid in ids:
             self.controller.clear_override(iid)
         self._regroup_refresh()
 
     def _average_corr(self, ids: list) -> None:
-        """Create a new averaged-correlogram measurement from the selection."""
+        """Create a new averaged-correlogram measurement from the selection.
+        This runs SYNCHRONOUSLY on the main thread: it only averages arrays (fast)
+        and then mutates workspace.measurements + regroups — structural changes the
+        main thread iterates for the sidebar, so they must not happen on the worker.
+        The busy guard keeps it from overlapping a background fit."""
+        if self._busy_guard():
+            return
         try:
             new_id = self.controller.average_dls_correlograms(ids)
         except ValueError as e:
@@ -772,19 +816,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cross_module.refresh()
 
     def _average_results(self, ids: list) -> None:
-        """Fit each selected replicate, report mean +/- SD/sqrt(N), write Rh to the sample."""
+        """Fit each selected replicate, report mean +/- SD/sqrt(N), write Rh to
+        the sample. The method prompt stays before dispatch (dialogs are
+        main-thread); the N replicate fits run on the worker."""
         method = ask_average_method(self)
         if method is None:
             return
-        try:
-            summary = self.controller.average_dls_results(ids, method)
-        except ValueError as e:
+        controller = self.controller
+
+        def done(summary: dict) -> None:
+            show_average_summary(self, summary)
+            self._refresh_sidebar()
+            self.cross_module.refresh()
+
+        def fail(exc: BaseException) -> None:
+            if not isinstance(exc, ValueError):
+                raise exc
             QtWidgets.QMessageBox.warning(
-                self, 'Cannot average derived results', str(e))
-            return
-        show_average_summary(self, summary)
-        self._refresh_sidebar()
-        self.cross_module.refresh()
+                self, 'Cannot average derived results', str(exc))
+
+        if not runner().try_submit(
+                lambda: controller.average_dls_results(ids, method),
+                done, fail, description='replicate averaging'):
+            self._busy_guard()
 
     @QtCore.Slot()
     def _on_delete_key(self) -> None:
@@ -793,6 +847,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._remove_measurements(ids)
 
     def _remove_measurements(self, item_ids: list) -> None:
+        if self._busy_guard():
+            return
         n = len(item_ids)
         resp = QtWidgets.QMessageBox.question(
             self, 'Remove from workspace',
@@ -811,6 +867,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _remove_sample_for(self, ids: list) -> None:
         """Remove every measurement in the sample(s) that contain `ids`."""
+        if self._busy_guard():
+            return
         ws = self.controller.workspace
         sample_ids = {self.controller.sample_id_of(i) for i in ids}
         sample_ids.discard(None)
@@ -884,7 +942,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_button.setEnabled(loading)
         self.load_sls_button.setEnabled(loading)
         if w is self.cross_module:
-            self.cross_module.refresh()      # pull the latest results on entry
+            # Deferred while a run is in flight: refresh() auto-selects labelled
+            # Rg/Rh/Mw/A2 picks, which WRITES SampleResult fields the worker may
+            # be reading — run it now, or once the current job completes.
+            run_when_idle(self.cross_module.refresh)
         if w is self.settings_module:
             self.sidebar_note.setText('Settings are global — no sample needed.')
         elif w is self.cross_module:

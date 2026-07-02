@@ -66,7 +66,8 @@ class LinearFit:
     """OLS y = intercept + slope*x with standard errors and covariance.
 
     `cov` is the 2x2 covariance of (intercept, slope), in that order. SEs are NaN
-    when there are too few points (n < 3) to estimate the residual variance.
+    when there are too few points (n < 4) to estimate the residual variance: with
+    p = 2 fitted parameters, _hc3_cov requires n - p >= 2 residual dof.
     """
     slope: float
     intercept: float
@@ -97,7 +98,8 @@ def linear_fit(x: Sequence[float], y: Sequence[float]) -> LinearFit:
 def linear_fit_through_origin(x: Sequence[float], y: Sequence[float]):
     """OLS slope of y = b x (no intercept) with its HC3-robust standard error.  (Eq. 31)
 
-    b = sum(xy)/sum(x^2). Returns (slope, slope_se); slope_se is NaN for n < 2.
+    b = sum(xy)/sum(x^2). Returns (slope, slope_se); slope_se is NaN for n < 3
+    (with p = 1 fitted parameter, _hc3_cov requires n - p >= 2 residual dof).
     """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)

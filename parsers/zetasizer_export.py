@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 
@@ -264,7 +264,7 @@ class ZetasizerExportParser(BaseDLSParser):
         # --- correlogram: pair each (delay, data) channel; keep finite-lag ones ---
         lag_us: List[float] = []
         corr: List[float] = []
-        for di, ci in zip(delay_cols, data_cols):
+        for di, ci in zip(delay_cols, data_cols, strict=True):
             t = _parse_float_or_none(row[di]) if di < len(row) else None
             if t is None:
                 continue   # padding / missing channel -> drop it

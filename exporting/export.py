@@ -1,6 +1,6 @@
 """
-io/export.py
-============
+exporting/export.py
+===================
 
 Origin-compatible CSV export for the analysis result objects produced by the
 DLS and SLS modules.
@@ -30,7 +30,7 @@ Design notes
 
 Change history
 --------------
-2026-06-13  io/export.py v1: core writer + exporters for the DLS result objects
+2026-06-13  export.py v1: core writer + exporters for the DLS result objects
             (cumulant/single/double/KWW correlogram fits, distributions,
             Gamma-q^2, concentration extrapolation) and SLS result objects
             (excess Rayleigh ratio, Debye, Zimm/Berry, calibration-free A2).
@@ -40,8 +40,8 @@ from __future__ import annotations
 
 import csv
 import math
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, Dict, Sequence
 
 import numpy as np
 

@@ -46,7 +46,7 @@ data model, never on a vendor file format.
 ├── PATCH_NOTES.md         # per-release changes + known issues
 ├── CLAUDE.md              # contributor/agent orientation + invariants
 ├── requirements.txt       # pinned dependencies (Python 3.13 venv)
-├── test-data/             # tracked datasets (Brookhaven, Malvern, ALV, Synthetic *)
+├── test-data/             # tracked datasets (Brookhaven, Malvern, ALV [per-sample subfolders], Synthetic *)
 ├── docs/                  # committed user-facing docs:
 │                          #   Quickstart.pdf, Advanced-Guide.pdf,
 │                          #   code_map.md (this file),
@@ -58,7 +58,8 @@ data model, never on a vendor file format.
 ├── exporting/             # CSV export
 ├── plotting/              # matplotlib layer
 ├── app/                   # controller + settings + units + version (framework-agnostic)
-└── gui/                   # PySide6 widgets
+├── gui/                   # PySide6 widgets
+└── tests/                 # pytest regression suite (run: python -m pytest)
 ```
 
 The tracked files above are everything needed to run, read, and build the program.
@@ -80,8 +81,9 @@ The tracked files above are everything needed to run, read, and build the progra
   (`BrookhavenDLSParser`) and count-rate trace `.CSV` (`BrookhavenTraceParser`).
 - **`brookhaven_sls.py`** — Brookhaven intensity-vs-angle `.CSV` (one preview per
   concentration).
-- **`alv_asc.py`** — ALV correlator `.ASC` (multi-angle): a DLS correlogram and a
-  count-rate trace per angle. NB lag time is in ms.
+- **`alv_asc.py`** — ALV correlator `.ASC`: multi-angle (ALV-7012, `Angle(1..12)`)
+  or single-angle (ALV-7004, a bare `Angle` key); a DLS correlogram and a count-rate
+  trace per angle. NB lag time is in ms.
 - **`zetasizer_clipboard.py`** — Malvern Zetasizer clipboard correlation text
   (tab-separated, g2-1, microsecond lag); one record column per measurement.
 - **`zetasizer_export.py`** — Malvern Zetasizer structured *export* (comma-separated,
@@ -163,6 +165,23 @@ The tracked files above are everything needed to run, read, and build the progra
   next to a plot.
 - **`export_helper.py`** — tiny shared helper behind the tabs' "Export CSV..." buttons.
 - **`stub_module.py`** — placeholder widget (no longer used now all six tabs exist).
+
+### `tests/` — the pytest regression suite
+- Run the whole suite from the repo root with `python -m pytest` (pytest is a
+  dev-only dependency in `requirements-dev.txt`). Fast inner loop:
+  `python -m pytest -m "not slow and not gui"`.
+- **`conftest.py` + `fixtures/`** — shared fixtures and the synthetic forward-model
+  builders (a closed Stokes-Einstein/Zimm round trip) plus committed-`test-data/`
+  path helpers. One `test_*.py` per engine (`test_physics`, `test_dls`,
+  `test_skip_channels`, `test_sls`, `test_depolarization`, `test_uncertainty`,
+  `test_utilities`, `test_trace_analysis`, `test_parsers`, `test_export`,
+  `test_workspace`, `test_polyelectrolyte`) checks recovery of known ground truth
+  (the last asserts anomaly diagnostics fire on real polyelectrolyte data);
+  `test_gui_smoke.py`
+  drives the widgets headless (Qt offscreen). Markers: `slow` (Monte-Carlo/CONTIN),
+  `gui` (needs PySide6), `realdata` (reads a committed instrument file).
+- **`screenshots/capture.py`** — a real-platform (not offscreen) harness that grabs
+  each GUI tab to a PNG for visual review; a review aid, not a pass/fail test.
 
 ## Running it
 

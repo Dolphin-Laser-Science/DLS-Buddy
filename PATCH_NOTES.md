@@ -9,6 +9,30 @@ window title.
 
 ---
 
+## 0.10.0 — Background analysis (2026-07-02)
+
+- **Heavy analyses now run in the background — the window no longer freezes.** When a
+  slow fit is running — a CONTIN size distribution, a DDLS rotational-diffusion fit,
+  replicate averaging, a Γ-vs-q² / D-vs-c fit, an SLS Zimm/Berry/Debye/Guinier fit, the
+  trace stationarity (ADF) check, or synthetic-data generation — the window stays movable
+  and responsive. The **Run** button shows a busy state and a busy cursor appears; the
+  result and plot update exactly as before once the fit finishes. **No change to any
+  number** — results are identical to the previous (synchronous) version.
+- **One analysis at a time.** While a fit is running, starting another, or editing
+  parameters/calibration/masks/settings, is briefly held off with a "wait for the running
+  analysis to finish" note (this keeps a background fit from computing on half-changed
+  inputs). There is **no Cancel** — a running scientific computation can't be safely
+  interrupted; if you change the inputs mid-run, the now-stale result is simply discarded
+  when it arrives.
+
+## Unreleased
+
+- **Consistent name for the depolarized dynamic sub-tab.** The DLS sub-tab for
+  depolarized dynamic light scattering is now labelled **"DDLS"** everywhere (it was
+  shown as "DPLS" on the tab while called DDLS in its controls and help). "DDLS" is
+  depolarized *dynamic* scattering (rotational diffusion); the static depolarization
+  calculator in the SLS tab is unchanged. No change to any calculation.
+
 ## 0.9.0 — Usability batch (2026-06-30)
 
 Readability and theme polish from user feedback. **No change to the analysis math.**
@@ -68,6 +92,11 @@ First of several themed batches from this feedback round.
 - **Quickstart: a "workflow at a glance" overview.** The Quickstart guide now opens with a
   short, step-by-step overview of a basic DLS/SLS analysis (Load → confirm parameters →
   run a method → export) so new users can see the whole flow before the details.
+- **Quickstart synced to the reworked tabs.** Chapter 10 (Running an Analysis) and the
+  launch/Visualization sections now describe the current UI — the Γ vs q² / D vs c points
+  tables with tick-to-include, the Distribution peak-results panel, the offset
+  correlogram-marker carets, the SLS/DDLS results tables and keep-last plots, the resizable
+  plot/control splitter grips, and the per-OS double-click launchers.
 
 ---
 
@@ -347,8 +376,6 @@ before formal version numbers existed. Capabilities as of this release:
 - **Visual peak picker** in the DLS distribution view is planned (peaks are already
   offered as Rh sources elsewhere, but not click-selectable in the plot).
 - **A2 source picker** in the Cross-Sample tab is planned.
-- **Threading is designed-for but not enabled** — long analyses run on the GUI
-  thread for now.
 - **Session JSON is not yet schema-versioned** — old sessions may not load after a
   data-model change.
 - A few library PDFs are **citation "promotion candidates"** not yet formally cited.

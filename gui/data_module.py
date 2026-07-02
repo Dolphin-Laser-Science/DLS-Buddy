@@ -4,9 +4,10 @@ gui/data_module.py
 
 The Data tab: confirm and manage the physical parameters of the selected
 measurement. This is the home of the parser "confirmation step" (parse -> blanks
--> user fills -> commit) and the place where shared per-sample parameters will be
-entered once (the propagation across a sample's measurements lands with the SLS /
-multi-measurement work; for now it edits one measurement at a time).
+-> user fills -> commit) and the place where shared per-sample parameters are
+entered once and propagated across the sample: `_on_cell_changed` routes shared
+keys to `controller.set_shared_param`, and `_apply_edits_to_selection` fans an
+edit across the highlighted measurements.
 
 It owns the editable parameter table, the Update (commit) / Undo (revert to
 committed) buttons, the changed-since-commit highlighting, and a pending-update
@@ -29,6 +30,7 @@ from app.controller import _SHARED_PARAM_KEYS
 from app import units as U
 from gui.help import section_header
 from gui.theme import ThemedLabel
+from gui.worker import busy_notice, runner
 
 
 # Unit labels now live in the dedicated Unit column, so the parameter names here
@@ -263,7 +265,7 @@ class DataModule(QtWidgets.QWidget):
         combo.setToolTip(
             'Polarisation/analyser geometry of this correlogram (incident, '
             'analyser): VV = polarised, VH = depolarised, VU = no analyser, '
-            '— = unspecified. The DPLS sub-tab pairs a VV with a VH '
+            '— = unspecified. The DDLS sub-tab pairs a VV with a VH '
             'at each angle to extract rotational diffusion. Leave — for ordinary '
             'polarised DLS.')
         combo.currentTextChanged.connect(self._on_geometry_changed)
@@ -411,6 +413,11 @@ class DataModule(QtWidgets.QWidget):
             self.controller.apply_value_to_items(others, key, working.get(key))
 
     def _on_update(self) -> None:
+        # A background run reads COMMITTED params mid-flight — committing under
+        # it would change the numbers it is computing from (invariant 4).
+        if runner().is_busy:
+            busy_notice(self.update_button)
+            return
         self._apply_edits_to_selection()
         self.controller.commit()
         self._populate()           # working == committed now -> highlights clear
@@ -418,6 +425,9 @@ class DataModule(QtWidgets.QWidget):
         self.committed.emit()      # shell re-groups + refreshes the sidebar
 
     def _on_undo(self) -> None:
+        if runner().is_busy:
+            busy_notice(self.undo_button)
+            return
         grouping_changed = self.controller.undo()
         self._populate()
         self._refresh_pending()

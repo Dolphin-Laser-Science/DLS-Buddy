@@ -68,7 +68,7 @@ Change history
 from __future__ import annotations
 
 import os
-from typing import List, Literal, Optional
+from typing import List, Optional
 
 import numpy as np
 

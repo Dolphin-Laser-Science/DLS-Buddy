@@ -96,9 +96,8 @@ def fit_cumulants(
     - 'nonlinear' (Frisken 2001): fit g2 - 1 directly by nonlinear least squares
       with a FLOATING baseline (moments-about-the-mean form), using the whole
       windowed correlogram (no amplitude cutoff). More robust to baseline drift
-      and noisy/low-count data. This is DLS Buddy's user-facing default (seeded
-      from Settings by the controller); the engine default stays 'linear' so
-      direct callers and existing tests are unchanged.
+      and noisy/low-count data. (See the module docstring for why the engine
+      default is 'linear' while the GUI seeds 'nonlinear'.)
 
     Both return the same CumulantResult. Per invariant 8 neither reports a +/-
     from a single correlogram (lag channels are correlated, Schaetzel 1990);
@@ -272,7 +271,7 @@ def _fit_cumulants_nonlinear(
     # The baseline is small drift around the (already ~0) long-time value, NOT a
     # free amplitude sink: bound it near the tail so the fit cannot absorb the
     # decay into B and chase a short-lag artefact (which would give a spurious
-    # Rh ~ 0). This is what makes the floating baseline a benefit, not a liability.
+    # Rh ~ 0).
     dB = max(5.0 * float(np.std(tail)), 0.05)
     B_lo, B_hi = B0 - dB, B0 + dB
 

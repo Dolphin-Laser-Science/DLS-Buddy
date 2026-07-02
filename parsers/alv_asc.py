@@ -2,11 +2,17 @@
 parsers/alv_asc.py
 ==================
 
-Parser for ALV correlator ``.ASC`` exports (ALV-5000/6000/7000 family; the test
-files are from an **ALV-7012 CGS-12F**, a multi-angle goniometer/correlator).
+Parser for ALV correlator ``.ASC`` exports (ALV-5000/6000/7000 family). Two
+header layouts are supported and auto-detected:
 
-One ``.ASC`` file is a single run that captures **several detection angles at
-once**. Its layout:
+* **Multi-angle** (e.g. **ALV-7012 CGS-12F**): one run captures several detection
+  angles at once, with per-detector keys ``Angle(1)``..``Angle(12)`` and one data
+  column per detector. Yields one preview per active angle.
+* **Single-angle** (e.g. **ALV-7004/USB**): one file is one angle, with a bare
+  ``Angle [deg]`` key and a single active data column (CH0, column 1). Yields one
+  preview. Detected only when no indexed ``Angle(i)`` key is present.
+
+Its layout:
 
     <line 1>          instrument / mode descriptor
     Key : value       header metadata (temperature, viscosity, n, wavelength,
@@ -177,6 +183,9 @@ def _read_numeric_block(lines: List[str], start: int) -> Tuple[np.ndarray, int]:
 
 def _parse_alv_file(file_path: str) -> _ALVData:
     lines = _read_lines(file_path)
+    # ALV .ASC files open with a line like "ALV-7004 / USB Data" (or "ALV-7012...").
+    # Sniff on the leading "ALV" token; take everything before " Data" as the
+    # instrument name.
     if not lines or not lines[0].lstrip().upper().startswith('ALV'):
         first = lines[0] if lines else '<empty file>'
         raise ParseError(
@@ -194,10 +203,19 @@ def _parse_alv_file(file_path: str) -> _ALVData:
             a = _to_float(value)
             if a is not None:
                 angles[int(m.group(1))] = a
+    # Single-angle instruments (e.g. ALV-7004/USB) write a bare `Angle [deg]`
+    # key instead of the multi-detector `Angle(1..12)` keys. Fall back to it only
+    # when no indexed key matched, and treat it as the one channel in column 1
+    # (CH0) -- the rest of the pipeline is index-driven and works unchanged.
+    if not angles:
+        a = _to_float(_get(header, 'Angle'))
+        if a is not None:
+            angles[1] = a
     active = sorted(i for i, a in angles.items() if a != 0.0)
     if not active:
         raise ParseError(
-            f"{file_path!r}: no active detection angles (all Angle(i) are 0).")
+            f"{file_path!r}: no active detection angles "
+            f"(no non-zero Angle(i) or bare Angle key).")
 
     # correlation block: lag (ms) + one g2-1 column per detector
     corr, after_corr = _read_numeric_block(lines, idx_corr + 1)

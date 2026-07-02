@@ -49,18 +49,15 @@ Change history
 
 from __future__ import annotations
 
-import math
 import os
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 
-from core.data_models import SLSMeasurement
 from parsers.base_parser import (
     BaseSLSParser,
     ParseError,
     SLSFilePreview,
-    convert_delay_times,
 )
 
 # Minimum number of angle/intensity data rows to accept.

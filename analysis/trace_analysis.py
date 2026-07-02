@@ -211,8 +211,10 @@ def compute_trace_statistics(
     baseline_method : str
         'percentile' (default) or 'sigma_clip'. See identify_baseline.
     baseline_parameter : float
-        For 'percentile': the percentile (default 25.0).
-        For 'sigma_clip': the number of sigma (default would be 3.0).
+        The single value passed through to identify_baseline for either method;
+        its default is 25.0. For 'percentile' that is the percentile. For
+        'sigma_clip' it is the number of sigma, so pass a typical ~3.0 explicitly
+        (leaving the default gives a very loose 25-sigma clip, not 3).
 
     Returns
     -------
@@ -663,7 +665,6 @@ def fit_count_rate_histogram(
 
     counts, bin_edges = np.histogram(y, bins=n_bins)
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    bin_width = bin_edges[1] - bin_edges[0]
 
     # --- count-space statistics ---
     counts_per_sample = y * integration_time_s
@@ -728,12 +729,11 @@ def fit_count_rate_histogram(
     if distribution in ('poisson', 'both'):
         lam = mean_counts
         result.poisson_lambda_counts = lam
-        # For each rate bin centre, the corresponding count is rate * T.
-        # Poisson PMF over (non-integer) counts uses the gamma-extended form
-        # via scipy's pmf at rounded integer counts; for overlay we evaluate
-        # the PMF at the nearest integer count for each bin centre, then scale
-        # to expected counts-per-bin: N_total * P(bin) where the probability
-        # mass per bin = pmf(count) summed over the integer counts in the bin.
+        # Counts are integer-valued (a rate is count / integration_time), so each
+        # rate bin maps to a contiguous range of integer counts [c_lo, c_hi]. The
+        # probability mass in a bin is the Poisson PMF summed over that integer
+        # range; the overlay is that mass scaled to expected counts-per-bin
+        # (N_total * P(bin)). Bins narrower than one count get zero mass (c_hi < c_lo).
         try:
             total = counts.sum()
             poisson_curve = np.empty_like(bin_centers, dtype=float)

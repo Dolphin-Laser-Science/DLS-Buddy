@@ -32,15 +32,12 @@ Four primary objects live here:
     DLSMeasurement - one DLS correlogram measured at one angle.
     SLSMeasurement - one SLS angular series measured at one concentration.
 
-A note on Python style for newcomers:
-    - We use @dataclass, which auto-generates __init__ for us. We only list
-      the fields and their types; Python writes the boilerplate constructor.
-    - Optional[X] means "an X, or None". Fields with a default of None are the
-      ones a measurement can exist without.
-    - We pass eq=False to @dataclass. These objects hold NumPy arrays, and the
-      auto-generated __eq__ would try to compare arrays with ==, which returns
-      an array (not a True/False) and raises an error. Turning equality off
-      avoids that trap. Identity and association are handled by SampleKey.
+Implementation note:
+    These are @dataclasses (Optional[X] fields default to None where a
+    measurement can exist without them). We pass eq=False because the objects
+    hold NumPy arrays: the auto-generated __eq__ would compare arrays with ==,
+    which returns an array rather than a bool and raises. Identity and
+    association are handled by SampleKey instead.
 
 Change history
 --------------
@@ -75,7 +72,7 @@ Change history
             default); workspace.build() forwards it.
 """
 
-from __future__ import annotations  # lets us reference types before they're defined
+from __future__ import annotations
 
 import math
 import warnings
@@ -422,8 +419,7 @@ class IntensityTrace:
     source_file: Optional[str] = None
 
     def __post_init__(self) -> None:
-        # __post_init__ runs automatically right after the auto-generated
-        # __init__. It is where we clean and validate inputs.
+        # Clean and validate inputs (runs right after the dataclass __init__).
         self.times_s = _as_1d_float_array(self.times_s, "times_s")
         self.count_rates_cps = _as_1d_float_array(
             self.count_rates_cps, "count_rates_cps"
@@ -604,15 +600,11 @@ class SLSMeasurement:
 
     Optional calibration reference  (informational; NOT used in analysis)
     ----------------------------------------------------------------------
-    The Rayleigh ratio used in analysis is always the Sivokhin & Kazantsev
-    (2021) temperature-corrected value from physics/constants.py, not the
-    value embedded in the instrument file. These fields record what the file
-    reported for traceability and comparison.
-
-    NOTE: The SLS calibration pipeline is not yet fully designed. This object
-    captures the structurally fixed decisions. Expect a small number of
-    additional optional fields when the SLS analysis module is built; adding
-    optional fields with defaults is a non-breaking change.
+    The Rayleigh ratio used in analysis is always the program-computed,
+    temperature-corrected toluene value from physics/constants.py (Takahashi
+    et al. 2019 at 532 nm; Sivokhin & Kazantsev 2021 at 660 nm), not the value
+    embedded in the instrument file. These fields record what the file reported
+    for traceability and comparison.
     """
 
     # --- measured data ---

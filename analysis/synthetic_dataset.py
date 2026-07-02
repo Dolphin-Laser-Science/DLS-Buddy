@@ -39,7 +39,7 @@ user input and nothing system-specific is baked into a generated artifact.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -439,7 +439,7 @@ def write_trace_csv(path: str, trace: SyntheticTrace, *, count_rate_unit: str = 
     cps = np.asarray(trace.count_rates_cps, dtype=float) * factor
     t = np.asarray(trace.times_s, dtype=float)
     with open(path, 'w', encoding='utf-8', newline='\n') as fh:
-        fh.write('\n'.join(f'{ti:.2f},{ci:.3f}' for ti, ci in zip(t, cps)) + '\n')
+        fh.write('\n'.join(f'{ti:.2f},{ci:.3f}' for ti, ci in zip(t, cps, strict=True)) + '\n')
     return path
 
 
@@ -529,7 +529,7 @@ def write_parameters_txt(out_dir: str, profile_name: str,
         f'DLS Buddy — {profile_name} test data', '=' * 50, '',
         'System: PEG in water, calibrated against a toluene standard.', '',
         'GLOBAL PARAMETERS (enter these at the Data-tab confirmation step):',
-        f'  Solvent                 : water',
+        '  Solvent                 : water',
         f'  Solvent refractive index: {DEFAULT_N_SOLVENT}',
         f'  Viscosity               : {DEFAULT_VISCOSITY_CP} cP   (= {DEFAULT_VISCOSITY_PA_S:g} Pa.s)',
         f'  Temperature             : {DEFAULT_TEMPERATURE_C} C  ({DEFAULT_TEMPERATURE_K} K)',
@@ -539,7 +539,7 @@ def write_parameters_txt(out_dir: str, profile_name: str,
         f'  Standard                : toluene   (geometry {cal.geometry})',
         f'  Standard refractive index: {cal.n_standard}',
         f'  Calibrant intensity     : {cal.calibrant_intensity:g}  at 90 deg',
-        f'  Dark count rate         : 0',
+        '  Dark count rate         : 0',
         f'  (the program then computes k_c = {cal.k_c():.4e})', '',
         'Notes:',
         '  - DLS files are ALV .ASC: all angles + a count-rate trace are in one file.',

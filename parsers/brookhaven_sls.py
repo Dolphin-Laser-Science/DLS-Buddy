@@ -56,8 +56,9 @@ EXTRACTED from the file (populated in each preview):
     - calibration_constant    from "Calibration Constant"
     - standard_name           from "Calibration Liquid"
     - standard_rayleigh_ratio_file  from "Rayleigh Ratio of Calibration Liquid"
-                              (informational only; analysis uses the
-                               Sivokhin & Kazantsev value instead)
+                              (informational only; analysis uses the program-
+                               computed toluene value instead — Takahashi 2019
+                               at 532 nm / Sivokhin & Kazantsev 2021 at 660 nm)
     - standard_refractive_index  from "Refractive Index of Calibration Liquid"
     - sample_label            from "Sample ID"
 
@@ -311,7 +312,8 @@ class BrookhavenSLSParser(BaseSLSParser):
         sample_label = metadata.get(_KEY_SAMPLE_ID)
 
         # Calibration reference values (informational only; never used in
-        # analysis, which uses the Sivokhin & Kazantsev toluene value).
+        # analysis, which uses the program-computed toluene value — Takahashi
+        # 2019 at 532 nm / Sivokhin & Kazantsev 2021 at 660 nm).
         cal_constant = self._optional_float(metadata.get(_KEY_CAL_CONSTANT))
         standard_name = metadata.get(_KEY_CAL_LIQUID)
         standard_rayleigh = self._optional_float(metadata.get(_KEY_RAYLEIGH_STANDARD))
