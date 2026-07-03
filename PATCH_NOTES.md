@@ -9,6 +9,43 @@ window title.
 
 ---
 
+## 0.11.0 — One consistent way to choose measurements (2026-07-02)
+
+A deliberate pass to make selecting measurements clean, consistent, and obvious across
+every tab. Before, each tab picked measurements differently; now there is **one idiom**,
+and the Workspace list on the left reflects it.
+
+- **One picker everywhere — tick to include.** Every analysis tab now selects with real
+  **checkboxes** (tick = use it), grouped by sample, with **Select all / none** and a
+  **?** help button. Ticked rows read **blue**. This replaces the older mix of
+  highlight-to-select lists, so "what is selected" looks the same in the DLS
+  Correlogram/Distribution/Summary, Γ vs q², D vs c, and DDLS tabs.
+- **The Workspace list mirrors what the active tab has selected.** Whatever you tick in a
+  tab is shown **bold blue** on the matching measurements in the left-hand Workspace
+  list — so you can see at a glance what each tab is analysing. The Workspace list
+  **navigates**; the tabs decide what gets analysed. Samples whose identity isn't
+  confirmed yet read **amber**.
+- **Clicking around no longer wipes a tab.** Selecting a measurement of a different kind
+  (e.g. an SLS row while looking at a DLS fit) no longer blanks the tab you were on —
+  each tab keeps its own selection until you change it there.
+- **SLS and I·sin θ now have their own Sample dropdown.** Pick the sample to analyse right
+  in the tab (only samples with the needed data appear), instead of relying on the
+  sidebar. The I·sin θ tab previously had no picker at all.
+- **DDLS: tick angles to include.** Choosing which paired angles enter the D_r/D_t fit is
+  now a checkbox list (all ticked by default; untick an outlier) instead of clicking
+  points on the plot. "Include all angles" re-ticks everything.
+- **Cross-Sample: replicate-averaged Rh is now a selectable Rh source** — and it is
+  preferred over a single-correlogram value, so refreshing the Cross-Sample tab no longer
+  overwrites an Rh you deliberately obtained by averaging replicates.
+- **Cross-Sample result tables now follow the display-unit setting.** The ρ table's Rg/Rh
+  columns and the manual-entry fields honor **Settings → Display units** (renamed from
+  "Plot axis units", since it now governs both plot axes and result tables) — e.g. show Rg/Rh
+  in µm or Mw in kg/mol. Values are stored canonically and only converted for display, and a
+  value you type is interpreted in the shown unit.
+
+No analysis numbers changed. (Fit results are identical; this release is about how you
+choose what to analyse and how the selection is shown.)
+
 ## 0.10.0 — Background analysis (2026-07-02)
 
 - **Heavy analyses now run in the background — the window no longer freezes.** When a

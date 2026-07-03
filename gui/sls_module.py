@@ -39,6 +39,7 @@ from gui.plot_controls import (
     AxisControlBar, make_split_panels, make_canvas_expanding, make_vertical_plot_stack)
 from gui.export_helper import export_to_csv
 from gui.help import add_help_to_groupbox
+from gui.widgets import SampleSelector
 from gui.theme import ThemedLabel, span
 from gui.worker import (
     BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, busy_notice, run_when_idle, runner)
@@ -111,6 +112,7 @@ class SLSModule(QtWidgets.QWidget):
     """Per-sample SLS analysis with a calibration panel."""
 
     committed = QtCore.Signal()   # emitted after Apply (grouping/k_c may change)
+    selectionChanged = QtCore.Signal()   # emitted when the analysed sample changes (mirror)
 
     def __init__(self, controller, parent=None) -> None:
         super().__init__(parent)
@@ -150,6 +152,19 @@ class SLSModule(QtWidgets.QWidget):
         # Control panel | plot split is draggable (feedback A3). The control column
         # has long calibration labels and a wide button, so it keeps a minimum width.
         _, left, right = make_split_panels(self, left_min_width=340)
+
+        # The tab OWNS its sample: pick it here (samples that have SLS data) rather
+        # than inheriting the sidebar focus — the sidebar only navigates. A whole
+        # Zimm set (solvent ref + concentration series) is analysed per sample.
+        self.sls_selector = SampleSelector(
+            self.controller, predicate=lambda s: s.has_sls,
+            label_fn=_sample_label, title='SLS sample',
+            help_text='Choose which sample to analyse (its whole Zimm set).',
+            help_bullets=['Only samples that have SLS intensity data appear.',
+                          'Selecting a sample here (not the sidebar) sets what SLS '
+                          'analyses.'])
+        self.sls_selector.sampleChanged.connect(self._on_sls_sample)
+        left.addWidget(self.sls_selector)
 
         self.header = QtWidgets.QLabel()
         self.header.setWordWrap(True)
@@ -508,28 +523,41 @@ class SLSModule(QtWidgets.QWidget):
 
     # ---------------------------------------------------------- selection ---
     def set_measurement(self, item_id: Optional[str]) -> None:
-        """Resolve the measurement's SAMPLE and operate on it (SLS is per-sample)."""
-        # Keep-last (#15): selecting a DLS-only measurement shouldn't blank the SLS plot.
-        # If the new pick has no SLS data and an SLS sample is already shown, keep it.
-        if item_id is not None and self.sample_id is not None:
-            _sid = self.controller.sample_id_of(item_id)
-            _sample = self.controller.workspace.samples.get(_sid) if _sid else None
-            if _sample is None or not _sample.has_sls:
-                return
+        """Sidebar focus is a SOFT seed for the SLS sample. The selector owns the
+        sample (the sidebar only navigates), so: adopt the focused sample ONLY if it
+        has SLS data; otherwise keep whatever the tab is already showing (this replaces
+        the old keep-last guard — nothing blanks). If nothing is loaded yet, reflect the
+        selector's current pick."""
+        self.sls_selector.refresh()
+        sid = self.controller.sample_id_of(item_id) if item_id is not None else None
+        sample = self.controller.workspace.samples.get(sid) if sid else None
+        if sample is not None and sample.has_sls:
+            self.sls_selector.set_current_sample_id(sid)
+            self._load_sample(sid)
+        elif self.sample_id is None or not self.sls_selector.has_sample(self.sample_id):
+            # Nothing loaded yet, or the shown sample vanished (removed/regrouped) —
+            # fall back to whatever the selector now points at.
+            self._load_sample(self.sls_selector.current_sample_id())
+        # else: an incompatible focus with a sample already shown → keep it (no-op).
+
+    @QtCore.Slot(str)
+    def _on_sls_sample(self, sid: str) -> None:
+        """The user picked a sample in the SLS selector."""
+        self._load_sample(sid or None)
+
+    def _load_sample(self, sid: Optional[str]) -> None:
+        """Point the tab at `sid` (a sample id, or None) and rebuild its per-sample
+        state (fraction/axis/mask/calibration + the restored last run)."""
         self.sample_id = None
         self._run_epoch += 1             # drop any in-flight fit for the old sample
         self._clear_result_table()       # stale result clears on a sample switch (#14)
         runnable = False
-        if item_id is None:
-            header = 'Select an SLS sample in the sidebar.'
+        if sid is None:
+            header = 'Pick an SLS sample above.'
         else:
-            sid = self.controller.sample_id_of(item_id)
-            sample = self.controller.workspace.samples.get(sid) if sid else None
-            if sample is None:
-                header = 'No sample for the selected measurement.'
-            elif not sample.has_sls:
-                header = (f'<b>{_sample_label(sample)}</b> has no SLS data yet — '
-                          'load an SLS intensity file.')
+            sample = self.controller.workspace.samples.get(sid)
+            if sample is None or not sample.has_sls:
+                header = 'That sample has no SLS data yet — load an SLS intensity file.'
             else:
                 self.sample_id = sid
                 runnable = True
@@ -554,6 +582,21 @@ class SLSModule(QtWidgets.QWidget):
         self._sync_calibration_scope()
         self._populate_calibration()
         self._refresh_calibration_display()
+        self.selectionChanged.emit()          # repaint the sidebar mirror
+
+    def selected_item_ids(self) -> list:
+        """The SLS measurements of the analysed sample (sidebar-mirror contract): SLS
+        works on a whole sample, so the mirror lights that sample's SLS rows + its
+        solvent reference."""
+        if self.sample_id is None:
+            return []
+        s = self.controller.workspace.samples.get(self.sample_id)
+        if s is None:
+            return []
+        ids = list(s.sls_item_ids)
+        if s.solvent_reference_item_id:
+            ids.append(s.solvent_reference_item_id)
+        return ids
 
     # ------------------------------------------------------------- mask ---
     def _populate_mask_lists(self) -> None:
@@ -765,6 +808,7 @@ class SLSModule(QtWidgets.QWidget):
             busy_notice(self)             # background fit is reading (invariant 4)
             return
         self.controller.commit()
+        self.sls_selector.refresh()       # a commit can rename/regroup the sample
         self._populate_calibration()
         self._refresh_calibration_display()
         if self.sample_id is not None:

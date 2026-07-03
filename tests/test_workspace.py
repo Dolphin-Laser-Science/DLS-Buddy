@@ -399,3 +399,39 @@ def test_run_ddls_recovers_dt_dr(controller):
     assert res.rh_t_nm > 0.0
     # result is cached for the sample
     assert ("ddls", sid) in c.results
+
+
+# ============================================ controller: averaged-Rh candidate ===
+
+def test_replicate_average_rh_wired_into_candidates(controller):
+    """A replicate-averaged Rh (durable sample_rh_rows) surfaces as a Cross-Sample Rh
+    candidate and is PREFERRED over a single cumulant, so an auto-refresh keeps the
+    deliberately-averaged value rather than clobbering it (feedback 2026-07-02)."""
+    from analysis.utilities import select_default_candidate
+
+    c = controller
+    iid = _add_dls(c, rh=30.0, angle=90.0, conc=1.0e-4)
+    c.commit()
+    sid = c.sample_id_of(iid)
+
+    # Before averaging: a single cumulant candidate, no replicate_avg.
+    base = c.dls_rh_candidates(sid, None)
+    assert base and all(cd.kind != "dls_replicate_avg" for cd in base)
+
+    c.workspace.upsert_sample_rh_row(SampleRhRow(
+        sample_id=sid, source_kind="replicate_avg", source_set="cumulant|None",
+        rh_nm=31.5, rh_se=0.4, is_apparent=True, rh_type_label="apparent",
+        from_label="replicate avg (3 runs, cumulant)", fraction=None))
+
+    cands = c.dls_rh_candidates(sid, None)
+    avg = [cd for cd in cands if cd.kind == "dls_replicate_avg"]
+    assert len(avg) == 1
+    a = avg[0]
+    assert a.value == pytest.approx(31.5) and a.value_se == pytest.approx(0.4)
+    assert a.is_apparent and a.tier == 1
+    # Preferred over the single cumulant -> auto-select keeps the averaged value.
+    assert select_default_candidate(cands) is a
+
+    # Fraction-scoped: not offered for a different Mw fraction.
+    assert all(cd.kind != "dls_replicate_avg"
+               for cd in c.dls_rh_candidates(sid, "A"))

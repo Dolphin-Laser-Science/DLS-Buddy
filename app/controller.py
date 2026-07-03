@@ -1789,11 +1789,14 @@ class Controller:
         a minor population is never silently chosen -- this is the peak picker for a
         multi-population sample.
 
-        Future: the DLS Summary store's `sample_rh_rows` already carry
-        rh_nm/rh_se/is_apparent/source_kind, so the replicate-average / Gamma-q^2 /
-        D-c rows could be mapped straight to ResultCandidate tiers here (apparent
-        for replicate_avg & gamma_q2, thermodynamic for conc_extrap) to wire
-        averaged Rh into rho. Not wired yet -- left as a deliberate next step.
+        Replicate-averaged Rh (parametric replicate averaging, which carries the
+        only honest single-sample dynamic SE -- invariant 8) is offered from the
+        durable `sample_rh_rows` store: one candidate per averaged (method, fraction),
+        apparent, and PREFERRED over a single cumulant (a finite positive quality beats
+        the single-fit `-rms` within tier 1) so an auto-refresh's default pick never
+        clobbers a value the user deliberately averaged. The Gamma-q^2 / D-c store rows
+        are NOT re-read here -- they are re-derived live below (tiers 2/3), so pulling
+        them from the store too would double-count.
         """
         lms = [lm for lm in self.workspace.sample_measurements(sample_id, 'dls')
                if lm.committed_params.get('mw_fraction') == fraction]
@@ -1820,6 +1823,25 @@ class Controller:
                 quality=(-float(res.rms_error)
                          if np.isfinite(res.rms_error) else None),
                 quality_kind='neg_rms', source_id=lm.item_id))
+
+        # replicate-averaged Rh from the durable Summary store (apparent, but the only
+        # single-sample dynamic Rh with an honest SE). Preferred over a single cumulant
+        # (quality 1.0 > the single-fit -rms in tier 1) so an auto-refresh never
+        # overwrites a value the user deliberately averaged. Only 'replicate_avg' rows
+        # are read here; the gamma_q2/conc_extrap rows are re-derived live below.
+        for row in self.workspace.sample_rh_rows.values():
+            if (row.sample_id != sample_id or row.fraction != fraction
+                    or row.source_kind != 'replicate_avg'):
+                continue
+            if row.rh_nm is None or not np.isfinite(row.rh_nm):
+                continue
+            cands.append(ResultCandidate(
+                value=float(row.rh_nm),
+                label=f'{row.from_label} — apparent (± SD/√N)',
+                kind='dls_replicate_avg', is_apparent=bool(row.is_apparent), tier=1,
+                quality=1.0, quality_kind='replicate_average',
+                source_id=f'replicate_avg@{row.source_set}',
+                value_se=unc.se_or_none(row.rh_se)))
 
         # distribution-model peaks (CONTIN/NNLS) from results already computed in
         # the DLS tab -- one candidate per resolved population (the peak picker).

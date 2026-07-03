@@ -95,6 +95,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.controller = Controller()
         self.current_item: Optional[str] = None
+        # item_id -> its measurement leaf in the tree, kept so the selection mirror can
+        # repaint rows without a full rebuild (rebuilt each _refresh_sidebar).
+        self._leaf_items: Dict[str, QtWidgets.QTreeWidgetItem] = {}
 
         self._build_ui()
         self._refresh_sidebar()
@@ -183,6 +186,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.utilities_module.workspaceChanged.connect(self._on_workspace_changed)
         self.settings_module = SettingsModule(self.controller)
         self.settings_module.applied.connect(self._on_settings_applied)
+        # Sidebar selection mirror: repaint the tree's "selected in the active tab" marks
+        # whenever a sample-scoped analysis tab's own selection changes.
+        self.dls_module.selectionChanged.connect(self._on_selection_changed)
+        self.sls_module.selectionChanged.connect(self._on_selection_changed)
+        self.utilities_module.selectionChanged.connect(self._on_selection_changed)
 
         # Each tab is wrapped in a resizable scroll area: when the window is shrunk
         # below a module's natural height the content scrolls instead of pinning a
@@ -428,7 +436,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # itemSelectionChanged and re-enter _set_current mid-rebuild.
         self.tree.blockSignals(True)
         self.tree.clear()
-        id_to_item: Dict[str, QtWidgets.QTreeWidgetItem] = {}
+        self._leaf_items = {}
         for s in self.controller.samples():
             parent = QtWidgets.QTreeWidgetItem([self._sample_label(s)])
             parent.setToolTip(0, self._sample_label(s))   # full name if clipped
@@ -438,6 +446,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # header-aware context menu and "click a header → select its children".
             parent.setData(0, QtCore.Qt.ItemDataRole.UserRole,
                            ('sample', s.sample_id))
+            # Status annotation: an unconfirmed sample (identity not yet set in the Data
+            # tab) reads amber, so it's obvious which samples still need confirming.
+            if self._sample_label(s) == '(unconfirmed sample)':
+                parent.setForeground(0, theme_color(self.tree, 'pending'))
             self.tree.addTopLevelItem(parent)
             parent.setExpanded(True)
             # Group the two measurement kinds under labelled, non-selectable headers
@@ -446,7 +458,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 dls_group = self._group_header(parent, 'DLS',
                                                ('group', 'dls', s.sample_id))
                 for iid in s.dls_item_ids:
-                    id_to_item[iid] = self._add_meas_item(dls_group, iid)
+                    self._leaf_items[iid] = self._add_meas_item(dls_group, iid)
             sls = ([(s.solvent_reference_item_id, 'solvent ref')]
                    if s.solvent_reference_item_id else [])
             sls += [(iid, '') for iid in s.sls_item_ids]
@@ -454,12 +466,47 @@ class MainWindow(QtWidgets.QMainWindow):
                 sls_group = self._group_header(parent, 'SLS',
                                                ('group', 'sls', s.sample_id))
                 for iid, marker in sls:
-                    id_to_item[iid] = self._add_meas_item(sls_group, iid, marker)
+                    self._leaf_items[iid] = self._add_meas_item(sls_group, iid, marker)
         self._add_trace_nodes()
         self.tree.blockSignals(False)
 
-        if self.current_item in id_to_item:
-            id_to_item[self.current_item].setSelected(True)
+        if self.current_item in self._leaf_items:
+            self._leaf_items[self.current_item].setSelected(True)
+        self._apply_selection_mirror()   # tint rows selected in the active tab
+
+    # ------------------------------------------------ selection mirror ---
+    def _active_module(self) -> Optional[QtWidgets.QWidget]:
+        """The module behind the current tab (tabs are reorderable, so resolve by
+        widget, not index)."""
+        return self._module_by_wrapper.get(self.tabs.currentWidget())
+
+    def _leaf_base_colour(self, item_id: str):
+        """A measurement leaf's NON-selected foreground: the derived-average green for a
+        replicate average (as `_add_meas_item` sets), otherwise the default palette."""
+        lm = self.controller.workspace.measurements.get(item_id)
+        is_avg = getattr(lm, 'derived_kind', None) == 'replicate_average'
+        return theme_color(self.tree, 'marker_active') if is_avg else QtGui.QBrush()
+
+    @QtCore.Slot()
+    def _on_selection_changed(self) -> None:
+        """A sample-scoped tab changed its own selection → repaint the mirror."""
+        self._apply_selection_mirror()
+
+    def _apply_selection_mirror(self) -> None:
+        """Read-only reflect the ACTIVE tab's selected measurements onto the sidebar:
+        selected leaves read `marker_selected` + bold, the rest revert to their base.
+        A light per-row repaint (no tree rebuild) so expansion/scroll/selection survive.
+        Tabs with no selection concept (Data/Cross/Settings) simply clear the marks."""
+        module = self._active_module()
+        getter = getattr(module, 'selected_item_ids', None)
+        selected = set(getter()) if callable(getter) else set()
+        for iid, item in self._leaf_items.items():
+            on = iid in selected
+            item.setForeground(0, theme_color(self.tree, 'marker_selected')
+                               if on else self._leaf_base_colour(iid))
+            font = item.font(0)
+            font.setBold(on)
+            item.setFont(0, font)
 
     @staticmethod
     def _sample_label(sample) -> str:
@@ -955,6 +1002,8 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.sidebar_note.setText(
                 'Pick a measurement to load it into the active module.')
+        # Re-point the sidebar mirror at whichever tab is now active.
+        self._apply_selection_mirror()
 
     # --------------------------------------------------------------- theme ---
     @staticmethod

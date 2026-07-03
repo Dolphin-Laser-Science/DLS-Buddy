@@ -108,10 +108,11 @@ class SettingsModule(QtWidgets.QWidget):
         # generator / Traces) as plain session fields, so they no longer clutter
         # this global tab.
 
-        form.addRow(self._header('Plot axis units'))
+        form.addRow(self._header('Display units'))
         plot_note = ThemedLabel(
-            'Default display units for plot axes. Plots store data in canonical units '
-            'and only convert for display; changing a unit redraws the plots.',
+            'Display units for plot axes AND the Cross-Sample result tables (Rg/Rh, Mw). '
+            'Everything is stored in canonical units and only converted for display; '
+            'changing a unit redraws the plots and re-labels the tables.',
             role='hint', size=11)
         plot_note.setWordWrap(True)
         form.addRow(plot_note)

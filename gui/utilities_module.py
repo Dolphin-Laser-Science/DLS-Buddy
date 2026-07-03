@@ -38,7 +38,16 @@ from gui.plot_controls import (
     make_split_panels, make_canvas_expanding, make_vertical_plot_stack,
 )
 from gui.theme import ThemedLabel
-from gui.widgets import roomy_tabs
+from gui.widgets import roomy_tabs, SampleSelector
+
+
+def _sample_label(sample) -> str:
+    """The 'polymer / solvent @ T K' sample name the sidebar shows (not the raw
+    sample_id key)."""
+    poly, solv, temp = sample.polymer_name, sample.solvent_name, sample.temperature_K
+    if poly and solv and temp is not None and temp == temp:      # temp==temp: not NaN
+        return f'{poly} / {solv} @ {temp:g} K'
+    return f'{poly or "?"} / {solv or "?"}'
 from gui.worker import BUSY_NOTICE, busy_notice, run_when_idle, runner
 
 from plotting.plots import (
@@ -133,6 +142,7 @@ class UtilitiesModule(QtWidgets.QWidget):
     # shell can rebuild the sidebar/Data tab (the utilities module has no reference
     # to the main window).
     workspaceChanged = QtCore.Signal()
+    selectionChanged = QtCore.Signal()   # emitted when the I·sinθ sample changes (mirror)
 
     def __init__(self, controller, parent=None) -> None:
         super().__init__(parent)
@@ -159,6 +169,20 @@ class UtilitiesModule(QtWidgets.QWidget):
     def _build_isin_tab(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
+
+        # The tab owns its sample: pick it here rather than inheriting the sidebar
+        # focus (the sidebar only navigates). Only SLS-bearing samples can produce an
+        # I·sin θ plot (it needs the c = 0 angular intensities).
+        self.isin_selector = SampleSelector(
+            self.controller,
+            predicate=lambda s: s.has_sls or bool(s.solvent_reference_item_id),
+            label_fn=_sample_label, title='Sample',
+            help_text='Choose which sample to plot I·sin θ for.',
+            help_bullets=['Only samples with angular intensity data (SLS / a solvent '
+                          'reference) appear.',
+                          'I·sin θ uses the c = 0 (solvent-reference) curves.'])
+        self.isin_selector.sampleChanged.connect(self._on_isin_sample)
+        v.addWidget(self.isin_selector)
 
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel('Scale:'))
@@ -1164,10 +1188,36 @@ class UtilitiesModule(QtWidgets.QWidget):
         self._update_trace()
 
     def set_measurement(self, item_id: Optional[str]) -> None:
-        """Point the tab at the sample owning `item_id` (shell navigator selection)."""
-        self.sample_id = (self.controller.sample_id_of(item_id)
-                          if item_id is not None else None)
+        """Sidebar focus is a SOFT seed for the I·sinθ sample: adopt the focused
+        sample only if it can produce an I·sinθ plot, else keep the tab's own pick (the
+        selector is the source of truth — the sidebar merely navigates)."""
+        sid = self.controller.sample_id_of(item_id) if item_id is not None else None
+        self.isin_selector.refresh()
+        if sid is not None and self.isin_selector.has_sample(sid):
+            self.isin_selector.set_current_sample_id(sid)
+        self.sample_id = self.isin_selector.current_sample_id()
         self._update_isin()
+        self.selectionChanged.emit()          # repaint the sidebar mirror
+
+    @QtCore.Slot(str)
+    def _on_isin_sample(self, sid: str) -> None:
+        """The user picked a sample in the I·sinθ selector."""
+        self.sample_id = sid or None
+        self._update_isin()
+        self.selectionChanged.emit()
+
+    def selected_item_ids(self) -> list:
+        """The measurements of the I·sinθ sample (sidebar-mirror contract). Traces are a
+        separate store and are not mirrored here."""
+        if self.sample_id is None:
+            return []
+        s = self.controller.workspace.samples.get(self.sample_id)
+        if s is None:
+            return []
+        ids = list(s.dls_item_ids) + list(s.sls_item_ids)
+        if s.solvent_reference_item_id:
+            ids.append(s.solvent_reference_item_id)
+        return ids
 
     def _update_isin(self) -> None:
         # run_i_sin_theta writes the shared controller.results dict, so it must

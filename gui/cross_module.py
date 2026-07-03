@@ -50,9 +50,12 @@ from gui.widgets import roomy_tabs
 from gui.worker import busy_notice, run_when_idle, runner
 from analysis.utilities import interpret_scaling_exponent
 from analysis.uncertainty import format_pm
+from app import units as U
 
 
-_COLS = ['Sample', 'Rg (nm)', 'Rh (nm)', 'ρ = Rg/Rh', 'Shape', 'Type']
+# ρ-table columns. Rg/Rh carry a unit that follows the global Display-units setting;
+# `_columns()` inserts the active label, so this template holds only the fixed parts.
+_COL_TEMPLATE = ['Sample', 'Rg', 'Rh', 'ρ = Rg/Rh', 'Shape', 'Type']
 _MANUAL_LABEL = 'Manual entry…'
 
 
@@ -138,8 +141,8 @@ class CrossSampleModule(QtWidgets.QWidget):
         # rho tab: the rho table + interpretation
         rho_tab = QtWidgets.QWidget()
         rl = QtWidgets.QVBoxLayout(rho_tab)
-        self.table = QtWidgets.QTableWidget(0, len(_COLS))
-        self.table.setHorizontalHeaderLabels(_COLS)
+        self.table = QtWidgets.QTableWidget(0, len(_COL_TEMPLATE))
+        self.table.setHorizontalHeaderLabels(self._columns())
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
@@ -194,7 +197,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.rg_combo.activated.connect(lambda i: self._on_source_chosen('rg', i))
         grid.addWidget(self.rg_combo, 0, 1)
         self.rg_manual = QtWidgets.QLineEdit()
-        self.rg_manual.setPlaceholderText('nm')
+        self.rg_manual.setPlaceholderText(self._radius_unit())
         self.rg_manual.setFixedWidth(70)
         grid.addWidget(self.rg_manual, 0, 2)
         self.rg_manual_apparent = QtWidgets.QCheckBox('apparent')
@@ -209,7 +212,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.rh_combo.activated.connect(lambda i: self._on_source_chosen('rh', i))
         grid.addWidget(self.rh_combo, 1, 1)
         self.rh_manual = QtWidgets.QLineEdit()
-        self.rh_manual.setPlaceholderText('nm')
+        self.rh_manual.setPlaceholderText(self._radius_unit())
         self.rh_manual.setFixedWidth(70)
         grid.addWidget(self.rh_manual, 1, 2)
         self.rh_manual_apparent = QtWidgets.QCheckBox('apparent')
@@ -225,7 +228,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.mw_combo.activated.connect(lambda i: self._on_source_chosen('mw', i))
         grid.addWidget(self.mw_combo, 2, 1)
         self.mw_manual = QtWidgets.QLineEdit()
-        self.mw_manual.setPlaceholderText('g/mol')
+        self.mw_manual.setPlaceholderText(self._mw_unit())
         self.mw_manual.setFixedWidth(70)
         grid.addWidget(self.mw_manual, 2, 2)
         mw_set = QtWidgets.QPushButton('Set')
@@ -305,6 +308,30 @@ class CrossSampleModule(QtWidgets.QWidget):
         self._rebuild_table()
         self._refresh_scaling()
 
+    # ----- display units (follow the global Settings "Display units" choice) -----
+    def _radius_unit(self) -> str:
+        """The active display unit for Rg/Rh (nm default), from the global setting."""
+        return ((self.controller.settings.plot_units or {}).get('radius')
+                or U.default_unit('radius'))
+
+    def _mw_unit(self) -> str:
+        """The active display unit for Mw (g/mol default), from the global setting."""
+        return ((self.controller.settings.plot_units or {}).get('molar_mass')
+                or U.default_unit('molar_mass'))
+
+    def _columns(self) -> list:
+        """ρ-table headers with the active Rg/Rh unit label."""
+        ru = self._radius_unit()
+        cols = list(_COL_TEMPLATE)
+        cols[1], cols[2] = f'Rg ({ru})', f'Rh ({ru})'
+        return cols
+
+    def _disp_radius(self, x: Optional[float], runit: str) -> str:
+        """Format a canonical (nm) radius in the active display unit; 'n/a' if missing."""
+        if x is None or not (isinstance(x, (int, float)) and math.isfinite(x)):
+            return 'n/a'
+        return _fmt(U.from_canonical('radius', x, runit))
+
     def _unit_label(self, sid: str, fraction: Optional[str]) -> str:
         by_id = {s.sample_id: s for s in self.controller.samples()}
         base = _sample_label(by_id[sid])
@@ -312,6 +339,9 @@ class CrossSampleModule(QtWidgets.QWidget):
 
     def _rebuild_table(self) -> None:
         self._suppress = True
+        # Re-apply headers so a Display-units change updates the Rg/Rh unit labels.
+        self.table.setHorizontalHeaderLabels(self._columns())
+        runit = self._radius_unit()
         samples = self.controller.workspace.samples
         # One ρ row per (sample, fraction): only included samples that can pair ρ
         # (have both DLS and SLS), expanded over each sample's fraction labels.
@@ -330,8 +360,10 @@ class CrossSampleModule(QtWidgets.QWidget):
                 rho_tip = (rho.interpretation if rho.rho_se is None else
                            rho.interpretation + '\n(± = statistical SE, from the '
                            'Rg and Rh regression fits; excludes systematics.)')
-                cells = [label, _fmt(rho.rg_nm), _fmt(rho.rh_nm), rho_text,
-                         rho.shape,
+                cells = [label,
+                         self._disp_radius(rho.rg_nm, runit),
+                         self._disp_radius(rho.rh_nm, runit),
+                         rho_text, rho.shape,
                          'apparent' if rho.is_apparent else 'thermodynamic']
                 tips = [rho.interpretation, rho.rg_label, rho.rh_label,
                         rho_tip, rho.interpretation, '']
@@ -464,14 +496,20 @@ class CrossSampleModule(QtWidgets.QWidget):
 
     def _populate_source_panel(self, sid: str, fraction: Optional[str]) -> None:
         self._current_unit = (sid, fraction)
+        # Manual-entry placeholders follow the active Display-units choice.
+        self.rg_manual.setPlaceholderText(self._radius_unit())
+        self.rh_manual.setPlaceholderText(self._radius_unit())
+        self.mw_manual.setPlaceholderText(self._mw_unit())
         r = self.controller.workspace.samples[sid].result_for(fraction)
         self._fill_combo(self.rg_combo, self.controller.sls_rg_candidates(sid, fraction),
-                         current_label=r.rg_label, current_source=r.rg_source)
+                         current_label=r.rg_label, current_source=r.rg_source,
+                         quantity='radius')
         self._fill_combo(self.rh_combo, self.controller.dls_rh_candidates(sid, fraction),
-                         current_label=r.rh_label, current_source=r.rh_source)
+                         current_label=r.rh_label, current_source=r.rh_source,
+                         quantity='radius')
         self._fill_combo(self.mw_combo, self.controller.sls_mw_candidates(sid, fraction),
                          current_label=r.mw_label, current_source=r.mw_source,
-                         unit='g/mol')
+                         quantity='molar_mass')
         self.source_box.setEnabled(True)
         self.source_box.setTitle(f'Source selection — {self._unit_label(sid, fraction)}')
         try:
@@ -484,13 +522,16 @@ class CrossSampleModule(QtWidgets.QWidget):
 
     def _fill_combo(self, combo: QtWidgets.QComboBox, candidates, *,
                     current_label: str, current_source: str,
-                    unit: str = 'nm') -> None:
+                    quantity: str = 'radius') -> None:
         """Rebuild a source-picker combo. Each item's UserRole data is a sentinel
         that `_on_source_chosen` dispatches on: a ResultCandidate object (a real
         result to select), the string 'USER' (keep the existing hand-entered
         value), or None (the trailing "Manual entry…" item). Signals are blocked
         during the rebuild so clearing/adding items does not fire currentIndexChanged
-        (which would re-enter selection handling mid-rebuild)."""
+        (which would re-enter selection handling mid-rebuild). `quantity` picks the
+        active display unit for the "User-entered" item (candidate labels carry no
+        numeric value, so only that item needs converting)."""
+        unit = (self._mw_unit() if quantity == 'molar_mass' else self._radius_unit())
         combo.blockSignals(True)
         combo.clear()
         select_index = -1
@@ -499,9 +540,12 @@ class CrossSampleModule(QtWidgets.QWidget):
             combo.setItemData(i, c, QtCore.Qt.ItemDataRole.UserRole)
             if current_source != 'user' and c.label == current_label:
                 select_index = i
-        # a hand-entered value shows as a distinct, pre-selected item
+        # a hand-entered value shows as a distinct, pre-selected item (in display units)
         if current_source == 'user':
-            combo.addItem(f'User-entered ({_fmt(self._user_value(combo))} {unit})')
+            val = self._user_value(combo)
+            disp = (U.from_canonical(quantity, val, unit)
+                    if isinstance(val, (int, float)) and math.isfinite(val) else val)
+            combo.addItem(f'User-entered ({_fmt(disp)} {unit})')
             combo.setItemData(combo.count() - 1, 'USER', QtCore.Qt.ItemDataRole.UserRole)
             select_index = combo.count() - 1
         combo.addItem(_MANUAL_LABEL)
@@ -555,8 +599,11 @@ class CrossSampleModule(QtWidgets.QWidget):
         text = edit.text().strip()
         if not text:
             return
+        # The user types in the active display unit; store canonical (nm / g·mol⁻¹).
+        quantity = 'molar_mass' if which == 'mw' else 'radius'
+        unit = self._mw_unit() if which == 'mw' else self._radius_unit()
         try:
-            value = float(text)
+            value = U.to_canonical(quantity, float(text), unit)
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, 'Invalid value', str(exc))
             return

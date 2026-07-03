@@ -48,9 +48,9 @@ from gui.plot_controls import (
     make_vertical_plot_stack, attach_residual_resizer,
 )
 from gui.export_helper import export_to_csv
-from gui.help import add_help_to_groupbox
-from gui.theme import ThemedLabel
-from gui.widgets import roomy_tabs
+from gui.help import add_help_to_groupbox, section_header
+from gui.theme import ThemedLabel, color as theme_color
+from gui.widgets import roomy_tabs, SelectionModel, MeasurementPicker
 from gui.worker import BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, run_when_idle, runner
 from analysis.uncertainty import format_pm
 
@@ -351,116 +351,27 @@ def show_average_summary(parent, summary: dict) -> None:
         parent, 'DLS replicate average', format_average_summary(summary))
 
 
-class _OverlaySelection:
-    """The set of DLS measurements co-plotted on the Correlogram and Distribution
-    tabs, SHARED between them (like the analysis region). Insertion order is kept so
-    each measurement gets a stable colour across both tabs and every panel."""
+# The DLS overlay selection + checklist were promoted to the shared, framework-side
+# `SelectionModel` + `MeasurementPicker` in `gui/widgets.py` (used by every analysis
+# tab now, with real checkboxes and one visual idiom). `DLSModule` builds one shared
+# `SelectionModel(colour_cycle=_CYCLE)` so overlay colours stay stable, and the
+# Correlogram / Distribution / Summary tabs each embed a `MeasurementPicker` bound to it.
+# `_meas_label` / `_sample_header` (above) are injected as the picker's label callables.
 
-    def __init__(self) -> None:
-        self._ids: List[str] = []           # ordered, unique
-
-    def ids(self) -> List[str]:
-        return list(self._ids)
-
-    def is_checked(self, iid: str) -> bool:
-        return iid in self._ids
-
-    def set(self, iid: str, on: bool) -> None:
-        if on and iid not in self._ids:
-            self._ids.append(iid)
-        elif not on and iid in self._ids:
-            self._ids.remove(iid)
-
-    def ensure(self, iid: Optional[str]) -> None:
-        """Tick a measurement if not already (used to auto-include the sidebar pick)."""
-        if iid and iid not in self._ids:
-            self._ids.append(iid)
-
-    def prune(self, live) -> None:
-        """Drop ids no longer in the workspace (preserving order of the rest)."""
-        self._ids = [i for i in self._ids if i in live]
-
-    def colour_for(self, iid: str) -> str:
-        """A stable palette colour, keyed by the measurement's position in the set."""
-        idx = self._ids.index(iid) if iid in self._ids else len(self._ids)
-        return _CYCLE[idx % len(_CYCLE)]
-
-
-class _MeasurementChecklist(QtWidgets.QWidget):
-    """A workspace-wide list of DLS measurements with checkboxes, backed by a shared
-    `_OverlaySelection`. Emits `changed` when the ticked set changes. Both analysis
-    tabs embed one; `refresh()` re-syncs the boxes from the shared model (so toggling
-    on one tab is reflected when the other tab is shown)."""
-
-    changed = QtCore.Signal()
-
-    def __init__(self, controller, selection: _OverlaySelection, parent=None) -> None:
-        super().__init__(parent)
-        self.controller = controller
-        self.selection = selection
-        v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.addWidget(QtWidgets.QLabel('Measurements to plot'))
-        self.list = QtWidgets.QListWidget()
-        # Min (not max) height so the list grows to fill its resizable splitter pane
-        # (feedback #9) instead of being capped.
-        self.list.setMinimumHeight(80)
-        self.list.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.list.itemSelectionChanged.connect(self._on_selection_changed)
-        v.addWidget(self.list)
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_all = QtWidgets.QPushButton('Select all')
-        btn_none = QtWidgets.QPushButton('Select none')
-        btn_row.addWidget(btn_all)
-        btn_row.addWidget(btn_none)
-        btn_row.addStretch(1)
-        v.addLayout(btn_row)
-        btn_all.clicked.connect(self._select_all)
-        btn_none.clicked.connect(self._select_none)
-
-    def refresh(self) -> None:
-        self.list.blockSignals(True)
-        self.list.clear()
-        live = set()
-        groups: dict = {}   # sid -> [lm, ...]  insertion-ordered
-        for lm in self.controller.workspace.measurements.values():
-            if lm.kind != 'dls':
-                continue
-            live.add(lm.item_id)
-            sid = self.controller.sample_id_of(lm.item_id)
-            groups.setdefault(sid, []).append(lm)
-        for sid, ms in groups.items():
-            sample = self.controller.workspace.samples.get(sid)
-            hdr_text = _sample_header(sample) if sample else '(unconfirmed)'
-            hdr = QtWidgets.QListWidgetItem(hdr_text)
-            hdr.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-            font = hdr.font()
-            font.setBold(True)
-            hdr.setFont(font)
-            self.list.addItem(hdr)
-            for lm in ms:
-                it = QtWidgets.QListWidgetItem('  ' + _meas_label(lm))
-                it.setData(QtCore.Qt.ItemDataRole.UserRole, lm.item_id)
-                self.list.addItem(it)
-                it.setSelected(self.selection.is_checked(lm.item_id))
-        self.selection.prune(live)
-        self.list.blockSignals(False)
-
-    def _on_selection_changed(self) -> None:
-        for i in range(self.list.count()):
-            it = self.list.item(i)
-            iid = it.data(QtCore.Qt.ItemDataRole.UserRole)
-            if iid is None:
-                continue   # group header
-            self.selection.set(iid, it.isSelected())
-        self.changed.emit()
-
-    def _select_all(self) -> None:
-        self.list.selectAll()   # skips non-selectable headers; triggers _on_selection_changed
-
-    def _select_none(self) -> None:
-        self.list.clearSelection()  # triggers _on_selection_changed
+# Help shown on the "?" badge of the DLS measurement pickers (how-to-use, doc-rule #8).
+_PICKER_HELP = 'Tick the measurements to analyse and overlay.'
+_PICKER_BULLETS = [
+    'Ticked measurements are fit and co-plotted together.',
+    'Grouped by sample — you can tick across samples to compare.',
+    '<b>Select all / none</b> toggles the whole list at once.',
+    'Selecting in the Workspace sidebar only navigates; the tick boxes here '
+    'decide what is analysed.',
+]
+_SUMMARY_PICKER_BULLETS = [
+    'Ticks pick which measurements the table shows when '
+    '<b>“Ticked only”</b> is on.',
+    'With “Ticked only” off, the table lists every DLS result.',
+]
 
 
 # ===========================================================================
@@ -506,8 +417,11 @@ class _CorrelogramTab(QtWidgets.QWidget):
     def _build_ui(self) -> None:
         _, left, right = make_split_panels(self)
 
-        self.checklist = _MeasurementChecklist(self.controller, self.selection)
-        self.checklist.changed.connect(self._on_selection_changed)
+        self.checklist = MeasurementPicker(
+            self.controller, self.selection, kinds=('dls',),
+            label_fn=_meas_label, header_fn=_sample_header,
+            help_text=_PICKER_HELP, help_bullets=_PICKER_BULLETS)
+        self.checklist.selectionChanged.connect(self._on_selection_changed)
 
         box = QtWidgets.QGroupBox('Parametric fit')
         add_help_to_groupbox(box, 'Fit the correlogram to get a size (Rh).', bullets=[
@@ -977,7 +891,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         for ax in (self.main_ax, self.resid_ax, *self.side_axes):
             ax.clear()
         if not self._raw:
-            self.main_ax.set_title('Select or tick a DLS measurement')
+            self.main_ax.set_title('Tick a measurement to plot')
             self.canvas.draw_idle()
             return
         ws = self.controller.workspace.measurements
@@ -1172,8 +1086,11 @@ class _DistributionTab(QtWidgets.QWidget):
     def _build_ui(self) -> None:
         _, left, right = make_split_panels(self)
 
-        self.checklist = _MeasurementChecklist(self.controller, self.selection)
-        self.checklist.changed.connect(self._on_selection_changed)
+        self.checklist = MeasurementPicker(
+            self.controller, self.selection, kinds=('dls',),
+            label_fn=_meas_label, header_fn=_sample_header,
+            help_text=_PICKER_HELP, help_bullets=_PICKER_BULLETS)
+        self.checklist.selectionChanged.connect(self._on_selection_changed)
 
         box = QtWidgets.QGroupBox('Distribution')
         add_help_to_groupbox(box, 'Recover a full size distribution (not just one '
@@ -1554,6 +1471,8 @@ class _DistributionTab(QtWidgets.QWidget):
 class _SampleAnalysisTab(QtWidgets.QWidget):
     """A single full-size sample-level plot: Gamma vs q^2, or D vs c."""
 
+    selectionChanged = QtCore.Signal()           # ticked include-set changed (for the mirror)
+
     def __init__(self, controller, kind: str, parent=None) -> None:
         super().__init__(parent)
         self.controller = controller
@@ -1603,7 +1522,15 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         # ---- per-measurement table section (tick to include — #11/#12) ----
         tsec = QtWidgets.QWidget()
         tl = QtWidgets.QVBoxLayout(tsec); tl.setContentsMargins(0, 0, 0, 0)
-        tl.addWidget(QtWidgets.QLabel('Measurements (tick to include in the fit)'))
+        tl.addWidget(section_header(
+            'Measurements (tick to include in the fit)',
+            'Tick which of this sample\'s measurements enter the fit.',
+            bullets=[
+                'Only this sample\'s DLS measurements appear — it is a single-sample fit.',
+                'The fit needs ≥ 2 distinct '
+                + ('angles.' if self.kind == 'gamma_q2' else 'concentrations.'),
+                'Rows that can\'t be built are greyed and can\'t be ticked.',
+                'Ticked rows read blue and light the matching sidebar leaves.']))
         self.table = QtWidgets.QTableWidget(0, 0)
         self.table.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1662,13 +1589,20 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             return None
         return self.controller.sample_id_of(self.item_id)
 
+    def selected_item_ids(self) -> list:
+        """The ticked measurements for the current sample (sidebar-mirror contract)."""
+        sid = self._sample_id()
+        return sorted(self._included.get(sid, set())) if sid else []
+
     def _fraction(self) -> Optional[str]:
         return self.controller.workspace.measurements[self.item_id].committed_params.get(
             'mw_fraction')
 
     def set_measurement(self, item_id: Optional[str], runnable: bool) -> None:
-        # Keep-last (#15): a non-DLS selection shouldn't blank a populated sample view —
-        # leave the current display (item_id, table, plot, run/export) untouched.
+        # Single-sample tab following the sidebar focus: focusing a non-DLS measurement
+        # keeps the current sample (display/table/plot untouched) rather than blanking
+        # it. This is the intended navigation for a single-sample view — you stay on
+        # your sample until you focus another DLS one — not a stopgap guard.
         if item_id is not None and not runnable and self._last_sid is not None:
             return
         self.item_id = item_id
@@ -1743,9 +1677,19 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
                     it = QtWidgets.QTableWidgetItem(v)
                     it.setFlags(Flag.ItemIsEnabled)
                     t.setItem(r, c, it)
+                self._tint_row(r, row['ok'] and row['item_id'] in inc)
             t.resizeColumnsToContents()
         finally:
             self._suppress_table = False
+
+    def _tint_row(self, r: int, on: bool) -> None:
+        """Colour a table row to match the shared idiom: ticked rows read
+        `marker_selected` blue, like the sidebar mirror and the DLS picker."""
+        col = theme_color(self.table, 'marker_selected') if on else QtGui.QBrush()
+        for c in range(self.table.columnCount()):
+            it = self.table.item(r, c)
+            if it is not None:
+                it.setForeground(col)
 
     def _on_table_changed(self, item) -> None:
         if self._suppress_table or item.column() != 0:
@@ -1755,10 +1699,15 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             return
         iid = item.data(QtCore.Qt.ItemDataRole.UserRole)
         inc = self._included.setdefault(sid, set())
-        if item.checkState() == QtCore.Qt.CheckState.Checked:
+        checked = item.checkState() == QtCore.Qt.CheckState.Checked
+        if checked:
             inc.add(iid)
         else:
             inc.discard(iid)
+        self._suppress_table = True    # setForeground re-emits itemChanged — guard it
+        self._tint_row(item.row(), checked)
+        self._suppress_table = False
+        self.selectionChanged.emit()  # repaint the sidebar mirror for the new subset
         self._run_epoch += 1         # ticked set changed: in-flight run is stale
         enough = self._update_run_enabled(sid)
         if sid in self._cache:
@@ -1950,6 +1899,8 @@ class _DDLSTab(QtWidgets.QWidget):
     _RESULT_ROWS = ['D_r (rad²/s)', 'τ_rot (µs)', 'D_t (m²/s)', 'R_h,t (nm)',
                     'paired angles', 'single-exp (qL)']
 
+    selectionChanged = QtCore.Signal()           # included angle set changed (mirror)
+
     def __init__(self, controller, parent=None) -> None:
         super().__init__(parent)
         self.controller = controller
@@ -1957,7 +1908,10 @@ class _DDLSTab(QtWidgets.QWidget):
         self._runnable = False
         self._cache: Dict[str, tuple] = {}      # sample_id -> (result, info) fitted
         self._full: Dict[str, tuple] = {}       # sample_id -> (result, info) all angles
-        self._excluded: Dict[str, set] = {}     # sample_id -> excluded angles (#9)
+        # sample_id -> the INCLUDED paired angles (tick to include, like Γ vs q²);
+        # the excluded set passed to the engine is derived as paired − included.
+        self._included: Dict[str, set] = {}
+        self._suppress_ddls = False             # re-entrancy guard for checkbox edits
         self._last_sid: Optional[str] = None    # last DLS sample shown (keep-last, #15)
         self._run_epoch = 0                     # async staleness token
         self._recompute_pending = False         # a refit is queued for when idle
@@ -1973,12 +1927,21 @@ class _DDLSTab(QtWidgets.QWidget):
         note.setWordWrap(True)
         left.addWidget(note)
 
-        # Read-only summary of the sample's correlograms + pairing status.
-        self.table = QtWidgets.QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(['Angle (°)', 'Polarization', 'Paired'])
+        # Paired angles with an include checkbox (tick to include in the D_r/D_t fit —
+        # the same idiom as Γ vs q²), plus each correlogram's polarisation + pairing.
+        left.addWidget(section_header(
+            'Paired angles (tick to include in the fit)',
+            'Tick which paired angles enter the D_r/D_t fit.',
+            bullets=['Only angles with BOTH a VV and a VH correlogram can be paired.',
+                     'Untick an angle to drop it (e.g. an outlier); the fit re-runs on '
+                     'the ticked angles.',
+                     'Ticked angles read blue and light the matching sidebar leaves.']))
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(['', 'Angle (°)', 'Polarization', 'Paired'])
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setMaximumHeight(170)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemChanged.connect(self._on_angle_toggled)
         left.addWidget(self.table)
 
         rod_row = QtWidgets.QHBoxLayout()
@@ -2001,14 +1964,10 @@ class _DDLSTab(QtWidgets.QWidget):
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._on_export)
         left.addWidget(self.export_button)
-        # Outlier removal (#9): click an angle's point to exclude it and recompute.
-        excl_hint = ThemedLabel(
-            'Click a point to exclude that angle from the D_r/D_t fit; excluded '
-            'angles are greyed.', role='hint', size=10)
-        excl_hint.setWordWrap(True)
-        left.addWidget(excl_hint)
-        self.reset_excl_button = QtWidgets.QPushButton('Reset excluded angles')
-        self.reset_excl_button.clicked.connect(self._on_reset_exclusions)
+        # Outlier removal (#9): untick an angle above to drop it; unticked angles are
+        # greyed on the plot. "Include all" re-ticks every paired angle.
+        self.reset_excl_button = QtWidgets.QPushButton('Include all angles')
+        self.reset_excl_button.clicked.connect(self._on_include_all)
         left.addWidget(self.reset_excl_button)
 
         left.addWidget(QtWidgets.QLabel('Results'))
@@ -2040,7 +1999,6 @@ class _DDLSTab(QtWidgets.QWidget):
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
         self.ax = self.figure.add_subplot(111)
         self._nav = NavigationToolbar(self.canvas, self)
-        self.canvas.mpl_connect('button_press_event', self._on_click)
         right.addWidget(self._nav)
         right.addWidget(self.canvas, 1)
         self.axis_bar = AxisControlBar(self.canvas)
@@ -2052,7 +2010,10 @@ class _DDLSTab(QtWidgets.QWidget):
         return self.controller.sample_id_of(self.item_id)
 
     def set_measurement(self, item_id: Optional[str], runnable: bool) -> None:
-        # Keep-last (#15): a non-DLS selection shouldn't blank a populated DDLS view.
+        # DDLS is a single-sample tab that follows the sidebar focus. Focusing a
+        # non-DLS measurement keeps the current sample rather than blanking it — the
+        # intended navigation for a single-sample view (not a stopgap): you stay on
+        # your sample until you focus another DLS one.
         if item_id is not None and not runnable and self._last_sid is not None:
             return
         self.item_id = item_id
@@ -2085,13 +2046,86 @@ class _DDLSTab(QtWidgets.QWidget):
         self.shape_caveat.clear()
         self.shape_box.setVisible(False)
 
+    def _paired_angles(self, sid: str) -> set:
+        """The angles that have BOTH a VV and a VH correlogram (fittable)."""
+        return {float(r['angle_deg'])
+                for r in self.controller.ddls_correlogram_summary(sid) if r['paired']}
+
+    def _excluded_angles(self, sid: str) -> set:
+        """Angles to exclude from the fit = paired − included (engine takes excludes)."""
+        inc = self._included.get(sid)
+        if inc is None:
+            return set()                          # not initialised yet → nothing excluded
+        return self._paired_angles(sid) - inc
+
     def _refresh_table(self, sid: str) -> None:
         rows = self.controller.ddls_correlogram_summary(sid)
-        self.table.setRowCount(len(rows))
-        for r, row in enumerate(rows):
-            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(f"{row['angle_deg']:g}"))
-            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(row['geometry'] or '—'))
-            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem('✓' if row['paired'] else ''))
+        paired = {float(r['angle_deg']) for r in rows if r['paired']}
+        # Default: every paired angle included. Preserve prior ticks across refreshes
+        # (intersect with the still-paired set), like the Γ vs q² tab.
+        prev = self._included.get(sid)
+        self._included[sid] = (prev & paired) if prev is not None else set(paired)
+        inc = self._included[sid]
+        self._suppress_ddls = True
+        try:
+            self.table.setRowCount(len(rows))
+            for r, row in enumerate(rows):
+                ang = float(row['angle_deg'])
+                chk = QtWidgets.QTableWidgetItem()
+                chk.setData(QtCore.Qt.ItemDataRole.UserRole, ang)
+                # Only paired angles are fittable → only they are checkable.
+                if row['paired']:
+                    chk.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                                 | QtCore.Qt.ItemFlag.ItemIsEnabled)
+                    chk.setCheckState(QtCore.Qt.CheckState.Checked if ang in inc
+                                      else QtCore.Qt.CheckState.Unchecked)
+                else:
+                    chk.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+                self.table.setItem(r, 0, chk)
+                self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{ang:g}"))
+                self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(row['geometry'] or '—'))
+                self.table.setItem(r, 3, QtWidgets.QTableWidgetItem('✓' if row['paired'] else ''))
+                self._tint_ddls_row(r, row['paired'] and ang in inc)
+        finally:
+            self._suppress_ddls = False
+
+    def _tint_ddls_row(self, r: int, on: bool) -> None:
+        col = theme_color(self.table, 'marker_selected') if on else QtGui.QBrush()
+        for c in range(self.table.columnCount()):
+            it = self.table.item(r, c)
+            if it is not None:
+                it.setForeground(col)
+
+    @QtCore.Slot('QTableWidgetItem*')
+    def _on_angle_toggled(self, item) -> None:
+        if self._suppress_ddls or item.column() != 0:
+            return
+        sid = self._sample_id()
+        if sid is None:
+            return
+        ang = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        inc = self._included.setdefault(sid, set())
+        checked = item.checkState() == QtCore.Qt.CheckState.Checked
+        if checked:
+            inc.add(float(ang))
+        else:
+            inc.discard(float(ang))
+        # An angle has two rows (VV + VH); keep both checkboxes + tints in sync.
+        # (setCheckState/setForeground re-emit itemChanged, so guard the sync.)
+        self._suppress_ddls = True
+        for r in range(self.table.rowCount()):
+            it0 = self.table.item(r, 0)
+            if (it0 is not None
+                    and it0.data(QtCore.Qt.ItemDataRole.UserRole) == ang
+                    and it0.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable):
+                it0.setCheckState(QtCore.Qt.CheckState.Checked if checked
+                                  else QtCore.Qt.CheckState.Unchecked)
+                self._tint_ddls_row(r, checked)
+        self._suppress_ddls = False
+        self.selectionChanged.emit()          # repaint the sidebar mirror
+        self._run_epoch += 1                  # ticked set changed: in-flight run is stale
+        if sid in self._cache:
+            self._recompute(sid)              # live refit on the new subset
 
     @QtCore.Slot()
     def _on_run(self) -> None:
@@ -2126,7 +2160,7 @@ class _DDLSTab(QtWidgets.QWidget):
             self.status.setText(BUSY_NOTICE)
             return
         rod = getattr(self, '_rod_nm', None)
-        excl = set(self._excluded.get(sid, set()))
+        excl = self._excluded_angles(sid)         # paired − included
         controller = self.controller
         self._run_epoch += 1                # this run supersedes any in flight
         epoch = self._run_epoch
@@ -2172,49 +2206,34 @@ class _DDLSTab(QtWidgets.QWidget):
         if sid is not None and self._runnable:
             self._recompute(sid)
 
-    def _on_click(self, event) -> None:
-        """Toggle the nearest angle's exclusion from the DDLS fit (#9)."""
-        if event.inaxes is not self.ax or event.xdata is None:
-            return
-        if getattr(self._nav, 'mode', ''):
-            return
+    def selected_item_ids(self) -> list:
+        """The DLS measurements at the currently-included angles (sidebar-mirror
+        contract): the mirror lights the VV/VH correlograms feeding the fit."""
         sid = self._sample_id()
-        if sid is None or sid not in self._full:
-            return
-        res = self._full[sid][0]
-        qf, gf = _disp_factor('scattering_q2'), _disp_factor('decay_rate')
-        q2 = np.asarray(res.q2_m2, float) * qf
-        angles = np.asarray(res.angles_deg, float)
-        # nearest among both the VV and VH points, in the plot's DISPLAY units
-        pts = np.vstack([
-            np.column_stack([q2, np.asarray(res.gamma_vv_s_inv, float) * gf]),
-            np.column_stack([q2, np.asarray(res.gamma_vh_s_inv, float) * gf])])
-        keys = np.concatenate([angles, angles])
-        if pts.shape[0] == 0:
-            return
-        px = self.ax.transData.transform(pts)
-        d = np.hypot(px[:, 0] - event.x, px[:, 1] - event.y)
-        i = int(np.argmin(d))
-        if d[i] > 18.0:
-            return
-        excl = self._excluded.setdefault(sid, set())
-        key = float(keys[i])
-        matched = {e for e in excl if np.isclose(e, key)}
-        if matched:
-            excl -= matched
-        else:
-            excl.add(key)
-        self._run_epoch += 1     # exclusions changed: drop any in-flight fit
-        self._recompute(sid)
+        if sid is None:
+            return []
+        inc = self._included.get(sid, set())
+        out = []
+        for lm in self.controller.workspace.sample_measurements(sid, 'dls'):
+            ang = lm.committed_params.get('angle_deg')
+            if ang is not None and float(ang) in inc:
+                out.append(lm.item_id)
+        return out
 
     @QtCore.Slot()
-    def _on_reset_exclusions(self) -> None:
+    def _on_include_all(self) -> None:
         sid = self._sample_id()
-        if sid is None or not self._excluded.get(sid):
+        if sid is None:
             return
-        self._excluded[sid] = set()
-        self._run_epoch += 1     # exclusions changed: drop any in-flight fit
-        self._recompute(sid)
+        paired = self._paired_angles(sid)
+        if self._included.get(sid) == paired:
+            return                                # already all-included
+        self._included[sid] = set(paired)
+        self._refresh_table(sid)                 # re-tick every row
+        self.selectionChanged.emit()
+        self._run_epoch += 1     # included set changed: drop any in-flight fit
+        if sid in self._cache:
+            self._recompute(sid)
 
     @QtCore.Slot()
     def _on_export(self) -> None:
@@ -2240,7 +2259,7 @@ class _DDLSTab(QtWidgets.QWidget):
         self.ax.clear()
         plot_ddls(res, ax=self.ax)
         sid = self._sample_id()
-        excl = self._excluded.get(sid) if sid else None
+        excl = self._excluded_angles(sid) if sid else None
         if excl and sid in self._full:
             full = self._full[sid][0]
             qf, gf = _disp_factor('scattering_q2'), _disp_factor('decay_rate')
@@ -2400,8 +2419,12 @@ class _SummaryTab(QtWidgets.QWidget):
     def _build_ui(self) -> None:
         _, left, right = make_split_panels(self)
 
-        self.checklist = _MeasurementChecklist(self.controller, self.selection)
-        self.checklist.changed.connect(self._refresh_tables)
+        self.checklist = MeasurementPicker(
+            self.controller, self.selection, kinds=('dls',),
+            label_fn=_meas_label, header_fn=_sample_header, title='Measurements',
+            help_text='Tick measurements to filter the Summary table.',
+            help_bullets=_SUMMARY_PICKER_BULLETS)
+        self.checklist.selectionChanged.connect(self._refresh_tables)
         left.addWidget(self.checklist)
 
         self.ticked_only = QtWidgets.QCheckBox('Ticked only')
@@ -2522,6 +2545,11 @@ class DLSModule(QtWidgets.QWidget):
     folded in), sharing one analysis region and one measurement selection. A
     Summary tab reads the durable snapshot store written by every DLS run."""
 
+    # Fires whenever the measurements this module has SELECTED for analysis change
+    # (the shared overlay set, a sample-tab include change, or a sub-tab switch). The
+    # shell connects it to repaint the sidebar's selection mirror.
+    selectionChanged = QtCore.Signal()
+
     def __init__(self, controller, parent=None) -> None:
         super().__init__(parent)
         self.controller = controller
@@ -2536,7 +2564,9 @@ class DLSModule(QtWidgets.QWidget):
         # measurements ticked for co-plotting — both used by the Correlogram and
         # Distribution tabs so the two stay consistent.
         self.region = _AnalysisRegion()
-        self.selection = _OverlaySelection()
+        # One shared selection model for the co-plotting tabs (Correlogram / Distribution
+        # / Summary). The colour cycle keeps each measurement a stable overlay colour.
+        self.selection = SelectionModel(colour_cycle=_CYCLE)
         self.correlogram_tab = _CorrelogramTab(controller, self.region, self.selection)
         self.distribution_tab = _DistributionTab(controller, self.region, self.selection)
         self.gamma_q2_tab = _SampleAnalysisTab(controller, 'gamma_q2')
@@ -2554,7 +2584,26 @@ class DLSModule(QtWidgets.QWidget):
         self.tabs.addTab(self.summary_tab, 'Summary')
         self.tabs.setMovable(True)               # drag to reorder sub-tabs (A4)
         layout.addWidget(self.tabs, 1)
+        # Re-emit selection changes for the sidebar mirror: the shared overlay model,
+        # each sample-scoped sub-tab's own include set, and a sub-tab switch (which
+        # changes WHICH selection is active) all bubble up as selectionChanged.
+        self.selection.changed.connect(self.selectionChanged)
+        self.tabs.currentChanged.connect(lambda _i: self.selectionChanged.emit())
+        for tab in (self.gamma_q2_tab, self.conc_tab, self.ddls_tab):
+            tab.selectionChanged.connect(self.selectionChanged)
         self.set_measurement(None)
+
+    def selected_item_ids(self) -> list:
+        """The measurements the ACTIVE sub-tab currently has selected (for the sidebar
+        mirror). Co-plot tabs use the shared overlay set; the Γ-q²/D-vs-c tabs use their
+        own per-sample include set; DDLS has none yet."""
+        w = self.tabs.currentWidget()
+        if w in (self.correlogram_tab, self.distribution_tab, self.summary_tab):
+            ws = self.controller.workspace.measurements
+            return [i for i in self.selection.ids() if i in ws and ws[i].kind == 'dls']
+        if w in (self.gamma_q2_tab, self.conc_tab, self.ddls_tab):
+            return w.selected_item_ids()
+        return []
 
     def reseed_from_settings(self) -> None:
         self.correlogram_tab.reseed_from_settings()
@@ -2563,7 +2612,8 @@ class DLSModule(QtWidgets.QWidget):
     def set_measurement(self, item_id: Optional[str]) -> None:
         self.item_id = item_id
         if item_id is None:
-            self.header.setText('Select a DLS measurement in the sidebar.')
+            self.header.setText('Pick a measurement in the Workspace list; '
+                                'tick measurements in the sub-tabs to analyse.')
             runnable = False
         else:
             kind = self.controller.workspace.measurements[item_id].kind

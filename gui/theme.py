@@ -52,6 +52,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 #   pending       — "pending update" amber
 #   marker_group  — tree group-header rows (DLS / SLS / Traces)
 #   marker_active — derived / replicate-average tree leaves
+#   marker_selected — measurements ticked in the active tab (sidebar mirror + picker rows)
 #   badge         — the "?" help-badge outline + glyph
 #
 # Light values keep today's intent but stay clearly readable on white; dark values are
@@ -64,6 +65,7 @@ LIGHT_TOKENS = {
     'pending':       '#b06000',
     'marker_group':  '#808080',
     'marker_active': '#008f63',
+    'marker_selected': '#0a66c2',
     'badge':         '#777777',
 }
 
@@ -75,6 +77,7 @@ DARK_TOKENS = {
     'pending':       '#e0a050',
     'marker_group':  '#9a9a9a',
     'marker_active': '#3fd0a0',
+    'marker_selected': '#5aa9ee',
     'badge':         '#bdbdbd',
 }
 
