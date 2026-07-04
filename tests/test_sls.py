@@ -234,9 +234,16 @@ def test_single_angle_mw():
     sa = sls.single_angle_mw(rr, angle)
     assert sa.is_apparent is True
     assert sa.angle_deg == pytest.approx(angle)
+    assert sa.calibrated is True and sa.mw_reliable is True
     assert math.isfinite(sa.mw_apparent_g_per_mol) and sa.mw_apparent_g_per_mol > 0
     # order-of-magnitude apparent Mw (contains P(q) and the 2 A2 c term).
     assert sa.mw_apparent_g_per_mol == pytest.approx(truth["mw"], rel=0.3)
+
+    # Uncalibrated: Mw_app is on an arbitrary scale, so it must be flagged unreliable
+    # (the "uncalibrated Mw flagged" invariant — no Rg here to survive).
+    rr_unc = S.rayleigh_results(meas, cal, calibrated=False)[0]
+    sa_unc = sls.single_angle_mw(rr_unc, angle)
+    assert sa_unc.calibrated is False and sa_unc.mw_reliable is False
 
     with pytest.raises(ValueError):
         sls.single_angle_mw(rr, 999.0)         # angle not measured
@@ -454,3 +461,200 @@ def test_real_ps900k_rg_survives_uncalibrated():
     assert z_unc.mw_reliable is False
     assert z_unc.rg_nm == pytest.approx(z_cal.rg_nm, rel=1e-9)
     assert 36.0 < z_unc.rg_nm < 45.0
+
+
+# ===========================================================================
+# 9. Monte-Carlo validation of the propagated SEs  [slow]
+# ===========================================================================
+#
+# invariant 8 (sharpened, 2026-07-03): an SE that propagates through a NONLINEAR
+# transform must be Monte-Carlo-validated against the sampling SD, in a regime that
+# stresses the approximation. Every SLS SE is a delta-method propagation through a
+# nonlinear transform -- Mw = 1/a (Zimm/Debye) or 1/a^2 (Berry), Rg = sqrt(3b/a),
+# Guinier Mw = exp(intercept), 2*A2*Mw = slope/intercept, Berry A2 = a*d -- so each
+# is validated here. The two LINEAR pass-throughs (Zimm a2_se = 0.5*d, and the
+# calibration-free a2_se = two_a2_mw_se/(2 Mw) with Mw treated exact) inherit the
+# HC3 covariance's own validation (test_uncertainty) and are only existence-checked.
+#
+# Pattern mirrors test_uncertainty.test_hc3_coverage_heteroscedastic: 400 noisy
+# synthetic sets, compare mean(reported SE) to the sampling SD of the recovered
+# quantity within rel=0.25, at a realistic 3% per-angle intensity SNR. A FAILURE
+# here is a real finding (the delta method is inadequate in-regime), NOT a test to
+# be loosened -- surface it instead.
+#
+# EXCEPTION -- the calibration-free 2*A2*Mw = slope/intercept (Session 97). Its SE is
+# validated by a *conservative-safe* assertion, not the symmetric rel=0.25 band,
+# because on the short, high-leverage concentration ladder (n=5, endpoint leverage
+# ~0.5-0.7) HC3 meets-or-exceeds the sampling spread (~1.3x here) -- it never
+# under-reports (the safe direction under invariant 8) and tightens to ~1.0 as the
+# ladder lengthens. This was root-caused (see that test): it is NOT a shared-reference
+# 'common-mode' artefact (refitting z=c/excess without any shared reference gives a
+# bit-identical SE) and NOT linearization failure (a GLS fit with the true per-point
+# variance recovers the sampling SD to 0.1%); it is purely HC3's residual-based
+# variance estimate being conservative on so few, high-leverage points -- exactly the
+# small-n conservatism Advanced Guide 15.1 documents (see the calibration-free A2
+# uncertainty discussion, 11.4 / 15.1).
+
+_MC_N = 400
+_MC_NOISE = 0.03          # 3% per-angle intensity scatter -- realistic SLS SNR
+_MC_TOL = 0.25            # same tolerance as the HC3 coverage test
+_MC_SEED0 = 70000         # base seed; draw i uses _MC_SEED0 + i (reproducible)
+
+
+def _mc_draws(run_one, n=_MC_N):
+    """run_one(seed) -> {name: (value, se)}; collect n draws into value/se arrays."""
+    keys = None
+    vals: dict = {}
+    ses: dict = {}
+    for i in range(n):
+        out = run_one(_MC_SEED0 + i)
+        if keys is None:
+            keys = list(out)
+            vals = {k: [] for k in keys}
+            ses = {k: [] for k in keys}
+        for k in keys:
+            v, s = out[k]
+            vals[k].append(np.nan if v is None else v)
+            ses[k].append(np.nan if s is None else s)
+    return ({k: np.asarray(v, float) for k, v in vals.items()},
+            {k: np.asarray(s, float) for k, s in ses.items()})
+
+
+def _assert_se_matches_sampling(vals, ses, key):
+    v, s = vals[key], ses[key]
+    finite = np.isfinite(v) & np.isfinite(s)
+    assert finite.sum() > 0.9 * len(v), (
+        f"{key}: {len(v) - finite.sum()}/{len(v)} draws were non-finite")
+    empirical_sd = float(np.std(v[finite], ddof=1))
+    mean_reported = float(np.mean(s[finite]))
+    assert mean_reported == pytest.approx(empirical_sd, rel=_MC_TOL), (
+        f"{key}: reported SE {mean_reported:.4g} vs sampling SD {empirical_sd:.4g} "
+        f"(rel tol {_MC_TOL}) -- delta-method SE may be inadequate in this regime")
+
+
+def _noisy_rr(seed, calibrated=True):
+    truth = S.SERIES["PEG 1M"]
+    meas, cal = S.make_sls_set(truth["mw"], truth["rg"], truth["a2"],
+                               noise=_MC_NOISE, seed=seed)
+    return S.rayleigh_results(meas, cal, calibrated=calibrated)
+
+
+@pytest.mark.slow
+def test_zimm_se_montecarlo():
+    def run_one(seed):
+        z = sls.zimm_analysis(_noisy_rr(seed), method="zimm")
+        return {"mw": (z.mw_g_per_mol, z.mw_se),      # nonlinear 1/a
+                "rg": (z.rg_nm, z.rg_se),             # nonlinear sqrt(3b/a)
+                "a2": (z.a2_mol_mL_per_g2, z.a2_se)}  # LINEAR 0.5*d -> inherits
+    vals, ses = _mc_draws(run_one)
+    _assert_se_matches_sampling(vals, ses, "mw")
+    _assert_se_matches_sampling(vals, ses, "rg")
+    assert np.all(np.isfinite(ses["a2"])) and np.all(ses["a2"] > 0)  # inherited
+
+
+@pytest.mark.slow
+def test_berry_se_montecarlo():
+    def run_one(seed):
+        b = sls.zimm_analysis(_noisy_rr(seed), method="berry")
+        return {"mw": (b.mw_g_per_mol, b.mw_se),      # nonlinear -2/a^3
+                "rg": (b.rg_nm, b.rg_se),             # nonlinear sqrt(3b/a)
+                "a2": (b.a2_mol_mL_per_g2, b.a2_se)}  # nonlinear a*d
+    vals, ses = _mc_draws(run_one)
+    for key in ("mw", "rg", "a2"):
+        _assert_se_matches_sampling(vals, ses, key)
+
+
+@pytest.mark.slow
+def test_debye_se_montecarlo():
+    def run_one(seed):
+        d = sls.debye_analysis(_noisy_rr(seed)[0])    # lowest non-zero concentration
+        return {"mw": (d.mw_apparent_g_per_mol, d.mw_apparent_se),  # 1/intercept
+                "rg": (d.rg_apparent_nm, d.rg_apparent_se)}         # sqrt(3 slope/intercept)
+    vals, ses = _mc_draws(run_one)
+    _assert_se_matches_sampling(vals, ses, "mw")
+    _assert_se_matches_sampling(vals, ses, "rg")
+
+
+@pytest.mark.slow
+def test_guinier_se_montecarlo():
+    def run_one(seed):
+        g = sls.guinier_analysis(_noisy_rr(seed)[0])
+        return {"mw": (g.mw_apparent_g_per_mol, g.mw_apparent_se),  # exp(intercept)
+                "rg": (g.rg_nm, g.rg_se)}                           # sqrt(-3 slope)
+    vals, ses = _mc_draws(run_one)
+    _assert_se_matches_sampling(vals, ses, "mw")
+    _assert_se_matches_sampling(vals, ses, "rg")
+
+
+@pytest.mark.slow
+def test_calibration_free_a2_se_conservative():
+    """The calibration-free 2*A2*Mw SE is HC3-through-slope/intercept, and on the
+    short, high-leverage ladder it is CONSERVATIVE, not exact -- it meets-or-exceeds
+    the sampling spread (never under-reports) rather than tracking it to rel=0.25.
+
+    Root cause (Session 97, superseding the earlier shared-reference story): the
+    ~1.3x over-report is HC3's residual-based variance estimate being cautious on so
+    few (n=5), high-leverage (endpoint h ~ 0.5-0.7) points. Verified NOT a shared-
+    reference/common-mode artefact -- refitting z = c/excess (no shared reference)
+    yields a bit-identical SE -- and NOT linearization failure -- a GLS fit with the
+    true per-point variance recovers the sampling SD to 0.1%. So the delta-method
+    propagation is exact; only the single-shot variance ESTIMATE is conservative, and
+    it tightens to ~1.0 as the concentration ladder lengthens (n >= 12-16). This is
+    the safe direction under invariant 8 (over-, never under-reporting) and the small-n
+    conservatism Advanced Guide 15.1 already documents for HC3. The a2 = (2A2Mw)/(2 Mw)
+    SE is a LINEAR pass-through and is only existence-checked.
+    """
+    truth = S.SERIES["PEG 1M"]
+    angle = float(S.DEFAULT_ANGLES[0])                # lowest angle, closest to q -> 0
+
+    def run_one(seed):
+        cf = sls.calibration_free_a2(_noisy_rr(seed), angle_deg=angle,
+                                     mw_g_per_mol=truth["mw"])
+        return {"two_a2_mw": (cf.two_a2_mw, cf.two_a2_mw_se),  # slope/intercept
+                "a2": (cf.a2_mol_mL_per_g2, cf.a2_se)}         # LINEAR /(2 Mw) -> inherits
+    vals, ses = _mc_draws(run_one)
+    v, s = vals["two_a2_mw"], ses["two_a2_mw"]
+    finite = np.isfinite(v) & np.isfinite(s)
+    assert finite.sum() > 0.9 * len(v), (
+        f"two_a2_mw: {len(v) - finite.sum()}/{len(v)} draws were non-finite")
+    ratio = float(np.mean(s[finite])) / float(np.std(v[finite], ddof=1))
+    # Conservative-safe band: HC3 must meet-or-exceed the sampling spread here (>= 1.0,
+    # never under-reporting) without being grossly inflated (<= 1.6). Deterministic
+    # value on these fixed seeds is ~1.29. A ratio < 1.0 would mean it started
+    # UNDER-reporting -- a real regression, not a tolerance to widen.
+    assert 1.0 <= ratio <= 1.6, (
+        f"calibration-free 2*A2*Mw SE/SD = {ratio:.3f} is outside the conservative-safe "
+        f"band [1.0, 1.6]; < 1.0 means the SE now UNDER-reports (see Session 97).")
+    # a2_se is the linear pass-through /(2 Mw): finite exactly where two_a2_mw_se is,
+    # so gate it with the same finite mask (not all-finite, which would over-constrain).
+    a2se = ses["a2"][finite]
+    assert np.all(np.isfinite(a2se)) and np.all(a2se > 0)  # linear inherit
+
+
+@pytest.mark.slow
+def test_calibration_free_a2_se_ols_under_reports():
+    """The OLS opt-in demonstrably reaches the classical estimator: on the SAME short,
+    high-leverage ladder where HC3 sits at ~1.29 (conservative), classical OLS lands
+    near ~0.90 mean(SE)/sampling-SD -- i.e. it UNDER-reports (Session 97). This is the
+    exact safe-direction violation invariant 8 forbids by default and why HC3, not OLS,
+    is the default; the toggle exposes OLS only for like-for-like comparability, with
+    provenance recorded. This test both (a) proves the estimator param routes through to
+    the covariance and (b) pins the documented ~10% under-report."""
+    truth = S.SERIES["PEG 1M"]
+    angle = float(S.DEFAULT_ANGLES[0])
+
+    def run_one(seed):
+        cf = sls.calibration_free_a2(_noisy_rr(seed), angle_deg=angle,
+                                     mw_g_per_mol=truth["mw"], estimator="ols")
+        assert cf.se_estimator == "ols"
+        return {"two_a2_mw": (cf.two_a2_mw, cf.two_a2_mw_se)}
+    vals, ses = _mc_draws(run_one)
+    v, s = vals["two_a2_mw"], ses["two_a2_mw"]
+    finite = np.isfinite(v) & np.isfinite(s)
+    assert finite.sum() > 0.9 * len(v)
+    ratio = float(np.mean(s[finite])) / float(np.std(v[finite], ddof=1))
+    # OLS under-reports here (< 1.0), around ~0.90; a band that excludes the HC3
+    # conservative regime (>= 1.0) and pins the documented magnitude.
+    assert 0.80 <= ratio < 1.0, (
+        f"classical-OLS 2*A2*Mw SE/SD = {ratio:.3f}; expected the documented ~0.90 "
+        f"under-report on the n=5 ladder (Session 97).")

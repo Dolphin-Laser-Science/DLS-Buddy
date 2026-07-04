@@ -346,6 +346,9 @@ def test_manual_mw_survives_reload_and_recompute(controller, tmp_path):
     c.set_manual_mw(sid, 7.7e5)              # hand-entered (e.g. characterised in water)
     sr = c.workspace.samples[sid].result_for(None)
     assert sr.mw_source == "user"
+    # a hand-entered Mw is a trusted (thermodynamic, calibrated) value
+    assert sr.mw_apparent is False
+    assert sr.calibrated is True
 
     # a re-analysis must NOT overwrite a user Mw
     c.run_zimm(sid, method="zimm")
@@ -360,6 +363,7 @@ def test_manual_mw_survives_reload_and_recompute(controller, tmp_path):
     sr = c.workspace.samples[sid].result_for(None)
     assert sr.mw_g_per_mol == pytest.approx(7.7e5, rel=1e-9)
     assert sr.mw_source == "user"
+    assert sr.calibrated is True
 
 
 def test_save_load_session_reloads_equal(controller, tmp_path):

@@ -278,6 +278,10 @@ class SLSModule(QtWidgets.QWidget):
             'only — a quick estimate, not extrapolated.',
             'Zimm fits the standard plot; <b>Berry</b> (√ axis) is better for larger '
             'or higher-Mw particles where Zimm curves.',
+            'Flags under the plot come in two tiers: a calm <b>ⓘ</b> note is a neutral, '
+            'expected qualifier (e.g. “apparent”, “± statistical only”) — not a problem; '
+            'a bold red <b>⚠</b> is a genuine data-quality issue (uncalibrated, or the '
+            'two extrapolation routes disagree by &gt;10%).',
             'See the Advanced Guide for the equations.',
         ])
         form = QtWidgets.QFormLayout(box)
@@ -675,11 +679,18 @@ class SLSModule(QtWidgets.QWidget):
         self.header.setText(header_html)
         self._runnable = runnable
         self.run_button.setEnabled(runnable)
+        # A stale soft-flag must never survive a sample/state switch (like the result
+        # table, #14). QLabel.clear() drops only the text, so clear the tooltip too —
+        # otherwise the calibration-free conservative-SE tooltip could linger on an
+        # unrelated sample. A subsequent run re-sets both in _present_method.
+        self.flag_label.clear()
+        self.flag_label.setToolTip('')
+        self.flag_label.setRole('error')   # reset the tier so a stale qualifier
+        self.flag_label.setBold(True)      # colour never survives a state switch
         if not runnable:
             self.export_button.setEnabled(False)
             self._export = None
             self.status.clear()
-            self.flag_label.clear()
             self._clear_plot()
 
     # ------------------------------------------------------------ fraction ---
@@ -992,6 +1003,7 @@ class SLSModule(QtWidgets.QWidget):
         calls itself (the masked-point overlay reads the cached full series)."""
         c = self.controller
         self._export = None
+        self.flag_label.setToolTip('')      # cleared per display; set per-method below
         if method in ('zimm', 'berry'):
             rr = payload['rr']
             res = payload['res']
@@ -1015,7 +1027,8 @@ class SLSModule(QtWidgets.QWidget):
                                           getattr(res, 'rg_apparent_se', None))),
                 ('R²', _fmt(res.r_squared)),
             ])
-            self.flag_label.setText(self._apparent_flag(res.calibrated) + _STAT_CAVEAT)
+            self._set_flag(self._apparent_flag(res.calibrated) + _STAT_CAVEAT,
+                           problem=not res.calibrated)
         elif method == 'guinier':
             res = payload['res']
             self._export = (f'{sid}_guinier.csv', lambda p: c.export_guinier(res, p))
@@ -1027,27 +1040,37 @@ class SLSModule(QtWidgets.QWidget):
                 ('qRg(max)', _fmt(res.qrg_max, 2)),
                 ('R²', _fmt(res.r_squared)),
             ])
-            flag = ('⚠ apparent (single concentration): Rg still contains '
+            # Tier tracks severity: the plain "apparent" note is a neutral qualifier;
+            # an out-of-regime qRg(max) is a genuine caution (red). _set_flag adds the glyph.
+            problem = not res.guinier_valid
+            flag = ('apparent (single concentration): Rg still contains '
                     'concentration effects — extrapolate over c for the '
                     'thermodynamic Rg.')
-            if not res.guinier_valid:
+            if problem:
                 flag += (f'  qRg(max) = {_fmt(res.qrg_max, 2)} > 1.3 is outside the '
                          'Guinier regime — treat Rg with caution (Berry/Zimm '
                          'linearise the high-qRg regime better).')
-            self.flag_label.setText(flag)
+            self._set_flag(flag, problem=problem)
         elif method == 'single':
             res = payload['res']
             self._export = (f'{sid}_single_angle.csv',
                             lambda p: c.export_single_angle(res, p))
             self._clear_plot()
+            mw_mark = '' if res.mw_reliable else '  [unreliable — uncalibrated]'
             self._fill_result_table([
-                ('Mw_app (g/mol)', _fmt(res.mw_apparent_g_per_mol)),
+                ('Mw_app (g/mol)', _fmt(res.mw_apparent_g_per_mol) + mw_mark),
                 ('Angle', f'{res.angle_deg:.0f}°'),
                 ('c (mg/mL)', f'{res.concentration_g_per_mL * 1000:.3g}'),
             ])
-            self.flag_label.setText(
-                '⚠ apparent: single angle + single concentration (contains the '
-                'form factor and the 2A₂c term).')
+            if res.calibrated:
+                self._set_flag(
+                    'apparent: single angle + single concentration (contains the '
+                    'form factor and the 2A₂c term).', problem=False)
+            else:
+                self._set_flag(
+                    'apparent + uncalibrated: single angle + single concentration '
+                    '(contains the form factor and the 2A₂c term), and Mw_app is on an '
+                    'arbitrary scale.', problem=True)
         elif method == 'calfree':
             res = payload['res']
             self._export = (f'{sid}_calibration_free_a2.csv',
@@ -1062,9 +1085,18 @@ class SLSModule(QtWidgets.QWidget):
                  format_pm(res.two_a2_mw, getattr(res, 'two_a2_mw_se', None))),
                 ('A₂ (mol·mL/g²)', a2),
             ])
-            self.flag_label.setText(
-                '(± statistical only)'
-                if getattr(res, 'two_a2_mw_se', None) is not None else '')
+            if getattr(res, 'two_a2_mw_se', None) is not None:
+                self._set_flag('± statistical only', problem=False)
+                self.flag_label.setToolTip(
+                    'No calibration or dn/dc enters this estimator — they cancel in the '
+                    'intensity ratio, so 2·A₂·Mw is systematics-free by construction; the '
+                    '± is the statistical (regression) SE. Being a ratio of two fitted '
+                    'coefficients on a short concentration ladder, it is conservative — it '
+                    'meets or exceeds the true spread and never under-reports, and tightens '
+                    'with more concentration points or repeat runs. See the Advanced Guide §15.1.')
+            else:
+                self._set_flag('', problem=False)
+                self.flag_label.setToolTip('')   # no SE → drop the §15.1 hover
         else:  # rayleigh
             rr = payload['rr']
             self._export = (f'{sid}_rayleigh.csv',
@@ -1079,9 +1111,10 @@ class SLSModule(QtWidgets.QWidget):
             calibrated = all(r.calibrated for r in rr)
             self._clear_result_table()           # a per-c series, not a scalar result
             self.status.setText(f'Excess Rayleigh ratio for {len(rr)} concentrations.')
-            self.flag_label.setText(
+            self._set_flag(
                 '' if calibrated else
-                '⚠ uncalibrated: ΔR is on an arbitrary scale.')
+                'uncalibrated: ΔR is on an arbitrary scale.',
+                problem=not calibrated)
         self._overlay_masked(method, sid)
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)      # single-angle method leaves ax None
@@ -1258,7 +1291,7 @@ class SLSModule(QtWidgets.QWidget):
         ])
         flag = (
             '' if res.calibrated else
-            '⚠ uncalibrated: Mw and absolute A₂ are unreliable; Rg and the '
+            'uncalibrated: Mw and absolute A₂ are unreliable; Rg and the '
             'calibration-free 2·A₂·Mw remain valid (the scale cancels).')
         # Two-route consistency: Mw can be read off the c→0 line OR the q→0 line, and
         # the two should match; a large gap warns of curvature/extrapolation error
@@ -1267,19 +1300,47 @@ class SLSModule(QtWidgets.QWidget):
         agree = getattr(res, 'extrapolation_agreement_rel', None)
         mc0 = getattr(res, 'mw_from_c0_g_per_mol', None)
         mq0 = getattr(res, 'mw_from_q0_g_per_mol', None)
+        route_disagrees = False
         if agree is not None and math.isfinite(agree) and mc0 is not None and mq0 is not None:
             note = (f'Mw from the two extrapolation routes — c→0: {_fmt(mc0)}, '
                     f'q→0: {_fmt(mq0)} g/mol — differ by {agree * 100:.0f}%')
             if agree > 0.10:
-                note += ' ⚠ >10% — check curvature/extrapolation'
+                route_disagrees = True
+                note += ' >10% — check curvature/extrapolation'
             flag = (flag + '\n' + note) if flag else note
         if mw_se is not None or a2_se is not None:
             flag = (flag + '\n' if flag else '') + _STAT_CAVEAT.strip()
-        self.flag_label.setText(flag)
+        # Red alarm only for a genuine problem (uncalibrated, or the two Mw routes
+        # disagree by >10 %); the plain two-route note and the ± caveat are neutral
+        # qualifiers. _set_flag adds the ⚠/ⓘ glyph to match the tier.
+        problem = (not res.calibrated) or route_disagrees
+        self._set_flag(flag, problem=problem)
+
+    def _set_flag(self, text: str, *, problem: bool = True) -> None:
+        """Set the shared flag label, choosing its visual tier by severity.
+
+        ``problem=True`` → a genuine data-quality issue (uncalibrated, >10 % route
+        disagreement …): bold red ``error``, message led with ⚠.
+        ``problem=False`` → a neutral, expected result-type qualifier (apparent /
+        ± statistical): a calm non-bold ``qualifier`` accent, message led with ⓘ.
+        Both stay visible (invariant 7 — apparent is never hidden); only the alarm
+        level differs. Empty text falls back to the default (red/bold) so no stale
+        qualifier colour lingers behind a later message.
+
+        The leading tier glyph is added HERE from ``problem`` — callers pass
+        glyph-less text — so the glyph and the colour tier can never disagree."""
+        alarm = problem or not text
+        self.flag_label.setRole('error' if alarm else 'qualifier')
+        self.flag_label.setBold(alarm)
+        if text:
+            text = f"{'⚠' if problem else 'ⓘ'} {text}"
+        self.flag_label.setText(text)
 
     @staticmethod
     def _apparent_flag(calibrated: bool) -> str:
-        base = '⚠ apparent (single concentration): intercept is 1/Mw + 2A₂c.'
+        # Glyph-less: _set_flag prepends the tier glyph. The uncalibrated clause is the
+        # genuine problem the caller routes on (problem=not calibrated).
+        base = 'apparent (single concentration): intercept is 1/Mw + 2A₂c.'
         if not calibrated:
             base += ' Also uncalibrated → Mw unreliable (Rg survives).'
         return base

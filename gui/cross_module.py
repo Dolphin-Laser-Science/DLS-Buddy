@@ -357,9 +357,12 @@ class CrossSampleModule(QtWidgets.QWidget):
                 rho = self.controller.compute_sample_rho(sid, frac)
                 rho_text = (format_pm(rho.rho, rho.rho_se)
                             if rho.rho_se is not None else _fmt(rho.rho))
+                est_note = (' [SE: classical OLS]'
+                            if rho.se_estimator == 'ols' else '')
                 rho_tip = (rho.interpretation if rho.rho_se is None else
                            rho.interpretation + '\n(± = statistical SE, from the '
-                           'Rg and Rh regression fits; excludes systematics.)')
+                           'Rg and Rh regression fits; excludes systematics.'
+                           + est_note + ')')
                 cells = [label,
                          self._disp_radius(rho.rg_nm, runit),
                          self._disp_radius(rho.rh_nm, runit),

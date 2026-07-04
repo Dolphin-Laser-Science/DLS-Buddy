@@ -335,10 +335,12 @@ class ScalingResult:
     r_squared: float
     n_points: int
     fit_valid: bool                   # at least two positive (x, y) points
-    exponent_se: Optional[float] = None   # HC3 SE of the exponent (None if < 2 dof)
+    exponent_se: Optional[float] = None   # regression SE of the exponent (None if < 2 dof)
+    se_estimator: str = 'hc3'             # covariance estimator behind exponent_se
 
 
-def fit_power_law(x: Sequence[float], y: Sequence[float]) -> 'ScalingResult':
+def fit_power_law(x: Sequence[float], y: Sequence[float],
+                  estimator: str = 'hc3') -> 'ScalingResult':
     """Fit y = prefactor * x^exponent by least squares in log-log space.
 
     Only finite, strictly positive (x, y) pairs are used (a log needs them). With
@@ -354,10 +356,11 @@ def fit_power_law(x: Sequence[float], y: Sequence[float]) -> 'ScalingResult':
         return ScalingResult(xv, yv, float('nan'), float('nan'), float('nan'),
                              n, False)
     lx, ly = np.log10(xv), np.log10(yv)
-    lf = unc.linear_fit(lx, ly)        # exponent = slope of log10(y) vs log10(x)
+    lf = unc.linear_fit(lx, ly, estimator)  # exponent = slope of log10(y) vs log10(x)
     return ScalingResult(xv, yv, float(lf.slope), float(10.0 ** lf.intercept),
                          float(lf.r_squared), n, True,
-                         exponent_se=unc.se_or_none(lf.slope_se))
+                         exponent_se=unc.se_or_none(lf.slope_se),
+                         se_estimator=estimator)
 
 
 def interpret_scaling_exponent(exponent: float, quantity: str) -> str:

@@ -174,6 +174,20 @@ def test_zimm_calibrated_is_unmarked(tmp_path):
     assert zr.rg_nm == pytest.approx(rg, rel=0.05)
 
 
+def test_single_angle_uncalibrated_marks_mw(tmp_path):
+    # A single-angle Mw_app from an uncalibrated Rayleigh ratio is on an arbitrary
+    # scale, so its Mw column must carry the uncalibrated note (no Rg here to survive).
+    rr, _zr, _rg = _build_uncalibrated_zimm()
+    sa = sls.single_angle_mw(rr[0], float(rr[0].angles_deg[0]))
+    assert sa.calibrated is False and sa.mw_reliable is False
+
+    out = tmp_path / "single_angle.csv"
+    X.export_single_angle(sa, str(out))
+    rows, header = _read_csv(out)
+    _ln, _units, comments, _params = _label_rows(rows)
+    assert comments[header["Mw (apparent)"]] == _UNCAL
+
+
 def test_export_zimm_no_samples_raises(tmp_path):
     # export_zimm filters out the c = 0 reference; with no non-zero results it
     # has nothing to write and must raise.

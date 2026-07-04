@@ -304,6 +304,8 @@ class SampleRho:
     interpretation: str
     shape: str = ''              # concise architecture label (e.g. 'random coil')
     rho_se: Optional[float] = None  # statistical SE (only when both Rg and Rh have one)
+    se_estimator: Optional[str] = None  # covariance estimator behind rho_se (Rg/Rh
+    #                                     regression SEs); None when rho_se is None
 
 
 @dataclass
@@ -745,6 +747,33 @@ class Controller:
         return len(dead)
 
     # ----------------------------------------------------------------------
+    # SE-estimator switch: identify + clear results whose ± depends on it
+    # ----------------------------------------------------------------------
+    # Cached analyses that carry a regression standard error routed through the
+    # selectable covariance estimator (uncertainty.linear_fit / multilinear_fit).
+    # Switching HC3 <-> OLS changes only the ±, never the point estimate.
+    _SE_BEARING_KINDS = ('zimm', 'debye', 'guinier', 'cal_free_a2',
+                         'gamma_q2', 'conc_extrap')
+
+    def se_dependent_result_count(self) -> int:
+        """How many cached results carry a regression SE whose value depends on the
+        chosen covariance estimator (HC3 vs classical OLS). Used to decide whether
+        switching the estimator needs a clear-and-warn. Point estimates (Mw, Rg, D,
+        Rh) are unaffected — only the ± changes."""
+        return sum(1 for k in self.results if k[0] in self._SE_BEARING_KINDS)
+
+    def clear_se_dependent_results(self) -> int:
+        """Drop cached SE-bearing analyses (Zimm/Berry, Debye, Guinier, calibration-
+        free A2, Γ-vs-q², D-vs-c) so they recompute under the newly-selected
+        covariance estimator. Leaves the sample Rh/Mw/Rg point-estimate rows intact
+        (the estimator changes only their ±, which refreshes on the next run).
+        Returns the number of cache entries removed."""
+        dead = [k for k in self.results if k[0] in self._SE_BEARING_KINDS]
+        for k in dead:
+            self.results.pop(k, None)
+        return len(dead)
+
+    # ----------------------------------------------------------------------
     # DLS analysis orchestration
     # ----------------------------------------------------------------------
     def run_cumulants(self, item_id: str, order: Optional[int] = None, **kw):
@@ -794,9 +823,11 @@ class Controller:
         elif method == 'lognormal':
             res = dls_engine.fit_lognormal(m, **kw)
         else:
-            # CONTIN: seed the L-curve alpha sweep range from settings too.
+            # CONTIN: seed the alpha sweep range + selection method from settings too.
             kw.setdefault('alpha_min', self.settings.lcurve_alpha_min)
             kw.setdefault('alpha_max', self.settings.lcurve_alpha_max)
+            kw.setdefault('alpha_method', self.settings.contin_alpha_method)
+            kw.setdefault('ftest_prob_reject', self.settings.contin_ftest_prob_reject)
             res = dls_engine.fit_contin(m, **kw)
         self.results[('distribution', item_id, method)] = res
         self._snapshot_distribution(item_id, method, res)
@@ -874,6 +905,7 @@ class Controller:
                 and (include_ids is None or lm.item_id in include_ids)]
         kw.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
         kw.setdefault('cumulant_method', self.settings.cumulant_method)
+        kw.setdefault('estimator', self.settings.se_estimator)
         res = dls_engine.analyze_gamma_q2(meas, **kw)
         self.results[('gamma_q2', sample_id, fraction)] = res
         # Gamma -> q->0 is APPARENT (q-extrapolated only; single c folded out).
@@ -881,7 +913,8 @@ class Controller:
             sample_id=sample_id, source_kind='gamma_q2', source_set=f'{fraction}',
             rh_nm=getattr(res, 'rh_nm', None), rh_se=getattr(res, 'rh_se', None),
             is_apparent=True, rh_type_label='apparent',
-            from_label=f'Γ vs q² ({len(meas)} angles)', fraction=fraction))
+            from_label=f'Γ vs q² ({len(meas)} angles)', fraction=fraction,
+            se_estimator=getattr(res, 'se_estimator', None)))
         return res
 
     def run_concentration_extrapolation(self, sample_id: str,
@@ -898,6 +931,7 @@ class Controller:
                 and (include_ids is None or lm.item_id in include_ids)]
         kw.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
         kw.setdefault('cumulant_method', self.settings.cumulant_method)
+        kw.setdefault('estimator', self.settings.se_estimator)
         res = dls_engine.extrapolate_diffusion_vs_concentration(meas, **kw)
         self.results[('conc_extrap', sample_id, fraction)] = res
         # D vs c -> c->0 is THERMODYNAMIC (invariant 7).
@@ -905,7 +939,8 @@ class Controller:
             sample_id=sample_id, source_kind='conc_extrap', source_set=f'{fraction}',
             rh_nm=getattr(res, 'rh0_nm', None), rh_se=getattr(res, 'rh0_se', None),
             is_apparent=False, rh_type_label='thermodynamic',
-            from_label=f'D vs c ({len(meas)} concentrations)', fraction=fraction))
+            from_label=f'D vs c ({len(meas)} concentrations)', fraction=fraction,
+            se_estimator=getattr(res, 'se_estimator', None)))
         return res
 
     # ---- DLS Summary snapshot writers (durable display scalars) ----
@@ -1256,6 +1291,8 @@ class Controller:
         if method == 'contin':
             kw['alpha_min'] = self.settings.lcurve_alpha_min
             kw['alpha_max'] = self.settings.lcurve_alpha_max
+            kw.setdefault('alpha_method', self.settings.contin_alpha_method)
+            kw.setdefault('ftest_prob_reject', self.settings.contin_ftest_prob_reject)
             res = dls_engine.fit_contin(m, **kw)
             return getattr(res, 'distribution', res)   # ContinResult wraps it
         raise ValueError(f"Unknown distribution method {method!r}.")
@@ -1361,7 +1398,7 @@ class Controller:
                 f"Only {n_conc} concentration(s) remain after masking; a "
                 f"{method.capitalize()} extrapolation needs at least two. Use "
                 f"Debye or Guinier for single-concentration analysis.")
-        res = sls_engine.zimm_analysis(rr, method=method)
+        res = sls_engine.zimm_analysis(rr, method=method, estimator=self.settings.se_estimator)
         self.results[('zimm', sample_id, method, fraction)] = res
         # attach Mw/Rg/A2 to this fraction's sample result, marking provenance.
         s = self.workspace.samples[sample_id].result_for(fraction)
@@ -1397,6 +1434,7 @@ class Controller:
         r = self.workspace.samples[sample_id].result_for(fraction)
         r.set_mw(mw_g_per_mol, source='user')
         r.mw_apparent = False
+        r.calibrated = True               # trusted value; also clears any stale flag from a prior run
         r.mw_label = 'user-entered'
         r.mw_se = None                    # a hand-entered value carries no statistical SE
 
@@ -1529,7 +1567,8 @@ class Controller:
                 angle_deg=a, q_m_inv=q, gamma_vv_s_inv=g_vv, gamma_vh_s_inv=g_vh))
 
         res = depol_engine.analyze_ddls(
-            points, temperature_K=t_k, viscosity_Pa_s=eta, rod_length_nm=rod_length_nm)
+            points, temperature_K=t_k, viscosity_Pa_s=eta, rod_length_nm=rod_length_nm,
+            estimator=self.settings.se_estimator)
         info = {
             'paired_angles': paired_angles,
             'vv_only': sorted(set(vv) - set(vh)),
@@ -1607,7 +1646,7 @@ class Controller:
                   fraction: Optional[str] = None):
         """Single-concentration apparent Debye analysis (Kc/dR vs q^2)."""
         r = self._rayleigh_at_concentration(sample_id, concentration_g_per_mL, fraction)
-        res = sls_engine.debye_analysis(r)
+        res = sls_engine.debye_analysis(r, estimator=self.settings.se_estimator)
         self.results[('debye', sample_id, concentration_g_per_mL, fraction)] = res
         return res
 
@@ -1619,7 +1658,8 @@ class Controller:
         r = self._rayleigh_at_concentration(sample_id, concentration_g_per_mL, fraction)
         if qrg_max_valid is None:
             qrg_max_valid = self.settings.guinier_qrg_max
-        res = sls_engine.guinier_analysis(r, qrg_max_valid=qrg_max_valid)
+        res = sls_engine.guinier_analysis(r, qrg_max_valid=qrg_max_valid,
+                                          estimator=self.settings.se_estimator)
         self.results[('guinier', sample_id, concentration_g_per_mL, fraction)] = res
         return res
 
@@ -1640,7 +1680,8 @@ class Controller:
         mw = mw_g_per_mol
         if mw is None:
             mw = self.workspace.samples[sample_id].result_for(fraction).effective_mw()
-        res = sls_engine.calibration_free_a2(rr, angle_deg, mw_g_per_mol=mw)
+        res = sls_engine.calibration_free_a2(rr, angle_deg, mw_g_per_mol=mw,
+                                             estimator=self.settings.se_estimator)
         self.results[('cal_free_a2', sample_id, angle_deg, fraction)] = res
         return res
 
@@ -2009,7 +2050,8 @@ class Controller:
         if n_conc >= 2:
             for method in ('zimm', 'berry'):
                 try:
-                    res = sls_engine.zimm_analysis(rr, method=method)
+                    res = sls_engine.zimm_analysis(rr, method=method,
+                                                   estimator=self.settings.se_estimator)
                 except Exception:
                     continue
                 if not np.isfinite(res.rg_nm):
@@ -2029,7 +2071,7 @@ class Controller:
         for r in nonzero:
             c = r.concentration_g_per_mL
             try:
-                d = sls_engine.debye_analysis(r)
+                d = sls_engine.debye_analysis(r, estimator=self.settings.se_estimator)
                 if np.isfinite(d.rg_apparent_nm):
                     r2 = float(d.r_squared)
                     cands.append(ResultCandidate(
@@ -2043,7 +2085,7 @@ class Controller:
             except Exception:
                 pass
             try:
-                g = sls_engine.guinier_analysis(r)
+                g = sls_engine.guinier_analysis(r, estimator=self.settings.se_estimator)
                 if np.isfinite(g.rg_nm):
                     r2 = float(g.r_squared)
                     cands.append(ResultCandidate(
@@ -2131,7 +2173,8 @@ class Controller:
         if n_conc >= 2:
             for method in ('zimm', 'berry'):
                 try:
-                    res = sls_engine.zimm_analysis(rr, method=method)
+                    res = sls_engine.zimm_analysis(rr, method=method,
+                                                   estimator=self.settings.se_estimator)
                 except Exception:
                     continue
                 if not np.isfinite(res.mw_g_per_mol):
@@ -2152,7 +2195,7 @@ class Controller:
             for kind, fn, mw_attr in (('sls_debye', sls_engine.debye_analysis, 'mw_apparent_g_per_mol'),
                                       ('sls_guinier', sls_engine.guinier_analysis, 'mw_apparent_g_per_mol')):
                 try:
-                    res = fn(r)
+                    res = fn(r, estimator=self.settings.se_estimator)
                 except Exception:
                     continue
                 mw = float(getattr(res, mw_attr))
@@ -2206,7 +2249,8 @@ class Controller:
             return r.a2_mol_mL_per_g2
         try:
             res = sls_engine.zimm_analysis(
-                self.masked_rayleigh(sample_id, fraction), method='zimm')
+                self.masked_rayleigh(sample_id, fraction), method='zimm',
+                estimator=self.settings.se_estimator)
         except Exception:
             return None
         if not np.isfinite(res.a2_mol_mL_per_g2):
@@ -2236,13 +2280,18 @@ class Controller:
         rr = compute_rho(rg_nm=float(r.rg_nm), rh_nm=float(r.rh_nm),
                          rg_se=r.rg_se, rh_se=r.rh_se)
         is_apparent = bool(r.rg_apparent) or bool(r.rh_apparent)
+        # rho_se is a ratio of the Rg and Rh REGRESSION SEs, so it inherits the
+        # selected covariance estimator (a single global setting). Carry that
+        # provenance so an OLS-derived rho ± is never shown unlabelled (invariant 8
+        # clause A). Only meaningful when rho_se exists.
+        rho_estimator = self.settings.se_estimator if rr.rho_se is not None else None
         return SampleRho(
             sample_id=sample_id, rho=rr.rho,
             rg_nm=float(r.rg_nm), rh_nm=float(r.rh_nm),
             rg_label=(r.rg_label or 'Rg'), rh_label=(r.rh_label or 'Rh'),
             rg_source=r.rg_source, rh_source=r.rh_source,
             is_apparent=is_apparent, interpretation=rr.interpretation,
-            shape=rr.shape, rho_se=rr.rho_se)
+            shape=rr.shape, rho_se=rr.rho_se, se_estimator=rho_estimator)
 
     def samples_pairable_rho(self) -> List[str]:
         """Sample ids that have both DLS and SLS (rho = Rg/Rh is possible)."""
@@ -2314,7 +2363,7 @@ class Controller:
                 y.append(float(yv))
                 if res.mw_source != 'user' and res.calibrated is False:
                     uncalibrated = True
-        fit = fit_power_law(mw, y)
+        fit = fit_power_law(mw, y, estimator=self.settings.se_estimator)
         return ScalingData(quantity=quantity, fit=fit, sample_ids=ids, labels=labels,
                            mw=mw, y=y, any_uncalibrated_mw=uncalibrated,
                            n_excluded=excluded)
@@ -2395,7 +2444,12 @@ class Controller:
     def export_distribution(self, result, file_path: str, axis: str = 'rh') -> str:
         """Export an NNLS / CONTIN / lognormal distribution."""
         d = getattr(result, 'distribution', result)
-        return exporter.export_distribution(d, file_path, axis=axis)
+        # CONTIN carries how α was chosen on the wrapper (ContinResult); pass it so the
+        # export records the α-selection method (never ambiguous downstream).
+        return exporter.export_distribution(
+            d, file_path, axis=axis,
+            alpha_selection_method=getattr(result, 'alpha_selection_method', None),
+            ftest_prob_reject=getattr(result, 'ftest_prob_reject', None))
 
     def export_gamma_q2(self, result, file_path: str) -> str:
         return exporter.export_gamma_q2(result, file_path)
@@ -2425,8 +2479,8 @@ class Controller:
                 else row.int_fraction * 100.0,
                 'rh_fast': row.rh_fast_nm, 'rh_slow': row.rh_slow_nm,
                 'rh_type': 'apparent', 'is_average': False,
-                'from': row.label,
-            })
+                'from': row.label, 'se_estimator': None,   # per-measurement fits
+            })                                             # carry no regression SE
         # Table 2 -- sample-level Rh (averages, Gamma-q^2, D-c).
         sample_rows = sorted(
             self.workspace.sample_rh_rows.values(),
@@ -2440,7 +2494,7 @@ class Controller:
                 'int_pct': None, 'rh_fast': None, 'rh_slow': None,
                 'rh_type': row.rh_type_label,
                 'is_average': row.source_kind == 'replicate_avg',
-                'from': row.from_label,
+                'from': row.from_label, 'se_estimator': row.se_estimator,
             })
         return exporter.export_dls_summary(records, file_path)
 

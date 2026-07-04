@@ -9,6 +9,74 @@ window title.
 
 ---
 
+## 0.13.0 — CONTIN α selection: L-curve (default) or Provencher's F-test (2026-07-03)
+
+The DLS Distribution tab now lets you choose how CONTIN picks its regularisation parameter α.
+
+- **L-curve corner** (default, unchanged): the elbow of the fit-vs-smoothness trade-off — modern
+  and robust.
+- **F-test (probability to reject)**: Provencher's original 1982 criterion — the smoothest solution
+  whose fit is not statistically significantly worse than the best. Use it to compare against legacy
+  CONTIN output. A **probability-to-reject** field (default 0.50) tunes the balance: a higher value
+  gives a smoother, more parsimonious distribution; a lower value keeps more detail.
+
+The selector lives on the Distribution tab next to the α controls; picking a method shows only that
+method's controls. The chosen method (and, for the F-test, the level) is noted under the plot and
+written into the CONTIN export. Distributions are unchanged when the default L-curve is left selected.
+Note (Advanced Guide, CONTIN §): the F-test assumes independent residuals, but a single correlogram's
+lag channels are correlated, so its level is a guide rather than an exact test — which is why the
+L-curve stays the default.
+
+---
+
+## 0.12.0 — Choose the uncertainty estimator: HC3 (default) or classical OLS (2026-07-03)
+
+A new **Settings → Uncertainty → Regression SE estimator** control lets you switch the ± reported
+for every straight-line and multilinear fit (SLS Zimm/Berry, Debye, Guinier, calibration-free A₂;
+DLS Γ vs q² and kD; the Rg/A₂–Mw scaling exponent) between two estimators.
+
+- **HC3 (robust)** — the default, unchanged. A heteroscedasticity-consistent standard error that
+  never under-reports when point precision varies across angles or concentrations.
+- **Classical OLS** — the textbook *s*²(XᵀX)⁻¹ standard error. Choose it only to reproduce a value
+  from classical software, a published table, or a spreadsheet **like-for-like**. It can
+  under-report (~10 % low on a short, high-leverage concentration ladder), which is why it is not
+  the default.
+
+The choice is global, persists across restart, and is **recorded on each result and written into
+the export**: an OLS ± column's *Comments* cell reads `SE: classical OLS` (HC3 stays silent). Point
+estimates (Mw, Rg, D, Rh) are identical either way — only the ± changes. Switching the estimator
+asks to confirm, then refreshes the affected results. SLS and DLS CSV exports now also include the
+previously-omitted ± columns (Mw SE, Rg SE, A₂ SE, D SE, …). See Advanced Guide §15.1.1.
+
+---
+
+## 0.11.1 — Calmer warnings: neutral qualifiers no longer look like errors (2026-07-03)
+
+Some SLS results printed a **bold red** line on every single-concentration or single-angle
+run — "apparent…", "± statistical…" — in the same alarm-red used for a genuine problem. Those
+are neutral, expected facts about that kind of result, not failures; too many always-on red
+lines train the eye to ignore all of them.
+
+- **"Apparent" and "± statistical" notes now read as a calm, neutral qualifier** — a
+  steel-blue **ⓘ** line, distinct from the bold red **⚠** reserved for a genuine data-quality
+  issue (uncalibrated, or the two Zimm/Berry extrapolation routes disagreeing by >10%). Nothing
+  is hidden — apparent-vs-thermodynamic is still always shown — only the colour tier changed.
+  A qRg out of the Guinier regime still escalates to the red tier.
+- **The DDLS shape verdict moved to a hover tooltip.** "Sphere consistent / inconsistent" and
+  the "dimensions assume the stated shape" caveat now show on hovering the shape table — the
+  ✓/✗ and ratio cells, plus the panel title *"assumed geometry — not measured"*, still carry
+  the gist at a glance — instead of an always-on line.
+- **Trimmed the distribution replicate-average peak caveat** to one concise sentence.
+- **An uncalibrated single-angle Mw is now flagged.** Previously a single-angle Mw computed
+  without calibration was shown (and exported) with no "uncalibrated" note; it now marks the value
+  `[unreliable — uncalibrated]`, shows the red **⚠** tier, and writes "uncalibrated, arbitrary
+  scale" into the export — matching Debye/Guinier/Zimm.
+
+Data-conditional warnings (PDI>0.3, non-diffusive γ-q², uncalibrated, >10% disagreement,
+unphysical ρv) are unchanged.
+
+---
+
 ## 0.11.0 — One consistent way to choose measurements (2026-07-02)
 
 A deliberate pass to make selecting measurements clean, consistent, and obvious across

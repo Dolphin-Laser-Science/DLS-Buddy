@@ -372,6 +372,8 @@ class DDLSResult:
     method: str                        # 'multi-angle' | 'single-angle'
     single_exponential_valid: Optional[bool]
     notes: str = ''
+    se_estimator: str = 'hc3'          # covariance estimator behind d_t_se (the only
+    #                                    regression SE here; d_r_se is a replicate SEM)
 
 
 def rotational_diffusion_from_rates(gamma_vv_s_inv: float,
@@ -393,7 +395,8 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
                  temperature_K: Optional[float] = None,
                  viscosity_Pa_s: Optional[float] = None,
                  rod_length_nm: Optional[float] = None,
-                 qL_limit: float = _DDLS_QL_SINGLE_EXP_LIMIT) -> DDLSResult:
+                 qL_limit: float = _DDLS_QL_SINGLE_EXP_LIMIT,
+                 estimator: str = 'hc3') -> DDLSResult:
     """Combine a VV/VH decay-rate set into D_r, D_t, Rh_t and the rotational time.
 
     Parameters
@@ -444,7 +447,7 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
 
     # D_t from the VV channel: Gamma_VV = q^2 D_t, slope through the origin.
     if n >= 2:
-        d_t, d_t_se = unc.linear_fit_through_origin(q2, g_vv)
+        d_t, d_t_se = unc.linear_fit_through_origin(q2, g_vv, estimator)
         d_t_se = unc.se_or_none(d_t_se)
         method = 'multi-angle'
     else:
@@ -494,7 +497,7 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
         d_r_rad2_s=d_r, d_r_se=d_r_se,
         rh_t_nm=rh_t_nm, rotational_time_s=rotational_time_s,
         n_angles=n, method=method, single_exponential_valid=single_exp_valid,
-        notes=' '.join(notes))
+        notes=' '.join(notes), se_estimator=estimator)
 
 
 # ===========================================================================

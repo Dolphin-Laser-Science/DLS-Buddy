@@ -160,6 +160,52 @@ def test_contin_bimodal_resolves_large_mode():
     assert any(130 < r < 320 for r in crhs), f"peaks at {[round(r, 1) for r in crhs]}"
 
 
+def _noisy_bimodal(rh_small, rh_large, f_small=0.5, noise=0.003, seed=1):
+    """A two-population correlogram with realistic Gaussian noise on g2-1. The F-test
+    is a STATISTICAL criterion: it needs a meaningful noise floor (on a noiseless fit
+    the least-regularised solution is trivially 'best', so no smoothing is chosen).
+    Real DLS always has noise; this mirrors that."""
+    tau = tau_grid()
+    g1 = (f_small * np.exp(-gamma_for_rh(rh_small) * tau)
+          + (1 - f_small) * np.exp(-gamma_for_rh(rh_large) * tau))
+    g2m1 = 0.9 * g1 ** 2 + np.random.RandomState(seed).normal(0.0, noise, tau.size)
+    return make_measurement(g2m1, tau)
+
+
+def test_contin_ftest_selection_picks_sensible_alpha():
+    """CONTIN with the Provencher F-test picks a sensible, reproducible alpha that
+    still resolves the bimodal, records its provenance, and moves monotonically with
+    the probability-to-reject level (higher -> smoother/larger alpha)."""
+    m = _noisy_bimodal(30.0, 200.0)
+    r = E.fit_contin(m, alpha_method="ftest", ftest_prob_reject=0.5)
+    # provenance recorded on the result
+    assert r.alpha_selection_method == "ftest"
+    assert r.ftest_prob_reject == 0.5
+    assert r.lcurve.dof_eff is not None and r.lcurve.ftest_fc is not None
+    # the F-test alpha comes from the sweep and is interior (not pinned to an end)
+    assert r.lcurve.alphas[0] < r.lcurve.optimal_alpha < r.lcurve.alphas[-1]
+    # it still resolves the large mode
+    peaks = E.find_distribution_peaks(r.distribution)
+    assert any(120 < p.rh_nm < 340 for p in peaks), (
+        f"peaks at {[round(p.rh_nm, 1) for p in peaks]}")
+    # direction: higher probability-to-reject -> smoother (>=) alpha, never rougher
+    alphas = [E.fit_contin(m, alpha_method="ftest", ftest_prob_reject=p).lcurve.optimal_alpha
+              for p in (0.1, 0.5, 0.9)]
+    assert alphas[0] <= alphas[1] <= alphas[2], f"non-monotonic: {alphas}"
+    assert alphas[2] > alphas[0], f"level had no effect: {alphas}"
+
+
+def test_contin_lcurve_default_unchanged_by_ftest_option():
+    """The default (untouched) CONTIN path is bit-identical to before the F-test option
+    existed: same chosen alpha and weights whether or not alpha_method is passed."""
+    m = _noisy_bimodal(30.0, 200.0, seed=7)
+    a = E.fit_contin(m)
+    b = E.fit_contin(m, alpha_method="lcurve")
+    assert a.alpha_selection_method == "lcurve"
+    assert a.lcurve.optimal_alpha == b.lcurve.optimal_alpha
+    assert np.array_equal(a.distribution.weights, b.distribution.weights)
+
+
 def test_nnls_monodisperse_single_peak():
     mono_peaks = E.find_distribution_peaks(E.fit_nnls(monomodal(30.0)))
     assert len(mono_peaks) == 1, f"got {len(mono_peaks)}"

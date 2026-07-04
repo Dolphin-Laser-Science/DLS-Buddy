@@ -176,3 +176,28 @@ def test_rod_dimensions_monte_carlo_se():
     assert res.length_se is not None and res.length_se > 0
     assert res.diameter_se is not None and res.diameter_se > 0
     assert res.aspect_ratio_se is not None and res.aspect_ratio_se > 0
+
+
+@pytest.mark.slow
+def test_sphere_radius_monte_carlo_se():
+    # invariant 8 (sharpened): the sphere radius SE is a delta-method propagation
+    # through a NONLINEAR power, R proportional to D_r^(-1/3) => SE(R)/R = (1/3) SE(D_r)/D_r,
+    # so it needs MC validation (the rod L,d already have it; this closes the sphere
+    # gap flagged in Session 96). Single smooth monotonic power, so the delta method is
+    # accurate at realistic precision and degrades only for large SE(D_r)/D_r; validate
+    # at a stressing 10% per-angle D_r spread.
+    import numpy as np
+    d_r_se = 0.10 * _D_R
+    res = dp.sphere_dimensions_from_diffusion(
+        _D_T, _D_R, temperature_K=_T, viscosity_Pa_s=_WATER_ETA, d_r_se=d_r_se)
+    assert res.radius_rot_se is not None and res.radius_rot_se > 0
+    rng = np.random.default_rng(4321)
+    draws = rng.normal(_D_R, d_r_se, 5000)
+    draws = draws[draws > 0]
+    radii = np.array([
+        dp.sphere_dimensions_from_diffusion(
+            _D_T, dr, temperature_K=_T, viscosity_Pa_s=_WATER_ETA).radius_rot_nm
+        for dr in draws])
+    sampling_sd = float(np.std(radii, ddof=1))
+    # delta-method SE matches the sampling spread to ~1.5% here; 0.15 leaves margin.
+    assert res.radius_rot_se == pytest.approx(sampling_sd, rel=0.15)

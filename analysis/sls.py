@@ -307,12 +307,15 @@ def compute_excess_rayleigh_ratio(
                                               standard_refractive_index)
     else:
         ri_corr = 1.0
-        if abs(sample.solvent_refractive_index - 1.496) > 0.02:
-            # solvent is plausibly not toluene; the correction may be needed
-            extra = (' No standard refractive index given, so the (n_s/n_cal)^2 '
-                     'correction was skipped; supply standard_refractive_index '
-                     'if the solvent differs from the calibration standard.')
-            note = (note + extra) if note else extra.strip()
+        # No standard refractive index supplied -> the (n_s/n_cal)^2 correction was
+        # genuinely skipped, so flag it. We do NOT gate this note on the solvent's
+        # actual n (e.g. "is it toluene?"): without the standard's n we cannot know
+        # whether the solvent matches the calibration standard, and a hard-coded n
+        # would be a solvent-specific magic number (invariants 3 & 4).
+        extra = (' No standard refractive index given, so the (n_s/n_cal)^2 '
+                 'correction was skipped; supply standard_refractive_index '
+                 'if the solvent differs from the calibration standard.')
+        note = (note + extra) if note else extra.strip()
 
     dR = k_c * I_excess * ri_corr   # cm^-1 (arbitrary scale if uncalibrated)
 
@@ -388,8 +391,9 @@ class DebyeResult:
     n_angles: int
     calibrated: bool                  # was the Rayleigh ratio calibrated?
     mw_reliable: bool                 # False if uncalibrated (Rg stays reliable)
-    mw_apparent_se: Optional[float] = None   # statistical (regression) SEs
-    rg_apparent_se: Optional[float] = None
+    mw_apparent_se: Optional[float] = None   # statistical (regression) SEs --
+    rg_apparent_se: Optional[float] = None   # exclude calibration/dn-dc systematics
+    se_estimator: str = 'hc3'                 # covariance estimator behind the SEs
 
 
 @dataclass
@@ -406,6 +410,8 @@ class SingleAngleResult:
     q2_nm2: float
     mw_apparent_g_per_mol: float
     is_apparent: bool                 # always True here
+    calibrated: bool = True           # was the Rayleigh ratio calibrated?
+    mw_reliable: bool = True          # False if uncalibrated (Mw_app on an arbitrary scale)
 
 
 @dataclass
@@ -436,11 +442,13 @@ class GuinierResult:
     is_apparent: bool                 # always True here
     calibrated: bool                  # was the Rayleigh ratio calibrated?
     mw_reliable: bool                 # False if uncalibrated (Rg stays reliable)
-    rg_se: Optional[float] = None            # statistical (regression) SEs
-    mw_apparent_se: Optional[float] = None
+    rg_se: Optional[float] = None            # statistical (regression) SEs --
+    mw_apparent_se: Optional[float] = None   # exclude calibration/dn-dc systematics
+    se_estimator: str = 'hc3'                 # covariance estimator behind the SEs
 
 
-def debye_analysis(rayleigh_result: RayleighRatioResult) -> DebyeResult:
+def debye_analysis(rayleigh_result: RayleighRatioResult,
+                   estimator: str = 'hc3') -> DebyeResult:
     """Single-concentration Debye plot: linear fit of Kc/dR vs q^2.
 
     Gives the apparent molecular weight (from the intercept) and apparent radius
@@ -470,7 +478,7 @@ def debye_analysis(rayleigh_result: RayleighRatioResult) -> DebyeResult:
             "Debye analysis needs at least two angles with finite Kc/dR."
         )
 
-    fit = unc.linear_fit(q2, y)             # cov order [intercept, slope]
+    fit = unc.linear_fit(q2, y, estimator)  # cov order [intercept, slope]
     slope, intercept = fit.slope, fit.intercept
     r2 = fit.r_squared
 
@@ -496,6 +504,7 @@ def debye_analysis(rayleigh_result: RayleighRatioResult) -> DebyeResult:
         calibrated=rayleigh_result.calibrated,
         mw_reliable=rayleigh_result.calibrated,
         mw_apparent_se=mw_se, rg_apparent_se=rg_se,
+        se_estimator=estimator,
     )
 
 
@@ -536,11 +545,14 @@ def single_angle_mw(rayleigh_result: RayleighRatioResult, angle_deg: float) -> S
         concentration_g_per_mL=c, angle_deg=float(rayleigh_result.angles_deg[i]),
         q2_nm2=float(rayleigh_result.q2_nm2[i]),
         mw_apparent_g_per_mol=float(mw_app), is_apparent=True,
+        calibrated=rayleigh_result.calibrated,
+        mw_reliable=rayleigh_result.calibrated,
     )
 
 
 def guinier_analysis(rayleigh_result: RayleighRatioResult,
-                     qrg_max_valid: float = 1.3) -> GuinierResult:
+                     qrg_max_valid: float = 1.3,
+                     estimator: str = 'hc3') -> GuinierResult:
     """Single-concentration Guinier plot: linear fit of ln(dR) vs q^2.
 
     Fits ln(dR) = ln(dR(0)) - (Rg^2/3) q^2. Rg comes from the slope
@@ -581,7 +593,7 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
         )
 
     y = np.log(dRg)
-    fit = unc.linear_fit(q2g, y)            # cov order [intercept, slope]
+    fit = unc.linear_fit(q2g, y, estimator)  # cov order [intercept, slope]
     slope, intercept = fit.slope, fit.intercept
     r2 = fit.r_squared
 
@@ -613,6 +625,7 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
         is_apparent=True, calibrated=rayleigh_result.calibrated,
         mw_reliable=rayleigh_result.calibrated,
         rg_se=rg_se, mw_apparent_se=mw_se,
+        se_estimator=estimator,
     )
 
 
@@ -673,6 +686,7 @@ class ZimmBerryResult:
     mw_from_c0_g_per_mol: Optional[float] = None
     mw_from_q0_g_per_mol: Optional[float] = None
     extrapolation_agreement_rel: Optional[float] = None
+    se_estimator: str = 'hc3'                 # covariance estimator behind the SEs
 
 
 @dataclass
@@ -693,8 +707,12 @@ class CalibrationFreeA2Result:
     two_a2_mw: float                  # slope / intercept = 2 A2 Mw  (mol*mL/g ... * g/mol)
     a2_mol_mL_per_g2: Optional[float] # if mw provided
     r_squared: float
+    # These SEs are free of calibration/dn-dc systematics *by construction*:
+    # 2*A2*Mw = slope/intercept is calibration- and dn/dc-independent (the point of
+    # this estimator), so unlike the Zimm/Debye SEs there is no such systematic to exclude.
     two_a2_mw_se: Optional[float] = None   # statistical SE (slope/intercept covariance)
     a2_se: Optional[float] = None          # if mw provided (mw treated as exact)
+    se_estimator: str = 'hc3'              # covariance estimator behind the SEs
 
 
 def _collect_zimm_points(rayleigh_results: Sequence[RayleighRatioResult]):
@@ -715,6 +733,7 @@ def _collect_zimm_points(rayleigh_results: Sequence[RayleighRatioResult]):
 def zimm_analysis(
     rayleigh_results: Sequence[RayleighRatioResult],
     method: str = 'zimm',
+    estimator: str = 'hc3',
 ) -> ZimmBerryResult:
     """Full Zimm or Berry double extrapolation for Mw, Rg, and A2.
 
@@ -786,7 +805,7 @@ def zimm_analysis(
 
     # Global multilinear fit: ordinate = a + b q^2 + d c, with its 3x3 covariance.
     A = np.column_stack([np.ones_like(q2), q2, c])
-    mf = unc.multilinear_fit(A, ordinate)
+    mf = unc.multilinear_fit(A, ordinate, estimator)
     a, b, d = float(mf.coeffs[0]), float(mf.coeffs[1]), float(mf.coeffs[2])
     cov = mf.cov                          # order (a, b, d)
     r2 = mf.r_squared
@@ -868,6 +887,7 @@ def zimm_analysis(
         mw_se=mw_se, rg_se=rg_se, a2_se=a2_se,
         mw_from_c0_g_per_mol=mw_c0, mw_from_q0_g_per_mol=mw_q0,
         extrapolation_agreement_rel=agree,
+        se_estimator=estimator,
     )
 
 
@@ -877,6 +897,7 @@ def calibration_free_a2(
     reference_index: int = 0,
     mw_g_per_mol: Optional[float] = None,
     use_excess_intensity=None,
+    estimator: str = 'hc3',
 ) -> CalibrationFreeA2Result:
     """A2 from intensity ratios at a fixed angle, without absolute calibration.
 
@@ -945,7 +966,7 @@ def calibration_free_a2(
 
     # Y(c) = (e_ref / c_ref) / (excess / c)
     Y = (e_ref / c_ref) / (excess / conc)
-    fit = unc.linear_fit(conc, Y)          # cov order [intercept, slope]
+    fit = unc.linear_fit(conc, Y, estimator)  # cov order [intercept, slope]
     slope, intercept = fit.slope, fit.intercept
     r2 = fit.r_squared
 
@@ -953,7 +974,11 @@ def calibration_free_a2(
     a2 = (two_a2_mw / (2.0 * mw_g_per_mol)) if mw_g_per_mol else None
 
     # SE of 2A2Mw = slope/intercept: slope & intercept are correlated (same fit),
-    # so propagate through the 2x2 covariance, not as an independent ratio.
+    # so propagate through the 2x2 covariance, not as an independent ratio. On a short
+    # concentration ladder this HC3 SE is CONSERVATIVE (meets-or-exceeds the sampling
+    # spread, ~1.3x at n=5; never under-reports) because HC3 up-weights the high-leverage
+    # endpoints; it tightens toward exact as the ladder lengthens. See advanced_guide
+    # 15.1/11.4 and tests/test_sls.test_calibration_free_a2_se_conservative (Session 97).
     two_a2_mw_se = a2_se = None
     if intercept != 0 and math.isfinite(fit.intercept_se):
         jac = [-slope / intercept ** 2, 1.0 / intercept]   # order [intercept, slope]
@@ -966,4 +991,5 @@ def calibration_free_a2(
         slope=float(slope), intercept=float(intercept), two_a2_mw=two_a2_mw,
         a2_mol_mL_per_g2=a2, r_squared=float(r2),
         two_a2_mw_se=two_a2_mw_se, a2_se=a2_se,
+        se_estimator=estimator,
     )

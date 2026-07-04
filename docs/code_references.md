@@ -18,7 +18,11 @@ to its literature, or to find which papers a given module relies on.
 - Frisken, Barbara J. (2001). Revisiting the Method of Cumulants for the Analysis of Dynamic Light-Scattering Data. *Applied Optics* **40**(24), 4087–4091. https://doi.org/10.1364/AO.40.004087
   - Used in: analysis/dls/cumulants.py (_fit_cumulants_nonlinear, _frisken_model); Advanced Guide §10.1, Eq. (47)
 - Provencher, Stephen W. (1982). CONTIN: A General Purpose Constrained Regularization Program for Inverting Noisy Linear Algebraic and Integral Equations. *Computer Physics Communications* **27**(3), 229–242. https://doi.org/10.1016/0010-4655(82)90174-6
-  - Used in: analysis/dls/distributions.py (fit_contin); analysis/dls/__init__.py (module docstring)
+  - Used in: analysis/dls/distributions.py (fit_contin, _ftest_corner – F-test alpha selection); analysis/dls/__init__.py (module docstring); Advanced Guide §10.2, Eqs. (48)–(49)
+- Scotti, A.; Liu, W.; Hyatt, J. S.; Herman, E. S.; Choi, H. S.; Kim, J. W.; Lyon, L. A.; Gasser, U.; Fernandez-Nieves, A. (2015). The CONTIN Algorithm and Its Application to Determine the Size Distribution of Microgel Suspensions. *The Journal of Chemical Physics* **142**(23), 234905. https://doi.org/10.1063/1.4921686
+  - Used in: analysis/dls/distributions.py (_ftest_corner, _tikhonov_effective_dof – probability-to-reject F-test, Eqs. 19–21); Advanced Guide §10.2, Eqs. (48)–(49)
+- Hansen, Per Christian (1998). Rank-Deficient and Discrete Ill-Posed Problems: Numerical Aspects of Linear Inversion. SIAM. https://doi.org/10.1137/1.9780898719697
+  - Used in: analysis/dls/distributions.py (_tikhonov_effective_dof – hat-matrix trace / effective degrees of freedom); Advanced Guide §10.2, Eq. (49)
 - Salazar, Marcos; Srivastav, Harsh; Srivastava, Abhishek; Srivastava, Samanvaya (2023). A User-Friendly Graphical User Interface for Dynamic Light Scattering Data Analysis. *Soft Matter* **19**(35), 6535–6544. https://doi.org/10.1039/d3sm00469d
   - Used in: analysis/dls/distributions.py (_lcurve_corner); analysis/dls/__init__.py (module docstring)
 - Liénard, François; Freyssingeas, Éric; Borgnat, Pierre (2022). A Multiscale Time-Laplace Method to Extract Relaxation Times from Non-Stationary Dynamic Light Scattering Signals. *Journal of Chemical Physics* **156**(22), 224901. https://doi.org/10.1063/5.0088005
@@ -70,6 +74,8 @@ to its literature, or to find which papers a given module relies on.
   - Used in: analysis/uncertainty.py (_hc3_cov, module docstring); Advanced Guide §15.1, Eq. (30)
 - Long, J. Scott; Ervin, Laurie H. (2000). Using Heteroscedasticity Consistent Standard Errors in the Linear Regression Model. *The American Statistician* **54**(3), 217–224. https://doi.org/10.1080/00031305.2000.10474549
   - Used in: analysis/uncertainty.py (module docstring); Advanced Guide §15.1
+- Draper, Norman R.; Smith, Harry (1998). Applied Regression Analysis. 3 ed. Wiley. https://doi.org/10.1002/9781118625590
+  - Used in: analysis/uncertainty.py (_ols_cov); Advanced Guide §15.1.1, Eq. (30a)
 - Taylor, John R. (1997). An Introduction to Error Analysis: The Study of Uncertainties in Physical Measurements. 2 ed. University Science Books.
   - Used in: analysis/uncertainty.py (propagate, ratio_se, power_law_se); Advanced Guide §15.2, Eqs. (33)–(35)
 - Bevington, Philip R.; Robinson, D. Keith (2003). Data Reduction and Error Analysis for the Physical Sciences. 3 ed. McGraw-Hill.

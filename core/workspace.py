@@ -327,6 +327,10 @@ class SampleRhRow:
     rh_type_label: str = ''               # 'apparent' / 'thermodynamic' (display convenience)
     from_label: str = ''                  # the 'From' column: contributing measurements/method
     fraction: Optional[str] = None
+    se_estimator: Optional[str] = None    # covariance estimator behind rh_se for a
+    #                                       regression source (gamma_q2/conc_extrap);
+    #                                       None for the replicate-average SEM (not a
+    #                                       regression SE, so estimator-independent).
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

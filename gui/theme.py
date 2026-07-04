@@ -48,7 +48,11 @@ from PySide6 import QtCore, QtGui, QtWidgets
 #   header        — bold section-header text
 #   muted         — secondary body text (the darker grey notes)
 #   hint          — quieter, smaller hint text (the lighter grey notes)
-#   error         — error / unreliable-result flags
+#   error         — error / unreliable-result flags (a genuine data-quality problem)
+#   qualifier     — a neutral, expected result-type qualifier (e.g. "apparent (single
+#                   concentration)", "± statistical only"): a calm steel/slate accent,
+#                   distinct from the alarm-red `error`, so a fact-of-life caveat does not
+#                   read as a failure. Kept visible (invariant 7), just off the red channel.
 #   pending       — "pending update" amber
 #   marker_group  — tree group-header rows (DLS / SLS / Traces)
 #   marker_active — derived / replicate-average tree leaves
@@ -62,6 +66,7 @@ LIGHT_TOKENS = {
     'muted':         '#4d4d4d',
     'hint':          '#6e6e6e',
     'error':         '#cc0000',
+    'qualifier':     '#3f6079',
     'pending':       '#b06000',
     'marker_group':  '#808080',
     'marker_active': '#008f63',
@@ -74,6 +79,7 @@ DARK_TOKENS = {
     'muted':         '#b4b4b4',
     'hint':          '#9a9a9a',
     'error':         '#ff6b6b',
+    'qualifier':     '#8fb3cc',
     'pending':       '#e0a050',
     'marker_group':  '#9a9a9a',
     'marker_active': '#3fd0a0',
@@ -140,6 +146,12 @@ class ThemedLabel(QtWidgets.QLabel):
 
     def setRole(self, role: str) -> None:
         self._role = role
+        self._apply()
+
+    def setBold(self, bold: bool) -> None:
+        """Toggle bold weight at runtime (mirrors ``setRole`` for colour). Lets one
+        shared label switch between a bold alarm and a calm non-bold note per message."""
+        self._bold = bold
         self._apply()
 
     def _apply(self) -> None:

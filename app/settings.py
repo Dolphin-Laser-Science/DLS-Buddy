@@ -45,10 +45,20 @@ class SettingsState:
     rh_grid_points: int = 100               # CONTIN/NNLS Rh grid resolution
     lcurve_alpha_min: float = 1.0e-6        # CONTIN L-curve alpha sweep lower bound
     lcurve_alpha_max: float = 1.0e2         # CONTIN L-curve alpha sweep upper bound
+    contin_alpha_method: str = 'lcurve'     # CONTIN alpha selection: 'lcurve' (corner,
+    #                                         default) or 'ftest' (Provencher F-test)
+    contin_ftest_prob_reject: float = 0.5   # F-test probability-to-reject level
+    #                                         (Provencher default 0.5); higher -> smoother
 
     # --- SLS defaults ---
     standard_geometry: str = 'VU'           # toluene Rayleigh geometry: VU / VV / VH
     guinier_qrg_max: float = 1.3            # Guinier validity limit q*Rg
+
+    # --- uncertainty (applies to every regression SE: SLS + DLS Gamma-q^2/kD) ---
+    se_estimator: str = 'hc3'               # 'hc3' (robust, default; never under-reports)
+    #                                         or 'ols' (classical s^2(X'X)^-1, opt-in for
+    #                                         comparability; can under-report). See invariant 8
+    #                                         clause A + Advanced Guide 15.1.
 
     # NOTE: the synthetic-generator (β/noise/points) and intensity-trace (outlier k,
     # baseline, block-variance, ADF) defaults used to live here. Per feedback

@@ -327,9 +327,8 @@ def format_average_summary(summary: dict) -> str:
         if summary.get('peak_count_warning'):
             lines += ['', f"⚠ {summary['peak_count_warning']}"]
         lines += ['',
-                  'Distribution peaks are reported only (not written to the sample); '
-                  'their positions are regularization-dependent, so treat the ± as a '
-                  'reproducibility spread, not a calibrated error.']
+                  'Peaks are reported only (not written); positions are '
+                  'regularization-dependent, so ± is a reproducibility spread.']
         return '\n'.join(lines)
 
     for p in summary.get('parameters', []):        # parametric method
@@ -1102,6 +1101,10 @@ class _DistributionTab(QtWidgets.QWidget):
                                  'least free, most stable.',
                                  'These are distribution-weighted, not z-average — '
                                  'compare against the cumulant Rh.',
+                                 '<b>CONTIN α selection</b>: L-curve corner (default, '
+                                 'robust) or Provencher’s F-test for legacy comparison. '
+                                 'For the F-test, a higher “probability to reject” gives '
+                                 'a smoother fit, lower gives more detail.',
                              ])
         form = QtWidgets.QFormLayout(box)
         # Per-method checkboxes (replacing the old single "Overlay NNLS+CONTIN").
@@ -1132,14 +1135,44 @@ class _DistributionTab(QtWidgets.QWidget):
             grow.addWidget(w)
         gholder = QtWidgets.QWidget(); gholder.setLayout(grow)
         form.addRow('Rh grid (min / max / pts):', gholder)
+        # CONTIN α selection: L-curve corner (default) or Provencher's F-test. The two
+        # methods need different controls, so only the selected method's control is
+        # shown (owner: show/hide, not grey-out — no confusing inert fields).
+        self.alpha_method = QtWidgets.QComboBox()
+        self.alpha_method.addItem('L-curve corner', 'lcurve')
+        self.alpha_method.addItem('F-test (probability to reject)', 'ftest')
+        self.alpha_method.setToolTip(
+            'How CONTIN chooses its regularisation α automatically.\n'
+            '• L-curve corner (default): the elbow of the fit-vs-smoothness trade-off '
+            '(Salazar et al. 2023) — modern and robust.\n'
+            '• F-test: Provencher’s original criterion — the smoothest solution '
+            'whose fit is not significantly worse than the best (Provencher 1982). Use '
+            'to compare against legacy CONTIN output. See the Advanced Guide (CONTIN).')
+        form.addRow('CONTIN α selection:', self.alpha_method)
         self.alpha_min = QtWidgets.QLineEdit()
         self.alpha_max = QtWidgets.QLineEdit()
         arow = QtWidgets.QHBoxLayout(); arow.setContentsMargins(0, 0, 0, 0)
         for w in (self.alpha_min, self.alpha_max):
             arow.addWidget(w)
-        aholder = QtWidgets.QWidget(); aholder.setLayout(arow)
-        form.addRow('CONTIN α (min / max):', aholder)
+        self._alpha_range_holder = QtWidgets.QWidget()
+        self._alpha_range_holder.setLayout(arow)
+        form.addRow('CONTIN α (min / max):', self._alpha_range_holder)
+        self._alpha_range_label = form.labelForField(self._alpha_range_holder)
+        # F-test level (only shown when the F-test method is selected).
+        self.ftest_prob = QtWidgets.QDoubleSpinBox()
+        self.ftest_prob.setRange(0.01, 0.99)
+        self.ftest_prob.setSingleStep(0.05)
+        self.ftest_prob.setDecimals(2)
+        self.ftest_prob.setToolTip(
+            'F-test significance level (Provencher default 0.50). A HIGHER value '
+            'accepts more fit degradation and so selects a SMOOTHER, more parsimonious '
+            'distribution; a LOWER value keeps a rougher, more-detailed one.')
+        form.addRow('F-test probability to reject:', self.ftest_prob)
+        self._ftest_prob_label = form.labelForField(self.ftest_prob)
+        self.alpha_method.currentIndexChanged.connect(
+            self._update_alpha_controls_visibility)
         self.reseed_from_settings()
+        self._update_alpha_controls_visibility()
         note = ThemedLabel('Delay window + baseline region are set on the '
                            'Correlogram tab (shared). Each ticked method runs on '
                            'every ticked measurement.', role='hint', size=10)
@@ -1206,6 +1239,17 @@ class _DistributionTab(QtWidgets.QWidget):
         self._gs.set_height_ratios([a, a, a, frac])
         self.canvas.draw_idle()
 
+    def _update_alpha_controls_visibility(self) -> None:
+        """Show only the selected α-selection method's control (L-curve α range vs the
+        F-test level) — the owner asked for show/hide, not greyed-out inert fields."""
+        is_ftest = self.alpha_method.currentData() == 'ftest'
+        self._alpha_range_holder.setVisible(not is_ftest)
+        if self._alpha_range_label is not None:
+            self._alpha_range_label.setVisible(not is_ftest)
+        self.ftest_prob.setVisible(is_ftest)
+        if self._ftest_prob_label is not None:
+            self._ftest_prob_label.setVisible(is_ftest)
+
     def reseed_from_settings(self) -> None:
         """(Re)seed the Rh grid + α fields from the global Settings defaults. The
         per-run values the user types here always win (run_distribution honours
@@ -1216,6 +1260,10 @@ class _DistributionTab(QtWidgets.QWidget):
         self.rh_points.setValue(s.rh_grid_points)
         self.alpha_min.setText(f'{s.lcurve_alpha_min:g}')
         self.alpha_max.setText(f'{s.lcurve_alpha_max:g}')
+        i = self.alpha_method.findData(s.contin_alpha_method)
+        self.alpha_method.setCurrentIndex(i if i >= 0 else 0)
+        self.ftest_prob.setValue(s.contin_ftest_prob_reject)
+        self._update_alpha_controls_visibility()
 
     @staticmethod
     def _as_float(text: str, fallback: float) -> float:
@@ -1234,6 +1282,8 @@ class _DistributionTab(QtWidgets.QWidget):
                                              s.lcurve_alpha_min)
             kw['alpha_max'] = self._as_float(self.alpha_max.text().strip(),
                                              s.lcurve_alpha_max)
+            kw['alpha_method'] = self.alpha_method.currentData()
+            kw['ftest_prob_reject'] = self.ftest_prob.value()
         return kw
 
     def showEvent(self, event) -> None:
@@ -1386,8 +1436,20 @@ class _DistributionTab(QtWidgets.QWidget):
         # Status now carries only operational notes; per-result peaks live in the
         # Summary tab (which is also where they persist).
         notes = []
-        if sum(1 for _i, k, _r in self._results if k == 'contin') > 3:
-            notes.append('CONTIN runs an L-curve per measurement — this can be slow.')
+        n_contin = sum(1 for _i, k, _r in self._results if k == 'contin')
+        if n_contin > 3:
+            notes.append('CONTIN runs an α sweep per measurement — this can be slow.')
+        # α-selection provenance: every CONTIN run this pass shares the same selector
+        # (seeded from one control), so one note names it (invariant-7-style method
+        # disclosure — a distribution is never ambiguous about how α was chosen).
+        contin_res = next((r for _i, k, r in self._results if k == 'contin'), None)
+        sel = getattr(contin_res, 'alpha_selection_method', None)
+        if sel == 'ftest':
+            p = getattr(contin_res, 'ftest_prob_reject', None)
+            notes.append(f'CONTIN α by F-test (p={p:.2f})' if p is not None
+                         else 'CONTIN α by F-test')
+        elif sel == 'lcurve':
+            notes.append('CONTIN α by L-curve corner')
         if getattr(self, '_failures', None):
             notes.append('⚠ skipped: ' + '; '.join(self._failures))
         if self.controller.is_dirty() and self._results:
@@ -2318,6 +2380,7 @@ class _DDLSTab(QtWidgets.QWidget):
             shapes = self.controller.ddls_shape(sid, model='both')
         except Exception as exc:
             self.shape_table.setRowCount(0)
+            self.shape_table.setToolTip('')      # drop any stale caveat hover
             self.shape_caveat.setText(f'Shape models unavailable: {exc}')
             self.shape_box.setVisible(True)
             return
@@ -2348,8 +2411,12 @@ class _DDLSTab(QtWidgets.QWidget):
         verdict = ('Sphere consistent — a near-spherical particle.'
                    if sph.is_consistent else
                    'Sphere inconsistent (ratio ≠ 1) → the rod model is the relevant one.')
-        self.shape_caveat.setText(
+        # This verdict + the "assumed shape" caveat fire on every DDLS run, so they live
+        # in a passive hover tooltip on the table (auto-gated by Settings → Show tooltips),
+        # not an always-on line — the ✓/✗ and ratio cells already carry the visible verdict.
+        self.shape_table.setToolTip(
             verdict + ' Dimensions assume the stated shape — not a direct measurement.')
+        self.shape_caveat.setText('')     # standalone caveat demoted to the tooltip above
         self.shape_box.setVisible(True)
 
     def _clear(self, message: str) -> None:

@@ -41,7 +41,7 @@ from __future__ import annotations
 import csv
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 
@@ -162,6 +162,10 @@ def export_dls_summary(records: Sequence[Dict[str, Any]], file_path: str,
         OriginColumn('Rh', 'nm', 'hydrodynamic radius', col('rh')),
         OriginColumn('Rh_SE', 'nm', 'statistical SE (blank when none is honest)',
                      col('rh_se')),
+        OriginColumn('SE estimator', '', 'covariance estimator behind Rh_SE for a '
+                     'regression source; blank = HC3 default or a non-regression SE',
+                     ['classical OLS' if r.get('se_estimator') == 'ols' else ''
+                      for r in records]),
         OriginColumn('PDI', '', 'cumulant polydispersity index', col('pdi')),
         OriginColumn('Intensity fraction', '%', 'intensity-weighted peak area '
                      '(NOT mass/weight percent)', col('int_pct')),
@@ -254,7 +258,9 @@ def export_correlogram_fit(measurement, result, file_path: str,
 
 
 def export_distribution(result, file_path: str, axis: str = 'rh',
-                        delimiter: str = ',') -> str:
+                        delimiter: str = ',', *,
+                        alpha_selection_method: Optional[str] = None,
+                        ftest_prob_reject: Optional[float] = None) -> str:
     """Export an NNLS or CONTIN distribution (DistributionResult).
 
     Writes the size/rate grid and the normalised weights. With axis='rh' the
@@ -290,9 +296,21 @@ def export_distribution(result, file_path: str, axis: str = 'rh',
         OriginColumn('g2-1 (fit)', '', 'reconstruction', np.asarray(result.fitted_g2m1, dtype=float)),
         OriginColumn('Residual', '', 'data - fit', np.asarray(result.residuals, dtype=float)),
     ]
+    # CONTIN records how alpha was chosen in the alpha column's Comments cell, so a
+    # distribution is never ambiguous about its regularisation (mirrors the SLS
+    # provenance-in-Comments convention). NNLS/lognormal pass no selection method.
+    if alpha_selection_method == 'ftest':
+        alpha_note = (f'alpha by F-test, p_reject={ftest_prob_reject:.2f}'
+                      if ftest_prob_reject is not None else 'alpha by F-test')
+    elif alpha_selection_method == 'lcurve':
+        alpha_note = 'alpha by L-curve corner'
+    elif alpha_selection_method == 'user':
+        alpha_note = 'alpha user-supplied'
+    else:
+        alpha_note = ''
     columns += [
         _scalar_column('Method', '', result.method),
-        _scalar_column('alpha', '', result.alpha),
+        _scalar_column('alpha', '', result.alpha, comments=alpha_note),
         _scalar_column('Peak Rh', 'nm', result.peak_rh_nm),
         _scalar_column('Mean Rh', 'nm', result.mean_rh_nm),
         _scalar_column('Mean Gamma', '1/s', result.mean_gamma_s_inv),
@@ -331,7 +349,11 @@ def export_gamma_q2(result, file_path: str, delimiter: str = ',') -> str:
         OriginColumn('D_app', 'm^2/s', 'Gamma / q^2',
                      np.asarray(result.d_app_m2_s, dtype=float)),
         _scalar_column('D', 'm^2/s', result.d_m2_s, 'through-origin slope'),
+        _scalar_column('D SE', 'm^2/s', result.d_se,
+                       comments=_se_note(result) or 'statistical (over angles)'),
         _scalar_column('Rh', 'nm', result.rh_nm),
+        _scalar_column('Rh SE', 'nm', result.rh_se,
+                       comments=_se_note(result) or 'statistical (over angles)'),
         _scalar_column('R^2', '', result.r_squared),
         _scalar_column('Intercept', '1/s', result.intercept_s_inv),
         _scalar_column('Intercept (relative)', '', result.intercept_relative),
@@ -368,7 +390,8 @@ def export_ddls(result, file_path: str, *, shapes=None,
                                     np.asarray(result.qL, dtype=float)))
     columns += [
         _scalar_column('D_t', 'm^2/s', result.d_t_m2_s, 'from VV, through-origin slope'),
-        _scalar_column('D_t SE', 'm^2/s', result.d_t_se, 'statistical only'),
+        _scalar_column('D_t SE', 'm^2/s', result.d_t_se,
+                       comments=_se_note(result) or 'statistical only'),
         _scalar_column('D_r', 'rad^2/s', result.d_r_rad2_s, 'mean of per-angle values'),
         _scalar_column('D_r SE', 'rad^2/s', result.d_r_se, 'statistical only'),
         _scalar_column('Rh_t', 'nm', result.rh_t_nm, 'Stokes radius from D_t'),
@@ -413,8 +436,14 @@ def export_concentration_extrapolation(result, file_path: str,
         OriginColumn('D_app', 'm^2/s', 'apparent diffusion coefficient',
                      np.asarray(result.d_values_m2_s, dtype=float)),
         _scalar_column('D0', 'm^2/s', result.d0_m2_s, 'c -> 0'),
+        _scalar_column('D0 SE', 'm^2/s', result.d0_se,
+                       comments=_se_note(result) or 'statistical (over concentrations)'),
         _scalar_column('Rh0', 'nm', result.rh0_nm),
+        _scalar_column('Rh0 SE', 'nm', result.rh0_se,
+                       comments=_se_note(result) or 'statistical (over concentrations)'),
         _scalar_column('kD', 'mL/g', result.kd_mL_per_g),
+        _scalar_column('kD SE', 'mL/g', result.kd_se,
+                       comments=_se_note(result) or 'statistical (over concentrations)'),
         _scalar_column('Slope', 'm^2/s/(g/mL)', result.slope),
         _scalar_column('R^2', '', result.r_squared),
     ]
@@ -424,6 +453,13 @@ def export_concentration_extrapolation(result, file_path: str,
 # ===========================================================================
 # SLS exporters
 # ===========================================================================
+
+def _se_note(result) -> str:
+    """Comments-cell label for a ± column: names the estimator only when it is the
+    non-default classical OLS (silent for HC3, matching the 'calibrated is the silent
+    default' convention). See invariant 8 clause A / Advanced Guide §15.1."""
+    return 'SE: classical OLS' if getattr(result, 'se_estimator', 'hc3') == 'ols' else ''
+
 
 def export_rayleigh_ratio(result, file_path: str, delimiter: str = ',') -> str:
     """Export an excess Rayleigh ratio (RayleighRatioResult).
@@ -462,7 +498,11 @@ def export_debye(result, file_path: str, delimiter: str = ',') -> str:
         _scalar_column('Concentration', 'g/mL', result.concentration_g_per_mL),
         _scalar_column('Mw (apparent)', 'g/mol', result.mw_apparent_g_per_mol,
                        comments=mw_comment or 'APPARENT, single concentration'),
+        _scalar_column('Mw SE', 'g/mol', result.mw_apparent_se,
+                       comments=_se_note(result) or 'statistical (excl. calibration/dn-dc)'),
         _scalar_column('Rg (apparent)', 'nm', result.rg_apparent_nm),
+        _scalar_column('Rg SE', 'nm', result.rg_apparent_se,
+                       comments=_se_note(result) or 'statistical (excl. calibration/dn-dc)'),
         _scalar_column('Intercept', 'mol/g', result.intercept_mol_per_g),
         _scalar_column('Slope', 'mol nm^2/g', result.slope),
         _scalar_column('R^2', '', result.r_squared),
@@ -484,8 +524,12 @@ def export_guinier(result, file_path: str, delimiter: str = ',') -> str:
                      np.asarray(result.ln_excess_rayleigh, dtype=float)),
         _scalar_column('Concentration', 'g/mL', result.concentration_g_per_mL),
         _scalar_column('Rg (apparent)', 'nm', result.rg_nm),
+        _scalar_column('Rg SE', 'nm', result.rg_se,
+                       comments=_se_note(result) or 'statistical (excl. calibration/dn-dc)'),
         _scalar_column('Mw (apparent)', 'g/mol', result.mw_apparent_g_per_mol,
                        comments=mw_comment or 'APPARENT, single concentration'),
+        _scalar_column('Mw SE', 'g/mol', result.mw_apparent_se,
+                       comments=_se_note(result) or 'statistical (excl. calibration/dn-dc)'),
         _scalar_column('Intercept', '', result.intercept, 'ln(dR(0))'),
         _scalar_column('Slope', 'nm^2', result.slope, '-Rg^2/3'),
         _scalar_column('qRg (max)', '', result.qrg_max),
@@ -497,13 +541,19 @@ def export_guinier(result, file_path: str, delimiter: str = ',') -> str:
 
 
 def export_single_angle(result, file_path: str, delimiter: str = ',') -> str:
-    """Export a single-angle, single-concentration apparent Mw (SingleAngleResult)."""
+    """Export a single-angle, single-concentration apparent Mw (SingleAngleResult).
+
+    The Mw column carries the uncalibrated marker in its Comments cell when the run
+    was uncalibrated (the value is then on an arbitrary scale), mirroring Debye/Guinier.
+    """
+    mw_comment = ('uncalibrated, arbitrary scale' if not result.mw_reliable else
+                  'APPARENT, single angle + single concentration')
     columns = [
         _scalar_column('Angle', 'deg', result.angle_deg),
         _scalar_column('q^2', 'nm^-2', result.q2_nm2),
         _scalar_column('Concentration', 'g/mL', result.concentration_g_per_mL),
         _scalar_column('Mw (apparent)', 'g/mol', result.mw_apparent_g_per_mol,
-                       comments='APPARENT, single angle + single concentration'),
+                       comments=mw_comment),
         _scalar_column('Is apparent', '', result.is_apparent),
     ]
     return write_origin_csv(file_path, columns, delimiter)
@@ -612,9 +662,15 @@ def export_zimm(rayleigh_results, zimm_result, file_path: str,
         _scalar_column('Method', '', zimm_result.method),
         _scalar_column('Mw', 'g/mol', zimm_result.mw_g_per_mol,
                        comments=mw_note or 'thermodynamic'),
+        _scalar_column('Mw SE', 'g/mol', zimm_result.mw_se,
+                       comments=_se_note(zimm_result) or 'statistical (excl. calibration/dn-dc)'),
         _scalar_column('Rg', 'nm', zimm_result.rg_nm),
+        _scalar_column('Rg SE', 'nm', zimm_result.rg_se,
+                       comments=_se_note(zimm_result) or 'statistical (excl. calibration/dn-dc)'),
         _scalar_column('A2', 'mol mL/g^2', zimm_result.a2_mol_mL_per_g2,
                        comments=a2_note),
+        _scalar_column('A2 SE', 'mol mL/g^2', zimm_result.a2_se,
+                       comments=_se_note(zimm_result) or 'statistical (excl. calibration/dn-dc)'),
         _scalar_column('R^2', '', zimm_result.r_squared),
         _scalar_column('Is apparent', '', zimm_result.is_apparent),
     ]
@@ -650,7 +706,8 @@ def export_scaling(quantity: str, labels, mw, y, fit, file_path: str,
         OriginColumn(y_label, y_units, '', np.asarray(y, dtype=float)),
         _scalar_column('Quantity', '', quantity),
         _scalar_column(f'Exponent ({exp_name})', '', fit.exponent),
-        _scalar_column('Exponent SE', '', fit.exponent_se),
+        _scalar_column('Exponent SE', '', fit.exponent_se,
+                       comments=_se_note(fit) or 'statistical (log-log regression)'),
         _scalar_column('Prefactor', '', fit.prefactor, 'y at Mw = 1'),
         _scalar_column('R^2', '', fit.r_squared),
         _scalar_column('n points', '', fit.n_points),
@@ -668,8 +725,12 @@ def export_calibration_free_a2(result, file_path: str, delimiter: str = ',') -> 
                      np.asarray(result.Y, dtype=float)),
         _scalar_column('Angle', 'deg', result.angle_deg),
         _scalar_column('2 A2 Mw', '', result.two_a2_mw, 'slope / intercept'),
+        _scalar_column('2 A2 Mw SE', '', result.two_a2_mw_se,
+                       comments=_se_note(result) or 'statistical (calibration/dn-dc-free)'),
         _scalar_column('A2', 'mol mL/g^2', result.a2_mol_mL_per_g2,
                        'only if Mw supplied'),
+        _scalar_column('A2 SE', 'mol mL/g^2', result.a2_se,
+                       comments=_se_note(result) or 'statistical (Mw treated as exact)'),
         _scalar_column('Slope', '', result.slope),
         _scalar_column('Intercept', '', result.intercept),
         _scalar_column('R^2', '', result.r_squared),

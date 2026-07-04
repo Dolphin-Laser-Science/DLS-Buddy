@@ -29,6 +29,12 @@ angles/concentrations (e.g. a per-angle Gamma whose precision changes with q) �
 Carlo-verified to match the sampling spread where ordinary least squares under-reports.
 It reduces to the usual s^2 (X^T X)^-1 under homoscedastic errors. A scalar f(b)
 propagates as var(f) = J^T Cov(b) J with J the gradient of f (first-order delta method).
+
+The covariance estimator is selectable via an `estimator` argument on the fitters
+('hc3', the default, vs 'ols', the classical s^2 (X^T X)^-1). HC3 is the default because
+it never under-reports; classical OLS is an opt-in for comparability with legacy/literature
+SEs and can under-report on short high-leverage designs (invariant 8 clause A). The choice
+is recorded on the returned fit object (`.estimator`) so provenance travels with every SE.
 """
 
 from __future__ import annotations
@@ -43,6 +49,14 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Linear regression with parameter covariance
 # ---------------------------------------------------------------------------
+
+# Estimator vocabulary — one spelling, no drift. The default HC3 never under-reports
+# under non-uniform precision; classical OLS is an opt-in for comparability with
+# legacy/literature/spreadsheet SEs and can under-report (invariant 8 clause A).
+HC3 = 'hc3'
+OLS = 'ols'
+_ESTIMATORS = (HC3, OLS)
+
 
 def _hc3_cov(X: np.ndarray, y: np.ndarray, beta: np.ndarray) -> np.ndarray:
     """HC3 heteroscedasticity-consistent covariance of the OLS coefficients.
@@ -61,13 +75,41 @@ def _hc3_cov(X: np.ndarray, y: np.ndarray, beta: np.ndarray) -> np.ndarray:
     meat = (X * w[:, None]).T @ X                     # sum_i w_i x_i x_i^T
     return XtX_inv @ meat @ XtX_inv
 
+
+def _ols_cov(X: np.ndarray, y: np.ndarray, beta: np.ndarray) -> np.ndarray:
+    """Classical homoscedastic OLS covariance Cov = s^2 (X^T X)^-1, s^2 = RSS/(n-p).
+
+    The textbook estimator: assumes every point shares one error variance. Offered as
+    an opt-in for comparability with classical software / literature tables (invariant 8
+    clause A) — it under-reports on short, high-leverage designs where precision varies
+    (Session 97: ~10% low on the 5-point calibration-free A2 ladder), which is why HC3,
+    not this, is the default. Returns NaN when there are too few residual dof to estimate
+    the spread (n - p < 1)."""
+    n, p = X.shape
+    if n - p < 1:
+        return np.full((p, p), np.nan)
+    XtX_inv = np.linalg.inv(X.T @ X)
+    resid = y - X @ beta
+    s2 = float(resid @ resid) / (n - p)
+    return s2 * XtX_inv
+
+
+def _cov(X: np.ndarray, y: np.ndarray, beta: np.ndarray, estimator: str = HC3) -> np.ndarray:
+    """Parameter covariance by the selected estimator (default HC3 sandwich; OLS opt-in)."""
+    if estimator == OLS:
+        return _ols_cov(X, y, beta)
+    if estimator == HC3:
+        return _hc3_cov(X, y, beta)
+    raise ValueError(f"unknown estimator {estimator!r}; expected one of {_ESTIMATORS}")
+
 @dataclass
 class LinearFit:
     """OLS y = intercept + slope*x with standard errors and covariance.
 
     `cov` is the 2x2 covariance of (intercept, slope), in that order. SEs are NaN
-    when there are too few points (n < 4) to estimate the residual variance: with
-    p = 2 fitted parameters, _hc3_cov requires n - p >= 2 residual dof.
+    when there are too few points to estimate the residual variance: HC3 (p = 2)
+    needs n - p >= 2 residual dof (n >= 4), classical OLS needs n - p >= 1 (n >= 3).
+    `estimator` records which covariance estimator produced `cov`/the SEs ('hc3' | 'ols').
     """
     slope: float
     intercept: float
@@ -76,10 +118,11 @@ class LinearFit:
     cov: np.ndarray              # 2x2, order [intercept, slope]
     r_squared: float
     n: int
+    estimator: str = HC3
 
 
-def linear_fit(x: Sequence[float], y: Sequence[float]) -> LinearFit:
-    """OLS y = a + b x with HC3 (heteroscedasticity-robust) standard errors.  (Eq. 30, 32)"""
+def linear_fit(x: Sequence[float], y: Sequence[float], estimator: str = HC3) -> LinearFit:
+    """OLS y = a + b x with robust HC3 (default) or classical OLS standard errors.  (Eq. 30, 30a, 32)"""
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     n = int(x.size)
@@ -89,17 +132,18 @@ def linear_fit(x: Sequence[float], y: Sequence[float]) -> LinearFit:
     ss_res = float(np.sum((y - X @ beta) ** 2))
     ss_tot = float(np.sum((y - y.mean()) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
-    cov = _hc3_cov(X, y, beta)                       # order [intercept, slope]
+    cov = _cov(X, y, beta, estimator)                # order [intercept, slope]
     a_se = math.sqrt(cov[0, 0]) if np.isfinite(cov[0, 0]) else float('nan')
     b_se = math.sqrt(cov[1, 1]) if np.isfinite(cov[1, 1]) else float('nan')
-    return LinearFit(b, a, b_se, a_se, cov, r2, n)
+    return LinearFit(b, a, b_se, a_se, cov, r2, n, estimator)
 
 
-def linear_fit_through_origin(x: Sequence[float], y: Sequence[float]):
-    """OLS slope of y = b x (no intercept) with its HC3-robust standard error.  (Eq. 31)
+def linear_fit_through_origin(x: Sequence[float], y: Sequence[float], estimator: str = HC3):
+    """OLS slope of y = b x (no intercept) with robust HC3 (default) or classical OLS SE.  (Eq. 31)
 
-    b = sum(xy)/sum(x^2). Returns (slope, slope_se); slope_se is NaN for n < 3
-    (with p = 1 fitted parameter, _hc3_cov requires n - p >= 2 residual dof).
+    b = sum(xy)/sum(x^2). Returns (slope, slope_se); with p = 1 fitted parameter,
+    slope_se is NaN for n < 3 under HC3 (needs n - p >= 2) and n < 2 under classical
+    OLS (needs n - p >= 1).
     """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -107,7 +151,7 @@ def linear_fit_through_origin(x: Sequence[float], y: Sequence[float]):
     sxx = float(x @ x)
     b = float(x @ y) / sxx if sxx > 0 else float('nan')
     if n > 1 and sxx > 0:
-        cov = _hc3_cov(x.reshape(-1, 1), y, np.array([b]))
+        cov = _cov(x.reshape(-1, 1), y, np.array([b]), estimator)
         b_se = math.sqrt(cov[0, 0]) if np.isfinite(cov[0, 0]) else float('nan')
     else:
         b_se = float('nan')
@@ -116,18 +160,25 @@ def linear_fit_through_origin(x: Sequence[float], y: Sequence[float]):
 
 @dataclass
 class MultiFit:
-    """Multilinear OLS y = X b (caller supplies the full design X, incl. intercept)."""
+    """Multilinear OLS y = X b (caller supplies the full design X, incl. intercept).
+
+    `estimator` records which covariance estimator produced `cov` ('hc3' | 'ols')."""
     coeffs: np.ndarray
     cov: np.ndarray             # p x p covariance of coeffs
     r_squared: float
     n: int
+    estimator: str = HC3
 
 
-def multilinear_fit(X: np.ndarray, y: Sequence[float]) -> MultiFit:
-    """OLS for a supplied design matrix X (n x p) with the parameter covariance.
+def multilinear_fit(X: np.ndarray, y: Sequence[float], estimator: str = HC3) -> MultiFit:
+    """OLS point estimate for a supplied design matrix X (n x p) with the selected covariance.
 
-    Cov(b) = s^2 (X^T X)^-1, s^2 = SSR/(n-p).  Used for the Zimm/Berry global fit
-    ordinate = a + b q^2 + d c (X = [1, q^2, c]).  (Eq. 32)
+    The coefficients are ordinary least squares; the parameter covariance is, by default,
+    the HC3 heteroscedasticity-consistent (sandwich) estimator (`_hc3_cov`), NOT the classical
+    Cov(b) = s^2 (X^T X)^-1 -- so it does not under-report under non-uniform precision. Passing
+    estimator='ols' selects the classical form for comparability (invariant 8 clause A).
+    Used for the Zimm/Berry global fit ordinate = a + b q^2 + d c (X = [1, q^2, c]).
+    (Eq. 32)
     """
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -136,8 +187,8 @@ def multilinear_fit(X: np.ndarray, y: Sequence[float]) -> MultiFit:
     ss_res = float(np.sum((y - X @ beta) ** 2))
     ss_tot = float(np.sum((y - y.mean()) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
-    cov = _hc3_cov(X, y, beta)
-    return MultiFit(beta, cov, r2, n)
+    cov = _cov(X, y, beta, estimator)
+    return MultiFit(beta, cov, r2, n, estimator)
 
 
 # ---------------------------------------------------------------------------

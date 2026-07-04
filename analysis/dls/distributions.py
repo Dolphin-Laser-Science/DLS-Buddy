@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
-from scipy import optimize
+from scipy import optimize, special
 
 from core.data_models import DLSMeasurement
 from analysis.dls._common import (
@@ -89,20 +89,35 @@ class DistributionResult:
 
 @dataclass
 class LCurveResult:
-    """The alpha sweep used to choose CONTIN's regularisation parameter."""
+    """The alpha sweep used to choose CONTIN's regularisation parameter.
+
+    Despite the name (kept for backward compatibility), this holds the sweep for
+    EITHER alpha-selection method — the L-curve corner or the Provencher F-test.
+    `dof_eff` and `ftest_fc` are populated only when the F-test method was used.
+    """
     alphas: np.ndarray
     residual_norms: np.ndarray        # ||A x - y||^2 for each alpha
     solution_norms: np.ndarray        # ||x||^2 for each alpha
     optimal_alpha: float
     optimal_index: int
+    dof_eff: Optional[np.ndarray] = None    # Tikhonov effective DOF per alpha (F-test)
+    ftest_fc: Optional[np.ndarray] = None   # cumulative F ("probability to reject") per alpha
 
 
 @dataclass
 class ContinResult:
-    """CONTIN result: the chosen distribution plus the L-curve it came from."""
+    """CONTIN result: the chosen distribution plus the sweep it came from.
+
+    `alpha_selection_method` records how the automatic alpha was chosen
+    ('lcurve' | 'ftest'), and `ftest_prob_reject` the F-test level when applicable,
+    so a distribution is never ambiguous about how its regularisation was picked.
+    When alpha was user-supplied, the method is reported as 'user'.
+    """
     distribution: DistributionResult
     lcurve: LCurveResult
     alpha_was_user_supplied: bool
+    alpha_selection_method: str = 'lcurve'    # 'lcurve' | 'ftest' | 'user'
+    ftest_prob_reject: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +392,76 @@ def _lcurve_corner(alphas, residual_norms, solution_norms) -> int:
     return int(np.argmin(dist))
 
 
+def _tikhonov_effective_dof(A: np.ndarray, L: np.ndarray, alpha: float,
+                            AtA: Optional[np.ndarray] = None) -> float:
+    """Effective degrees of freedom of the Tikhonov solution at this alpha.
+
+    The regularised least-squares solution has the linear "hat" (influence) matrix
+    H = A (A^T A + alpha^2 L^T L)^-1 A^T; its trace is the effective number of free
+    parameters -- the honest degrees of freedom, NOT the raw grid size (Hansen 1998;
+    the number of grid points is "to a large extent arbitrary", Provencher 1982). It
+    decreases smoothly from ~rank(A) toward 0 as alpha grows (more smoothing = fewer
+    effective parameters). tr(H) = tr((A^T A + alpha^2 L^T L)^-1 A^T A). For the
+    ill-conditioned Laplace-inversion kernel A this stays well below the data count,
+    so the F-test degrees of freedom are always well defined. The non-negativity
+    constraint can only lower it further, so this is a mild upper bound.
+    """
+    if AtA is None:
+        AtA = A.T @ A
+    M = AtA + (alpha ** 2) * (L.T @ L)
+    try:
+        sol = np.linalg.solve(M, AtA)
+    except np.linalg.LinAlgError:
+        sol = np.linalg.lstsq(M, AtA, rcond=None)[0]
+    return float(np.clip(np.trace(sol), 1e-6, None))
+
+
+def _ftest_corner(residual_norms, dof_eff, n_data: int,
+                  prob_reject: float = 0.5):
+    """Provencher's F-test ("probability to reject") alpha selection.
+
+    Implements the criterion of Provencher (1982) as formulated by Scotti et al.
+    (2015, Eqs. 19-21): among the sweep of increasingly-smoothed solutions, judge how
+    significant each solution's residual increase over the least-regularised fit is,
+    and pick the one at the chosen probability level. For each alpha the F-statistic is
+
+        F(alpha) = [ (V(alpha) - V0) / V0 ] * (Ny - p) / p                    (Eq. 19)
+
+    with V(alpha) = ||A x - y||^2, V0 the value at the smallest alpha (essentially the
+    unregularised least-squares fit), Ny the number of data points, and p the
+    effective degrees of freedom of the regularised solution (`dof_eff`, the
+    hat-matrix trace -- see `_tikhonov_effective_dof`). F is F-distributed with
+    (p, Ny - p) degrees of freedom, so its cumulative value
+
+        fc(alpha) = I_{pF/(pF + Ny - p)}(p/2, (Ny - p)/2)                     (Eq. 21)
+
+    is the "probability to reject": ~0 where the regulariser barely changes the fit
+    (rough, under-smoothed) and ~1 where it changes it a lot (over-smoothed). The
+    chosen solution is the one whose fc is closest to `prob_reject` (Provencher's
+    default 0.5). A HIGHER prob_reject tolerates more fit degradation -> selects a
+    LARGER alpha (smoother, more parsimonious); a LOWER one selects a smaller alpha
+    (rougher, more detailed).
+
+    Returns (index, fc_array). fc_array is returned for the result/plot.
+
+    Caveat (documented in the guide): the F-test assumes independent residuals, but a
+    single correlogram's lag channels are correlated (Schaetzel 1990), so Ny overstates
+    the independent information and the level is a guide, not an exact test -- part of
+    why the L-curve remains the default.
+    """
+    v = np.asarray(residual_norms, dtype=float)
+    p = np.asarray(dof_eff, dtype=float)
+    v0 = float(v[0])                      # smallest alpha ~ unregularised least squares
+    ny = float(n_data)
+    # residual DOF must stay positive; effective p is well below Ny for this kernel.
+    p = np.clip(p, 1e-6, ny - 1e-6)
+    frac_increase = np.clip((v - v0) / v0 if v0 > 0 else np.zeros_like(v), 0.0, None)
+    f_stat = frac_increase * (ny - p) / p
+    fc = special.fdtr(p, ny - p, f_stat)    # F CDF = regularized incomplete beta (Eq. 21)
+    idx = int(np.argmin(np.abs(fc - prob_reject)))
+    return idx, fc
+
+
 def fit_contin(
     measurement: DLSMeasurement,
     rh_min_nm: float = 1.0,
@@ -391,6 +476,8 @@ def fit_contin(
     tau_min_s: Optional[float] = None,
     tau_max_s: Optional[float] = None,
     skip_initial_channels: int = 0,
+    alpha_method: str = 'lcurve',
+    ftest_prob_reject: float = 0.5,
 ) -> ContinResult:
     """Recover a smoothed decay-rate distribution by regularised inversion.
 
@@ -398,29 +485,44 @@ def fit_contin(
     second-difference operator (Provencher 1982). The regularisation parameter
     alpha trades fit quality against distribution smoothness.
 
-    If alpha is None (default), an L-curve sweep over [alpha_min, alpha_max] is
-    run and the corner is chosen automatically; the full sweep is returned so the
+    If alpha is None (default), a sweep over [alpha_min, alpha_max] is run and alpha
+    is chosen automatically by `alpha_method`; the full sweep is returned so the
     choice can be inspected and overridden. If alpha is given, that value is used
-    directly and a single-point "L-curve" is returned for consistency.
+    directly and a single-point sweep is returned for consistency.
+
+    Two automatic selectors share the same sweep (only the selection differs):
+      * 'lcurve' (default): the L-curve corner (Salazar et al. 2023).
+      * 'ftest': Provencher's original F-test / "probability to reject" criterion
+        (Provencher 1982; Scotti et al. 2015), picking the solution whose residual
+        increase over the least-regularised fit sits at the `ftest_prob_reject`
+        significance level (default 0.5). Higher -> smoother, lower -> rougher.
 
     Parameters
     ----------
     measurement : DLSMeasurement
     rh_min_nm, rh_max_nm, n_grid : grid specification (default 1-1000 nm, 100 pts)
     alpha : float, optional
-        Fixed regularisation parameter. If omitted, chosen by the L-curve.
+        Fixed regularisation parameter. If omitted, chosen by `alpha_method`.
     alpha_min, alpha_max, n_alpha :
-        Log-spaced alpha sweep for the L-curve (default 1e-6 to 1e2, 20 points).
+        Log-spaced alpha sweep (default 1e-6 to 1e2, 20 points).
     beta, baseline : float, optional
         Coherence factor and baseline; estimated from the data if omitted.
     tau_min_s, tau_max_s : float, optional
         Inclusive delay-time window. Default uses all points.
+    alpha_method : str
+        'lcurve' (default) or 'ftest'. Ignored if `alpha` is given.
+    ftest_prob_reject : float
+        F-test significance level (Provencher default 0.5). Only used for 'ftest'.
 
     Returns
     -------
     ContinResult
-        .distribution is the chosen DistributionResult; .lcurve holds the sweep.
+        .distribution is the chosen DistributionResult; .lcurve holds the sweep;
+        .alpha_selection_method records which selector chose alpha.
     """
+    if alpha_method not in ('lcurve', 'ftest'):
+        raise ValueError(
+            f"alpha_method must be 'lcurve' or 'ftest', got {alpha_method!r}.")
     (tau, g2m1, baseline, baseline_est, beta, beta_est,
      q, rh_grid, gamma_grid, A, y) = _prepare_distribution_inputs(
         measurement, tau_min_s, tau_max_s, beta, baseline,
@@ -443,9 +545,10 @@ def fit_contin(
             solution_norms=np.array([dist.solution_norm]),
             optimal_alpha=alpha, optimal_index=0)
         return ContinResult(distribution=dist, lcurve=lcurve,
-                            alpha_was_user_supplied=True)
+                            alpha_was_user_supplied=True,
+                            alpha_selection_method='user')
 
-    # L-curve sweep
+    # Sweep (shared by both selectors -- only the selection function differs).
     alphas = np.geomspace(alpha_min, alpha_max, n_alpha)
     residual_norms = np.empty(n_alpha)
     solution_norms = np.empty(n_alpha)
@@ -456,7 +559,15 @@ def fit_contin(
         residual_norms[i] = np.sum((A @ x - y) ** 2)
         solution_norms[i] = np.sum(x ** 2)
 
-    opt_idx = _lcurve_corner(alphas, residual_norms, solution_norms)
+    dof_eff = ftest_fc = None
+    if alpha_method == 'ftest':
+        AtA = A.T @ A
+        dof_eff = np.array([_tikhonov_effective_dof(A, L, a, AtA) for a in alphas])
+        opt_idx, ftest_fc = _ftest_corner(
+            residual_norms, dof_eff, n_data=int(y.size),
+            prob_reject=ftest_prob_reject)
+    else:
+        opt_idx = _lcurve_corner(alphas, residual_norms, solution_norms)
     opt_alpha = float(alphas[opt_idx])
     x_opt = solutions[opt_idx]
 
@@ -468,9 +579,12 @@ def fit_contin(
     lcurve = LCurveResult(
         alphas=alphas, residual_norms=residual_norms,
         solution_norms=solution_norms, optimal_alpha=opt_alpha,
-        optimal_index=opt_idx)
+        optimal_index=opt_idx, dof_eff=dof_eff, ftest_fc=ftest_fc)
     return ContinResult(distribution=dist, lcurve=lcurve,
-                        alpha_was_user_supplied=False)
+                        alpha_was_user_supplied=False,
+                        alpha_selection_method=alpha_method,
+                        ftest_prob_reject=(ftest_prob_reject
+                                           if alpha_method == 'ftest' else None))
 
 
 # ---------------------------------------------------------------------------

@@ -66,6 +66,7 @@ class GammaQ2Result:
     # statistical (regression) standard errors (each angle is an independent point)
     d_se: Optional[float] = None
     rh_se: Optional[float] = None
+    se_estimator: str = 'hc3'             # covariance estimator behind the SEs
 
 
 @dataclass
@@ -88,6 +89,7 @@ class ConcentrationExtrapolationResult:
     d0_se: Optional[float] = None
     rh0_se: Optional[float] = None
     kd_se: Optional[float] = None
+    se_estimator: str = 'hc3'             # covariance estimator behind the SEs
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +173,7 @@ def analyze_gamma_q2(
     intercept_rel_threshold: float = 0.1,
     skip_initial_channels: int = 0,
     cumulant_method: str = 'linear',
+    estimator: str = 'hc3',
 ) -> GammaQ2Result:
     """Analyse Gamma vs q^2 across angles for one sample.
 
@@ -241,7 +244,7 @@ def analyze_gamma_q2(
 
     # Through-origin slope D (Gamma = D q^2) with its standard error (each angle is
     # an independent measurement, so the regression SE is defensible).
-    d, d_se = unc.linear_fit_through_origin(q2, gamma)
+    d, d_se = unc.linear_fit_through_origin(q2, gamma, estimator)
     d = float(d)
 
     # Unconstrained linear fit for the intercept and R^2.
@@ -283,6 +286,7 @@ def analyze_gamma_q2(
         gamma_source=gamma_source, temperature_K=temperature_K,
         r2_threshold=r2_threshold, intercept_rel_threshold=intercept_rel_threshold,
         d_se=unc.se_or_none(d_se), rh_se=unc.se_or_none(rh_se),
+        se_estimator=estimator,
     )
 
 
@@ -297,6 +301,7 @@ def extrapolate_diffusion_vs_concentration(
     tau_max_s: Optional[float] = None,
     skip_initial_channels: int = 0,
     cumulant_method: str = 'linear',
+    estimator: str = 'hc3',
 ) -> ConcentrationExtrapolationResult:
     """Extrapolate the apparent diffusion coefficient to infinite dilution.
 
@@ -365,7 +370,7 @@ def extrapolate_diffusion_vs_concentration(
     order = np.argsort(conc)
     conc, d_app = conc[order], d_app[order]
 
-    lf = unc.linear_fit(conc, d_app)        # D(c) = D0 + slope*c; cov [intercept, slope]
+    lf = unc.linear_fit(conc, d_app, estimator)  # D(c) = D0 + slope*c; cov [intercept, slope]
     slope, intercept = lf.slope, lf.intercept
     d0 = float(intercept)
     r2 = lf.r_squared
@@ -392,4 +397,5 @@ def extrapolate_diffusion_vs_concentration(
         r_squared=r2, temperature_K=temperature_K,
         n_concentrations=int(np.unique(conc).size),
         d0_se=d0_se, rh0_se=unc.se_or_none(rh0_se), kd_se=kd_se,
+        se_estimator=estimator,
     )

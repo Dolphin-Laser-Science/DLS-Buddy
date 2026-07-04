@@ -44,6 +44,55 @@ def test_linear_fit_hc3_dof_guard():
     assert math.isfinite(fit.intercept)
 
 
+def test_linear_fit_ols_matches_textbook_covariance():
+    # Classical OLS SE = sqrt(diag(s^2 (X^T X)^-1)), s^2 = RSS/(n-p). Check the
+    # 'ols' estimator reproduces the hand-computed textbook value to machine
+    # precision (a noisy line so the residuals -- hence the SE -- are nonzero).
+    x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    y = np.array([2.3, 4.1, 6.5, 8.0, 10.2])   # ~ 2 + 2x with structured residuals
+    fit = unc.linear_fit(x, y, estimator='ols')
+    assert fit.estimator == 'ols'
+    X = np.column_stack([np.ones_like(x), x])
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    s2 = float(np.sum((y - X @ beta) ** 2)) / (x.size - 2)
+    cov = s2 * np.linalg.inv(X.T @ X)          # order [intercept, slope]
+    assert fit.intercept_se == pytest.approx(math.sqrt(cov[0, 0]), rel=1e-12)
+    assert fit.slope_se == pytest.approx(math.sqrt(cov[1, 1]), rel=1e-12)
+
+
+def test_linear_fit_default_is_hc3_and_tagged():
+    # No estimator arg -> HC3, and the choice is recorded on the fit object.
+    x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    y = np.array([2.3, 4.1, 6.5, 8.0, 10.2])
+    default = unc.linear_fit(x, y)
+    hc3 = unc.linear_fit(x, y, estimator='hc3')
+    assert default.estimator == 'hc3'
+    # Default and explicit HC3 are bit-identical (no behaviour change for the default).
+    assert default.slope_se == hc3.slope_se
+    assert default.intercept_se == hc3.intercept_se
+    # On this heteroscedastic-ish design OLS and HC3 genuinely differ.
+    ols = unc.linear_fit(x, y, estimator='ols')
+    assert ols.slope_se != pytest.approx(hc3.slope_se, rel=1e-6)
+
+
+def test_ols_through_origin_and_multilinear_tagged():
+    x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    y = np.array([1.1, 2.3, 2.8, 4.2, 4.9])
+    slope, se = unc.linear_fit_through_origin(x, y, estimator='ols')
+    # hand OLS through origin: var(b) = s^2 / sum(x^2), s^2 = RSS/(n-1)
+    b = float(x @ y) / float(x @ x)
+    s2 = float(np.sum((y - b * x) ** 2)) / (x.size - 1)
+    assert se == pytest.approx(math.sqrt(s2 / float(x @ x)), rel=1e-12)
+    X = np.column_stack([np.ones_like(x), x])
+    mf = unc.multilinear_fit(X, y, estimator='ols')
+    assert mf.estimator == 'ols'
+
+
+def test_unknown_estimator_raises():
+    with pytest.raises(ValueError):
+        unc.linear_fit([1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0], estimator='bogus')
+
+
 def test_linear_fit_through_origin_exact():
     x = np.array([1.0, 2.0, 3.0, 4.0])
     y = 5.0 * x
