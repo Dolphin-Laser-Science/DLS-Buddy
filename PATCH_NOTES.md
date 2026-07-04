@@ -9,6 +9,18 @@ window title.
 
 ---
 
+## 0.13.1 — CONTIN F-test: exact Provencher degrees-of-freedom (2026-07-03)
+
+Correctness fix to the new CONTIN F-test α-selection (0.13.0), validated against Provencher's
+original 1982 theory paper. The F-test now uses the effective degrees of freedom **at the
+least-squares reference**, held fixed across the α sweep, exactly as Provencher defines it — where
+0.13.0 mistakenly used the per-α value. In practice the F-test now selects a **smoother** α, in the
+same range as the L-curve (both defensible), rather than a systematically rougher one. Only the F-test
+option is affected; the default L-curve and every other analysis are unchanged. If you used the F-test
+in 0.13.0, re-run those distributions.
+
+---
+
 ## 0.13.0 — CONTIN α selection: L-curve (default) or Provencher's F-test (2026-07-03)
 
 The DLS Distribution tab now lets you choose how CONTIN picks its regularisation parameter α.

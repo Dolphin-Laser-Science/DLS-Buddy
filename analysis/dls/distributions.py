@@ -420,29 +420,35 @@ def _ftest_corner(residual_norms, dof_eff, n_data: int,
                   prob_reject: float = 0.5):
     """Provencher's F-test ("probability to reject") alpha selection.
 
-    Implements the criterion of Provencher (1982) as formulated by Scotti et al.
-    (2015, Eqs. 19-21): among the sweep of increasingly-smoothed solutions, judge how
-    significant each solution's residual increase over the least-regularised fit is,
-    and pick the one at the chosen probability level. For each alpha the F-statistic is
+    Implements the original criterion of Provencher (1982a, "A constrained
+    regularization method...", Comput. Phys. Commun. 27:213), Eqs. (3.23)-(3.24).
+    Among the sweep of increasingly-smoothed solutions, judge how significant each
+    solution's residual increase over the least-squares reference is, and pick the one
+    at the chosen probability level. For each alpha the F-statistic is
 
-        F(alpha) = [ (V(alpha) - V0) / V0 ] * (Ny - p) / p                    (Eq. 19)
+        F(alpha) = [ (V(alpha) - V0) / V0 ] * (Ny - NDF0) / NDF0             (Eq. 3.24)
 
-    with V(alpha) = ||A x - y||^2, V0 the value at the smallest alpha (essentially the
-    unregularised least-squares fit), Ny the number of data points, and p the
-    effective degrees of freedom of the regularised solution (`dof_eff`, the
-    hat-matrix trace -- see `_tikhonov_effective_dof`). F is F-distributed with
-    (p, Ny - p) degrees of freedom, so its cumulative value
+    with V(alpha) = ||A x - y||^2, and V0 the MINIMUM residual over the sweep, at the
+    reference alpha_0 (the least-regularised / least-squares end). Ny is the number of
+    data points and NDF0 = NDF(alpha_0) the effective degrees of freedom AT that
+    reference -- Provencher's NDF = sum_j s_j^2/(s_j^2 + alpha^2) (Eqs. 3.15-3.16),
+    which is exactly the trace of the Tikhonov hat matrix (`_tikhonov_effective_dof`),
+    NOT the raw grid size. NDF0 is a single fixed value (taken at alpha_0), used in
+    BOTH the scaling factor and the F-distribution -- not the per-alpha DOF. F is
+    F-distributed with (NDF0, Ny - NDF0) degrees of freedom, so its cumulative value
 
-        fc(alpha) = I_{pF/(pF + Ny - p)}(p/2, (Ny - p)/2)                     (Eq. 21)
+        fc(alpha) = P[F(alpha); NDF0, Ny - NDF0]                             (Eq. 3.23)
 
-    is the "probability to reject": ~0 where the regulariser barely changes the fit
-    (rough, under-smoothed) and ~1 where it changes it a lot (over-smoothed). The
-    chosen solution is the one whose fc is closest to `prob_reject` (Provencher's
-    default 0.5). A HIGHER prob_reject tolerates more fit degradation -> selects a
-    LARGER alpha (smoother, more parsimonious); a LOWER one selects a smaller alpha
-    (rougher, more detailed).
+    is Provencher's PROB1, the "probability to reject": ~0 where the regulariser barely
+    changes the fit (rough, under-smoothed) and ~1 where it changes it a lot (Provencher:
+    "only when PROB1 > ~0.9 are there significant grounds to suspect alpha may be too
+    large"). The chosen solution is the one whose fc is closest to `prob_reject`
+    (Provencher's default 0.5). A HIGHER prob_reject tolerates more fit degradation ->
+    selects a LARGER alpha (smoother, more parsimonious); a LOWER one a smaller alpha
+    (rougher). For an ill-posed Laplace kernel NDF0 is small (Provencher: "surprisingly
+    small even with accurate data"), so the F-test dof are always well defined.
 
-    Returns (index, fc_array). fc_array is returned for the result/plot.
+    Returns (index, fc_array). fc_array (PROB1 per alpha) is returned for the result/plot.
 
     Caveat (documented in the guide): the F-test assumes independent residuals, but a
     single correlogram's lag channels are correlated (Schaetzel 1990), so Ny overstates
@@ -450,14 +456,17 @@ def _ftest_corner(residual_norms, dof_eff, n_data: int,
     why the L-curve remains the default.
     """
     v = np.asarray(residual_norms, dtype=float)
-    p = np.asarray(dof_eff, dtype=float)
-    v0 = float(v[0])                      # smallest alpha ~ unregularised least squares
+    dof = np.asarray(dof_eff, dtype=float)
     ny = float(n_data)
-    # residual DOF must stay positive; effective p is well below Ny for this kernel.
-    p = np.clip(p, 1e-6, ny - 1e-6)
+    # Reference alpha_0 = the solution with the MINIMUM residual (least-squares end;
+    # normally the smallest alpha, but argmin also covers Provencher's note that a
+    # numerical instability can push it to a slightly larger alpha).
+    ref = int(np.argmin(v))
+    v0 = float(v[ref])
+    ndf0 = float(np.clip(dof[ref], 1e-6, ny - 1e-6))   # NDF(alpha_0), fixed
     frac_increase = np.clip((v - v0) / v0 if v0 > 0 else np.zeros_like(v), 0.0, None)
-    f_stat = frac_increase * (ny - p) / p
-    fc = special.fdtr(p, ny - p, f_stat)    # F CDF = regularized incomplete beta (Eq. 21)
+    f_stat = frac_increase * (ny - ndf0) / ndf0
+    fc = special.fdtr(ndf0, ny - ndf0, f_stat)         # F CDF, dof (NDF0, Ny-NDF0)
     idx = int(np.argmin(np.abs(fc - prob_reject)))
     return idx, fc
 

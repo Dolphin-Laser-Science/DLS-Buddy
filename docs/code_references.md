@@ -17,8 +17,10 @@ to its literature, or to find which papers a given module relies on.
   - Used in: analysis/dls/cumulants.py; analysis/dls/__init__.py (module docstring)
 - Frisken, Barbara J. (2001). Revisiting the Method of Cumulants for the Analysis of Dynamic Light-Scattering Data. *Applied Optics* **40**(24), 4087–4091. https://doi.org/10.1364/AO.40.004087
   - Used in: analysis/dls/cumulants.py (_fit_cumulants_nonlinear, _frisken_model); Advanced Guide §10.1, Eq. (47)
+- Provencher, Stephen W. (1982). A Constrained Regularization Method for Inverting Data Represented by Linear Algebraic or Integral Equations. *Computer Physics Communications* **27**(3), 213–227. https://doi.org/10.1016/0010-4655(82)90173-4
+  - Used in: analysis/dls/distributions.py (_ftest_corner, _tikhonov_effective_dof – the F-test alpha-selection criterion Eqs. 3.23–3.24 and the effective degrees of freedom NDF Eqs. 3.15–3.16); Advanced Guide §10.2, Eqs. (48)–(49)
 - Provencher, Stephen W. (1982). CONTIN: A General Purpose Constrained Regularization Program for Inverting Noisy Linear Algebraic and Integral Equations. *Computer Physics Communications* **27**(3), 229–242. https://doi.org/10.1016/0010-4655(82)90174-6
-  - Used in: analysis/dls/distributions.py (fit_contin, _ftest_corner – F-test alpha selection); analysis/dls/__init__.py (module docstring); Advanced Guide §10.2, Eqs. (48)–(49)
+  - Used in: analysis/dls/distributions.py (fit_contin – CONTIN Tikhonov inversion); analysis/dls/__init__.py (module docstring); Advanced Guide §10.2, Eq. (17)
 - Scotti, A.; Liu, W.; Hyatt, J. S.; Herman, E. S.; Choi, H. S.; Kim, J. W.; Lyon, L. A.; Gasser, U.; Fernandez-Nieves, A. (2015). The CONTIN Algorithm and Its Application to Determine the Size Distribution of Microgel Suspensions. *The Journal of Chemical Physics* **142**(23), 234905. https://doi.org/10.1063/1.4921686
   - Used in: analysis/dls/distributions.py (_ftest_corner, _tikhonov_effective_dof – probability-to-reject F-test, Eqs. 19–21); Advanced Guide §10.2, Eqs. (48)–(49)
 - Hansen, Per Christian (1998). Rank-Deficient and Discrete Ill-Posed Problems: Numerical Aspects of Linear Inversion. SIAM. https://doi.org/10.1137/1.9780898719697

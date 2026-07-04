@@ -195,6 +195,35 @@ def test_contin_ftest_selection_picks_sensible_alpha():
     assert alphas[2] > alphas[0], f"level had no effect: {alphas}"
 
 
+def test_ftest_uses_fixed_reference_dof_not_per_alpha():
+    """Provencher's F-statistic (Eqs. 3.23-3.24) uses NDF at the reference alpha_0
+    (least-squares end), held FIXED across the sweep -- NOT the per-alpha DOF. On a
+    kernel whose effective DOF falls steeply with alpha the two rules pick different
+    solutions; `_ftest_corner` must follow the fixed-NDF_0 rule (else it selects too
+    rough an alpha, as the 0.13.0 bug did)."""
+    from scipy import special
+    from analysis.dls.distributions import _ftest_corner
+
+    ny = 200
+    v = np.linspace(1.0, 1.25, 20)             # residual rises GENTLY (fc crosses 0.5 mid-sweep)
+    dof = np.linspace(27.0, 5.0, 20)           # effective DOF falls steeply with alpha
+    frac = np.clip((v - v[0]) / v[0], 0.0, None)
+
+    # correct (Provencher): NDF fixed at the reference alpha_0 = argmin(V) = index 0
+    ndf0 = dof[0]
+    fc_fixed = special.fdtr(ndf0, ny - ndf0, frac * (ny - ndf0) / ndf0)
+    idx_fixed = int(np.argmin(np.abs(fc_fixed - 0.5)))
+    # buggy (per-alpha) rule, for contrast
+    fc_per = special.fdtr(dof, ny - dof, frac * (ny - dof) / dof)
+    idx_per = int(np.argmin(np.abs(fc_per - 0.5)))
+
+    idx, fc = _ftest_corner(v, dof, n_data=ny, prob_reject=0.5)
+    assert idx == idx_fixed, f"selector must use fixed NDF_0 (got {idx}, expected {idx_fixed})"
+    assert idx != idx_per, "test design: the two rules should differ here"
+    assert idx_fixed > idx_per, "fixed-NDF_0 must pick a smoother (larger-alpha) solution"
+    assert np.allclose(fc, fc_fixed)
+
+
 def test_contin_lcurve_default_unchanged_by_ftest_option():
     """The default (untouched) CONTIN path is bit-identical to before the F-test option
     existed: same chosen alpha and weights whether or not alpha_method is passed."""
