@@ -50,7 +50,7 @@ from gui.plot_controls import (
 from gui.export_helper import export_to_csv
 from gui.help import add_help_to_groupbox, section_header
 from gui.theme import ThemedLabel, color as theme_color
-from gui.widgets import roomy_tabs, SelectionModel, MeasurementPicker
+from gui.widgets import roomy_tabs, SelectionModel, MeasurementPicker, GroupTickBar
 from gui.worker import BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, run_when_idle, runner
 from analysis.uncertainty import format_pm
 from analysis.dls import CUMULANT_PDI_VALIDITY_LIMIT
@@ -390,6 +390,19 @@ _SUMMARY_PICKER_BULLETS = [
     'With “Ticked only” off, the table lists every DLS result.',
 ]
 
+# Bulk "tick all at X" group fields for the DLS measurement pickers (feedback
+# 2026-07-07): concentration shown in mg/mL (stored g/mL), angle in degrees. Shared by
+# the Distribution picker (both fields) and the Γ-q²/D-c tabs (one field each). Each is
+# (committed-param key, noun, item-formatter-with-unit).
+_GROUP_FIELD_CONC = ('concentration_g_per_mL', 'concentration',
+                     lambda c: f'{c * 1000:g} mg/mL')
+_GROUP_FIELD_ANGLE = ('angle_deg', 'angle', lambda a: f'{a:g}°')
+# Distribution is cross-sample, so it offers both; its help gains one extra bullet.
+_DIST_PICKER_BULLETS = _PICKER_BULLETS + [
+    '<b>Tick all at concentration / angle</b> ticks every listed measurement '
+    'sharing the chosen value (concentration in mg/mL, angle in °).',
+]
+
 
 # ===========================================================================
 # Correlogram sub-tab (parametric fits + 4-scale views + residuals + tables)
@@ -432,7 +445,8 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        _, left, right = make_split_panels(self)
+        _, left, right = make_split_panels(self, left_min_width=300,
+                                           sizes=(360, 740))
 
         self.checklist = MeasurementPicker(
             self.controller, self.selection, kinds=('dls',),
@@ -1115,12 +1129,17 @@ class _DistributionTab(QtWidgets.QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        _, left, right = make_split_panels(self)
+        # Distribution has the longest form labels ('CONTIN α selection:' etc.), so it
+        # gets a slightly wider default + minimum than the other DLS tabs (feedback
+        # 2026-07-07: labels clipped at the old 340 px default).
+        _, left, right = make_split_panels(self, left_min_width=360,
+                                           sizes=(380, 740))
 
         self.checklist = MeasurementPicker(
             self.controller, self.selection, kinds=('dls',),
             label_fn=_meas_label, header_fn=_sample_header,
-            help_text=_PICKER_HELP, help_bullets=_PICKER_BULLETS)
+            help_text=_PICKER_HELP, help_bullets=_DIST_PICKER_BULLETS,
+            group_fields=(_GROUP_FIELD_CONC, _GROUP_FIELD_ANGLE))
         self.checklist.selectionChanged.connect(self._on_selection_changed)
 
         box = QtWidgets.QGroupBox('Distribution')
@@ -1533,7 +1552,11 @@ class _DistributionTab(QtWidgets.QWidget):
                 else:
                     txt = '—'
                 table.setItem(r, col, QtWidgets.QTableWidgetItem(txt))
-        table.setMaximumHeight(34 + 22 * n_rows)
+        # No max-height cap: the peak table sits in a stretch slot of the vertical
+        # splitter, so it should fill (and be resizable into) that slot rather than
+        # stay pinned to a row-count height (feedback 2026-07-07: the results section
+        # did not expand vertically). The 22 px/row estimate also clipped rows on
+        # platforms with taller default rows.
 
     def _clear_results(self) -> None:
         self.result_table.clear()
@@ -1594,7 +1617,8 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        _, left, right = make_split_panels(self)
+        _, left, right = make_split_panels(self, left_min_width=300,
+                                           sizes=(360, 740))
 
         # ---- controls section ----
         controls = QtWidgets.QWidget()
@@ -1630,10 +1654,8 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         tsec = QtWidgets.QWidget()
         tl = QtWidgets.QVBoxLayout(tsec); tl.setContentsMargins(0, 0, 0, 0)
         # The Γ-q² fit varies ANGLE at a fixed concentration → group by concentration;
-        # the D-c fit varies CONCENTRATION at a fixed angle → group by angle
-        # (owner feedback 2026-07-06).
-        by = 'concentration' if self.kind == 'gamma_q2' else 'angle'
-        other = 'angle' if self.kind == 'gamma_q2' else 'concentration'
+        # the D-c fit varies CONCENTRATION at a fixed angle → group by angle (owner
+        # feedback 2026-07-06). The group-by field is set with the GroupTickBar below.
         tl.addWidget(section_header(
             'Measurements (tick to include in the fit)',
             'Tick which of this sample\'s measurements enter the fit, then press Run.',
@@ -1644,7 +1666,9 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
                 'Greyed rows can\'t be ticked — hover a row to see why '
                 '(unconfirmed parameters, or a different Mw fraction).',
                 'Γ and D fill in only after you Run; ticking never refits on its own.',
-                'Ticked rows read blue and light the matching sidebar leaves.']))
+                'Ticked rows read blue and light the matching sidebar leaves.',
+                'Unticked points still plot as a grey × (labelled "excluded" in the '
+                'legend) so you can see what the fit left out.']))
         # Empty/ineligible-state hint + NaN-temperature sibling note (feedback 2026-07-06).
         self.table_note = ThemedLabel('', role='hint', size=10)
         self.table_note.setWordWrap(True); tl.addWidget(self.table_note)
@@ -1659,19 +1683,19 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self.select_none_btn = QtWidgets.QPushButton('Select none')
         self.select_none_btn.setToolTip('Untick every measurement.')
         self.select_none_btn.clicked.connect(self._select_none)
-        hl.addWidget(self.select_all_btn); hl.addWidget(self.select_none_btn)
-        hl.addWidget(QtWidgets.QLabel(f'Tick all at {by}:'))
-        self.group_combo = QtWidgets.QComboBox()
-        self.group_combo.setToolTip(
-            f'Tick every eligible measurement sharing the chosen {by} '
-            f'(the fit varies {other}).')
-        hl.addWidget(self.group_combo, 1)
-        self.group_tick_btn = QtWidgets.QPushButton('Tick')
-        self.group_tick_btn.setToolTip(
-            f'Add every eligible measurement at the selected {by} to the ticked set.')
-        self.group_tick_btn.clicked.connect(self._tick_all_at_group)
-        hl.addWidget(self.group_tick_btn)
+        hl.addWidget(self.select_all_btn)
+        hl.addWidget(self.select_none_btn)
+        hl.addStretch(1)
         tl.addWidget(helper)
+        # "Tick all at X" bulk selector via the shared GroupTickBar, on its own row so it
+        # fits the narrow column: concentration in mg/mL for Γ-q² (angle varies), angle in
+        # ° for D-c (concentration varies). The bar emits (key, value); we resolve this
+        # sample's matching rows and tick them.
+        self._group_field_spec = (_GROUP_FIELD_CONC if self.kind == 'gamma_q2'
+                                  else _GROUP_FIELD_ANGLE)
+        self.group_bar = GroupTickBar((self._group_field_spec,))
+        self.group_bar.tickRequested.connect(self._on_group_tick)
+        tl.addWidget(self.group_bar)
         self.table = QtWidgets.QTableWidget(0, 0)
         self.table.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1922,24 +1946,20 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
     def _group_field(self) -> str:
         """The metadata key the 'tick all at X' selector groups by: concentration for
         the Γ-q² tab (angle varies), angle for the D-c tab (concentration varies)."""
-        return ('concentration_g_per_mL' if self.kind == 'gamma_q2' else 'angle_deg')
+        return self._group_field_spec[0]
 
     def _set_helpers_enabled(self, on: bool) -> None:
-        for w in (self.select_all_btn, self.select_none_btn,
-                  self.group_combo, self.group_tick_btn):
-            w.setEnabled(on)
+        self.select_all_btn.setEnabled(on)
+        self.select_none_btn.setEnabled(on)
+        self.group_bar.setEnabled(on)
 
     def _populate_group_combo(self, sid: str) -> None:
-        """Fill the 'tick all at X' combo with the distinct values among ELIGIBLE rows."""
+        """Fill the 'tick all at X' combo with the distinct values among ELIGIBLE rows
+        (formatted with units by the GroupTickBar — mg/mL for concentration, ° for angle)."""
         field = self._group_field()
         vals = sorted({r[field] for r in self._points.get(sid, [])
                        if r['ok'] and r[field] is not None})
-        self.group_combo.blockSignals(True)
-        self.group_combo.clear()
-        for v in vals:
-            self.group_combo.addItem(f'{v:g}', v)
-        self.group_combo.blockSignals(False)
-        self.group_tick_btn.setEnabled(bool(vals))
+        self.group_bar.set_values(field, vals)
 
     def _apply_included(self, sid: str, ids: set) -> None:
         """Set the ticked include-set for a sample and refresh the dependent UI once
@@ -1967,14 +1987,12 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             return
         self._apply_included(sid, set())
 
-    @QtCore.Slot()
-    def _tick_all_at_group(self) -> None:
-        """Add every eligible measurement sharing the chosen value to the ticked set."""
+    def _on_group_tick(self, field: str, target) -> None:
+        """Add every eligible measurement sharing the chosen value to the ticked set
+        (GroupTickBar.tickRequested handler)."""
         sid = self._sample_id()
-        if sid is None or self.group_combo.currentIndex() < 0:
+        if sid is None or target is None:
             return
-        target = self.group_combo.currentData()
-        field = self._group_field()
         add = {r['item_id'] for r in self._points.get(sid, [])
                if r['ok'] and r[field] is not None
                and round(float(r[field]), 9) == round(float(target), 9)}
@@ -2133,15 +2151,26 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             self.ax.set_title('D vs c → infinite dilution')
             flag = ('(± statistical only)'
                     if (res.d0_se is not None or res.kd_se is not None) else '')
+        drew_excluded = False
         if sid is not None:
-            self._grey_points(sid)        # grey the unticked (excluded) ok points
+            drew_excluded = self._grey_points(sid)   # grey the unticked (excluded) ok points
+        if drew_excluded:
+            # The grey ×'s are added AFTER the analysis layer built the legend, so
+            # re-issue it (preserving any title, e.g. the D-vs-c k_D title) to give the
+            # 'excluded' marker an entry.
+            leg = self.ax.get_legend()
+            title = leg.get_title().get_text() if leg is not None else None
+            self.ax.legend(frameon=False, fontsize=9, title=title or None)
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)
         self.flag_label.setText(flag)
 
-    def _grey_points(self, sid: str) -> None:
+    def _grey_points(self, sid: str) -> bool:
         """Grey × the computed points that are NOT ticked, from the run's per-point
-        values (by item_id, so replicates are disambiguated)."""
+        values (by item_id, so replicates are disambiguated). Returns True if any
+        excluded point was drawn (so the caller can add a legend entry). Only the
+        first marker is labelled so the legend shows one 'excluded' entry, not one
+        per point."""
         inc = self._included.get(sid, set())
         if self.kind == 'gamma_q2':
             xf, yf, xk, yk = (_disp_factor('scattering_q2'),
@@ -2150,12 +2179,16 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             xf, yf, xk, yk = (_disp_factor('concentration'),
                               _disp_factor('diffusion'),
                               'concentration_g_per_mL', 'd_app_m2_s')
+        drew = False
         for pt in self._run_points.get(sid, []):
             if (pt['quality'] not in ('ok', 'high_pdi') or pt['item_id'] in inc
                     or pt[xk] is None or not math.isfinite(pt[xk])):
                 continue
             self.ax.plot([pt[xk] * xf], [pt[yk] * yf], 'x', color='#999999',
-                         ms=9, mew=2, zorder=4)
+                         ms=9, mew=2, zorder=4,
+                         label='excluded (unticked)' if not drew else None)
+            drew = True
+        return drew
 
     def _clear(self, message: str) -> None:
         self.ax.clear()
@@ -2193,7 +2226,8 @@ class _DDLSTab(QtWidgets.QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        _, left, right = make_split_panels(self)
+        _, left, right = make_split_panels(self, left_min_width=300,
+                                           sizes=(360, 740))
         note = ThemedLabel(
             'Pairs the sample\'s VV (polarized) and VH (depolarized) correlograms '
             'by angle and extracts the rotational diffusion coefficient '
@@ -2210,6 +2244,8 @@ class _DDLSTab(QtWidgets.QWidget):
             bullets=['Only angles with BOTH a VV and a VH correlogram can be paired.',
                      'Untick an angle to drop it (e.g. an outlier); the fit re-runs on '
                      'the ticked angles.',
+                     'Dropped angles still plot as a grey × (labelled "excluded" in the '
+                     'legend) so you can see what was left out.',
                      'Ticked angles read blue and light the matching sidebar leaves.']))
         self.table = QtWidgets.QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(['', 'Angle (°)', 'Polarization', 'Paired'])
@@ -2539,6 +2575,7 @@ class _DDLSTab(QtWidgets.QWidget):
         plot_ddls(res, ax=self.ax)
         sid = self._sample_id()
         excl = self._excluded_angles(sid) if sid else None
+        drew_excluded = False
         if excl and sid in self._full:
             full = self._full[sid][0]
             qf, gf = _disp_factor('scattering_q2'), _disp_factor('decay_rate')
@@ -2549,7 +2586,13 @@ class _DDLSTab(QtWidgets.QWidget):
                 for x, y, a in zip(q2, ys, ang, strict=True):
                     if any(np.isclose(a, e) for e in excl):
                         self.ax.plot([x], [y], 'x', color='#999999', ms=9, mew=2,
-                                     zorder=5)
+                                     zorder=5,
+                                     label='excluded (unticked)' if not drew_excluded
+                                     else None)
+                        drew_excluded = True
+        if drew_excluded:
+            # Re-issue the legend so the grey ×'s (added after plot_ddls built it) show.
+            self.ax.legend(fontsize=8)
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)
 
@@ -2701,7 +2744,8 @@ class _SummaryTab(QtWidgets.QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        _, left, right = make_split_panels(self)
+        _, left, right = make_split_panels(self, left_min_width=300,
+                                           sizes=(360, 740))
 
         self.checklist = MeasurementPicker(
             self.controller, self.selection, kinds=('dls',),

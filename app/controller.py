@@ -356,6 +356,11 @@ class Controller:
         self.sls_masks: Dict[str, SLSMask] = {}
         # last analysis results, keyed for the GUI to fetch and plot
         self.results: Dict[str, Any] = {}
+        # Memoized SLS candidate/A2 computations for the Cross-Sample tab, keyed by the
+        # full sls_run_signature (feedback 2026-07-07): refresh() re-runs the same
+        # Zimm/Debye/Guinier fits 3-5x per fraction (auto-select + source panel), so this
+        # collapses them to one until an input changes. See _sls_cached.
+        self._sls_candidate_cache: Dict[tuple, Any] = {}
         # Undo history: a stack of committed-state snapshots, one pushed before each
         # Update that actually changes something. `undo` steps back through these
         # previously-applied parameter sets (feedback 2026-06-29 #5).
@@ -731,6 +736,44 @@ class Controller:
                 if k not in _PROVENANCE_KEYS))
             out.append((iid, params))
         return tuple(out)
+
+    def sls_run_signature(self, sample_id: str,
+                          fraction: Optional[str] = None) -> tuple:
+        """A hashable signature of everything an SLS fit for (sample, fraction) depends
+        on: the committed params of its SLS measurements + the shared solvent reference,
+        the fraction's data mask, the effective (per-sample or session) calibration, the
+        settings-seeded fit inputs (SE estimator + Guinier qRg-max validity limit), and
+        the sample's stored Mw (the calibration-free A₂ reads it). Two signatures compare
+        equal iff a re-run would read identical inputs — so the SLS tab can redisplay a
+        cached fit and flag it stale exactly when recomputing would change it.
+        `committed_signature` alone would miss the mask, calibration, the two settings
+        inputs (`se_estimator`; `guinier_qrg_max`, which sets the Guinier validity
+        caution), and the stored Mw — the inputs the SLS fits read beyond the measurement
+        params. If a future fit path reads another `self.settings.*` value or workspace
+        field, add it here or the redisplay could show a fit against a stale input."""
+        ids = [lm.item_id
+               for lm in self.workspace.sample_measurements(sample_id, 'sls')
+               if lm.committed_params.get('mw_fraction') == fraction]
+        ref = self.workspace.solvent_reference(sample_id)
+        if ref is not None:
+            ids.append(ref.item_id)
+        mask = self.sls_masks.get((sample_id, fraction))
+        mask_sig = () if (mask is None or mask.is_empty()) else (
+            tuple(sorted(mask.masked_angles)),
+            tuple(sorted(mask.masked_concentrations)),
+            tuple(sorted(tuple(p) for p in mask.masked_points)))
+        cal_sig = tuple(sorted(self._calibration_for_sample(sample_id).to_dict().items()))
+        # The calibration-free A₂ reads the sample's stored Mw when none is passed (the
+        # SLS tab always lets it), so a changed Mw must flag a cached 'calfree' fit stale
+        # (an SLS run does NOT store Mw, so this stays stable across run→redisplay; only a
+        # manual/Cross-Sample Mw edit moves it). Conservative for the other methods, which
+        # don't read the stored Mw — the safe direction for a stale guard.
+        sample = self.workspace.samples.get(sample_id)
+        mw_sig = ((None, None) if sample is None else
+                  (sample.result_for(fraction).effective_mw(),
+                   sample.result_for(fraction).mw_source))
+        return (self.committed_signature(ids), mask_sig, cal_sig,
+                self.settings.se_estimator, self.settings.guinier_qrg_max, mw_sig)
 
     def commit(self) -> None:
         """Adopt all working edits as committed and re-group. Runs no analysis."""
@@ -2341,16 +2384,19 @@ class Controller:
         return cands
 
     def set_sample_rh(self, sample_id: str, candidate: ResultCandidate,
-                      fraction: Optional[str] = None) -> None:
+                      fraction: Optional[str] = None, *, explicit: bool = False) -> None:
         """Store a chosen DLS-derived Rh candidate as the sample/fraction's Rh.
 
         An explicit selection (the GUI picked this candidate), so it overrides any
         previously stored value, including a hand-entered one. Records the
-        provenance label and apparent/thermodynamic status for rho.
+        provenance label and apparent/thermodynamic status for rho. `explicit=True`
+        marks the source 'picked' (a deliberate user choice, which a later passive
+        auto-select refresh must NOT clobber back to the default); the default fill
+        (`auto_select_*`) leaves it 'computed'.
         """
         r = self.workspace.samples[sample_id].result_for(fraction)
         r.rh_nm = float(candidate.value)
-        r.rh_source = 'computed'
+        r.rh_source = 'picked' if explicit else 'computed'
         r.rh_apparent = bool(candidate.is_apparent)
         r.rh_label = candidate.label
         r.rh_se = candidate.value_se
@@ -2359,14 +2405,14 @@ class Controller:
                        fraction: Optional[str] = None) -> Optional[ResultCandidate]:
         """Pick and store the default Rh for a sample (most-extrapolated first).
 
-        Never overwrites a hand-entered Rh (rh_source == 'user'); returns the
-        stored-or-chosen candidate, or None if no DLS Rh is available. The default
-        is labelled -- the GUI shows where the value came from; it is never silent.
+        Never overwrites a hand-entered Rh ('user') or an explicit pick ('picked');
+        returns the stored-or-chosen candidate, or None if no DLS Rh is available. The
+        default is labelled -- the GUI shows where the value came from; never silent.
         """
         r = self.workspace.samples[sample_id].result_for(fraction)
         cands = self.dls_rh_candidates(sample_id, fraction)
-        if r.rh_source == 'user' and r.rh_nm is not None:
-            return None                      # respect the manual override
+        if r.rh_source in ('user', 'picked') and r.rh_nm is not None:
+            return None                      # respect a manual override or explicit pick
         chosen = select_default_candidate(cands)
         if chosen is not None:
             self.set_sample_rh(sample_id, chosen, fraction)
@@ -2391,8 +2437,39 @@ class Controller:
         r.rh_label = 'user-entered'
         r.rh_se = None                    # a hand-entered value carries no statistical SE
 
+    def _sls_cached(self, kind: str, sample_id: str, fraction: Optional[str], compute):
+        """Memoize an SLS candidate/A2 computation for (sample, fraction) under the full
+        `sls_run_signature`. The Cross-Sample refresh calls the candidate + A2 functions
+        several times per fraction and each re-runs the same Zimm/Debye/Guinier fits;
+        this returns the first result until an input changes. Keyed on the run signature,
+        so a mask/commit/calibration/estimator/Mw change simply MISSES — no explicit
+        invalidation needed. The estimator is IN the key, so this cache is deliberately
+        NOT swept by `clear_se_dependent_results` (doing so would be redundant; keying on
+        the signature is the single invalidation mechanism). Bounded: only the current
+        signature is kept per (kind, sample, fraction)."""
+        sig = self.sls_run_signature(sample_id, fraction)
+        key = (kind, sample_id, fraction, sig)
+        cache = self._sls_candidate_cache
+        if key in cache:
+            return cache[key]
+        val = compute()
+        for stale in [k for k in cache if k[:3] == (kind, sample_id, fraction)]:
+            del cache[stale]                 # evict the same slot under an older signature
+        cache[key] = val
+        return val
+
     def sls_rg_candidates(self, sample_id: str,
                           fraction: Optional[str] = None) -> List[ResultCandidate]:
+        """Available SLS-derived Rg values for a sample, each with provenance (memoized by
+        `_sls_cached` under the run signature — see `_sls_rg_candidates_uncached`)."""
+        # Return a shallow copy so a caller can't mutate (sort/filter in place) the cached
+        # list and poison the memo — the load-bearing "cache never changes a result" rule.
+        return list(self._sls_cached(
+            'rg', sample_id, fraction,
+            lambda: self._sls_rg_candidates_uncached(sample_id, fraction)))
+
+    def _sls_rg_candidates_uncached(self, sample_id: str,
+                                    fraction: Optional[str] = None) -> List[ResultCandidate]:
         """Available SLS-derived Rg values for a sample, each with provenance.
 
         Two kinds (higher tier = preferred):
@@ -2469,15 +2546,17 @@ class Controller:
         return cands
 
     def set_sample_rg(self, sample_id: str, candidate: ResultCandidate,
-                      fraction: Optional[str] = None) -> None:
+                      fraction: Optional[str] = None, *, explicit: bool = False) -> None:
         """Store a chosen SLS-derived Rg candidate as the sample/fraction's Rg.
 
         An explicit selection -- overrides any previously stored value, including a
         hand-entered one. Records provenance and apparent/thermodynamic status.
+        `explicit=True` marks the source 'picked' (a deliberate user choice a later
+        passive auto-select must not clobber); the default fill leaves it 'computed'.
         """
         r = self.workspace.samples[sample_id].result_for(fraction)
         r.rg_nm = float(candidate.value)
-        r.rg_source = 'computed'
+        r.rg_source = 'picked' if explicit else 'computed'
         r.rg_apparent = bool(candidate.is_apparent)
         r.rg_label = candidate.label
         r.rg_se = candidate.value_se
@@ -2486,11 +2565,12 @@ class Controller:
                        fraction: Optional[str] = None) -> Optional[ResultCandidate]:
         """Pick and store the default Rg for a sample (most-extrapolated first).
 
-        Never overwrites a hand-entered Rg (rg_source == 'user'); returns the
-        chosen candidate, or None if no SLS Rg is available. Labelled, never silent.
+        Never overwrites a hand-entered Rg ('user') or an explicit pick ('picked');
+        returns the chosen candidate, or None if no SLS Rg is available. Labelled,
+        never silent.
         """
         r = self.workspace.samples[sample_id].result_for(fraction)
-        if r.rg_source == 'user' and r.rg_nm is not None:
+        if r.rg_source in ('user', 'picked') and r.rg_nm is not None:
             return None
         chosen = select_default_candidate(self.sls_rg_candidates(sample_id, fraction))
         if chosen is not None:
@@ -2517,6 +2597,15 @@ class Controller:
 
     def sls_mw_candidates(self, sample_id: str,
                           fraction: Optional[str] = None) -> List[ResultCandidate]:
+        """Available SLS-derived Mw values for a sample, each with provenance (memoized by
+        `_sls_cached` under the run signature — see `_sls_mw_candidates_uncached`)."""
+        # Shallow copy — see sls_rg_candidates (don't let a caller poison the memo).
+        return list(self._sls_cached(
+            'mw', sample_id, fraction,
+            lambda: self._sls_mw_candidates_uncached(sample_id, fraction)))
+
+    def _sls_mw_candidates_uncached(self, sample_id: str,
+                                    fraction: Optional[str] = None) -> List[ResultCandidate]:
         """Available SLS-derived Mw values for a sample, each with provenance.
 
         tier 3  Zimm / Berry (thermodynamic, needs >= 2 concentrations);
@@ -2555,7 +2644,8 @@ class Controller:
                     kind=f'sls_{method}', is_apparent=False, tier=3,
                     quality=(r2 if np.isfinite(r2) else None),
                     quality_kind='r_squared', source_id=method,
-                    value_se=unc.se_or_none(getattr(res, 'mw_se', None))))
+                    value_se=unc.se_or_none(getattr(res, 'mw_se', None)),
+                    calibrated=bool(res.calibrated)))
 
         for r in nonzero:
             c = r.concentration_g_per_mL
@@ -2577,55 +2667,122 @@ class Controller:
                     kind=kind, is_apparent=True, tier=2,
                     quality=(r2 if np.isfinite(r2) else None),
                     quality_kind='r_squared', source_id=f'{kind}@{c}',
-                    value_se=unc.se_or_none(getattr(res, 'mw_apparent_se', None))))
+                    value_se=unc.se_or_none(getattr(res, 'mw_apparent_se', None)),
+                    calibrated=bool(res.calibrated)))
         return cands
 
     def set_sample_mw(self, sample_id: str, candidate: ResultCandidate,
-                      fraction: Optional[str] = None) -> None:
+                      fraction: Optional[str] = None, *, explicit: bool = False) -> None:
         """Store a chosen SLS-derived Mw candidate as the sample/fraction's Mw
-        (explicit pick; overrides any previous value, including a hand-entered one)."""
+        (explicit pick; overrides any previous value, including a hand-entered one).
+        `explicit=True` marks the source 'picked' (a deliberate user choice a later
+        passive auto-select must not clobber); the default fill leaves it 'computed'."""
         r = self.workspace.samples[sample_id].result_for(fraction)
         r.mw_g_per_mol = float(candidate.value)
-        r.mw_source = 'computed'
+        r.mw_source = 'picked' if explicit else 'computed'
         r.mw_apparent = bool(candidate.is_apparent)
         r.mw_label = candidate.label
         r.mw_se = candidate.value_se
-        r.calibrated = 'UNCALIBRATED' not in candidate.label
+        # Carry the calibration flag as a real field off the candidate -- never
+        # parse it back out of the human-readable label string.
+        r.calibrated = candidate.calibrated
 
     def auto_select_mw(self, sample_id: str,
                        fraction: Optional[str] = None) -> Optional[ResultCandidate]:
         """Pick and store the default Mw (most-extrapolated first); never overwrites
-        a hand-entered Mw. Returns the chosen candidate, or None."""
+        a hand-entered Mw ('user') or an explicit pick ('picked'). Returns the chosen
+        candidate, or None."""
         r = self.workspace.samples[sample_id].result_for(fraction)
-        if r.mw_source == 'user' and r.mw_g_per_mol is not None:
+        if r.mw_source in ('user', 'picked') and r.mw_g_per_mol is not None:
             return None
         chosen = select_default_candidate(self.sls_mw_candidates(sample_id, fraction))
         if chosen is not None:
             self.set_sample_mw(sample_id, chosen, fraction)
         return chosen
 
+    def sls_a2_candidates(self, sample_id: str,
+                          fraction: Optional[str] = None) -> List[ResultCandidate]:
+        """Available SLS-derived A2 values for a sample, each with provenance (memoized by
+        `_sls_cached` under the run signature — see `_sls_a2_candidates_uncached`)."""
+        # Shallow copy — see sls_rg_candidates (don't let a caller poison the memo).
+        return list(self._sls_cached(
+            'a2', sample_id, fraction,
+            lambda: self._sls_a2_candidates_uncached(sample_id, fraction)))
+
+    def _sls_a2_candidates_uncached(self, sample_id: str,
+                                    fraction: Optional[str] = None) -> List[ResultCandidate]:
+        """Available SLS-derived A2 values for a sample, each with provenance.
+
+        A2 is a second-virial (two-concentration) coefficient, so only the
+        thermodynamic Zimm / Berry double extrapolation yields one -- there is no
+        single-concentration A2 (Debye/Guinier give none). Like Mw, **A2 is
+        calibration-dependent**: an uncalibrated run puts A2 on an arbitrary scale,
+        recorded on each candidate's `calibrated` flag (never parsed from the label).
+        Needs >= 2 concentrations and a solvent reference; empty otherwise.
+        """
+        cands: List[ResultCandidate] = []
+        try:
+            rr = self.masked_rayleigh(sample_id, fraction)
+        except Exception:
+            return cands
+        nonzero = [r for r in rr if r.concentration_g_per_mL != 0]
+        n_conc = len({round(r.concentration_g_per_mL, 12) for r in nonzero})
+        if n_conc < 2:
+            return cands
+        for method in ('zimm', 'berry'):
+            try:
+                res = sls_engine.zimm_analysis(rr, method=method,
+                                               estimator=self.settings.se_estimator)
+            except Exception:
+                continue
+            if not np.isfinite(res.a2_mol_mL_per_g2):
+                continue
+            r2 = float(res.r_squared)
+            cal = bool(res.calibrated)
+            cal_note = '' if cal else '; UNCALIBRATED — arbitrary scale'
+            cands.append(ResultCandidate(
+                value=float(res.a2_mol_mL_per_g2),
+                label=(f"{method.capitalize()} extrapolation, "
+                       f"{res.n_concentrations} concentrations (thermodynamic"
+                       f"{cal_note}, R² = {_fmt_r2(r2)})"),
+                kind=f'sls_{method}', is_apparent=False, tier=3,
+                quality=(r2 if np.isfinite(r2) else None),
+                quality_kind='r_squared', source_id=method,
+                value_se=unc.se_or_none(getattr(res, 'a2_se', None)),
+                calibrated=cal))
+        return cands
+
+    def set_sample_a2(self, sample_id: str, candidate: ResultCandidate,
+                      fraction: Optional[str] = None, *, explicit: bool = False) -> None:
+        """Store a chosen SLS-derived A2 candidate as the sample/fraction's A2
+        (explicit pick; overrides any previous value). Carries the calibration flag
+        as a real field off the candidate -- never parsed from the label. A2 has no
+        hand-entered path (unlike Mw): it is a solvent/T-specific interaction
+        coefficient with no external 'standard' and is the y-axis the scaling plot
+        fits, so only fit-derived candidates are offered. `explicit=True` marks the
+        source 'picked' (a deliberate user choice a later passive auto-select must not
+        clobber); the default fill leaves it 'computed'."""
+        r = self.workspace.samples[sample_id].result_for(fraction)
+        r.a2_mol_mL_per_g2 = float(candidate.value)
+        r.a2_source = 'picked' if explicit else 'computed'
+        r.a2_label = candidate.label
+        r.a2_se = candidate.value_se
+        r.a2_calibrated = candidate.calibrated
+
     def auto_select_a2(self, sample_id: str,
                        fraction: Optional[str] = None) -> Optional[float]:
-        """Populate A2 from the thermodynamic Zimm fit (for the A2-Mw scaling plot),
-        unless a user A2 is set. A2 is calibration-dependent -- an uncalibrated A2 is
-        on an arbitrary scale (the run's `calibrated` flag records this). Returns the
-        stored A2, or None if none could be computed. There is no A2 source picker
-        (yet): the scaling plot uses the Zimm/Berry A2."""
+        """Pick and store the default A2 (best-tier Zimm/Berry fit) for the A2-Mw
+        scaling plot; never overwrites a hand-set A2 ('user', reserved for a future
+        external-value path) or an explicit pick ('picked'). Returns the stored A2, or
+        None if none could be computed. Labelled via `set_sample_a2`, never silent."""
         r = self.workspace.samples[sample_id].result_for(fraction)
-        if r.a2_source == 'user':
+        if r.a2_source in ('user', 'picked'):
             return r.a2_mol_mL_per_g2
-        try:
-            res = sls_engine.zimm_analysis(
-                self.masked_rayleigh(sample_id, fraction), method='zimm',
-                estimator=self.settings.se_estimator)
-        except Exception:
-            return None
-        if not np.isfinite(res.a2_mol_mL_per_g2):
-            return None
-        r.a2_mol_mL_per_g2 = float(res.a2_mol_mL_per_g2)
-        r.a2_source = 'computed'
-        r.a2_se = unc.se_or_none(getattr(res, 'a2_se', None))
-        return r.a2_mol_mL_per_g2
+        chosen = select_default_candidate(self.sls_a2_candidates(sample_id, fraction))
+        if chosen is not None:
+            self.set_sample_a2(sample_id, chosen, fraction)
+            return r.a2_mol_mL_per_g2
+        return None
 
     def compute_sample_rho(self, sample_id: str,
                            fraction: Optional[str] = None) -> SampleRho:
@@ -3108,6 +3265,11 @@ class Controller:
         dead = ids | vanished
         self.results = {k: v for k, v in self.results.items()
                         if not (len(k) > 1 and k[1] in dead)}
+        # The SLS candidate memo is keyed (kind, sample_id, fraction, sig); drop any
+        # entry for a vanished sample (stale entries would otherwise just miss, but this
+        # keeps it bounded).
+        self._sls_candidate_cache = {
+            k: v for k, v in self._sls_candidate_cache.items() if k[1] not in dead}
         if vanished:
             # sls_masks is keyed by (sample_id, fraction); drop every fraction of a
             # vanished sample.
@@ -3204,6 +3366,7 @@ class Controller:
                 (sid, None): SLSMask.from_dict(d)
                 for sid, d in raw_masks.items()}
         self.results.clear()
+        self._sls_candidate_cache.clear()   # the memo belongs to the old workspace
         # The undo history belongs to the previous session's measurements; drop it so
         # Undo can't step back into a no-longer-loaded state.
         self._commit_history.clear()

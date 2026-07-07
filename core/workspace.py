@@ -259,7 +259,7 @@ class SampleResult:
     prefer the user value when present.
     """
     mw_g_per_mol: Optional[float] = None
-    mw_source: str = 'computed'        # 'computed' or 'user'
+    mw_source: str = 'computed'        # 'computed' (auto-default) | 'picked' (explicit) | 'user' (manual)
     mw_apparent: Optional[bool] = None  # True = single-condition (Debye/Guinier/single-angle); False = Zimm/Berry
     mw_label: str = ''                  # plain-language provenance of mw_g_per_mol
     mw_se: Optional[float] = None       # statistical SE (None for user/no-SE sources)
@@ -270,7 +270,9 @@ class SampleResult:
     rg_se: Optional[float] = None
     a2_mol_mL_per_g2: Optional[float] = None
     a2_source: str = 'computed'
+    a2_label: str = ''                  # plain-language provenance of a2_mol_mL_per_g2 (shown in Cross-Sample)
     a2_se: Optional[float] = None
+    a2_calibrated: Optional[bool] = None  # whether the SLS run that filled A2 was calibrated (A2 is scale-dependent)
     rh_nm: Optional[float] = None       # from DLS (infinite-dilution if available)
     rh_source: str = 'computed'
     rh_apparent: Optional[bool] = None  # True = apparent (single q or single c); False = thermodynamic (c->0)

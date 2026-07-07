@@ -10,7 +10,9 @@ Small cross-module Qt widget helpers that don't belong to any one tab:
 * the **shared selection layer** (`SelectionModel` + `MeasurementPicker`) — the one
   measurement-picker idiom every analysis tab uses (real checkboxes, include-semantics,
   select-all/none, grouped by sample). Promoted from the DLS-only checklist so all tabs
-  share one look and one model, and the sidebar can mirror "what's selected".
+  share one look and one model, and the sidebar can mirror "what's selected";
+* the **bulk group-tick row** (`GroupTickBar`) — a "tick all at concentration / angle"
+  helper shared by the Γ-q²/D-c tabs and the Distribution picker (feedback 2026-07-07).
 
 The tab-bar fix widens each tab's **size hint** rather than applying a `QTabBar::tab`
 stylesheet — a stylesheet would override Fusion's native tab painting (flat, unstyled
@@ -210,6 +212,85 @@ class SelectionModel(QtCore.QObject):
         return self._cycle[idx % len(self._cycle)]
 
 
+class GroupTickBar(QtWidgets.QWidget):
+    """A physics-free "tick all at X" helper row: one *(label, combo, Tick button)* group
+    per field. Emits ``tickRequested(key, value)`` when a Tick button is pressed; the
+    HOST resolves which measurements share that value and ticks them — this widget owns
+    no selection state, so the same bar works over a table-backed selection
+    (``_SampleAnalysisTab``) or a :class:`SelectionModel` (the Distribution picker).
+
+    ``fields`` is a sequence of ``(key, noun, formatter)``: ``key`` labels the emitted
+    signal, ``noun`` fills the label/tooltips ("Tick all at {noun}:"), and
+    ``formatter(value) -> str`` renders each combo item WITH its unit (e.g.
+    ``lambda c: f'{c*1000:g} mg/mL'``). The host supplies the distinct raw values per
+    field via :meth:`set_values`; the raw value rides the combo item's ``UserRole`` and
+    comes back verbatim in ``tickRequested`` (kept a Python object, not restringified)."""
+
+    tickRequested = QtCore.Signal(str, object)
+
+    def __init__(self, fields: Sequence[tuple],
+                 parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._combos: dict = {}          # key -> QComboBox
+        self._buttons: dict = {}         # key -> QPushButton
+        self._formatters: dict = {key: fmt for key, _noun, fmt in fields}
+        # One (label, combo, Tick) row PER field, stacked vertically — a single HBox
+        # would overflow the narrow control column once there are two fields (feedback
+        # 2026-07-07). A single-field bar is just one row.
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        for key, noun, _fmt in fields:
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(QtWidgets.QLabel(f'Tick all at {noun}:'))
+            combo = QtWidgets.QComboBox()
+            combo.setToolTip(
+                f'Tick every eligible measurement sharing the chosen {noun}.')
+            # Grow to its content but don't hog the row — keep the Tick button visible
+            # in the narrow control column (feedback 2026-07-07).
+            combo.setSizeAdjustPolicy(
+                QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+            self._combos[key] = combo
+            row.addWidget(combo)
+            btn = QtWidgets.QPushButton('Tick')
+            btn.setToolTip(
+                f'Add every eligible measurement at the selected {noun} to the '
+                'ticked set.')
+            btn.clicked.connect(lambda _checked=False, k=key: self._emit(k))
+            self._buttons[key] = btn
+            row.addWidget(btn)
+            row.addStretch(1)
+            outer.addLayout(row)
+
+    def set_values(self, key: str, values: Iterable) -> None:
+        """Fill one field's combo with the distinct raw ``values`` (formatted via the
+        field's formatter). Disables that field's combo + button when there are none."""
+        combo = self._combos.get(key)
+        if combo is None:
+            return
+        fmt = self._formatters[key]
+        combo.blockSignals(True)
+        combo.clear()
+        for v in values:
+            combo.addItem(fmt(v), v)
+        combo.blockSignals(False)
+        has = combo.count() > 0
+        combo.setEnabled(has)
+        self._buttons[key].setEnabled(has)
+
+    def item_texts(self, key: str) -> list:
+        """The formatted (unit-bearing) display strings currently in a field's combo —
+        e.g. ['1.4 mg/mL', '0.6 mg/mL']. Handy for verifying the unit rendering."""
+        combo = self._combos.get(key)
+        return [combo.itemText(i) for i in range(combo.count())] if combo else []
+
+    def _emit(self, key: str) -> None:
+        combo = self._combos[key]
+        if combo.currentIndex() < 0:
+            return
+        self.tickRequested.emit(key, combo.currentData())
+
+
 class MeasurementPicker(QtWidgets.QWidget):
     """The shared "which measurements?" picker: a sample-grouped list of **real
     checkboxes** (`Qt.ItemIsUserCheckable`, include-semantics) backed by a
@@ -230,6 +311,7 @@ class MeasurementPicker(QtWidgets.QWidget):
                  title: str = 'Measurements to plot',
                  help_text: str = '', help_bullets: Optional[Sequence[str]] = None,
                  single: bool = False,
+                 group_fields: Sequence[tuple] = (),
                  parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self._controller = controller
@@ -238,6 +320,7 @@ class MeasurementPicker(QtWidgets.QWidget):
         self._label_fn = label_fn
         self._header_fn = header_fn
         self._single = single
+        self._group_fields = tuple(group_fields)
         self._leaf_by_id: dict = {}          # item_id -> QListWidgetItem (checkable leaves)
 
         v = QtWidgets.QVBoxLayout(self)
@@ -261,6 +344,14 @@ class MeasurementPicker(QtWidgets.QWidget):
         btn_row.addWidget(self._btn_none)
         btn_row.addStretch(1)
         v.addLayout(btn_row)
+
+        # Optional bulk group-tick row (feedback 2026-07-07): "tick all at concentration
+        # / angle" over the currently-listed measurements. Emits a (key, value); we
+        # resolve the matching leaves and tick them on the shared model.
+        self._group_bar = GroupTickBar(self._group_fields) if self._group_fields else None
+        if self._group_bar is not None:
+            self._group_bar.tickRequested.connect(self._on_group_tick)
+            v.addWidget(self._group_bar)
 
         # The model is the single source of truth: any mutation (this picker, a sibling
         # picker sharing the model, a prune) re-syncs the checkboxes here and re-emits.
@@ -301,6 +392,37 @@ class MeasurementPicker(QtWidgets.QWidget):
         self._list.blockSignals(False)
         self._model.prune(live)              # emits changed → _on_model_changed if it drops any
         self._apply_palette()                # tint the checked rows for the current theme
+        self._refresh_group_values()
+
+    def _refresh_group_values(self) -> None:
+        """Fill each group-tick combo with the distinct committed values among the
+        currently-listed leaves (Distribution is cross-sample: the bar groups over
+        every measurement on screen, matching the plotted committed data)."""
+        if self._group_bar is None:
+            return
+        for key, _noun, _fmt in self._group_fields:
+            vals = sorted({v for iid in self._leaf_by_id
+                           if (v := self._group_value(iid, key)) is not None})
+            self._group_bar.set_values(key, vals)
+
+    def _group_value(self, iid: str, key: str):
+        """The committed value of ``key`` for a leaf (what the plot uses), or None."""
+        lm = self._controller.workspace.measurements.get(iid)
+        return lm.committed_params.get(key) if lm is not None else None
+
+    def _on_group_tick(self, key: str, value) -> None:
+        """Tick every listed leaf whose committed ``key`` matches ``value`` (float-safe),
+        adding to the current selection (never unticking)."""
+        try:
+            target = round(float(value), 9)
+        except (TypeError, ValueError):
+            return
+        match = []
+        for iid in self._leaf_by_id:
+            v = self._group_value(iid, key)
+            if v is not None and round(float(v), 9) == target:
+                match.append(iid)
+        self._model.set_many(match, True)
 
     def selected_item_ids(self) -> list[str]:
         """The ticked measurements that still exist as rows (model order preserved)."""

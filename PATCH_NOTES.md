@@ -9,6 +9,69 @@ window title.
 
 ---
 
+## 0.17.1 — Cross-Sample source panel: explicit selection + A₂ picker (2026-07-07)
+
+A redesign of how you pick which fitted values represent each sample in the Cross-Sample
+tab, from the same owner feedback round. The analysis numbers are unchanged — this is about
+making the selection explicit and consistent with the rest of the program.
+
+- **The focused sample is now chosen explicitly, in the tab.** The source panel has its own
+  **Sample** and **Fraction** selectors, so it always says which sample and which Mw fraction
+  you are editing. Previously the sample was re-pointed by a hidden side effect of clicking a
+  ρ-table row, and the fraction was only shown in the panel title. The ρ table is now a
+  read-only results view, and the Workspace tree on the left simply *highlights* the focused
+  sample (it no longer needs to be used to drive this tab).
+- **New A₂ source picker.** The A₂–Mw scaling plot now has a visible A₂ row, so you can see
+  and choose which fit supplies A₂ (Zimm or Berry) instead of it being picked silently. A₂ has
+  **no hand-entry box** (unlike Mw): it is a solvent/temperature-specific interaction
+  coefficient with no external "standard", and it is the very quantity the A₂–Mw plot fits, so
+  only fit-derived values are offered.
+- **Uncalibrated Mw / A₂ are now flagged in the panel.** Because Mw and A₂ are on an arbitrary
+  scale until the run is calibrated, each row shows a **⚠ uncalibrated** badge and the panel
+  shows a one-line banner when the chosen value is uncalibrated. Rg is scale-independent, so it
+  is never flagged.
+- **The source dropdowns are no longer overwhelming.** They now group candidates by result
+  type (extrapolated / distribution / averaged / single-condition) and hide the long tail of
+  per-angle / per-concentration apparent values behind a **"Show all single-condition results"**
+  checkbox. The best value is still selected by default either way.
+- **A source you pick now sticks.** Choosing a non-default Rg / Rh / Mw / A₂ in the source panel
+  is remembered — switching tabs or committing an edit no longer silently reverts it to the
+  auto-default (it previously did).
+
+## 0.17.0 — UI/UX pass: consistent explicit-Run, clearer selection, tidier plots (2026-07-07)
+
+A batch of usability fixes and one consistency change, from an owner feedback round. The
+analysis results are unchanged throughout — this release is about *how* you drive the
+program and read its plots, not the numbers.
+
+- **SLS now works like the DLS tabs: nothing recomputes until you press Run.** Previously
+  the SLS tab silently re-ran its fit every time you switched sample or committed a
+  parameter. Now switching sample/fraction or committing **redisplays the last fit** and,
+  if an input that fed it changed, shows *"Inputs changed since this fit — press Run to
+  refresh"* — instead of quietly recomputing. Hiding/showing a point (mask) still refits
+  immediately, as before. This makes every analysis tab behave the same way.
+- **"Tick all at concentration / angle" now shows units, and the Distribution tab gets
+  both.** The bulk-selection dropdowns on Γ vs q² / D vs c read **mg/mL** and **°** (they
+  showed a bare number before), and the Distribution tab — which only had Select all/none —
+  now has the same **tick all at concentration** and **tick all at angle** helpers over its
+  measurement list.
+- **Excluded points are now labelled on the plot.** The grey ×'s for measurements you've
+  unticked (Γ vs q², D vs c, DDLS) and the hollow grey markers for masked SLS points now
+  appear in the plot legend ("excluded" / "masked"), so it's clear what the fit left out.
+- **Data tab keeps confident trailing zeros.** A library-filled refractive index or
+  viscosity is now shown to the precision its uncertainty supports — e.g. `1.3300` instead
+  of `1.33` — so the displayed value matches the precision the program actually stands
+  behind. Hand-entered values are shown as you typed them.
+- **Distribution-tab layout fixes:** the left-hand control labels no longer clip at the
+  default window width; the "Peak results" table now grows to fill its space instead of
+  staying pinned small; and the draggable divider between the distribution and its residual
+  no longer overlaps the axis label.
+- **Faster Cross-Sample refresh** (internal): the tab no longer re-runs the same SLS fits
+  several times per refresh — they are cached and reused until an input changes. No visible
+  change, just less waiting on samples with many concentrations.
+
+---
+
 ## 0.16.0 — Γ vs q² / D vs c: explicit-Run workflow + easier point selection (2026-07-06)
 
 The multi-angle **Γ vs q²** and concentration-series **D vs c** tabs were reworked so

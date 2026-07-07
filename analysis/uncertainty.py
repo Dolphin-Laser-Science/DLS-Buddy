@@ -360,3 +360,30 @@ def format_pm(value: Optional[float], se: Optional[float], unit: str = '') -> st
         d = max(0, dec)
         body = f'{val_r:.{d}f} ± {se_r:.{d}f}'
     return f'{body} {unit}' if unit else body
+
+
+def format_value_at_uncertainty(value: Optional[float],
+                                sigma: Optional[float]) -> str:
+    """Format ``value`` at the decimal place ``sigma`` stands behind, KEEPING the
+    confident trailing zeros that place implies (e.g. value 1.33, sigma 6e-4 ->
+    '1.3300') — the bare-value companion to :func:`format_pm`, with no '+/- se'.
+
+    Used for a display-only readout of an already-rounded, uncertainty-tagged value
+    (the Data-tab solvent-library cells): the value is shown to exactly the precision
+    the library's per-condition sigma supports, so a rounded 1.3300 does not collapse
+    to '1.33'. The place comes from the shared :func:`_pdg_decimals`, so it can never
+    drift from :func:`round_to_uncertainty` (the autofill rounding). Falls back to a
+    clean general format when sigma is missing/zero/non-finite (nothing to stand
+    behind). The sigma chooses the decimal place and travels no further (invariant #8).
+    """
+    if value is None or not math.isfinite(value):
+        return ''
+    has_sig = sigma is not None and math.isfinite(sigma) and sigma > 0
+    if not has_sig:
+        return f'{value:.10g}'
+    # Round at the σ place FIRST (honouring a negative ndigits for a coarse σ, e.g.
+    # σ≈60 -> the tens place), exactly as round_to_uncertainty/format_pm do, THEN
+    # show that place — so the two can never drift. `max(0, dec)` only clips the
+    # DISPLAY decimals (a place at/left of the units digit shows no fractional part).
+    dec = _pdg_decimals(sigma)
+    return f'{round(value, dec):.{max(0, dec)}f}'

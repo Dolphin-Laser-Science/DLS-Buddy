@@ -191,6 +191,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dls_module.selectionChanged.connect(self._on_selection_changed)
         self.sls_module.selectionChanged.connect(self._on_selection_changed)
         self.utilities_module.selectionChanged.connect(self._on_selection_changed)
+        # Cross-Sample selects in-tab (its own Sample combo, not the tree), but it
+        # read-only MIRRORS the focused sample onto the tree so the two stay coherent.
+        self.cross_module.selectionChanged.connect(self._on_selection_changed)
 
         # Each tab is wrapped in a resizable scroll area: when the window is shrunk
         # below a module's natural height the content scrolls instead of pinning a
@@ -496,7 +499,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Read-only reflect the ACTIVE tab's selected measurements onto the sidebar:
         selected leaves read `marker_selected` + bold, the rest revert to their base.
         A light per-row repaint (no tree rebuild) so expansion/scroll/selection survive.
-        Tabs with no selection concept (Data/Cross/Settings) simply clear the marks."""
+        Cross-Sample reports its focused sample's measurements here (a read-only
+        mirror); tabs with no selection concept (Data/Settings) simply clear the marks."""
         module = self._active_module()
         getter = getattr(module, 'selected_item_ids', None)
         selected = set(getter()) if callable(getter) else set()
@@ -1005,8 +1009,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sidebar_note.setText('Settings are global — no sample needed.')
         elif w is self.cross_module:
             self.sidebar_note.setText(
-                'Cross-Sample is aggregate: include/exclude samples in the list '
-                'on the left of the tab. The shell navigator is not used here.')
+                'Cross-Sample is aggregate: include/exclude samples and pick the '
+                'focused sample in the tab. The tree highlights that sample (read-'
+                'only) — clicking it here does not change the tab.')
         else:
             self.sidebar_note.setText(
                 'Pick a measurement to load it into the active module.')

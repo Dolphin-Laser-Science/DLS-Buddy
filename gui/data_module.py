@@ -28,6 +28,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from core.workspace import _DLS_PARAM_KEYS, _SLS_PARAM_KEYS
 from app.controller import _SHARED_PARAM_KEYS
 from app import units as U
+from analysis.uncertainty import format_value_at_uncertainty
 from physics import solvents as solvents_lib
 from gui.help import section_header
 from gui.theme import ThemedLabel, color as theme_color, token as theme_token
@@ -365,10 +366,32 @@ class DataModule(QtWidgets.QWidget):
             item.setForeground(QtCore.Qt.GlobalColor.gray)
             self.table.setItem(row, 2, item)
 
-    def _display_text(self, key: str, v) -> str:
-        """The value as shown in the current unit (canonical -> display)."""
+    def _display_text(self, key: str, v, working: Optional[dict] = None) -> str:
+        """The value as shown in the current unit (canonical -> display).
+
+        A library-filled solvent cell (n / viscosity) is shown at the precision the
+        library's per-condition σ supports, KEEPING the confident trailing zeros that
+        rounding implies (1.3300, not 1.33); every other cell uses the plain clean
+        format. Needs ``working`` to read the provenance tag + re-derive σ; without it
+        the σ-aware branch is skipped (plain format)."""
         if v is None:
             return ''
+        if (working is not None and key in _SOLVENT_VALUE_KEYS
+                and working.get(_SOLVENT_SOURCE_KEYS[key]) == 'library:primary'
+                and isinstance(v, (int, float))):
+            sigma = self._solvent_sigma(key, working)
+            if sigma is not None:
+                if key in _QUANTITY:                    # viscosity: convert value + σ
+                    # Converting the σ through from_canonical is valid only for a
+                    # PURE-SCALE quantity (viscosity/concentration). The two library
+                    # value keys are both scale-only; an affine quantity (temperature)
+                    # must never join _SOLVENT_VALUE_KEYS or its offset would corrupt
+                    # the chosen decimal place.
+                    q = _QUANTITY[key]; unit = self._units[q]
+                    return format_value_at_uncertainty(
+                        U.from_canonical(q, float(v), unit),
+                        U.from_canonical(q, float(sigma), unit))
+                return format_value_at_uncertainty(float(v), sigma)   # n: dimensionless
         if key in _QUANTITY:
             return _fmt_num(U.from_canonical(_QUANTITY[key], float(v),
                                              self._units[_QUANTITY[key]]))
@@ -379,6 +402,34 @@ class DataModule(QtWidgets.QWidget):
         if isinstance(v, float):
             return _fmt_num(v)
         return str(v)
+
+    def _solvent_sigma(self, key: str, working: dict) -> Optional[float]:
+        """The canonical absolute per-condition σ for a library-filled n or viscosity
+        cell (dimensionless for n, Pa·s for viscosity), or None if it can't be
+        evaluated. Uses the SAME controller accessors the autofill rounded with
+        (``solvent_value_n``/``solvent_value_eta`` — which turn the relative η σ into an
+        absolute Pa·s ±), so the displayed precision matches the stored rounding exactly
+        (Spec 3). The σ chooses the decimal place and travels no further (invariant #8)."""
+        name = working.get(_SOLVENT_KEY)
+        # A cleared solvent name can linger with a stale 'library:primary' tag (the
+        # autofill early-returns without clearing it), so guard the falsy/non-string
+        # case here rather than letting it reach the library (name.strip() would raise
+        # AttributeError, which the except below does not catch) — return None so the
+        # cell falls back to the plain format.
+        if not isinstance(name, str) or not name.strip():
+            return None
+        temp_K = working.get('temperature_K')
+        lam = working.get('wavelength_nm')
+        try:
+            if key == 'solvent_refractive_index':
+                return self.controller.solvent_value_n(
+                    name, float(lam), float(temp_K) - 273.15)[1]
+            if key == 'viscosity_Pa_s':
+                return self.controller.solvent_value_eta(
+                    name, float(temp_K) - 273.15)[1]
+        except (TypeError, ValueError, AttributeError):
+            return None
+        return None
 
     def _populate(self) -> None:
         self._suppress = True
@@ -394,7 +445,8 @@ class DataModule(QtWidgets.QWidget):
                 # editingFinished, so this never re-enters the handler.
                 self.table.cellWidget(r, 1).setCurrentText(working.get(key) or '')
                 continue
-            self.table.item(r, 1).setText(self._display_text(key, working.get(key)))
+            self.table.item(r, 1).setText(
+                self._display_text(key, working.get(key), working))
         self._suppress = False
         self._refresh_dirty()
         self._refresh_provenance()
@@ -516,8 +568,9 @@ class DataModule(QtWidgets.QWidget):
 
     def _revert_cell(self, row: int, key: str) -> None:
         self._suppress = True
-        v = self.controller.workspace.measurements[self.item_id].working_params.get(key)
-        self.table.item(row, 1).setText(self._display_text(key, v))
+        working = self.controller.workspace.measurements[self.item_id].working_params
+        self.table.item(row, 1).setText(
+            self._display_text(key, working.get(key), working))
         self._suppress = False
 
     # ---------------------------------------------------------- commit/undo ---
@@ -665,6 +718,11 @@ class DataModule(QtWidgets.QWidget):
         stated once in the section ? help + the legend, not here. No citations
         (doc-rule #8) — 'sources: Advanced Guide'."""
         name = working.get(_SOLVENT_KEY)
+        # A cleared solvent name can linger with a stale 'library:primary' tag, so a
+        # falsy/non-string name would reach solvent_property_info -> normalize_solvent_name
+        # -> name.strip() (AttributeError, NOT caught below). Guard it here.
+        if not isinstance(name, str) or not name.strip():
+            return 'Library value (primary).'
         try:
             info = solvents_lib.solvent_property_info(name)
         except (ValueError, TypeError):

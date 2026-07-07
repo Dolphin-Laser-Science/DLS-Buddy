@@ -179,8 +179,16 @@ class _ResidualResizer:
         self.canvas.blit(self.fig.bbox)
 
     def _gap_y_px(self):
-        """Pixel y of the gap centre (between residual top and fit bottom) and the
-        x-pixel span of the fit, or None if the axes have no valid position yet."""
+        """Pixel y of the grip line and the x-pixel span of the fit, or None if the
+        axes have no valid position yet.
+
+        The grip sits in the gap between the residual (below) and the fit (above).
+        When the fit axes carries its OWN x-axis label — the Distribution tab, where
+        fit and residual do not share x — that label (ticks + title) hangs down into
+        the gap, so centering the grip on the geometric gap midpoint drops it onto the
+        label (feedback 2026-07-07). When we can measure the fit's x-axis extent at draw
+        time we put the grip just below it; otherwise (no renderer yet, or nothing on
+        the fit's x-axis reaches into the gap) we fall back to the geometric midpoint."""
         try:
             mpos = self.main_ax.get_position()
             rpos = self.resid_ax.get_position()
@@ -188,7 +196,22 @@ class _ResidualResizer:
             return None
         h = self.fig.bbox.height
         w = self.fig.bbox.width
-        y_gap = 0.5 * (rpos.y1 + mpos.y0) * h
+        top_px = mpos.y0 * h            # fit axes bottom edge (figure pixels)
+        resid_top_px = rpos.y1 * h      # residual axes top edge
+        # If the fit's x-axis (tick labels + axis title) extends into the gap, use its
+        # bottom instead of the axes edge so the grip clears it.
+        try:
+            renderer = self.canvas.get_renderer()
+            bb = (self.main_ax.xaxis.get_tightbbox(renderer)
+                  if renderer is not None else None)
+        except Exception:
+            bb = None
+        if bb is not None and bb.y0 < top_px:
+            top_px = bb.y0
+        y_gap = 0.5 * (resid_top_px + top_px)
+        # Stay strictly inside the gap: a few px clear of the residual top, never above
+        # the fit's bottom edge.
+        y_gap = min(max(y_gap, resid_top_px + 3.0), mpos.y0 * h)
         return y_gap, mpos.x0 * w, mpos.x1 * w
 
     def _on_gap(self, event):

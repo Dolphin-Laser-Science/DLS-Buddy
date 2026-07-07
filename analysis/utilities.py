@@ -447,6 +447,7 @@ class ResultCandidate:
     quality_kind: str = ''           # what `quality` means, for display ('r_squared', ...)
     source_id: str = ''              # optional identity for re-selecting (item id / conc)
     value_se: Optional[float] = None # statistical SE of `value` (None if undefined)
+    calibrated: Optional[bool] = None  # None = calibration N/A (Rg/Rh); real flag for scale-dependent SLS Mw/A2
 
 
 def select_default_candidate(

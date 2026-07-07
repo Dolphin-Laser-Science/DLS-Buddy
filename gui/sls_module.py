@@ -42,12 +42,17 @@ from gui.help import add_help_to_groupbox
 from gui.widgets import SampleSelector
 from gui.theme import ThemedLabel, span
 from gui.worker import (
-    BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, busy_notice, run_when_idle, runner)
+    BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, busy_notice, runner)
 from analysis.uncertainty import format_pm
 
 # Reminder appended where a calibration-dependent quantity (Mw, absolute A₂) is
 # shown with a ±: the SE is statistical (regression) only.
 _STAT_CAVEAT = ' (± statistical; excludes calibration & dn/dc)'
+
+# Shown when a redisplayed (cached) SLS fit no longer matches its committed params /
+# mask / calibration / estimator — the same explicit-Run + staleness-hint contract the
+# DLS tabs use (feedback 2026-07-07). Matches gui.dls_module._STALE_HINT wording.
+_SLS_STALE_HINT = 'Inputs changed since this fit — press Run to refresh.'
 
 
 def _adapt_form(form: QtWidgets.QFormLayout) -> None:
@@ -282,6 +287,10 @@ class SLSModule(QtWidgets.QWidget):
             'expected qualifier (e.g. “apparent”, “± statistical only”) — not a problem; '
             'a bold red <b>⚠</b> is a genuine data-quality issue (uncalibrated, or the '
             'two extrapolation routes disagree by &gt;10%).',
+            '<b>Run analysis</b> is the only thing that computes a fit. Switching sample '
+            'or fraction, or committing a parameter, redisplays the last fit and — if the '
+            'inputs changed — flags it “press Run to refresh” rather than silently '
+            'recomputing. Hiding/showing a point (mask) refits immediately.',
             'See the Advanced Guide for the equations.',
         ])
         form = QtWidgets.QFormLayout(box)
@@ -373,7 +382,8 @@ class SLSModule(QtWidgets.QWidget):
         v.addWidget(self.clear_mask_button)
         hint = ThemedLabel('Untick an angle or concentration to hide it; the '
                            'analysis re-runs on the shown points (hidden ones '
-                           'are greyed). Or click a point on the plot to '
+                           'show as hollow grey markers, labelled "masked" in the '
+                           'legend). Or click a point on the plot to '
                            'hide/show just that point.', role='hint', size=11)
         hint.setWordWrap(True)
         v.addWidget(hint)
@@ -573,10 +583,10 @@ class SLSModule(QtWidgets.QWidget):
             self._populate_axis_selectors()
             self._populate_mask_lists()
             self._refresh_mw_display()
-            # Restore the last analysis run on this (sample, fraction) by replaying
-            # it; otherwise show a blank plot.
+            # Redisplay the last analysis run on this (sample, fraction) from its cache
+            # (no recompute); otherwise show a blank plot.
             if (self.sample_id, self._fraction) in self._last_run_by_sample:
-                self._restore_last_run(self.sample_id, self._fraction)
+                self._redisplay_cached(self.sample_id, self._fraction)
             else:
                 self._clear_plot()
         else:
@@ -723,7 +733,7 @@ class SLSModule(QtWidgets.QWidget):
         self._populate_mask_lists()
         self._refresh_mw_display()
         if (self.sample_id, self._fraction) in self._last_run_by_sample:
-            self._restore_last_run(self.sample_id, self._fraction)
+            self._redisplay_cached(self.sample_id, self._fraction)
         else:
             self._clear_plot()
 
@@ -940,8 +950,14 @@ class SLSModule(QtWidgets.QWidget):
                 return
             self._ran = True
             self.export_button.setEnabled(self._export is not None)
+            # Cache the full payload + a signature so a sample/fraction switch or a
+            # commit can REDISPLAY this fit without recomputing (explicit-Run parity
+            # with the DLS tabs, feedback 2026-07-07); the signature drives the
+            # staleness hint on redisplay.
             self._last_run_by_sample[(sid, frac)] = {
-                'method': method, 'conc': conc, 'angle': angle}
+                'method': method, 'conc': conc, 'angle': angle,
+                'payload': payload,
+                'sig': self.controller.sls_run_signature(sid, frac)}
 
         if runner().try_submit(
                 lambda: self._compute_method(method, sid, frac, conc, angle),
@@ -987,15 +1003,42 @@ class SLSModule(QtWidgets.QWidget):
         if idx >= 0:
             combo.setCurrentIndex(idx)
 
-    def _restore_last_run(self, sid: str, fraction: Optional[str]) -> None:
-        """Replay this (sample, fraction)'s last analysis (method + axis selection)."""
-        last = self._last_run_by_sample[(sid, fraction)]
-        self._set_combo_data(self.method_combo, last['method'])
-        self._set_combo_data(self.conc_combo, last['conc'])
-        self._set_combo_data(self.angle_combo, last['angle'])
-        # Re-run from committed state + persisted masks. Deferred if a fit is in
-        # flight (switching samples during a run replays once the worker frees).
-        run_when_idle(self._on_run)
+    def _redisplay_cached(self, sid: str, fraction: Optional[str]) -> None:
+        """REDISPLAY this (sample, fraction)'s last fit from its cached payload — no
+        recompute (explicit-Run parity with the DLS tabs, feedback 2026-07-07). Restores
+        the method/axis combos and replots, then flags the result stale if the committed
+        params / mask / calibration / estimator have changed since it ran. The only
+        recompute paths are the Run button and a mask edit (cheap; via `_rerun`)."""
+        cached = self._last_run_by_sample.get((sid, fraction))
+        if cached is None:
+            self._clear_plot()
+            return
+        method, conc = cached['method'], cached['conc']
+        self._set_combo_data(self.method_combo, method)
+        self._set_combo_data(self.conc_combo, conc)
+        self._set_combo_data(self.angle_combo, cached['angle'])
+        payload = cached['payload']
+        self._full_rr = {(sid, fraction): payload['full_rr']}
+        # Clear the status FIRST so the stale hint can't accumulate across repeated
+        # redisplays (most methods leave self.status untouched in _present_method, so a
+        # leftover "Running…"/prior-hint string would otherwise be the append base).
+        self.status.clear()
+        try:
+            self._present_method(method, sid, conc, payload)
+        except Exception:                    # noqa: BLE001
+            # A cached payload that no longer plots (rare) — clear rather than crash.
+            self._clear_plot()
+            self.export_button.setEnabled(False)
+            self.status.setText('Could not redisplay the last fit — press Run.')
+            return
+        self._ran = True
+        self.export_button.setEnabled(self._export is not None)
+        # Staleness: append the hint (on the now-clean status base, or the one method —
+        # rayleigh — that sets its own note) when a re-run would differ.
+        if self.controller.sls_run_signature(sid, fraction) != cached['sig']:
+            base = self.status.text()
+            self.status.setText(f'{base}  —  {_SLS_STALE_HINT}' if base
+                                else _SLS_STALE_HINT)
 
     def _present_method(self, method: str, sid: str, conc, payload: Dict) -> None:
         """Main-thread phase: plot + fill tables from the worker's payload. Reads
@@ -1180,7 +1223,13 @@ class SLSModule(QtWidgets.QWidget):
             return
         if xs:
             self.ax.scatter(xs, ys, s=42, facecolors='none', edgecolors='#b0b0b0',
-                            linewidths=1.2, zorder=2)
+                            linewidths=1.2, zorder=2, label='masked (excluded)')
+            # The hollow markers are added after the method plot built its legend, so
+            # re-issue it (preserving any title) to give 'masked' an entry.
+            leg = self.ax.get_legend()
+            if leg is not None:
+                title = leg.get_title().get_text()
+                self.ax.legend(frameon=False, fontsize=9, title=title or None)
 
     # ------------------------------------------------ click-to-mask points ---
     _CLICKABLE = ('zimm', 'berry', 'debye', 'guinier', 'rayleigh')

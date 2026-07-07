@@ -7,24 +7,35 @@ tabs (Data/DLS/SLS) operate on the one measurement picked in the shell sidebar,
 this tab reads results ACROSS samples: the ρ = Rg/Rh pairing and the log–log
 scaling plots (Rg–Mw, A₂–Mw) are both built here.
 
+Selection model (two distinct things, both in-tab — Item 10)
+------------------------------------------------------------
+This is the only AGGREGATE tab, so it needs two selections a sample-scoped tab
+collapses into one, and both are made explicitly in the tab (never via the shell
+tree, which only read-only *mirrors* the focused sample):
+
+* **Membership** — the left include/exclude list: which samples enter the ρ table
+  and scaling regressions. All SLS samples start included; untick to exclude.
+* **Focus** — the source panel's own **Sample + Fraction** combos: which one
+  sample/fraction the source rows edit. Explicit — not a side effect of clicking a
+  list row or a ρ-table row (that hidden coupling was removed).
+
 Layout
 ------
-* Left  — an include/exclude list of every sample with SLS data (the Cross-Sample
-  universe: ρ also needs DLS, the scaling plots need Mw + Rg). All start included;
-  click a sample to load it into the source panel; untick to exclude it from the
-  views. This lives inside the tab (not the shell tree) so the module stays
-  self-contained and headless-testable, and the shell's single-selection navigator
-  is not overloaded with an aggregate selection model.
-* Right — inner tabs: **ρ = Rg/Rh** (a table, one row per included sample that can
-  pair ρ) and **Scaling** (log–log Rg–Mw and A₂–Mw plots over the included
-  samples). Beneath them, a shared **source panel** for the selected sample: which
-  Rg (SLS), Rh (DLS), and Mw (SLS) feed the analyses — each a labelled default the
-  user can override or replace with a hand-entered value. ρ uses Rg/Rh; the scaling
-  plots use Mw and Rg/A₂.
+* Left  — the membership list (every sample with SLS data: ρ also needs DLS, the
+  scaling plots need Mw + Rg).
+* Right — inner tabs: **ρ = Rg/Rh** (read-only table, one row per included sample
+  that can pair ρ) and **Scaling** (log–log Rg–Mw and A₂–Mw plots). Beneath them a
+  shared **source panel**: Sample/Fraction focus combos, then Rg (SLS), Rh (DLS),
+  Mw (SLS) and A₂ (SLS) source pickers. Each combo is a labelled default (best tier)
+  the user can override; Rg/Rh/Mw also allow a hand-entered value. **A₂ is picker-
+  only** — a solvent/T-specific coefficient with no external standard, and the very
+  y-axis the A₂–Mw plot fits. Candidates are grouped by result type with the
+  single-condition tail behind a "show all" toggle; Mw/A₂ carry an uncalibrated
+  badge (scale-dependent; Rg is not).
 
 All numbers and provenance come from the controller (`compute_sample_rho`,
-`sls_rg_candidates`, `dls_rh_candidates`, the auto/select/manual setters). No
-analysis or physics here — the tab only displays and chooses.
+`sls_rg_candidates`, `dls_rh_candidates`, `sls_a2_candidates`, the auto/select/manual
+setters). No analysis or physics here — the tab only displays and chooses.
 
 Apparent vs thermodynamic is shown per row: ρ is "apparent" if either Rg or Rh is
 an apparent (single-condition) value, never silently mixed with a thermodynamic
@@ -44,11 +55,11 @@ from matplotlib.figure import Figure
 from plotting.plots import plot_scaling
 from gui.plot_controls import make_canvas_expanding
 from gui.export_helper import export_to_csv
-from gui.help import section_header
+from gui.help import section_header, add_help_to_groupbox
 from gui.theme import ThemedLabel
 from gui.widgets import roomy_tabs
 from gui.worker import busy_notice, run_when_idle, runner
-from analysis.utilities import interpret_scaling_exponent
+from analysis.utilities import interpret_scaling_exponent, select_default_candidate
 from analysis.uncertainty import format_pm
 from app import units as U
 
@@ -72,8 +83,31 @@ def _sample_label(sample) -> str:
     return '(unconfirmed sample)'
 
 
+# Candidate grouping for the source-picker combos. Maps a candidate `kind` to
+# (group heading, hidden-by-default). "Hidden" candidates are the long tail of
+# single-condition apparents (per-angle cumulants, per-conc Debye/Guinier) that
+# overflowed the flat dropdown — they hide behind the "show all" checkbox, but the
+# currently-selected and default candidates are always shown regardless.
+_KIND_GROUP = {
+    'sls_zimm':              ('Extrapolated (thermodynamic)', False),
+    'sls_berry':             ('Extrapolated (thermodynamic)', False),
+    'dls_conc_extrap':       ('Extrapolated (thermodynamic)', False),
+    'dls_gamma_q2':          ('Extrapolated (q→0)', False),
+    'dls_replicate_avg':     ('Replicate-averaged', False),
+    'dls_distribution_peak': ('Distribution peaks', False),
+    'dls_cumulant':          ('Single-angle (apparent)', True),
+    'sls_debye':             ('Single-condition (apparent)', True),
+    'sls_guinier':           ('Single-condition (apparent)', True),
+}
+_HEADER_SENTINEL = '__HEADER__'
+
+
 class CrossSampleModule(QtWidgets.QWidget):
     """Aggregate ρ = Rg/Rh across samples, with per-sample source selection."""
+
+    # Emitted when the in-tab focused sample changes, so the shell can read-only
+    # mirror it onto the Workspace tree (the tab selects in-tab, not via the tree).
+    selectionChanged = QtCore.Signal()
 
     def __init__(self, controller, parent=None) -> None:
         super().__init__(parent)
@@ -84,6 +118,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         self._row_units: List[Tuple[str, Optional[str]]] = []
         self._current_unit: Optional[Tuple[str, Optional[str]]] = None
         self._size_quantity = 'rg'               # top scaling plot: 'rg' or 'rh'
+        self._show_all_single = False            # reveal the single-condition tail
         self._suppress = False                   # guard signal storms on rebuild
         # Hand-entered Rg/Rh/Mw typed while the worker was busy, keyed by which,
         # applied (re-checking) once it frees — a precious value is never dropped.
@@ -107,15 +142,17 @@ class CrossSampleModule(QtWidgets.QWidget):
                 'rod) — needs both an SLS Rg and a DLS Rh per sample.',
                 '<b>Scaling</b> fits Rg–Mw and A₂–Mw power laws across the included '
                 'samples.',
-                'Per-sample, choose which Rg / Rh / Mw value to use in the source '
-                'panel below.',
+                'Tick to include in the views; choose the focused sample and its '
+                'Rg / Rh / Mw / A₂ sources with the panel below (its Sample selector).',
             ]))
         self.sample_list = QtWidgets.QListWidget()
         self.sample_list.setMinimumWidth(240)
         self.sample_list.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        # The left list is MEMBERSHIP only (tick = included in the aggregate views).
+        # Which sample the source panel edits ("focus") is chosen explicitly by the
+        # in-tab Sample combo below — not by clicking here, and not by ρ-table rows.
         self.sample_list.itemSelectionChanged.connect(self._on_selection_changed)
-        self.sample_list.currentItemChanged.connect(self._on_list_current)
         left.addWidget(self.sample_list, 1)
         sel_row = QtWidgets.QHBoxLayout()
         btn_sel_all = QtWidgets.QPushButton('Select all')
@@ -150,7 +187,9 @@ class CrossSampleModule(QtWidgets.QWidget):
             QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.itemSelectionChanged.connect(self._on_row_selected)
+        # The ρ table is READ-ONLY results — selecting a row no longer re-points the
+        # source panel (that was the hidden, unintuitive coupling). Focus is the
+        # Sample/Fraction combos only.
         rl.addWidget(self.table, 1)
         self.interp = ThemedLabel('', role='muted', size=11)
         self.interp.setWordWrap(True)
@@ -188,54 +227,138 @@ class CrossSampleModule(QtWidgets.QWidget):
         right.addWidget(self._build_source_panel())
 
     def _build_source_panel(self) -> QtWidgets.QWidget:
-        self.source_box = QtWidgets.QGroupBox('Source selection (selected sample)')
+        self.source_box = QtWidgets.QGroupBox('Source selection')
         grid = QtWidgets.QGridLayout(self.source_box)
 
+        # ---- header: explicit Sample + Fraction selectors (the focus, in-tab) -----
+        header = QtWidgets.QHBoxLayout()
+        header.addWidget(QtWidgets.QLabel('Sample:'))
+        self.sample_combo = QtWidgets.QComboBox()
+        self.sample_combo.setMinimumWidth(200)
+        self.sample_combo.setToolTip(
+            'Which included sample this panel edits. Explicit — the Workspace tree '
+            'only mirrors this choice; it does not drive it.')
+        self.sample_combo.currentIndexChanged.connect(self._on_sample_combo)
+        header.addWidget(self.sample_combo, 1)
+        self.fraction_label = QtWidgets.QLabel('Fraction:')
+        header.addWidget(self.fraction_label)
+        self.fraction_combo = QtWidgets.QComboBox()
+        self.fraction_combo.setMinimumWidth(120)
+        self.fraction_combo.setToolTip(
+            'Which Mw fraction of this sample to edit (a sample can hold several '
+            'fractions, each its own SLS series). Hidden when there is only one.')
+        self.fraction_combo.currentIndexChanged.connect(self._on_fraction_combo)
+        header.addWidget(self.fraction_combo)
+        header.addStretch(1)
+        grid.addLayout(header, 0, 0, 1, 5)
+
         # Rg row: a combo of SLS candidates + Manual; a manual entry beside it.
-        grid.addWidget(QtWidgets.QLabel('Rg (SLS):'), 0, 0)
+        grid.addWidget(QtWidgets.QLabel('Rg (SLS):'), 1, 0)
         self.rg_combo = QtWidgets.QComboBox()
         self.rg_combo.activated.connect(lambda i: self._on_source_chosen('rg', i))
-        grid.addWidget(self.rg_combo, 0, 1)
+        grid.addWidget(self.rg_combo, 1, 1)
         self.rg_manual = QtWidgets.QLineEdit()
         self.rg_manual.setPlaceholderText(self._radius_unit())
         self.rg_manual.setFixedWidth(70)
-        grid.addWidget(self.rg_manual, 0, 2)
+        grid.addWidget(self.rg_manual, 1, 2)
         self.rg_manual_apparent = QtWidgets.QCheckBox('apparent')
-        grid.addWidget(self.rg_manual_apparent, 0, 3)
+        grid.addWidget(self.rg_manual_apparent, 1, 3)
         rg_set = QtWidgets.QPushButton('Set')
         rg_set.clicked.connect(lambda: self._on_manual('rg'))
-        grid.addWidget(rg_set, 0, 4)
+        grid.addWidget(rg_set, 1, 4)
 
         # Rh row: a combo of DLS candidates + Manual; a manual entry beside it.
-        grid.addWidget(QtWidgets.QLabel('Rh (DLS):'), 1, 0)
+        # (Disabled for an SLS-only sample — no DLS data to pick from.)
+        self.rh_label = QtWidgets.QLabel('Rh (DLS):')
+        grid.addWidget(self.rh_label, 2, 0)
         self.rh_combo = QtWidgets.QComboBox()
         self.rh_combo.activated.connect(lambda i: self._on_source_chosen('rh', i))
-        grid.addWidget(self.rh_combo, 1, 1)
+        grid.addWidget(self.rh_combo, 2, 1)
         self.rh_manual = QtWidgets.QLineEdit()
         self.rh_manual.setPlaceholderText(self._radius_unit())
         self.rh_manual.setFixedWidth(70)
-        grid.addWidget(self.rh_manual, 1, 2)
+        grid.addWidget(self.rh_manual, 2, 2)
         self.rh_manual_apparent = QtWidgets.QCheckBox('apparent')
-        grid.addWidget(self.rh_manual_apparent, 1, 3)
+        grid.addWidget(self.rh_manual_apparent, 2, 3)
         rh_set = QtWidgets.QPushButton('Set')
         rh_set.clicked.connect(lambda: self._on_manual('rh'))
-        grid.addWidget(rh_set, 1, 4)
+        grid.addWidget(rh_set, 2, 4)
+        self._rh_widgets = [self.rh_combo, self.rh_manual,
+                            self.rh_manual_apparent, rh_set]
 
         # Mw row (feeds the scaling plots): SLS candidates + Manual. No "apparent"
         # box -- a hand-entered Mw is treated as a trusted (calibrated) value.
-        grid.addWidget(QtWidgets.QLabel('Mw (SLS):'), 2, 0)
+        # Column 3 carries a calibration badge (Mw is scale-dependent).
+        grid.addWidget(QtWidgets.QLabel('Mw (SLS):'), 3, 0)
         self.mw_combo = QtWidgets.QComboBox()
         self.mw_combo.activated.connect(lambda i: self._on_source_chosen('mw', i))
-        grid.addWidget(self.mw_combo, 2, 1)
+        grid.addWidget(self.mw_combo, 3, 1)
         self.mw_manual = QtWidgets.QLineEdit()
         self.mw_manual.setPlaceholderText(self._mw_unit())
         self.mw_manual.setFixedWidth(70)
-        grid.addWidget(self.mw_manual, 2, 2)
+        grid.addWidget(self.mw_manual, 3, 2)
+        self.mw_badge = ThemedLabel('', role='pending', size=11, bold=True)
+        self.mw_badge.setToolTip(
+            'Mw is scale-dependent: an uncalibrated fit gives an arbitrary-scale Mw.')
+        grid.addWidget(self.mw_badge, 3, 3)
         mw_set = QtWidgets.QPushButton('Set')
         mw_set.clicked.connect(lambda: self._on_manual('mw'))
-        grid.addWidget(mw_set, 2, 4)
+        grid.addWidget(mw_set, 3, 4)
+
+        # A2 row (feeds the A2-Mw scaling plot): a picker over fit-derived Zimm/Berry
+        # candidates ONLY — no manual entry. A2 is a solvent/T-specific interaction
+        # coefficient (no external "standard" as Mw has) and is the y-axis the scaling
+        # plot fits, so a hand-typed value would invite circularity. Scale-dependent,
+        # so it carries a calibration badge like Mw.
+        grid.addWidget(QtWidgets.QLabel('A₂ (SLS):'), 4, 0)
+        self.a2_combo = QtWidgets.QComboBox()
+        self.a2_combo.setToolTip(
+            'A₂ from the Zimm/Berry double extrapolation (thermodynamic). '
+            'Calibration-dependent — an uncalibrated A₂ is on an arbitrary scale '
+            '(see the Advanced Guide, SLS section). No manual entry: A₂ is a '
+            'solvent/temperature-specific interaction coefficient with no external '
+            'standard, and it is the y-axis the A₂–Mw plot fits.')
+        self.a2_combo.activated.connect(lambda i: self._on_source_chosen('a2', i))
+        grid.addWidget(self.a2_combo, 4, 1)
+        self.a2_unit_label = QtWidgets.QLabel('mol·mL/g²')
+        grid.addWidget(self.a2_unit_label, 4, 2)
+        self.a2_badge = ThemedLabel('', role='pending', size=11, bold=True)
+        self.a2_badge.setToolTip(
+            'A₂ is scale-dependent: an uncalibrated fit gives an arbitrary-scale A₂.')
+        grid.addWidget(self.a2_badge, 4, 3)
+
+        # "Show all" reveals the single-condition tail (per-angle cumulants, per-conc
+        # Debye/Guinier) hidden by default to keep the pickers scannable.
+        self.show_all_check = QtWidgets.QCheckBox('Show all single-condition results')
+        self.show_all_check.setToolTip(
+            'Reveal the per-angle / per-concentration apparent results hidden by '
+            'default. The best-tier value stays selected either way.')
+        self.show_all_check.toggled.connect(self._on_show_all_toggled)
+        grid.addWidget(self.show_all_check, 5, 1, 1, 4)
+
+        # Panel-level banner: fires when the chosen Mw and/or A2 is uncalibrated.
+        self.cal_banner = ThemedLabel('', role='pending', size=11)
+        self.cal_banner.setWordWrap(True)
+        grid.addWidget(self.cal_banner, 6, 0, 1, 5)
 
         grid.setColumnStretch(1, 1)
+        add_help_to_groupbox(
+            self.source_box,
+            'Choose which fitted value represents this sample in the ρ table and the '
+            'scaling plots.',
+            bullets=[
+                '<b>Sample / Fraction</b>: pick the sample and Mw fraction to edit. '
+                'Explicit here — the Workspace tree only mirrors this choice.',
+                '<b>Rg / Rh / Mw / A₂</b>: pick the fit that feeds each analysis; the '
+                'best-tier result is selected by default.',
+                '<b>Show all single-condition results</b>: reveal the per-angle / '
+                'per-concentration apparent values hidden by default.',
+                '<b>⚠ badges</b>: Mw and A₂ are scale-dependent — an uncalibrated fit '
+                'is on an arbitrary scale. Rg is scale-independent, so it never badges.',
+                '<b>Manual entry</b> (Rg / Rh / Mw): type a trusted external value. A₂ '
+                'has no manual entry — it is solvent/temperature-specific with no '
+                'external standard.',
+            ])
         self.source_box.setEnabled(False)
         return self.source_box
 
@@ -269,8 +392,8 @@ class CrossSampleModule(QtWidgets.QWidget):
                 'ρ also needs DLS (for Rh); the scaling plots need Mw and Rg.')
         else:
             self.left_note.setText(
-                f'{len(universe)} sample(s) with SLS. Untick to exclude; click a '
-                'sample to edit its sources below.')
+                f'{len(universe)} sample(s) with SLS. Untick to exclude from the '
+                'views; pick the sample to edit in the panel below.')
 
         # Default Rg / Rh / Mw for each included sample's fractions (labelled; never
         # clobbers a hand-entered value). Rh is a no-op for an SLS-only sample.
@@ -280,17 +403,9 @@ class CrossSampleModule(QtWidgets.QWidget):
 
         self._recompute()
 
-        # point the source panel at a unit (keep the current one if still valid)
-        cur_sid = self._current_unit[0] if self._current_unit else None
-        if not self._included.get(cur_sid):
-            self._current_unit = None
-        target = cur_sid if self._included.get(cur_sid) else (
-            universe[0] if universe else None)
-        if target is not None:
-            self._select_list_sample(target)
-        else:
-            self.source_box.setEnabled(False)
-            self.interp.setText('')
+        # Rebuild the in-tab focus selector (the Sample combo) from the included
+        # samples and focus one — keeping the current sample/fraction if still valid.
+        self._populate_sample_combo()
 
     def _auto_select_all(self, sid: str) -> None:
         """Run the labelled default Rg/Rh/Mw/A2 picks for every fraction of a sample
@@ -462,40 +577,112 @@ class CrossSampleModule(QtWidgets.QWidget):
         for sid in newly_included:
             self._auto_select_all(sid)
         self._recompute()
+        # Membership drives which samples the focus combo offers.
+        self._populate_sample_combo()
 
-    @QtCore.Slot(QtWidgets.QListWidgetItem, QtWidgets.QListWidgetItem)
-    def _on_list_current(self, current, _previous) -> None:
-        if self._suppress or current is None:
+    # -------------------------------------------------- in-tab focus combos ---
+    def _populate_sample_combo(self) -> None:
+        """Rebuild the Sample focus combo from the included samples, then focus one
+        (keeping the current sample if it is still included, else the first)."""
+        included = [sid for sid, inc in self._included.items() if inc]
+        by_id = {s.sample_id: s for s in self.controller.samples()}
+        cur_sid = self._current_unit[0] if self._current_unit else None
+        self._suppress = True
+        self.sample_combo.clear()
+        for sid in included:
+            self.sample_combo.addItem(_sample_label(by_id[sid]))
+            self.sample_combo.setItemData(
+                self.sample_combo.count() - 1, sid, QtCore.Qt.ItemDataRole.UserRole)
+        self._suppress = False
+        if not included:
+            self._current_unit = None
+            self.source_box.setEnabled(False)
+            self.interp.setText('')
+            self.selectionChanged.emit()             # clear the tree mirror
             return
-        sid = current.data(QtCore.Qt.ItemDataRole.UserRole)
-        fracs = self.controller.sample_fractions(sid, 'sls')
-        self._populate_source_panel(sid, fracs[0] if fracs else None)
+        target = cur_sid if cur_sid in included else included[0]
+        # Keep the current fraction only when the sample is unchanged.
+        keep_frac = (self._current_unit[1]
+                     if (self._current_unit and self._current_unit[0] == target)
+                     else None)
+        self._focus_sample(target, fraction=keep_frac)
 
-    def _select_list_sample(self, sid: str,
-                            fraction: Optional[str] = '__first__') -> None:
-        """Highlight a sample in the list and load a unit into the source panel.
-        With fraction left at the sentinel, the sample's first SLS fraction is used."""
-        for i in range(self.sample_list.count()):
-            it = self.sample_list.item(i)
-            if it.data(QtCore.Qt.ItemDataRole.UserRole) == sid:
-                self._suppress = True
-                self.sample_list.setCurrentItem(it)
-                self._suppress = False
-                break
-        if fraction == '__first__':
-            fracs = self.controller.sample_fractions(sid, 'sls')
-            fraction = fracs[0] if fracs else None
-        self._populate_source_panel(sid, fraction)
+    def _sample_combo_index(self, sid: str) -> int:
+        for i in range(self.sample_combo.count()):
+            if self.sample_combo.itemData(i, QtCore.Qt.ItemDataRole.UserRole) == sid:
+                return i
+        return -1
 
-    @QtCore.Slot()
-    def _on_row_selected(self) -> None:
+    def _populate_fraction_combo(self, sid: str,
+                                 prefer: Optional[str] = None) -> Optional[str]:
+        """Fill the Fraction combo with the sample's SLS fractions; return the chosen
+        one. Hidden when the sample has a single unlabelled fraction (nothing to pick)."""
+        fracs = list(self.controller.sample_fractions(sid, 'sls')) or [None]
+        self._suppress = True
+        self.fraction_combo.clear()
+        for frac in fracs:
+            self.fraction_combo.addItem('(unlabelled)' if frac is None else str(frac))
+            self.fraction_combo.setItemData(
+                self.fraction_combo.count() - 1, frac,
+                QtCore.Qt.ItemDataRole.UserRole)
+        chosen = prefer if prefer in fracs else fracs[0]
+        self.fraction_combo.setCurrentIndex(max(fracs.index(chosen), 0))
+        self._suppress = False
+        single_unlabelled = (len(fracs) == 1 and fracs[0] is None)
+        self.fraction_label.setVisible(not single_unlabelled)
+        self.fraction_combo.setVisible(not single_unlabelled)
+        return chosen
+
+    def _focus_sample(self, sid: str, fraction: Optional[str] = None) -> None:
+        """Point the source panel at (sid, fraction): sync both header combos, fill the
+        rows, and notify the shell so the Workspace tree mirrors the focused sample."""
+        self._suppress = True
+        idx = self._sample_combo_index(sid)
+        if idx >= 0:
+            self.sample_combo.setCurrentIndex(idx)
+        self._suppress = False
+        frac = self._populate_fraction_combo(sid, prefer=fraction)
+        self._current_unit = (sid, frac)
+        self._populate_source_panel(sid, frac)
+        self.selectionChanged.emit()
+
+    @QtCore.Slot(int)
+    def _on_sample_combo(self, _index: int) -> None:
         if self._suppress:
             return
-        rows = self.table.selectionModel().selectedRows()
-        if not rows:
+        sid = self.sample_combo.currentData(QtCore.Qt.ItemDataRole.UserRole)
+        if sid is None:
             return
-        sid, frac = self._row_units[rows[0].row()]
-        self._select_list_sample(sid, frac)
+        self._focus_sample(sid)                      # new sample → first fraction
+
+    @QtCore.Slot(int)
+    def _on_fraction_combo(self, _index: int) -> None:
+        if self._suppress or self._current_unit is None:
+            return
+        sid = self._current_unit[0]
+        frac = self.fraction_combo.currentData(QtCore.Qt.ItemDataRole.UserRole)
+        self._current_unit = (sid, frac)
+        self._populate_source_panel(sid, frac)
+        self.selectionChanged.emit()
+
+    @QtCore.Slot(bool)
+    def _on_show_all_toggled(self, checked: bool) -> None:
+        self._show_all_single = checked
+        if self._current_unit is not None:
+            sid, frac = self._current_unit
+            self._populate_source_panel(sid, frac)
+
+    def selected_item_ids(self) -> List[str]:
+        """The focused sample's DLS+SLS measurement item ids, for the shell's read-only
+        tree mirror (this tab selects in-tab, not via the tree)."""
+        if self._current_unit is None:
+            return []
+        sid = self._current_unit[0]
+        ids: List[str] = []
+        for kind in ('dls', 'sls'):
+            for lm in self.controller.workspace.sample_measurements(sid, kind):
+                ids.append(lm.item_id)
+        return ids
 
     def _populate_source_panel(self, sid: str, fraction: Optional[str]) -> None:
         self._current_unit = (sid, fraction)
@@ -504,17 +691,47 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.rh_manual.setPlaceholderText(self._radius_unit())
         self.mw_manual.setPlaceholderText(self._mw_unit())
         r = self.controller.workspace.samples[sid].result_for(fraction)
-        self._fill_combo(self.rg_combo, self.controller.sls_rg_candidates(sid, fraction),
-                         current_label=r.rg_label, current_source=r.rg_source,
-                         quantity='radius')
-        self._fill_combo(self.rh_combo, self.controller.dls_rh_candidates(sid, fraction),
-                         current_label=r.rh_label, current_source=r.rh_source,
-                         quantity='radius')
-        self._fill_combo(self.mw_combo, self.controller.sls_mw_candidates(sid, fraction),
-                         current_label=r.mw_label, current_source=r.mw_source,
-                         quantity='molar_mass')
+        hidden = 0
+        hidden += self._fill_candidate_combo(
+            self.rg_combo, self.controller.sls_rg_candidates(sid, fraction),
+            current_label=r.rg_label, current_source=r.rg_source, quantity='radius')
+        hidden += self._fill_candidate_combo(
+            self.mw_combo, self.controller.sls_mw_candidates(sid, fraction),
+            current_label=r.mw_label, current_source=r.mw_source, quantity='molar_mass')
+        hidden += self._fill_candidate_combo(
+            self.a2_combo, self.controller.sls_a2_candidates(sid, fraction),
+            current_label=r.a2_label, current_source=r.a2_source,
+            quantity='molar_mass', allow_manual=False)
+
+        # Rh row: disabled for an SLS-only sample (no DLS data to pick from).
+        has_dls = bool(self.controller.workspace.sample_measurements(sid, 'dls'))
+        for w in self._rh_widgets:
+            w.setEnabled(has_dls)
+        self.rh_label.setEnabled(has_dls)
+        if has_dls:
+            hidden += self._fill_candidate_combo(
+                self.rh_combo, self.controller.dls_rh_candidates(sid, fraction),
+                current_label=r.rh_label, current_source=r.rh_source, quantity='radius')
+        else:
+            self.rh_combo.blockSignals(True)
+            self.rh_combo.clear()
+            self.rh_combo.addItem('— no DLS data for this sample —')
+            self.rh_combo.blockSignals(False)
+
+        # Calibration surfacing: badge the scale-dependent rows (Mw, A2) when the
+        # chosen candidate is uncalibrated; Rg is scale-independent (no badge).
+        self._set_cal_badge(self.mw_badge, r.calibrated, r.mw_source, r.mw_g_per_mol)
+        self._set_cal_badge(self.a2_badge, r.a2_calibrated, r.a2_source, r.a2_mol_mL_per_g2)
+        self._update_cal_banner(r)
+
+        # "Show all" reveals the hidden single-condition tail; annotate its count.
+        base = 'Show all single-condition results'
+        self.show_all_check.setText(
+            base if (self._show_all_single or not hidden) else f'{base} ({hidden} hidden)')
+        self.show_all_check.setEnabled(bool(hidden) or self._show_all_single)
+
         self.source_box.setEnabled(True)
-        self.source_box.setTitle(f'Source selection — {self._unit_label(sid, fraction)}')
+        self.source_box.setTitle('Source selection')
         try:
             rho = self.controller.compute_sample_rho(sid, fraction)
             flag = ('  [apparent ρ — at least one input is a single-condition '
@@ -523,40 +740,110 @@ class CrossSampleModule(QtWidgets.QWidget):
         except Exception as exc:
             self.interp.setText(str(exc))
 
-    def _fill_combo(self, combo: QtWidgets.QComboBox, candidates, *,
-                    current_label: str, current_source: str,
-                    quantity: str = 'radius') -> None:
-        """Rebuild a source-picker combo. Each item's UserRole data is a sentinel
-        that `_on_source_chosen` dispatches on: a ResultCandidate object (a real
-        result to select), the string 'USER' (keep the existing hand-entered
-        value), or None (the trailing "Manual entry…" item). Signals are blocked
-        during the rebuild so clearing/adding items does not fire currentIndexChanged
-        (which would re-enter selection handling mid-rebuild). `quantity` picks the
-        active display unit for the "User-entered" item (candidate labels carry no
-        numeric value, so only that item needs converting)."""
-        unit = (self._mw_unit() if quantity == 'molar_mass' else self._radius_unit())
+    def _set_cal_badge(self, badge: ThemedLabel, calibrated: Optional[bool],
+                       source: str, value: Optional[float]) -> None:
+        """Show a colourblind-safe (symbol + text) uncalibrated badge when a chosen,
+        scale-dependent value (Mw/A2) is uncalibrated. Blank when calibrated, unknown,
+        hand-entered (trusted), or absent."""
+        show = (calibrated is False and source != 'user'
+                and value is not None and math.isfinite(value))
+        badge.setText('⚠ uncalibrated' if show else '')
+
+    def _update_cal_banner(self, r) -> None:
+        which = []
+        if r.calibrated is False and r.mw_source != 'user' and r.mw_g_per_mol is not None:
+            which.append('Mw')
+        if (r.a2_calibrated is False and r.a2_source != 'user'
+                and r.a2_mol_mL_per_g2 is not None):
+            which.append('A₂')
+        if which:
+            self.cal_banner.setText(
+                f'⚠ {" and ".join(which)} are UNCALIBRATED (arbitrary scale) — '
+                'calibrate on the SLS tab, or select a calibrated fit.')
+        else:
+            self.cal_banner.setText('')
+
+    def _fill_candidate_combo(self, combo: QtWidgets.QComboBox, candidates, *,
+                              current_label: str, current_source: str,
+                              quantity: str = 'radius',
+                              allow_manual: bool = True) -> int:
+        """Rebuild a source-picker combo, GROUPED by result type with the long tail of
+        single-condition apparents hidden behind the "show all" checkbox.
+
+        Each real item's UserRole data is a sentinel `_on_source_chosen` dispatches on:
+        a ResultCandidate (select it), 'USER' (keep the hand-entered value), '__HEADER__'
+        (a disabled group heading — ignored), or None (the trailing "Manual entry…").
+        Signals are blocked during the rebuild so it doesn't re-enter selection handling.
+        The current selection and the default candidate are ALWAYS shown, even if their
+        group is hidden. Returns the number of candidates hidden (for the checkbox hint)."""
+        default = select_default_candidate(list(candidates))
         combo.blockSignals(True)
         combo.clear()
+        model = combo.model()
         select_index = -1
-        for i, c in enumerate(candidates):
-            combo.addItem(c.label)
-            combo.setItemData(i, c, QtCore.Qt.ItemDataRole.UserRole)
-            if current_source != 'user' and c.label == current_label:
-                select_index = i
+        default_index = -1
+        hidden = 0
+
+        # Decide visibility, then group the visible candidates preserving order.
+        groups: Dict[str, list] = {}
+        for c in candidates:
+            title, hide_default = _KIND_GROUP.get(c.kind, ('Other', False))
+            is_current = (current_source != 'user' and c.label == current_label)
+            is_default = (default is not None and c is default)
+            if hide_default and not self._show_all_single and not (is_current or is_default):
+                hidden += 1
+                continue
+            groups.setdefault(title, []).append(c)
+
+        for title, items in groups.items():
+            combo.addItem(f'— {title} —')
+            hi = combo.count() - 1
+            combo.setItemData(hi, _HEADER_SENTINEL, QtCore.Qt.ItemDataRole.UserRole)
+            model.item(hi).setEnabled(False)       # non-selectable heading
+            for c in items:
+                combo.addItem(f'    {c.label}')
+                idx = combo.count() - 1
+                combo.setItemData(idx, c, QtCore.Qt.ItemDataRole.UserRole)
+                if current_source != 'user' and c.label == current_label:
+                    select_index = idx
+                if default is not None and c is default:
+                    default_index = idx
+
         # a hand-entered value shows as a distinct, pre-selected item (in display units)
         if current_source == 'user':
+            unit = (self._mw_unit() if quantity == 'molar_mass' else self._radius_unit())
             val = self._user_value(combo)
             disp = (U.from_canonical(quantity, val, unit)
                     if isinstance(val, (int, float)) and math.isfinite(val) else val)
             combo.addItem(f'User-entered ({_fmt(disp)} {unit})')
             combo.setItemData(combo.count() - 1, 'USER', QtCore.Qt.ItemDataRole.UserRole)
             select_index = combo.count() - 1
-        combo.addItem(_MANUAL_LABEL)
-        combo.setItemData(combo.count() - 1, None, QtCore.Qt.ItemDataRole.UserRole)
-        if select_index < 0 and combo.count() > 1:
-            select_index = 0
-        combo.setCurrentIndex(max(select_index, 0))
+        if allow_manual:
+            combo.addItem(_MANUAL_LABEL)
+            combo.setItemData(combo.count() - 1, None, QtCore.Qt.ItemDataRole.UserRole)
+        elif not groups and current_source != 'user':
+            # no fit-derived candidates and no manual path (A2): a disabled hint
+            combo.addItem('— no fit available (needs ≥2 concentrations) —')
+            combo.setItemData(combo.count() - 1, _HEADER_SENTINEL,
+                              QtCore.Qt.ItemDataRole.UserRole)
+            model.item(combo.count() - 1).setEnabled(False)
+
+        if select_index < 0:
+            select_index = default_index
+        if select_index < 0:                       # first selectable (skip headings)
+            select_index = self._first_selectable(combo)
+        if select_index >= 0:
+            combo.setCurrentIndex(select_index)
         combo.blockSignals(False)
+        return hidden
+
+    @staticmethod
+    def _first_selectable(combo: QtWidgets.QComboBox) -> int:
+        """Index of the first non-heading item, or -1 if the combo is headings-only."""
+        for i in range(combo.count()):
+            if combo.itemData(i, QtCore.Qt.ItemDataRole.UserRole) != _HEADER_SENTINEL:
+                return i
+        return -1
 
     def _user_value(self, combo: QtWidgets.QComboBox) -> Optional[float]:
         if self._current_unit is None:
@@ -570,16 +857,21 @@ class CrossSampleModule(QtWidgets.QWidget):
         return r.rh_nm
 
     def _combo(self, which: str) -> QtWidgets.QComboBox:
-        return {'rg': self.rg_combo, 'rh': self.rh_combo, 'mw': self.mw_combo}[which]
+        return {'rg': self.rg_combo, 'rh': self.rh_combo,
+                'mw': self.mw_combo, 'a2': self.a2_combo}[which]
 
     def _on_source_chosen(self, which: str, index: int) -> None:
         if self._current_unit is None:
             return
         sid, frac = self._current_unit
         data = self._combo(which).itemData(index, QtCore.Qt.ItemDataRole.UserRole)
+        if data == _HEADER_SENTINEL:     # a disabled group heading — ignore
+            return
         if data is None:                 # "Manual entry…" — let the user type + Set
-            {'rg': self.rg_manual, 'rh': self.rh_manual,
-             'mw': self.mw_manual}[which].setFocus()
+            edit = {'rg': self.rg_manual, 'rh': self.rh_manual,
+                    'mw': self.mw_manual}.get(which)
+            if edit is not None:         # A2 has no manual field
+                edit.setFocus()
             return
         if data == 'USER':               # keep the existing hand-entered value
             return
@@ -589,8 +881,11 @@ class CrossSampleModule(QtWidgets.QWidget):
             return
         setter = {'rg': self.controller.set_sample_rg,
                   'rh': self.controller.set_sample_rh,
-                  'mw': self.controller.set_sample_mw}[which]
-        setter(sid, data, frac)
+                  'mw': self.controller.set_sample_mw,
+                  'a2': self.controller.set_sample_a2}[which]
+        # explicit=True marks the pick 'picked' so a later passive refresh's
+        # auto-select won't silently revert it to the best-tier default.
+        setter(sid, data, frac, explicit=True)
         self._recompute()
         self._populate_source_panel(sid, frac)
 
