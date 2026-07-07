@@ -59,8 +59,9 @@ import numpy as np
 
 from core.workspace import (
     Workspace, LoadedMeasurement, LoadedTrace, Sample, MeasurementResultRow, SampleRhRow,
-    _DLS_PARAM_KEYS, _SLS_PARAM_KEYS,
+    _DLS_PARAM_KEYS, _SLS_PARAM_KEYS, _PROVENANCE_KEYS,
 )
+from physics import solvents as solvents_lib
 from app.settings import SettingsState
 from analysis import dls as dls_engine
 from analysis import sls as sls_engine
@@ -437,6 +438,233 @@ class Controller:
             else:
                 lm.working_params[key] = value
 
+    # -- solvent-property autofill (library:primary) --------------------------
+    # Maps a value key to its sidecar provenance key. Both value keys are ordinary
+    # (shared) params; the *_source keys are the excluded _PROVENANCE_KEYS.
+    _SOLVENT_SOURCE_KEYS = {
+        'solvent_refractive_index': 'solvent_refractive_index_source',
+        'viscosity_Pa_s': 'viscosity_Pa_s_source',
+    }
+
+    def autofill_solvent_props(self, item_id: str, *, force: bool = False) -> dict:
+        """Propose n (and, for DLS, viscosity) from the solvent-property library.
+
+        THE single chokepoint for library autofill (invariant #5: logic lives in
+        the controller, never the GUI). At the sample's WORKING solvent / T / lambda
+        it computes each property via ``physics.solvents`` and writes the value plus
+        a ``'library:primary'`` source tag across every measurement in the sample.
+
+        Rules:
+          - Only primary-tier solvents are served here (the estimator tab handles
+            the rest); unknown/estimate -> no fill.
+          - A field the user has claimed (``'user'``) on ANY measurement in the
+            sample is NEVER overwritten (unless ``force``) -- mirrors the mw_source
+            guard; the check is sample-wide because the write is sample-wide.
+          - Out-of-range / unavailable (ValueError) -> the field is not filled; a
+            previously *library*-sourced value (stale, computed at a different
+            condition) is CLEARED, a user value is left untouched.
+          - SLS measurements take refractive index only (no viscosity field).
+          - Each proposed value is ROUNDED at the last digit the library can stand
+            behind (``unc.round_to_uncertainty``: the display sigma chooses the
+            decimal place -- and travels no further, invariant #8) before the
+            write, so the parameter table never shows false precision. Idempotent;
+            only these library-sourced writes are rounded, never a user value.
+        Requires both temperature and wavelength; otherwise nothing is filled.
+        Returns a small status dict for the UI.
+        """
+        sid = self._sample_id_of(item_id)
+        targets = self._item_ids_in_sample(sid) if sid is not None else [item_id]
+        wp = self.workspace.measurements[item_id].working_params
+        solvent = wp.get('solvent_name')
+        temp_K = wp.get('temperature_K')
+        wavelength_nm = wp.get('wavelength_nm')
+        status = {'filled': [], 'out_of_range': [], 'skipped_user': [],
+                  'tier': None, 'reason': None}
+        if not solvent:
+            status['reason'] = 'no solvent'
+            return status
+        status['tier'] = tier = solvents_lib.solvent_tier(solvent)
+        if tier != 'primary':
+            status['reason'] = 'not a primary-tier solvent'
+            return status
+        if temp_K is None or wavelength_nm is None:
+            status['reason'] = 'need both temperature and wavelength'
+            return status
+        temp_C = float(temp_K) - 273.15
+        # Each computer returns (value, display sigma) via the SAME accessors the
+        # Solvent Explorer readout uses (solvent_value_*) -- since the Spec-3
+        # engine amendment those return the PER-CONDITION sigma at the sample's
+        # committed condition, so the rounding place is chosen by exactly the
+        # uncertainty the library stands behind THERE, and the two surfaces can
+        # never round/display at different sigmas.
+        computers = (
+            ('solvent_refractive_index',
+             lambda: self.solvent_value_n(solvent, float(wavelength_nm), temp_C)),
+            ('viscosity_Pa_s',
+             lambda: self.solvent_value_eta(solvent, temp_C)),
+        )
+        for field_name, compute in computers:
+            # User-guard is SAMPLE-WIDE, matching the sample-wide write: if the user
+            # has claimed this field on ANY measurement in the sample, skip it
+            # entirely (n/viscosity are shared params -- filling only the untagged
+            # siblings would both overwrite a user value and split the sample).
+            if not force and self._any_target_field_user(targets, field_name):
+                status['skipped_user'].append(field_name)
+                continue
+            try:
+                value, sigma = compute()
+            except ValueError:
+                # Clear a stale library value (+ tag); never touch a user value.
+                self._write_solvent_field(targets, field_name, None, None,
+                                          only_if_library=True)
+                status['out_of_range'].append(field_name)
+                continue
+            value = unc.round_to_uncertainty(value, sigma)
+            if self._write_solvent_field(targets, field_name, value, 'library:primary'):
+                status['filled'].append(field_name)
+        return status
+
+    def _any_target_field_user(self, targets, field_name: str) -> bool:
+        """True if any applicable measurement in the sample has hand-claimed
+        ``field_name`` ('user'). Used to make the autofill user-guard sample-wide."""
+        src_key = self._SOLVENT_SOURCE_KEYS[field_name]
+        for iid in targets:
+            lm = self.workspace.measurements[iid]
+            allowed = _DLS_PARAM_KEYS if lm.kind == 'dls' else _SLS_PARAM_KEYS
+            if field_name in allowed and lm.working_params.get(src_key) == 'user':
+                return True
+        return False
+
+    def _write_solvent_field(self, targets, field, value, source,
+                             *, only_if_library: bool = False) -> int:
+        """Write ``field`` (+ its source tag) across ``targets`` where applicable.
+
+        ``source=None`` clears the value and drops the tag. ``only_if_library``
+        touches only measurements whose current tag is ``'library:primary'`` (used
+        when clearing a stale value -- never disturbs a user field). Returns the
+        number of measurements written."""
+        src_key = self._SOLVENT_SOURCE_KEYS[field]
+        wrote = 0
+        for iid in targets:
+            lm = self.workspace.measurements[iid]
+            allowed = _DLS_PARAM_KEYS if lm.kind == 'dls' else _SLS_PARAM_KEYS
+            if field not in allowed:          # e.g. viscosity on an SLS measurement
+                continue
+            if only_if_library and lm.working_params.get(src_key) != 'library:primary':
+                continue
+            lm.working_params[field] = value
+            if source is None:
+                lm.working_params.pop(src_key, None)
+            else:
+                lm.working_params[src_key] = source
+            wrote += 1
+        return wrote
+
+    def mark_solvent_field_user(self, item_id: str, field: str) -> None:
+        """Tag n or viscosity as user-owned (sample-wide) so autofill never
+        overwrites it. Call this when the user hand-edits the field."""
+        if field not in self._SOLVENT_SOURCE_KEYS:
+            raise KeyError(f"{field!r} is not a solvent-autofill field.")
+        sid = self._sample_id_of(item_id)
+        targets = self._item_ids_in_sample(sid) if sid is not None else [item_id]
+        src_key = self._SOLVENT_SOURCE_KEYS[field]
+        for iid in targets:
+            lm = self.workspace.measurements[iid]
+            allowed = _DLS_PARAM_KEYS if lm.kind == 'dls' else _SLS_PARAM_KEYS
+            if field in allowed:
+                lm.working_params[src_key] = 'user'
+
+    def reautofill_after(self, item_id: str, changed_key: str) -> Optional[dict]:
+        """Re-derive n/viscosity when the solvent, temperature, or wavelength
+        changes. Returns the autofill status, or None if ``changed_key`` is not a
+        re-derive trigger."""
+        if changed_key in ('temperature_K', 'wavelength_nm', 'solvent_name'):
+            return self.autofill_solvent_props(item_id)
+        return None
+
+    # -- Solvent Explorer wrappers (display-only calculator; GUI holds no physics) --
+    # All forward to physics.solvents and let ValueError surface for the tab to show.
+    # The engine's display-only PER-CONDITION uncertainty (Spec 3: σ_n(λ,T) /
+    # σ_η,rel(T)) is returned for the readout / confidence band; per invariant #8 it
+    # is NEVER propagated into any analysis SE (these values never reach a
+    # measurement — the Explorer is a standalone calculator).
+    _SOLVENT_CURVE_POINTS = 121
+
+    def solvent_value_n(self, name: str, wavelength_nm: float,
+                        temperature_C: float):
+        """(n, absolute PER-CONDITION display uncertainty) at one condition (Spec 3:
+        σ_n(λ,T), so the readout's ± matches the band at the selected dot). Raises
+        ``ValueError`` (unknown solvent / out-of-range λ or T) for the tab to display."""
+        n = solvents_lib.refractive_index_solvent(name, wavelength_nm, temperature_C)
+        return n, solvents_lib.solvent_uncertainty_n(name, wavelength_nm, temperature_C)
+
+    def solvent_value_eta(self, name: str, temperature_C: float):
+        """(η in Pa·s, absolute PER-CONDITION display uncertainty in Pa·s) at one
+        temperature; the relative σ_η,rel(T) is turned into an absolute ± here for
+        the readout. Raises ``ValueError`` (unknown / no-viscosity / out-of-range T)."""
+        eta = solvents_lib.viscosity_solvent(name, temperature_C)
+        return eta, solvents_lib.solvent_uncertainty_eta(name, temperature_C) * eta
+
+    def _solvent_sample_box(self, lo: float, hi: float, compute):
+        """Grid ``compute`` over ``[lo, hi]`` (SOLVENT_CURVE_POINTS), keeping only the
+        points where it evaluates. The per-point guard drops an exact box-edge point
+        nudged out by a float round-trip; callers validate the fixed axis up front so a
+        genuine out-of-range condition raises before the grid rather than emptying it."""
+        xs, ys = [], []
+        for x in np.linspace(lo, hi, self._SOLVENT_CURVE_POINTS):
+            try:
+                ys.append(compute(float(x)))
+                xs.append(float(x))
+            except ValueError:
+                continue
+        return np.asarray(xs), np.asarray(ys)
+
+    def solvent_curve_n_vs_T(self, name: str, wavelength_nm: float):
+        """(T_C[], n[], band_half[]) across the record's refractive-index temperature
+        box at the selected wavelength. ``band_half`` is the PER-CONDITION absolute
+        σ_n(λ, T[i]) (Spec 3) — tightest near the reference temperature, growing
+        toward the box edges, never exceeding the box-wide ``n_uncertainty``. Raises
+        ``ValueError`` if the wavelength is outside the box (so the tab hides the RI
+        curve but can still draw η)."""
+        info = solvents_lib.solvent_property_info(name)
+        t0, t1 = info['n_temp_min_C'], info['n_temp_max_C']
+        # Validate the wavelength up front (its error is the meaningful one).
+        solvents_lib.refractive_index_solvent(name, wavelength_nm, 0.5 * (t0 + t1))
+        temps, ns = self._solvent_sample_box(
+            t0, t1, lambda t: solvents_lib.refractive_index_solvent(name, wavelength_nm, t))
+        band = np.array([solvents_lib.solvent_uncertainty_n(name, wavelength_nm, t)
+                         for t in temps])
+        return temps, ns, band
+
+    def solvent_curve_n_vs_lambda(self, name: str, temperature_C: float):
+        """(lambda_nm[], n[], band_half[]) across the refractive-index wavelength box
+        at the selected temperature. ``band_half`` is the PER-CONDITION absolute
+        σ_n(λ[i], T) (Spec 3). Raises ``ValueError`` if the temperature is outside
+        the box."""
+        info = solvents_lib.solvent_property_info(name)
+        l0, l1 = info['n_lambda_min_nm'], info['n_lambda_max_nm']
+        solvents_lib.refractive_index_solvent(name, 0.5 * (l0 + l1), temperature_C)
+        lams, ns = self._solvent_sample_box(
+            l0, l1, lambda lam: solvents_lib.refractive_index_solvent(name, lam, temperature_C))
+        band = np.array([solvents_lib.solvent_uncertainty_n(name, lam, temperature_C)
+                         for lam in lams])
+        return lams, ns, band
+
+    def solvent_curve_eta_vs_T(self, name: str):
+        """(T_C[], eta[], band_half[]) across the viscosity temperature box (η in
+        Pa·s). ``band_half`` is the PER-CONDITION σ_η,rel(T[i]) · η[i] (Spec 3):
+        relative, so it widens with η, and the relative width itself varies where
+        the source supports a shape (flat for bulk-grade sources). Raises
+        ``ValueError`` if the solvent carries no viscosity block."""
+        info = solvents_lib.solvent_property_info(name)
+        if not info.get('has_viscosity'):
+            raise ValueError(f"Viscosity data is not available for {name!r}.")
+        temps, etas = self._solvent_sample_box(
+            info['eta_temp_min_C'], info['eta_temp_max_C'],
+            lambda t: solvents_lib.viscosity_solvent(name, t))
+        rel = np.array([solvents_lib.solvent_uncertainty_eta(name, t) for t in temps])
+        return temps, etas, rel * etas
+
     def sample_id_of(self, item_id: str) -> Optional[str]:
         """Public: the sample currently containing this measurement (or None)."""
         return self._sample_id_of(item_id)
@@ -476,6 +704,33 @@ class Controller:
     def dirty_items(self) -> List[str]:
         """item_ids with un-committed edits (for the pending-update indicator)."""
         return [i for i, m in self.workspace.measurements.items() if m.is_dirty()]
+
+    def committed_signature(self, item_ids) -> tuple:
+        """A hashable signature of the *committed* analysis parameters of `item_ids`.
+        Two signatures compare equal iff none of those measurements' fit-affecting
+        committed parameters changed. Provenance sidecar keys (`_PROVENANCE_KEYS`) are
+        excluded — they don't affect a fit (mirrors `LoadedMeasurement.is_dirty`).
+
+        The GUI records this when it caches a fit and re-checks it on redisplay, so a
+        result shown after the user commits a parameter edit is flagged stale — the
+        window the coarse `is_dirty()` note misses, since committing clears `is_dirty`
+        while leaving the displayed fit computed from the old values (feedback
+        2026-07-06). The signature embeds each item_id, so `_is_stale` can recover the
+        input set from a stored signature without a side table."""
+        def _hashable(v):
+            return tuple(v) if isinstance(v, list) else v
+
+        out = []
+        for iid in sorted(item_ids):
+            lm = self.workspace.measurements.get(iid)
+            if lm is None:
+                out.append((iid, None))
+                continue
+            params = tuple(sorted(
+                (k, _hashable(v)) for k, v in lm.committed_params.items()
+                if k not in _PROVENANCE_KEYS))
+            out.append((iid, params))
+        return tuple(out)
 
     def commit(self) -> None:
         """Adopt all working edits as committed and re-group. Runs no analysis."""
@@ -833,65 +1088,150 @@ class Controller:
         self._snapshot_distribution(item_id, method, res)
         return res
 
-    def dls_sample_points(self, sample_id: str, kind: str,
-                          fraction: Optional[str] = None):
-        """Per-measurement breakdown for the Γ vs q² / D vs c tables (feedback
-        2026-06-30 #11/#13): one dict per DLS measurement of the sample (optionally one
-        Mw fraction), each with its cumulant-derived Γ and q via the SAME path the fits
-        use (`gamma_per_measurement`), so the table values match the fitted points.
+    def dls_sample_rows(self, sample_id: str, kind: str,
+                        fraction: Optional[str] = None):
+        """Metadata-only enumeration for the Γ vs q² / D vs c tables — **no fitting**
+        (feedback 2026-07-06): one dict per DLS measurement of the sample, so the tabs
+        can populate cheaply on load/commit without silently computing an analysis. The
+        Γ/D values themselves are produced only by an explicit Run (see `run_gamma_q2` /
+        `run_concentration_extrapolation`, whose results carry per-point values).
 
-        `kind` is 'gamma_q2' (rows sorted by q²) or 'conc_extrap' (sorted by
+        `kind` is 'gamma_q2' (rows sorted by angle) or 'conc_extrap' (sorted by
         concentration). Each dict: item_id, angle_deg, concentration_g_per_mL,
-        gamma_s_inv, q2_m2, d_app_m2_s (= γ/q²), ok. A measurement whose parameters
-        aren't confirmed (build fails) or whose fit/q is non-finite gets ok=False (NaN
-        scalars) and sorts last.
+        mw_fraction, reason, ok. `reason` explains eligibility so the GUI can grey a
+        row and say *why*:
+          'ok'             — buildable (parameters confirmed); tickable.
+          'unbuilt'        — parameters not confirmed yet (`build()` fails).
+          'other_fraction' — a different Mw fraction than the focused one (a single fit
+                             must not mix fractions), shown greyed rather than hidden.
+        `ok == (reason == 'ok')`. Non-ok rows sort after the ok rows.
         """
-        lms = [lm for lm in self.workspace.sample_measurements(sample_id, 'dls')
-               if fraction is None
-               or lm.committed_params.get('mw_fraction') == fraction]
-        # Build the measurements that can be built (unconfirmed params -> skip, ok=False).
-        gamma_by_idx = {}
-        built, built_idx = [], []
-        for i, lm in enumerate(lms):
-            try:
-                built.append(lm.build())
-                built_idx.append(i)
-            except Exception:
-                pass
-        if built:
-            g, q = dls_engine.gamma_per_measurement(
-                built,
-                skip_initial_channels=self.settings.skip_initial_channels,
-                cumulant_method=self.settings.cumulant_method)
-            for j, i in enumerate(built_idx):
-                gamma_by_idx[i] = (float(g[j]), float(q[j]))
-
+        lms = self.workspace.sample_measurements(sample_id, 'dls')
         rows = []
-        for i, lm in enumerate(lms):
+        for lm in lms:
             p = lm.committed_params
-            gamma, q = gamma_by_idx.get(i, (float('nan'), float('nan')))
-            ok = (math.isfinite(gamma) and math.isfinite(q) and q > 0.0)
-            q2 = q * q if ok else float('nan')
-            d_app = gamma / q2 if ok else float('nan')
+            lm_frac = p.get('mw_fraction')
+            if fraction is not None and lm_frac != fraction:
+                reason = 'other_fraction'
+            else:
+                try:
+                    lm.build()
+                    reason = 'ok'
+                except Exception:
+                    reason = 'unbuilt'
             rows.append({
                 'item_id': lm.item_id,
                 'angle_deg': p.get('angle_deg'),
                 'concentration_g_per_mL': p.get('concentration_g_per_mL'),
-                'gamma_s_inv': gamma if ok else float('nan'),
-                'q2_m2': q2,
-                'd_app_m2_s': d_app,
-                'ok': ok,
+                'mw_fraction': lm_frac,
+                'reason': reason,
+                'ok': reason == 'ok',
             })
 
         def _sort_key(r):
-            if not r['ok']:
-                return (1, float('inf'))
+            ok_rank = 0 if r['ok'] else 1
             if kind == 'gamma_q2':
-                return (0, r['q2_m2'])
-            c = r['concentration_g_per_mL']
-            return (0, c if c is not None else float('inf'))
+                v = r['angle_deg']
+            else:
+                v = r['concentration_g_per_mL']
+            return (ok_rank, v if v is not None else float('inf'))
         rows.sort(key=_sort_key)
         return rows
+
+    def dls_pending_temperature_siblings(self, sample_id: str) -> int:
+        """Count DLS measurements of the same polymer/solvent as `sample_id` whose
+        temperature is **not yet confirmed** — they group into a separate NaN-temperature
+        sample (see `sample_group_key`) and so are invisible from this sample's tabs.
+        The GUI surfaces this as a one-line note so the user knows why some siblings are
+        missing (feedback 2026-07-06). Returns 0 if the sample is unknown."""
+        s = self.workspace.samples.get(sample_id)
+        if s is None:
+            return 0
+        poly = (s.polymer_name or '').strip().lower()
+        solv = (s.solvent_name or '').strip().lower()
+        members = set(s.dls_item_ids)
+        n = 0
+        for iid, lm in self.workspace.measurements.items():
+            if lm.kind != 'dls' or iid in members:
+                continue
+            p = lm.committed_params
+            if p.get('temperature_K') is not None:      # temperature confirmed -> grouped
+                continue
+            if ((p.get('polymer_name', '') or '').strip().lower() == poly
+                    and (p.get('solvent_name', '') or '').strip().lower() == solv):
+                n += 1
+        return n
+
+    def _dls_run_points(self, sample_id: str, fraction: Optional[str]):
+        """Per-measurement cumulant points for one fraction of a sample, computed at
+        **Run** time (not on focus). One 2nd-order cumulant fit per buildable measurement
+        — the same fit the line uses — yielding Γ, q², D_app, and a `quality` tag the GUI
+        shows so the user can vet/untick a bad point in place. Failure-tolerant.
+
+        `quality`: 'ok' | 'fit_failed' (Γ non-finite) | 'nonpositive_q' (q ≤ 0) |
+        'high_pdi' (PDI > the cumulant validity limit — fit ran but is unreliable).
+        Returns a list of dicts aligned with the fraction's buildable measurements."""
+        points = []
+        for lm in self.workspace.sample_measurements(sample_id, 'dls'):
+            p = lm.committed_params
+            if fraction is not None and p.get('mw_fraction') != fraction:
+                continue
+            try:
+                m = lm.build()
+            except Exception:
+                continue                        # unconfirmed params -> not a point
+            try:
+                cu = dls_engine.fit_cumulants(
+                    m, order=2,
+                    skip_initial_channels=self.settings.skip_initial_channels,
+                    method=self.settings.cumulant_method)
+                gamma, pdi_valid = float(cu.gamma_s_inv), bool(cu.pdi_valid)
+            except Exception:
+                gamma, pdi_valid = float('nan'), False
+            try:
+                q = float(phys.scattering_vector_q_m(
+                    m.angle_deg, m.wavelength_nm, m.solvent_refractive_index))
+            except Exception:
+                q = float('nan')
+            if not math.isfinite(gamma):
+                quality = 'fit_failed'
+            elif not (math.isfinite(q) and q > 0.0):
+                quality = 'nonpositive_q'
+            elif not pdi_valid:
+                quality = 'high_pdi'
+            else:
+                quality = 'ok'
+            q2 = q * q if math.isfinite(q) else float('nan')
+            d_app = gamma / q2 if (quality in ('ok', 'high_pdi')) else float('nan')
+            points.append({
+                'item_id': lm.item_id,
+                'angle_deg': p.get('angle_deg'),
+                'concentration_g_per_mL': p.get('concentration_g_per_mL'),
+                'gamma_s_inv': gamma if math.isfinite(gamma) else float('nan'),
+                'q2_m2': q2,
+                'd_app_m2_s': d_app,
+                'quality': quality,
+            })
+        return points
+
+    @staticmethod
+    def _too_few_usable_message(points, include_ids, kind):
+        """A clear error when the fit is left with < 2 usable points *because* ticked
+        measurements were dropped for a fit-quality reason (failed cumulant / q ≤ 0) —
+        the run-enable gate counts buildable rows, but the run drops unfittable ones, so
+        without this the engine would raise a bare "needs at least two" that looks wrong
+        to a user who ticked enough (feedback 2026-07-06). Returns None when nothing was
+        dropped, so the engine's own message applies (genuinely too few ticked)."""
+        considered = [pt for pt in points
+                      if include_ids is None or pt['item_id'] in include_ids]
+        dropped = [pt for pt in considered if pt['quality'] not in ('ok', 'high_pdi')]
+        if not dropped:
+            return None
+        word = 'angles' if kind == 'gamma_q2' else 'concentrations'
+        return (f'Only {len(considered) - len(dropped)} of the ticked measurements '
+                f'could be fit — {len(dropped)} failed their cumulant fit or had a '
+                f'non-physical scattering vector, leaving fewer than two usable {word}. '
+                f'Untick or fix the flagged rows (hover them for the reason).')
 
     def run_gamma_q2(self, sample_id: str, fraction: Optional[str] = None,
                      include_ids=None, **kw):
@@ -899,14 +1239,28 @@ class Controller:
 
         `include_ids` (a set of measurement item_ids) restricts the fit to the ticked
         measurements, so the user can choose a subset / drop outliers and recompute
-        (feedback 2026-06-30 #11/#12). `None` = every eligible measurement."""
+        (feedback 2026-06-30 #11/#12). `None` = every eligible measurement.
+
+        The result also carries `all_points` — every eligible measurement's per-point
+        Γ/q²/D_app + quality (feedback 2026-07-06), so the tab can fill its table and grey
+        the excluded points from the run itself rather than a separate on-focus fit. Only
+        fit-usable ticked points (quality 'ok'/'high_pdi', finite) enter the line fit."""
+        points = self._dls_run_points(sample_id, fraction)
+        usable = {pt['item_id'] for pt in points
+                  if pt['quality'] in ('ok', 'high_pdi')}
         meas = [lm.build() for lm in self.workspace.sample_measurements(sample_id, 'dls')
                 if (fraction is None or lm.committed_params.get('mw_fraction') == fraction)
-                and (include_ids is None or lm.item_id in include_ids)]
+                and (include_ids is None or lm.item_id in include_ids)
+                and lm.item_id in usable]
+        if len(meas) < 2:
+            msg = self._too_few_usable_message(points, include_ids, 'gamma_q2')
+            if msg:
+                raise ValueError(msg)
         kw.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
         kw.setdefault('cumulant_method', self.settings.cumulant_method)
         kw.setdefault('estimator', self.settings.se_estimator)
         res = dls_engine.analyze_gamma_q2(meas, **kw)
+        res.all_points = points
         self.results[('gamma_q2', sample_id, fraction)] = res
         # Gamma -> q->0 is APPARENT (q-extrapolated only; single c folded out).
         self.workspace.upsert_sample_rh_row(SampleRhRow(
@@ -925,14 +1279,27 @@ class Controller:
 
         `include_ids` (a set of measurement item_ids) restricts the fit to the ticked
         measurements, so the user can choose a subset / drop outliers and recompute
-        (feedback 2026-06-30 #11/#12). `None` = every eligible measurement."""
+        (feedback 2026-06-30 #11/#12). `None` = every eligible measurement.
+
+        As with `run_gamma_q2`, the result carries `all_points` (every eligible
+        measurement's per-point D_app + quality, feedback 2026-07-06); only fit-usable
+        ticked points enter the extrapolation."""
+        points = self._dls_run_points(sample_id, fraction)
+        usable = {pt['item_id'] for pt in points
+                  if pt['quality'] in ('ok', 'high_pdi')}
         meas = [lm.build() for lm in self.workspace.sample_measurements(sample_id, 'dls')
                 if (fraction is None or lm.committed_params.get('mw_fraction') == fraction)
-                and (include_ids is None or lm.item_id in include_ids)]
+                and (include_ids is None or lm.item_id in include_ids)
+                and lm.item_id in usable]
+        if len(meas) < 2:
+            msg = self._too_few_usable_message(points, include_ids, 'conc_extrap')
+            if msg:
+                raise ValueError(msg)
         kw.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
         kw.setdefault('cumulant_method', self.settings.cumulant_method)
         kw.setdefault('estimator', self.settings.se_estimator)
         res = dls_engine.extrapolate_diffusion_vs_concentration(meas, **kw)
+        res.all_points = points
         self.results[('conc_extrap', sample_id, fraction)] = res
         # D vs c -> c->0 is THERMODYNAMIC (invariant 7).
         self.workspace.upsert_sample_rh_row(SampleRhRow(

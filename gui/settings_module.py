@@ -21,6 +21,7 @@ from PySide6 import QtCore, QtWidgets
 
 from app import units as U
 from app.settings import SettingsState
+from physics import solvents as solvents_lib
 from gui.help import HelpBadge
 from gui.theme import ThemedLabel
 from gui.worker import busy_notice, runner
@@ -102,6 +103,14 @@ class SettingsModule(QtWidgets.QWidget):
         self.qrg_max.setRange(0.5, 3.0)
         self.qrg_max.setSingleStep(0.1)
         form.addRow('Guinier qRg validity limit', self.qrg_max)
+
+        form.addRow(self._header('Solvent library'))
+        self.default_solvent = QtWidgets.QComboBox()
+        self.default_solvent.addItems(solvents_lib.available_solvents('primary'))
+        self.default_solvent.setToolTip(
+            'The solvent the Solvent Explorer (a Utilities sub-tab) starts on. A '
+            'convenience default only — it never sets a value in any analysis.')
+        form.addRow('Default solvent', self.default_solvent)
 
         form.addRow(self._header('Uncertainty'))
         self.se_estimator = QtWidgets.QComboBox()
@@ -207,6 +216,8 @@ class SettingsModule(QtWidgets.QWidget):
         self.skip_channels.setValue(s.skip_initial_channels)
         self.geometry.setCurrentText(s.standard_geometry)
         self.qrg_max.setValue(s.guinier_qrg_max)
+        k = self.default_solvent.findText(s.default_solvent)
+        self.default_solvent.setCurrentIndex(k if k >= 0 else 0)
         j = self.se_estimator.findData(s.se_estimator)
         self.se_estimator.setCurrentIndex(j if j >= 0 else 0)
         for q, combo in self.plot_unit_combos.items():
@@ -224,6 +235,7 @@ class SettingsModule(QtWidgets.QWidget):
             skip_initial_channels=self.skip_channels.value(),
             standard_geometry=self.geometry.currentText(),
             guinier_qrg_max=self.qrg_max.value(),
+            default_solvent=self.default_solvent.currentText(),
             se_estimator=self.se_estimator.currentData(),
             plot_units={q: combo.currentText()
                         for q, combo in self.plot_unit_combos.items()},

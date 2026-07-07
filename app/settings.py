@@ -54,6 +54,10 @@ class SettingsState:
     standard_geometry: str = 'VU'           # toluene Rayleigh geometry: VU / VV / VH
     guinier_qrg_max: float = 1.3            # Guinier validity limit q*Rg
 
+    # --- solvent library ---
+    default_solvent: str = 'water'          # preselects the Solvent Explorer combo
+    #                                         (seed, not a physics override)
+
     # --- uncertainty (applies to every regression SE: SLS + DLS Gamma-q^2/kD) ---
     se_estimator: str = 'hc3'               # 'hc3' (robust, default; never under-reports)
     #                                         or 'ols' (classical s^2(X'X)^-1, opt-in for

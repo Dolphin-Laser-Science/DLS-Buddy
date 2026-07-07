@@ -959,6 +959,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_committed(self) -> None:
         # Committing may have changed a sample's identity -> re-group + redraw.
         self._refresh_sidebar()
+        # Re-fan-out the current focus so the analysis tabs repopulate against the
+        # freshly committed parameters — without this the Γ-q²/D-c measurement tables
+        # stay empty until a sidebar re-click (feedback 2026-07-06).
+        self._set_current(self.current_item)
         self.cross_module.refresh()      # the pairable-sample set may have changed
 
     @QtCore.Slot()
@@ -984,6 +988,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Tabs hold scroll-area wrappers and are reorderable, so resolve the active
         # module by the current WIDGET rather than assuming a fixed index order.
         w = self._module_by_wrapper.get(self.tabs.widget(index))
+        # The global Settings tab needs no sample: disable the sidebar. (The Solvent
+        # Explorer — also global — lives as a Utilities sub-tab; Utilities' sample-
+        # scoped sidebar simply stays active while it is shown, harmlessly — the
+        # Explorer ignores selection by design.)
         loading = w is not self.settings_module
         self.tree.setEnabled(loading)
         self.load_button.setEnabled(loading)
@@ -1078,5 +1086,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_sidebar()      # re-pick tree marker colours for the new theme
         self.dls_module.reseed_from_settings()
         self.utilities_module.reseed_from_settings()
+        # NB: the Solvent Explorer (a Utilities sub-tab) is intentionally NOT reseeded
+        # here or by Utilities' reseed — default_solvent is a build-time seed ("seed,
+        # never override"), so an unrelated Settings Apply must not yank the user's
+        # active solvent/condition. It re-themes itself via its own changeEvent.
         self.cross_module.refresh()                             # redraw scaling axes
         self.sls_module.set_measurement(self.current_item)      # redraw SLS axes

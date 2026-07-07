@@ -58,6 +58,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 #   marker_active — derived / replicate-average tree leaves
 #   marker_selected — measurements ticked in the active tab (sidebar mirror + picker rows)
 #   badge         — the "?" help-badge outline + glyph
+#   lib_primary   — solvent-library provenance: a primary-tier auto-filled value (the
+#                   Data-tab teal dot + the Solvent Explorer primary badge). Teal, chosen
+#                   to avoid every taken meaning (yellow=dirty, amber=pending, red=error,
+#                   steel=qualifier, green/azure=markers).
+#   lib_estimate  — solvent-library provenance: an estimate-tier value (Solvent Explorer
+#                   badge only — estimate solvents are never auto-filled into a
+#                   measurement). Violet, previously unused.
 #
 # Light values keep today's intent but stay clearly readable on white; dark values are
 # chosen for contrast on the dark base (Window/Base are 35–53 grey).
@@ -72,6 +79,8 @@ LIGHT_TOKENS = {
     'marker_active': '#008f63',
     'marker_selected': '#0a66c2',
     'badge':         '#777777',
+    'lib_primary':   '#0f9d8a',
+    'lib_estimate':  '#7a4fd0',
 }
 
 DARK_TOKENS = {
@@ -85,6 +94,8 @@ DARK_TOKENS = {
     'marker_active': '#3fd0a0',
     'marker_selected': '#5aa9ee',
     'badge':         '#bdbdbd',
+    'lib_primary':   '#4fd0bf',
+    'lib_estimate':  '#b79cf0',
 }
 
 

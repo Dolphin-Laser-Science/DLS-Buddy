@@ -38,7 +38,7 @@ to its literature, or to find which papers a given module relies on.
   - Used in: physics/constants.py:266–268; physics/constants.py:277; physics/constants.py:284; physics/constants.py:306; physics/constants.py:330; physics/constants.py:565; physics/constants.py:606; analysis/sls.py:51; analysis/sls.py:67; core/data_models.py:540–541; parsers/brookhaven_sls.py:60; parsers/brookhaven_sls.py:314; Advanced Guide §11.6, Eq. (38)
 - Wu, Hua (2010). Correlations between the Rayleigh Ratio and the Wavelength for Toluene and Benzene. *Chemical Physics* **367**(1), 44–47. https://doi.org/10.1016/j.chemphys.2009.10.019
   - Used in: physics/constants.py:258; physics/constants.py:270; physics/constants.py:279
-- Seery, Thomas A. P.; Shorter, John A.; Amis, Eric J. (1989). Concurrent Static and Dynamic Light Scattering from Macromolecular Solutions. 1. Model Systems in the Low q Regime. *Polymer* **30**(7), 1197–1203. https://doi.org/10.1016/0032-3861(89)90036-0
+- Seery, Thomas A. P.; Shorter, Jeffrey A.; Amis, Eric J. (1989). Concurrent Static and Dynamic Light Scattering from Macromolecular Solutions. 1. Model Systems in the Low q Regime. *Polymer* **30**(7), 1197–1203. https://doi.org/10.1016/0032-3861(89)90036-0
   - Used in: analysis/sls.py:43; analysis/sls.py:66
 - Guinier, André (1939). La diffraction des rayons X aux très petits angles: application à l'étude de phénomènes ultramicroscopiques. *Annales de Physique (Paris)* **11**(12), 161–237. https://doi.org/10.1051/anphys/193911120161
   - Used in: analysis/sls.py (guinier_analysis); Advanced Guide §11.5, Eq. (27)
@@ -91,6 +91,57 @@ to its literature, or to find which papers a given module relies on.
 
 - CODATA / NIST (2024). CODATA Recommended Values of the Fundamental Physical Constants: 2022. NIST SP 961 (May 2024), National Institute of Standards and Technology. k_B and N_A are exact values fixed by the 2019 SI redefinition.
   - Used in: physics/constants.py:70; physics/constants.py:73 (k_B = 1.380649e-23 J/K; N_A = 6.02214076e23 /mol)
+
+### Solvent properties (refractive index & viscosity)
+
+- Daimon, Masahiko; Masumura, Akira (2007). Measurement of the Refractive Index of Distilled Water from the Near-Infrared Region to the Ultraviolet Region. *Applied Optics* **46**(18), 3811–3820. https://doi.org/10.1364/AO.46.003811
+  - Used in: physics/solvents.py (water refractive index); Advanced Guide §12 (Eq. 50)
+- Harvey, Allan H.; Gallagher, John S.; Levelt Sengers, J. M. H. (1998). Revised Formulation for the Refractive Index of Water and Steam as a Function of Wavelength, Temperature and Density. *Journal of Physical and Chemical Reference Data* **27**(4), 761–774. https://doi.org/10.1063/1.556029
+  - Used in: Advanced Guide §12 (water slope allowance)
+- Pátek, Jaroslav; Hrubý, Jan; Klomfar, Jaroslav; Součková, Monika; Harvey, Allan H. (2009). Reference Correlations for Thermophysical Properties of Liquid Water at 0.1 MPa. *Journal of Physical and Chemical Reference Data* **38**(1), 21–29. https://doi.org/10.1063/1.3043575
+  - Used in: physics/solvents.py (water viscosity, Eq. 7); Advanced Guide §12 (Eq. 51)
+- Samoc, Anna (2003). Dispersion of Refractive Properties of Solvents: Chloroform, Toluene, Benzene, and Carbon Disulfide in Ultraviolet, Visible, and Near-Infrared. *Journal of Applied Physics* **94**(9), 6167–6174. https://doi.org/10.1063/1.1615294
+  - Used in: physics/solvents.py (toluene refractive index; chloroform + CS2, estimate tier); Advanced Guide §12 (Eq. 50)
+- Santos, F. J. V.; Nieto de Castro, C. A.; Dymond, J. H.; Dalaouti, N. K.; Assael, M. J.; Nagashima, A. (2006). Standard Reference Data for the Viscosity of Toluene. *Journal of Physical and Chemical Reference Data* **35**(1), 1–8. https://doi.org/10.1063/1.1928233
+  - Used in: physics/solvents.py (toluene viscosity, Eq. 5); Advanced Guide §12 (Eq. 51)
+- Moreels, E.; de Greef, C.; Finsy, R. (1984). Laser Light Refractometer. *Applied Optics* **23**(17), 3010–3013. https://doi.org/10.1364/AO.23.003010
+  - Used in: physics/solvents.py (ethanol/benzene/cyclohexane/acetone refractive index + dn/dT; CCl4, estimate tier); Advanced Guide §12 (Eq. 50)
+- Sotiriadou, S.; Ntonti, E.; Velliadou, D.; Antoniadis, K. D.; Assael, M. J.; Huber, M. L. (2023). Reference Correlation for the Viscosity of Ethanol from the Triple Point to 620 K and up to 102 MPa. *International Journal of Thermophysics* **44**(3), 40. https://doi.org/10.1007/s10765-022-03149-z
+  - Used in: physics/solvents.py (ethanol viscosity, Eq. 13); Advanced Guide §12 (Eq. 51)
+- Jakubczyk, Daniel; Derkachov, Gennadiy; Nyandey, Kwasi; Alikhanzadeh-Arani, Sima; others (2023). Chromatic Dispersion and Thermal Coefficients of Hygroscopic Liquids: 5 Glycols and Glycerol. *Scientific Data* **10**, 894. https://doi.org/10.1038/s41597-023-02819-3
+  - Used in: physics/solvents.py (glycerol + ethylene glycol refractive index + dn/dT); Advanced Guide §12 (Eq. 50)
+- Ferreira, A. G. M.; Egas, A. P. V.; Fonseca, I. M. A.; Costa, A. C.; Abreu, D. C.; Lobo, Lélio Q. (2017). The Viscosity of Glycerol. *Journal of Chemical Thermodynamics* **113**, 162–182. https://doi.org/10.1016/j.jct.2017.05.042
+  - Used in: physics/solvents.py (glycerol viscosity, VFT fit to measured data); Advanced Guide §12 (Eq. 51)
+- Avgeri, S.; Assael, M. J.; Huber, M. L.; Perkins, R. A. (2014). Reference Correlation of the Viscosity of Benzene from the Triple Point to 675 K and up to 300 MPa. *Journal of Physical and Chemical Reference Data* **43**(3), 033103. https://doi.org/10.1063/1.4892935
+  - Used in: physics/solvents.py (benzene viscosity, recommended table); Advanced Guide §12 (Eq. 51)
+- Tariq, U.; Jusoh, A. R. B.; Riesco, N.; Vesovic, V. (2014). Reference Correlation of the Viscosity of Cyclohexane from the Triple Point to 700 K and up to 110 MPa. *Journal of Physical and Chemical Reference Data* **43**(3), 033101. https://doi.org/10.1063/1.4891103
+  - Used in: physics/solvents.py (cyclohexane viscosity, recommended table); Advanced Guide §12 (Eq. 51)
+- Kozma, I. Z.; Krok, P.; Riedle, E. (2005). Direct Measurement of the Group-Velocity Mismatch and Derivation of the Refractive-Index Dispersion for a Variety of Solvents in the Ultraviolet. *Journal of the Optical Society of America B* **22**(7), 1479–1485. https://doi.org/10.1364/JOSAB.22.001479
+  - Used in: physics/solvents.py (n-hexane refractive index); Advanced Guide §12 (Eq. 50)
+- Michailidou, E. K.; Assael, M. J.; Huber, M. L.; Perkins, R. A. (2013). Reference Correlation of the Viscosity of n-Hexane from the Triple Point to 600 K and up to 100 MPa. *Journal of Physical and Chemical Reference Data* **42**(3), 033104. https://doi.org/10.1063/1.4818980
+  - Used in: physics/solvents.py (n-hexane viscosity, recommended table); Advanced Guide §12 (Eq. 51)
+- Moutzouris, Konstantinos; Papamichael, Myrtia; Betsis, Sokratis C.; Stavrakas, Ilias; Hloupis, George; Triantis, Dimos (2014). Refractive, Dispersive and Thermo-Optic Properties of Twelve Organic Solvents in the Visible and Near-Infrared. *Applied Physics B* **116**(3), 617–622. https://doi.org/10.1007/s00340-013-5744-3
+  - Used in: physics/solvents.py (methanol refractive index; acetonitrile, estimate tier); Advanced Guide §12 (Eq. 50)
+- El-Kashef, H. (2000). The Necessary Requirements Imposed on Polar Dielectric Laser Dye Solvents. *Physica B* **279**(4), 295–301. https://doi.org/10.1016/S0921-4526(99)00856-X
+  - Used in: physics/solvents.py (methanol dn/dT); Advanced Guide §12 (Eq. 50)
+- Xiang, H. W.; Laesecke, A.; Huber, M. L. (2006). A New Reference Correlation for the Viscosity of Methanol. *Journal of Physical and Chemical Reference Data* **35**(4), 1597–1620. https://doi.org/10.1063/1.2360605
+  - Used in: physics/solvents.py (methanol viscosity, recommended table); Advanced Guide §12 (Eq. 51)
+- Sotiriadou, S.; Ntonti, E.; Assael, M. J.; Huber, M. L. (2025). Reference Correlations of the Viscosity and Thermal Conductivity of Acetone from the Triple Point to High Temperatures and Pressures. *International Journal of Thermophysics* **46**(1), 3. https://doi.org/10.1007/s10765-024-03465-6
+  - Used in: physics/solvents.py (acetone viscosity, recommended table); Advanced Guide §12 (Eq. 51)
+- Riddick, John A.; Bunger, William B. (1970). Organic Solvents: Physical Properties and Methods of Purification. 3rd ed. Wiley-Interscience. ISBN 9780471927266; bulk tabulated dn/dt used as an estimate-grade fallback.
+  - Used in: physics/solvents.py (n-hexane + estimate-tier bulk dn/dT and viscosity); Advanced Guide §12
+- Li, Xiaoning; Wang, Chengchao; Ma, Lanxin; Liu, Linhua (2022). Ellipsometry-Transmission Measurement of the Complex Refractive Indices for a Series of Organic Solvents in the 200–1700 nm Spectral Range. *Infrared Physics & Technology* **125**, 104313. https://doi.org/10.1016/j.infrared.2022.104313
+  - Used in: physics/solvents.py (DMSO/DMF/DCM/ethyl acetate/THF refractive index, estimate tier); Advanced Guide §12 (Eq. 50)
+- Sotiriadou, Sofia G.; Ntonti, Eleftheria; Assael, Marc J.; Antoniadis, Konstantinos D.; Huber, Marcia L. (2024). Correlations for the Viscosity and Thermal Conductivity of Tetrahydrofuran. *International Journal of Thermophysics* **45**(8), 123. https://doi.org/10.1007/s10765-024-03415-2
+  - Used in: physics/solvents.py (THF viscosity, recommended table, estimate tier); Advanced Guide §12 (Eq. 51)
+- Mebelli, Marko; Velliadou, Danai; Assael, Marc J.; Huber, Marcia L. (2021). Reference Correlation for the Viscosity of Ethane-1,2-diol (Ethylene Glycol) from the Triple Point to 465 K and up to 100 MPa. *International Journal of Thermophysics* **42**(8), 116. https://doi.org/10.1007/s10765-021-02867-0
+  - Used in: physics/solvents.py (ethylene glycol viscosity, promotes it to primary); Advanced Guide §12 (Eq. 51)
+- Akmarov, K. A.; Lapshov, S. N.; Sherstobitova, A. S.; Yas'kov, A. D. (2013). Optical Properties of Aqueous Solutions of Dimethyl Sulfoxide and Application of Refractometry for Monitoring Their Composition. *Journal of Applied Spectroscopy* **80**(4), 610–614. https://doi.org/10.1007/s10812-013-9814-4
+  - Used in: physics/solvents.py (DMSO dn/dT, measured on pure DMSO); Advanced Guide §12 (Eq. 50)
+- Grande, María del Carmen; García, Mariano; Marschoff, Carlos M. (2009). Density and Viscosity of Anhydrous Mixtures of Dimethylsulfoxide with Acetonitrile in the Range (298.15 to 318.15) K. *Journal of Chemical and Engineering Data* **54**(3), 652–658. https://doi.org/10.1021/je8001909
+  - Used in: physics/solvents.py (DMSO + acetonitrile viscosity, measured pure-component); Advanced Guide §12 (Eq. 51)
+- Nikam, Pandharinath S.; Kharat, Sanjeevan J. (2005). Density and Viscosity Studies of Binary Mixtures of N,N-Dimethylformamide with Toluene and Methyl Benzoate at (298.15, 303.15, 308.15, and 313.15) K. *Journal of Chemical and Engineering Data* **50**(2), 455–459. https://doi.org/10.1021/je040012q
+  - Used in: physics/solvents.py (DMF viscosity, measured pure-component); Advanced Guide §12 (Eq. 51)
 
 ### Instrument manuals
 

@@ -204,6 +204,14 @@ _SOLVENT_ALIASES = {
     'n-methyl-2-pyrrolidone': 'nmp',
     # ethylene glycol
     'ethylene glycol': 'ethylene glycol',
+    # carbon tetrachloride
+    'carbon tetrachloride': 'ccl4',
+    'ccl4': 'ccl4',
+    'tetrachloromethane': 'ccl4',
+    # carbon disulfide
+    'carbon disulfide': 'cs2',
+    'carbon disulphide': 'cs2',
+    'cs2': 'cs2',
 }
 
 # Tracks which unrecognised solvent names have already triggered a warning,

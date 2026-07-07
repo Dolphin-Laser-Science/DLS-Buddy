@@ -35,6 +35,19 @@ from gui.theme import color
 TAB_EXTRA_PX = 14
 
 
+def value_unit_row(value_widget: QtWidgets.QWidget,
+                   unit_widget: QtWidgets.QWidget) -> QtWidgets.QWidget:
+    """A ``[value][unit]`` composite for a form row (the synthetic generator's and the
+    Solvent Explorer's unit-aware inputs). Shared here so the two callers don't drift."""
+    row = QtWidgets.QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.addWidget(value_widget)
+    row.addWidget(unit_widget)
+    holder = QtWidgets.QWidget()
+    holder.setLayout(row)
+    return holder
+
+
 class RoomyTabBar(QtWidgets.QTabBar):
     """A QTabBar that reserves a little extra width per tab so labels don't clip.
 

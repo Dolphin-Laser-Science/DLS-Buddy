@@ -14,6 +14,10 @@ Inner tabs (all built):
     ideal isotropic, dust-free scattering volume the curve is flat across angle.
   * **Synthetic data** — the synthetic-dataset generator (correlogram / trace /
     multi-angle DLS / SLS slices) with per-artifact Preview + Save.
+  * **Solvent Explorer** — the global, display-only solvent-property calculator
+    (`gui/solvent_explorer_module.py`). It ignores the sidebar selection by
+    design (nothing is ever written into a measurement); hosting it here keeps
+    the shell at the six locked top-level tabs.
 
 All analysis lives in the controller/engine; this widget only drives the controller
 and displays what comes back.
@@ -37,8 +41,9 @@ from app import units as U
 from gui.plot_controls import (
     make_split_panels, make_canvas_expanding, make_vertical_plot_stack,
 )
+from gui.solvent_explorer_module import SolventExplorerModule
 from gui.theme import ThemedLabel
-from gui.widgets import roomy_tabs, SampleSelector
+from gui.widgets import roomy_tabs, SampleSelector, value_unit_row as _value_unit_row
 
 
 def _sample_label(sample) -> str:
@@ -60,18 +65,6 @@ from parsers.base_parser import ParseError
 from parsers.alv_asc import ALVTraceParser
 from parsers.brookhaven_dls import BrookhavenTraceParser
 from parsers.generic_trace import GenericTraceParser
-
-def _value_unit_row(value_edit, unit_combo) -> QtWidgets.QWidget:
-    """A [value][unit] composite for a form row (used by the synthetic generator's
-    unit-aware temperature/viscosity inputs)."""
-    row = QtWidgets.QHBoxLayout()
-    row.setContentsMargins(0, 0, 0, 0)
-    row.addWidget(value_edit)
-    row.addWidget(unit_combo)
-    holder = QtWidgets.QWidget()
-    holder.setLayout(row)
-    return holder
-
 
 _OUTLIER_COLOUR = '#D55E00'   # Okabe-Ito vermilion, for the GUI-owned flag overlay
 _TRACE_CYCLE = ['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#E69F00',
@@ -164,6 +157,10 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.inner.addTab(self._build_traces_tab(), 'Traces')
         self.inner.addTab(self._build_isin_tab(), 'I·sin θ')
         self.inner.addTab(self._build_synth_tab(), 'Synthetic generator')
+        # The Solvent Explorer is a self-contained global calculator; it seeds its
+        # own solvent in its __init__ and ignores the sample selection by design.
+        self.solvent_explorer = SolventExplorerModule(self.controller)
+        self.inner.addTab(self.solvent_explorer, 'Solvent Explorer')
         self.refresh_traces()
 
     def _build_isin_tab(self) -> QtWidgets.QWidget:
@@ -1184,7 +1181,12 @@ class UtilitiesModule(QtWidgets.QWidget):
     def reseed_from_settings(self) -> None:
         """Re-render after a Settings change (e.g. plot palette). The trace + synthetic
         defaults are session-only in-tab fields now (feedback 2026-06-26 #6), so there
-        is nothing to re-seed from SettingsState here."""
+        is nothing to re-seed from SettingsState here.
+
+        NB: this must NOT cascade into the nested Solvent Explorer — default_solvent
+        is a build-time seed ("seed, never override"), so an unrelated Settings Apply
+        must not yank the user's active solvent/condition. The Explorer seeds itself
+        once in its __init__ and re-themes via its own changeEvent."""
         self._update_trace()
 
     def set_measurement(self, item_id: Optional[str]) -> None:

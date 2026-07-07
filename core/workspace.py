@@ -64,6 +64,17 @@ _SLS_PARAM_KEYS = (
     'mw_fraction',
 )
 
+# Sidecar provenance tags for solvent-property autofill: which SOURCE produced the
+# refractive index / viscosity ('user' vs 'library:primary'). Deliberately NOT in
+# the *_PARAM_KEYS tuples above -- so they never become Data-table rows, never
+# reach LoadedMeasurement.build() (which reads named keys, not **params -- the
+# invariant-3 linchpin), and are rejected by set_param/set_shared_param. They ride
+# in the param dicts only via the dedicated controller writers, and are excluded
+# from dirty-tracking below so a source-only flip never raises a phantom pending.
+_PROVENANCE_KEYS = frozenset({
+    'solvent_refractive_index_source', 'viscosity_Pa_s_source',
+})
+
 
 @dataclass
 class LoadedMeasurement:
@@ -90,12 +101,20 @@ class LoadedMeasurement:
 
     # ---- change tracking ----
     def is_dirty(self) -> bool:
-        """True if any working parameter differs from the committed one."""
-        return self.working_params != self.committed_params
+        """True if any non-provenance working parameter differs from committed.
+
+        Provenance source tags (_PROVENANCE_KEYS) are ignored: a re-derive that
+        only flips a source tag must not raise a phantom "changes pending".
+        """
+        keys = (set(self.working_params) | set(self.committed_params)) - _PROVENANCE_KEYS
+        return any(self.working_params.get(k) != self.committed_params.get(k)
+                   for k in keys)
 
     def dirty_keys(self) -> List[str]:
-        """The parameter names whose working value differs from committed."""
-        keys = set(self.working_params) | set(self.committed_params)
+        """The parameter names whose working value differs from committed.
+
+        Excludes provenance source tags (_PROVENANCE_KEYS)."""
+        keys = (set(self.working_params) | set(self.committed_params)) - _PROVENANCE_KEYS
         return sorted(k for k in keys
                       if self.working_params.get(k) != self.committed_params.get(k))
 
@@ -113,6 +132,12 @@ class LoadedMeasurement:
 
         Uses committed (not working) parameters: analysis runs on what has been
         confirmed, never on un-applied edits.
+
+        INVARIANT-3 LINCHPIN: this reads *named* keys off the committed dict (never
+        `**params`). That is what lets the param dict carry sidecar provenance keys
+        (e.g. solvent_refractive_index_source) that never reach the pure engine. Do
+        NOT switch this to `**p` / dict-splat construction — it would silently feed
+        every stray key into the measurement and break the provenance separation.
         """
         p = self.committed_params
         if self.kind == 'dls':

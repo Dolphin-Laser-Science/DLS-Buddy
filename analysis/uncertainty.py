@@ -296,13 +296,44 @@ def replicate_mean_se(values: Sequence[float]) -> ReplicateStats:
 # Display: value +/- uncertainty with significant figures driven by the SE
 # ---------------------------------------------------------------------------
 
+def _pdg_decimals(sigma: float) -> int:
+    """The decimal place (as ``round()``'s ``ndigits``) the PDG-style convention
+    assigns to an uncertainty: round sigma to 1 significant figure — 2 if its
+    leading digit is 1 — and report the value at that same place. The single
+    place-chooser shared by ``format_pm`` and ``round_to_uncertainty`` so the
+    display convention and the autofill rounding can never drift apart."""
+    exp = math.floor(math.log10(sigma))
+    lead = int(sigma / 10 ** exp)              # first significant digit of sigma
+    sig = 2 if lead == 1 else 1
+    return -(exp - (sig - 1))                  # decimals for round()
+
+
+def round_to_uncertainty(value: Optional[float],
+                         sigma: Optional[float]) -> Optional[float]:
+    """Round ``value`` at the last digit ``sigma`` can stand behind (the PDG-style
+    place of ``format_pm``) — e.g. value 1.3325541, sigma 6e-4 -> 1.3326.
+
+    Used by the solvent-library autofill to strip false precision from proposed
+    values before they are written (display-class perturbation, <= half a unit in
+    the last confident digit; the sigma chooses the decimal place and travels no
+    further — invariant #8). Idempotent. A missing/zero/non-finite sigma means
+    there is nothing to stand behind, so the value is returned unrounded.
+    """
+    has_val = value is not None and math.isfinite(value)
+    has_sig = sigma is not None and math.isfinite(sigma) and sigma > 0
+    if not has_val or not has_sig:
+        return value
+    return round(value, _pdg_decimals(sigma))
+
+
 def format_pm(value: Optional[float], se: Optional[float], unit: str = '') -> str:
     """Format 'value +/- se' with the precision set by the uncertainty.
 
     Convention (PDG-style): round the SE to 1 significant figure, or 2 if its
-    leading digit is 1; round the value to the same decimal place. Large/small
-    magnitudes are shown with a shared power of ten, e.g. '(1.23 +/- 0.06)e6'.
-    Falls back to a plain value when no usable SE is given.
+    leading digit is 1; round the value to the same decimal place (the place
+    comes from the shared ``_pdg_decimals``). Large/small magnitudes are shown
+    with a shared power of ten, e.g. '(1.23 +/- 0.06)e6'. Falls back to a plain
+    value when no usable SE is given.
     """
     has_val = value is not None and math.isfinite(value)
     has_se = se is not None and math.isfinite(se) and se > 0
@@ -312,11 +343,9 @@ def format_pm(value: Optional[float], se: Optional[float], unit: str = '') -> st
         s = f'{value:.4g}'
         return f'{s} {unit}' if unit else s
 
-    exp = math.floor(math.log10(se))
-    lead = int(se / 10 ** exp)                 # first significant digit of the SE
-    sig = 2 if lead == 1 else 1
-    last = exp - (sig - 1)                      # power-of-ten place of the last sig fig
-    dec = -last                                 # decimals for round()
+    exp = math.floor(math.log10(se))            # SE's order (sci-notation fallback)
+    dec = _pdg_decimals(se)
+    last = -dec                                 # power-of-ten place of the last sig fig
     se_r = round(se, dec)
     val_r = round(value, dec)
 

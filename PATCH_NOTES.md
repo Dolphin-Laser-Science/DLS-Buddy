@@ -9,6 +9,152 @@ window title.
 
 ---
 
+## 0.16.0 — Γ vs q² / D vs c: explicit-Run workflow + easier point selection (2026-07-06)
+
+The multi-angle **Γ vs q²** and concentration-series **D vs c** tabs were reworked so
+they are predictable about *when* they compute, and easier to load with data. Based on
+owner feedback that it was unclear how measurements became eligible and that "something
+got plotted before any analysis was run."
+
+- **Nothing is fitted or plotted until you press Run.** On selecting a sample the
+  points table now lists its measurements as *metadata only* — Γ and *D*<sub>app</sub>
+  read "—" until you Run. This removes the earlier behaviour where focusing a sample
+  silently computed a cumulant fit per measurement.
+- **The table refreshes when you commit.** After confirming parameters in the Data tab,
+  the Γ-q²/D-c tables repopulate immediately — no more switching away and re-clicking
+  the sample in the sidebar to make measurements appear.
+- **Ticking only selects; it never refits or clears the plot.** Changing which points
+  are included marks a shown result *"selection changed — press Run to refresh"* instead
+  of silently refitting or wiping the plot.
+- **New selection helpers:** **Select all**, **Select none**, and **Tick all at** a
+  chosen value — concentration on Γ vs q², angle on D vs c.
+- **Clearer eligibility.** Rows that can't be ticked are greyed with a hover tooltip
+  saying why (parameters not confirmed, or a different Mw fraction — which is now shown
+  greyed rather than hidden). A note flags same-polymer/solvent measurements that are
+  grouped separately because their temperature isn't confirmed yet. After a Run, a point
+  whose cumulant fit failed or whose PDI exceeds the validity limit is flagged in its
+  tooltip so you can untick it.
+- **"Inputs changed — press Run to refresh" hint** across every DLS analysis tab
+  (Correlogram, Distribution, Γ vs q², D vs c, DDLS). If you commit a change to a
+  parameter that fed a displayed fit, the plot stays but a status line tells you it is
+  now out of date — so a fit is never silently shown against parameters it wasn't
+  computed with. The hint is precise: it appears only for the results whose *own* inputs
+  changed, not for an unrelated edit elsewhere. (SLS already re-runs its fit on commit,
+  so it is always current.)
+
+Analysis results are unchanged — the fit, its Γ source (internal 2nd-order cumulant),
+and the reported uncertainties are identical; only *when* and *how* points are selected
+and displayed changed.
+
+**Distribution note:** starting with this release the automated developer test suite is
+no longer included in the download — it is development tooling; nothing in it is needed
+to run the program.
+
+---
+
+## 0.15.1 — Water refractive-index band: honest widening at warm temperatures (2026-07-06)
+
+A focused correctness review found that water's refractive-index confidence band
+**under-stated the true model error above ~38 °C**: water's d*n*/d*T* steepens with
+temperature (per the IAPWS standard formulation, Harvey *et al.* 1998), and the
+library's constant slope — fitted near 20 °C — accumulates ~7×10⁻⁴ of error by 45 °C,
+where the band claimed ~3.5×10⁻⁴. (The pre-0.15 flat figure, ±6×10⁻⁴, under-stated it
+too.)
+
+- Water's d*n*/d*T* slope allowance is widened so the band bounds the measured drift
+  across the whole 15–45 °C range: the box-wide *n* uncertainty becomes **9×10⁻⁴**
+  (was 6×10⁻⁴ pre-0.15). Near room temperature nothing changes — the band still
+  narrows to ~3×10⁻⁴ there, and auto-filled values are identical.
+- No other solvent is affected (water was the only record whose served range outruns
+  its source's measured temperatures).
+
+---
+
+## 0.15.0 — Solvent library: per-condition confidence band (2026-07-06)
+
+The library's display uncertainty is now evaluated **at your wavelength and
+temperature**, not as one flat figure for the whole validity range.
+
+- **The Explorer band now grows and narrows honestly.** It is narrowest near the
+  conditions each source measures best (e.g. water *n* around 20 °C) and widens toward
+  the edges of the validity range. Every part of its shape derives from real
+  quantities — the source's stated accuracy, the library's own fit-residual envelopes,
+  and standard d*n*/d*T*-slope propagation (Advanced Guide §12, Eqs. 52–53). Where a
+  bulk/handbook source states no temperature shape, the band stays **flat** — nothing
+  is ever invented.
+- **Numeric readouts and auto-fill follow.** The Explorer's ± and the Data-tab
+  auto-fill rounding now use the per-condition value, so mid-range look-ups often gain
+  a digit (water at 532 nm, 25 °C now reads *n* = 1.3349 ± 0.0003 instead of ± 0.0006).
+  The box-wide figures in tooltips remain the band's maximum — the per-condition value
+  never exceeds them.
+- **Honesty corrections both ways.** Most box-wide *n* uncertainties tightened
+  (removing box-edge pessimism); a few viscosity figures widened slightly where the
+  fit deviation now counts on top of the source's stated uncertainty instead of beside
+  it (water 1.0 → 1.1 %, *n*-hexane/methanol 2.0 → 2.1 %, acetone 5.5 → 5.8 %,
+  THF 6.0 → 6.1 %, ethylene glycol 4.9 → 5.0 %). Three viscosity validity ranges were
+  **clipped to the range their source states its uncertainty for**: toluene 260–370 K,
+  benzene 288–340 K, methanol 273–343 K (values outside those ranges were previously
+  served with an uncertainty the source does not support).
+- Nothing changes in how analyses treat the uncertainty: it is still **displayed,
+  never folded into a reported ±**. The underlying n/η fits are identical; an
+  auto-filled value may simply keep **one more digit** where the per-condition
+  uncertainty is genuinely tighter than the old box-wide figure (re-running
+  auto-fill on an old session updates the fields once, as in 0.14.1).
+
+---
+
+## 0.14.1 — Solvent Explorer relocation + layout; auto-fill rounding (2026-07-06)
+
+Five owner-requested refinements to the 0.14.0 solvent-library surface.
+
+- **The Solvent Explorer moved under Utilities.** It is now the fourth **Utilities
+  sub-tab** (after Traces, I·sin θ, Synthetic generator), restoring the six-tab shell.
+  Everything about it works as before — it still needs no loaded sample and never
+  writes into a measurement.
+- **One shared figure, two plots side by side.** The Explorer's two stacked plots are
+  now two smaller panels on a single canvas (one toolbar), resizing together; the
+  freed vertical space goes to the condition/readout area above.
+- **Temperature plot axes swapped.** Viscosity — the quantity that actually varies
+  strongly with temperature — is now the **left** axis (log-capable, log by default);
+  refractive index rides the right axis. Colours, bands, and markers are unchanged.
+- **Auto-filled values are rounded at the last confident digit.** The Data-tab
+  auto-fill used to write full-precision floats (e.g. *n* = 1.3325541…); it now rounds
+  each proposed value at the decimal place its library uncertainty can stand behind
+  (water at 25 °C, 633 nm → *n* = 1.3315; η = 0.891 mPa·s). The uncertainty only picks
+  the rounding place — it still never enters any analysis. Values you type yourself
+  are, as always, never touched. (If you re-run auto-fill on a pre-0.14.1 session,
+  the fields will update once to the rounded form.)
+
+---
+
+## 0.14.0 — Solvent property library: auto-fill + Solvent Explorer tab (2026-07-06)
+
+The solvent-property library (added headless in 0.13.x) now has its front-ends.
+
+- **Data tab — auto-fill.** The solvent name is now a dropdown of the library’s primary
+  solvents (water, toluene, ethanol, methanol, benzene, cyclohexane, *n*-hexane, acetone,
+  glycerol, ethylene glycol; free text still works for anything else). Pick one and the
+  **refractive index** and — for DLS — the **viscosity** fill in from the temperature and
+  wavelength, marked with a **teal dot**. They **re-derive** whenever you change the
+  temperature or wavelength; a value you **type by hand is never overwritten** (and shows
+  no dot). Outside a solvent’s validity range the program does not guess — it clears the
+  library value and tells you to enter it manually. **dn/dc is never proposed** — it stays
+  hand-entered.
+- **New Solvent Explorer tab.** A global look-up + visual calculator over the whole library
+  (both confidence tiers; estimate-tier solvents are labelled). Enter a solvent, temperature,
+  and wavelength to read *n* and η with their uncertainty and a tier badge, and see two
+  plots: *n* and η vs temperature (twin axes, each drawn only across the range the library
+  covers) and *n* vs wavelength, each with a **confidence band** and a marker at your chosen
+  condition. The band is a conservative bound shown for judgement — it is **never** folded
+  into any reported ± (Advanced Guide §12).
+- **Settings → Solvent library → Default solvent** sets which solvent the Explorer opens on.
+
+The library only ever *offers* a value; nothing enters an analysis without your commit, and
+no solvent constant is baked into the maths. Sources and the per-solvent validity/uncertainty
+detail are in the Advanced Guide (§12) — never shown as citations in the program.
+
+---
+
 ## 0.13.1 — CONTIN F-test: exact Provencher degrees-of-freedom (2026-07-03)
 
 Correctness fix to the new CONTIN F-test α-selection (0.13.0), validated against Provencher's

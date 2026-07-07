@@ -53,6 +53,7 @@ from gui.theme import ThemedLabel, color as theme_color
 from gui.widgets import roomy_tabs, SelectionModel, MeasurementPicker
 from gui.worker import BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, run_when_idle, runner
 from analysis.uncertainty import format_pm
+from analysis.dls import CUMULANT_PDI_VALIDITY_LIMIT
 
 
 # Scale modes for the four correlogram views, named Yscale-Xscale -> (xscale, yscale).
@@ -126,6 +127,23 @@ def _fmt(x: Optional[float], sig: int = 3) -> str:
     if x is None or not (isinstance(x, (int, float)) and math.isfinite(x)):
         return 'n/a'
     return f'{x:.{sig}g}'
+
+
+# Shown when a displayed fit was computed from parameters that have since been
+# committed-changed (feedback 2026-07-06). Complements the pre-commit '(ran on last
+# committed values)' note: this covers the post-commit window, where `is_dirty()` has
+# already gone false but the plot still reflects the old inputs.
+_STALE_HINT = 'Inputs changed since this fit — press Run to refresh.'
+
+
+def _is_stale(controller, sig) -> bool:
+    """True if the committed parameters of the measurements that produced a cached fit
+    (encoded in `sig`, from `controller.committed_signature`) have since changed. The
+    item_ids are recovered from `sig` itself, so no side table of inputs is needed."""
+    if not sig:
+        return False
+    ids = [entry[0] for entry in sig]
+    return controller.committed_signature(ids) != sig
 
 
 def _ordinal_peak(i: int) -> str:
@@ -607,6 +625,16 @@ class _CorrelogramTab(QtWidgets.QWidget):
         return any(self._cache.get(i, {}).get('key') == key
                    for i in self.selection.ids())
 
+    def _any_stale(self) -> bool:
+        """True if any co-plotted, method-matching cached fit was computed from
+        committed params that have since changed (feedback 2026-07-06)."""
+        key = self.method_combo.currentData()
+        for iid in self.selection.ids():
+            v = self._cache.get(iid)
+            if v and v.get('key') == key and _is_stale(self.controller, v.get('sig')):
+                return True
+        return False
+
     def _fit_for(self, iid: str):
         """The cached result for `iid` IF it was fit with the current method, else
         None (so switching method without re-running drops stale fits)."""
@@ -650,7 +678,8 @@ class _CorrelogramTab(QtWidgets.QWidget):
                     res = c.run_double_exponential(iid, **kw)
                 else:
                     res = c.run_kww(iid, **kw)
-                self._cache[iid] = {'key': key, 'result': res}
+                self._cache[iid] = {'key': key, 'result': res,
+                                    'sig': c.committed_signature([iid])}
             except Exception as exc:               # per-measurement; never abort all
                 self._run_failures[iid] = str(exc)
                 self._cache.pop(iid, None)
@@ -1030,10 +1059,12 @@ class _CorrelogramTab(QtWidgets.QWidget):
             _text, flag = self._summary(key, res)
             if flag:
                 flags.append(f'{_meas_short(lm)}: {flag}')
-        note = ''
+        notes = []
         if self.controller.is_dirty() and self._any_cached():
-            note = '(ran on last committed values)'
-        self.status.setText(note)
+            notes.append('(ran on last committed values)')
+        if self._any_stale():
+            notes.append(_STALE_HINT)
+        self.status.setText('  '.join(notes))
         self.flag_label.setText('\n'.join(flags))
 
     def _summary(self, key: str, r) -> Tuple[str, str]:
@@ -1076,6 +1107,7 @@ class _DistributionTab(QtWidgets.QWidget):
         self.item_id: Optional[str] = None
         self._runnable = False
         self._results: List[Tuple] = []         # [(iid, method, result), ...] last run
+        self._results_sig: tuple = ()           # committed-param signature of the last run's inputs
         self._failures: List[str] = []
         # Staleness token for async runs: bumped when the ticked set changes, so
         # a background fit whose inputs are outdated is dropped, not drawn.
@@ -1305,6 +1337,10 @@ class _DistributionTab(QtWidgets.QWidget):
         self.run_button.setEnabled(self._has_checked())
         if not self._results:
             self._clear('Tick measurements + methods, then Run.')
+        elif _is_stale(self.controller, self._results_sig):
+            # A displayed result whose committed inputs changed (e.g. a commit just
+            # happened) — flag it without redrawing (feedback 2026-07-06).
+            self.status.setText(_STALE_HINT)
 
     @QtCore.Slot()
     def _on_selection_changed(self) -> None:
@@ -1313,6 +1349,7 @@ class _DistributionTab(QtWidgets.QWidget):
         # result is discarded on arrival.
         self._run_epoch += 1
         self._results = []
+        self._results_sig = ()
         self._failures = []
         self.export_button.setEnabled(False)
         self.run_button.setEnabled(self._has_checked())
@@ -1371,6 +1408,8 @@ class _DistributionTab(QtWidgets.QWidget):
             if epoch != self._run_epoch:
                 return          # selection changed while the fit ran — stale
             self._results, self._failures = payload
+            self._results_sig = self.controller.committed_signature(
+                [iid for iid, _m, _r in self._results])
             self.export_button.setEnabled(bool(self._results))
             self._draw()
 
@@ -1454,6 +1493,8 @@ class _DistributionTab(QtWidgets.QWidget):
             notes.append('⚠ skipped: ' + '; '.join(self._failures))
         if self.controller.is_dirty() and self._results:
             notes.append('(ran on last committed values)')
+        if _is_stale(self.controller, self._results_sig):
+            notes.append(_STALE_HINT)
         notes.append('Peak values are also in the Summary tab.')
         self.status.setText('   '.join(notes))
         self._refresh_results()
@@ -1542,7 +1583,9 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self.item_id: Optional[str] = None
         self._runnable = False
         self._cache: Dict[str, object] = {}      # sample_id -> fitted result (subset)
-        self._points: Dict[str, list] = {}       # sample_id -> dls_sample_points rows
+        self._cache_sig: Dict[str, tuple] = {}   # sample_id -> committed-param signature of the fit's inputs
+        self._points: Dict[str, list] = {}       # sample_id -> dls_sample_rows metadata
+        self._run_points: Dict[str, list] = {}   # sample_id -> last run's all_points (Γ/D + quality)
         self._included: Dict[str, set] = {}      # sample_id -> ticked item_ids (#11/#12)
         self._suppress_table = False             # re-entrancy guard for checkbox edits
         self._last_sid: Optional[str] = None     # last DLS sample shown (keep-last, #15)
@@ -1562,10 +1605,12 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
                 '(current Mw fraction).')
         lbl = ThemedLabel(note, role='hint', size=11); lbl.setWordWrap(True)
         cl.addWidget(lbl)
-        # Item 13: make the data source explicit.
+        # Item 13 + feedback 2026-07-06: make the data source explicit AND that nothing
+        # is computed until Run.
         src = ThemedLabel(
-            'Γ at each angle (and D = Γ/q²) comes from an internal 2nd-order cumulant '
-            'fit of each correlogram — independent of any saved Correlogram/Distribution '
+            'Nothing is fitted until you press Run: the table below lists this sample\'s '
+            'measurements, and Run computes Γ (and D = Γ/q²) for each from an internal '
+            '2nd-order cumulant fit — independent of any saved Correlogram/Distribution '
             'result — using the global skip-channels + cumulant method (Settings).',
             role='hint', size=10)
         src.setWordWrap(True); cl.addWidget(src)
@@ -1584,15 +1629,49 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         # ---- per-measurement table section (tick to include — #11/#12) ----
         tsec = QtWidgets.QWidget()
         tl = QtWidgets.QVBoxLayout(tsec); tl.setContentsMargins(0, 0, 0, 0)
+        # The Γ-q² fit varies ANGLE at a fixed concentration → group by concentration;
+        # the D-c fit varies CONCENTRATION at a fixed angle → group by angle
+        # (owner feedback 2026-07-06).
+        by = 'concentration' if self.kind == 'gamma_q2' else 'angle'
+        other = 'angle' if self.kind == 'gamma_q2' else 'concentration'
         tl.addWidget(section_header(
             'Measurements (tick to include in the fit)',
-            'Tick which of this sample\'s measurements enter the fit.',
+            'Tick which of this sample\'s measurements enter the fit, then press Run.',
             bullets=[
                 'Only this sample\'s DLS measurements appear — it is a single-sample fit.',
                 'The fit needs ≥ 2 distinct '
                 + ('angles.' if self.kind == 'gamma_q2' else 'concentrations.'),
-                'Rows that can\'t be built are greyed and can\'t be ticked.',
+                'Greyed rows can\'t be ticked — hover a row to see why '
+                '(unconfirmed parameters, or a different Mw fraction).',
+                'Γ and D fill in only after you Run; ticking never refits on its own.',
                 'Ticked rows read blue and light the matching sidebar leaves.']))
+        # Empty/ineligible-state hint + NaN-temperature sibling note (feedback 2026-07-06).
+        self.table_note = ThemedLabel('', role='hint', size=10)
+        self.table_note.setWordWrap(True); tl.addWidget(self.table_note)
+        self.temp_note = ThemedLabel('', role='hint', size=10)
+        self.temp_note.setWordWrap(True); tl.addWidget(self.temp_note)
+        # Selection helpers (feedback 2026-07-06): Select all / none + "tick all at X".
+        helper = QtWidgets.QWidget()
+        hl = QtWidgets.QHBoxLayout(helper); hl.setContentsMargins(0, 0, 0, 0)
+        self.select_all_btn = QtWidgets.QPushButton('Select all')
+        self.select_all_btn.setToolTip('Tick every eligible measurement of this sample.')
+        self.select_all_btn.clicked.connect(self._select_all)
+        self.select_none_btn = QtWidgets.QPushButton('Select none')
+        self.select_none_btn.setToolTip('Untick every measurement.')
+        self.select_none_btn.clicked.connect(self._select_none)
+        hl.addWidget(self.select_all_btn); hl.addWidget(self.select_none_btn)
+        hl.addWidget(QtWidgets.QLabel(f'Tick all at {by}:'))
+        self.group_combo = QtWidgets.QComboBox()
+        self.group_combo.setToolTip(
+            f'Tick every eligible measurement sharing the chosen {by} '
+            f'(the fit varies {other}).')
+        hl.addWidget(self.group_combo, 1)
+        self.group_tick_btn = QtWidgets.QPushButton('Tick')
+        self.group_tick_btn.setToolTip(
+            f'Add every eligible measurement at the selected {by} to the ticked set.')
+        self.group_tick_btn.clicked.connect(self._tick_all_at_group)
+        hl.addWidget(self.group_tick_btn)
+        tl.addWidget(helper)
         self.table = QtWidgets.QTableWidget(0, 0)
         self.table.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1677,23 +1756,55 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             self.table.setRowCount(0)
             self.run_button.setEnabled(False)
             self.export_button.setEnabled(False)
+            self._set_helpers_enabled(False)
+            self.temp_note.clear()
+            self.table_note.setText(
+                'Select a DLS measurement in the sidebar to see this sample\'s '
+                'measurements here.')
             self._clear_results()
             self._clear('Select a DLS measurement.')
             self.status.clear()
             return
-        # Enumerate the sample's per-measurement points (cumulant Γ/D) for the table.
-        self._points[sid] = self.controller.dls_sample_points(
+        # Enumerate the sample's measurements as METADATA ONLY — no fitting on focus
+        # (feedback 2026-07-06). Γ/D appear only after an explicit Run.
+        self._points[sid] = self.controller.dls_sample_rows(
             sid, self.kind, self._fraction())
         fresh = {r['item_id'] for r in self._points[sid] if r['ok']}
         prev = self._included.get(sid)
+        # Auto-tick all eligible rows on first focus (ticking now only selects — it
+        # computes nothing), so the common "use every point" case is one Run away.
         self._included[sid] = (prev & fresh) if prev is not None else set(fresh)
+        # Restore this sample's last-run per-point values (for the table Γ/D + greying).
+        cached = self._cache.get(sid)
+        self._run_points[sid] = list(getattr(cached, 'all_points', None) or [])
         self._refresh_table(sid)
+        self._populate_group_combo(sid)
         self._update_run_enabled(sid)
+        self._set_helpers_enabled(True)
         self.export_button.setEnabled(sid in self._cache)
         self._last_sid = sid                      # remember for keep-last (#15)
+        # Empty-state / eligibility guidance.
+        if not self._points[sid]:
+            self.table_note.setText('This sample has no DLS measurements.')
+        elif not fresh:
+            self.table_note.setText(
+                'No measurements have confirmed parameters yet — set them in the Data '
+                'tab and press Update, then return here.')
+        else:
+            self.table_note.clear()
+        n_pending = self.controller.dls_pending_temperature_siblings(sid)
+        if n_pending:
+            self.temp_note.setText(
+                f'{n_pending} measurement(s) of this polymer/solvent have no confirmed '
+                'temperature and are grouped separately — confirm it in the Data tab to '
+                'include them here.')
+        else:
+            self.temp_note.clear()
         if sid in self._cache:
             self._fill_results(self._cache[sid])
             self._draw(self._cache[sid])
+            if _is_stale(self.controller, self._cache_sig.get(sid)):
+                self.status.setText(_STALE_HINT)
         else:
             self._clear_results()
             self._clear('Tick measurements, then Run.')
@@ -1712,6 +1823,9 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
                        f'D_app ({_disp_unit("diffusion")})']
         dfc, dfg, dfd = (_disp_factor('concentration'), _disp_factor('decay_rate'),
                          _disp_factor('diffusion'))
+        # Per-point Γ/D + quality come from the last Run (feedback 2026-07-06) — '—'
+        # until then, so nothing is computed on focus.
+        run_by_id = {p['item_id']: p for p in self._run_points.get(sid, [])}
         Flag = QtCore.Qt.ItemFlag
         self._suppress_table = True
         try:
@@ -1727,12 +1841,15 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
                 chk.setCheckState(QtCore.Qt.CheckState.Checked
                                   if (row['ok'] and row['item_id'] in inc)
                                   else QtCore.Qt.CheckState.Unchecked)
+                chk.setToolTip(self._row_tooltip(row, run_by_id.get(row['item_id'])))
                 t.setItem(r, 0, chk)
                 ang = '—' if row['angle_deg'] is None else f"{row['angle_deg']:g}"
                 conc = ('—' if row['concentration_g_per_mL'] is None
                         else f"{row['concentration_g_per_mL'] * dfc:g}")
-                gtxt = _fmt(row['gamma_s_inv'] * dfg) if row['ok'] else '—'
-                dtxt = _fmt(row['d_app_m2_s'] * dfd) if row['ok'] else '—'
+                pt = run_by_id.get(row['item_id'])
+                has_val = pt is not None and pt['quality'] in ('ok', 'high_pdi')
+                gtxt = _fmt(pt['gamma_s_inv'] * dfg) if has_val else '—'
+                dtxt = _fmt(pt['d_app_m2_s'] * dfd) if has_val else '—'
                 vals = ([ang, conc, gtxt, dtxt] if self.kind == 'gamma_q2'
                         else [conc, ang, dtxt])
                 for c, v in enumerate(vals, start=1):
@@ -1743,6 +1860,30 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             t.resizeColumnsToContents()
         finally:
             self._suppress_table = False
+
+    def _row_tooltip(self, row: dict, pt: Optional[dict]) -> str:
+        """Explain a row's eligibility / quality so the user knows why it is greyed or
+        excluded (feedback 2026-07-06)."""
+        reason = row.get('reason')
+        if reason == 'unbuilt':
+            return ('Parameters not confirmed yet — set them in the Data tab and press '
+                    'Update to make this measurement eligible.')
+        if reason == 'other_fraction':
+            frac = row.get('mw_fraction')
+            return (f'A different Mw fraction ({frac!r}) than the focused measurement — '
+                    'a single fit must not mix fractions. Focus a measurement of this '
+                    'fraction to include it.')
+        if pt is not None:
+            q = pt['quality']
+            if q == 'fit_failed':
+                return 'Cumulant fit failed for this correlogram — excluded from the fit.'
+            if q == 'nonpositive_q':
+                return 'Non-physical scattering vector (q ≤ 0) — excluded from the fit.'
+            if q == 'high_pdi':
+                return (f'PDI exceeds the cumulant validity limit '
+                        f'({CUMULANT_PDI_VALIDITY_LIMIT:g}) — the point is included but '
+                        'its Γ is unreliable; consider unticking it.')
+        return 'Eligible — ticked rows enter the fit when you press Run.'
 
     def _tint_row(self, r: int, on: bool) -> None:
         """Colour a table row to match the shared idiom: ticked rows read
@@ -1771,15 +1912,80 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self._suppress_table = False
         self.selectionChanged.emit()  # repaint the sidebar mirror for the new subset
         self._run_epoch += 1         # ticked set changed: in-flight run is stale
+        # Ticking only selects — it never refits or clears the plot (feedback
+        # 2026-07-06). A shown result just gets marked stale until the next Run.
         enough = self._update_run_enabled(sid)
-        if sid in self._cache:
-            if enough:
-                self._recompute(sid)            # live refit on the new subset
-            else:
-                self._cache.pop(sid, None)
-                self.export_button.setEnabled(False)
-                self._clear_results()
-                self._clear('Tick at least two — then Run.')
+        if sid in self._cache and enough:
+            self.status.setText('Selection changed — press Run to refresh.')
+
+    # ---- selection helpers (Select all/none + tick-all-at-X, feedback 2026-07-06) ----
+    def _group_field(self) -> str:
+        """The metadata key the 'tick all at X' selector groups by: concentration for
+        the Γ-q² tab (angle varies), angle for the D-c tab (concentration varies)."""
+        return ('concentration_g_per_mL' if self.kind == 'gamma_q2' else 'angle_deg')
+
+    def _set_helpers_enabled(self, on: bool) -> None:
+        for w in (self.select_all_btn, self.select_none_btn,
+                  self.group_combo, self.group_tick_btn):
+            w.setEnabled(on)
+
+    def _populate_group_combo(self, sid: str) -> None:
+        """Fill the 'tick all at X' combo with the distinct values among ELIGIBLE rows."""
+        field = self._group_field()
+        vals = sorted({r[field] for r in self._points.get(sid, [])
+                       if r['ok'] and r[field] is not None})
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        for v in vals:
+            self.group_combo.addItem(f'{v:g}', v)
+        self.group_combo.blockSignals(False)
+        self.group_tick_btn.setEnabled(bool(vals))
+
+    def _apply_included(self, sid: str, ids: set) -> None:
+        """Set the ticked include-set for a sample and refresh the dependent UI once
+        (table, run-enabled, sidebar mirror) — the shared path for the bulk helpers."""
+        self._included[sid] = set(ids)
+        self._refresh_table(sid)
+        self.selectionChanged.emit()
+        self._run_epoch += 1
+        enough = self._update_run_enabled(sid)
+        if sid in self._cache and enough:
+            self.status.setText('Selection changed — press Run to refresh.')
+
+    @QtCore.Slot()
+    def _select_all(self) -> None:
+        sid = self._sample_id()
+        if sid is None:
+            return
+        self._apply_included(sid, {r['item_id'] for r in self._points.get(sid, [])
+                                   if r['ok']})
+
+    @QtCore.Slot()
+    def _select_none(self) -> None:
+        sid = self._sample_id()
+        if sid is None:
+            return
+        self._apply_included(sid, set())
+
+    @QtCore.Slot()
+    def _tick_all_at_group(self) -> None:
+        """Add every eligible measurement sharing the chosen value to the ticked set."""
+        sid = self._sample_id()
+        if sid is None or self.group_combo.currentIndex() < 0:
+            return
+        target = self.group_combo.currentData()
+        field = self._group_field()
+        add = {r['item_id'] for r in self._points.get(sid, [])
+               if r['ok'] and r[field] is not None
+               and round(float(r[field]), 9) == round(float(target), 9)}
+        self._apply_included(sid, self._included.get(sid, set()) | add)
+
+    def showEvent(self, event) -> None:
+        """Re-populate from the current focus when the tab becomes visible, so
+        switching to it shows content without a sidebar re-click (feedback 2026-07-06)."""
+        super().showEvent(event)
+        if self.item_id is not None:
+            self.set_measurement(self.item_id, self._runnable)
 
     def _distinct_keys(self, sid: str) -> int:
         """Distinct angles (Γq²) / concentrations (D-vs-c) among the ticked ok points
@@ -1847,6 +2053,11 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             if epoch != self._run_epoch:
                 return                      # sample/tick set changed — stale
             self._cache[sid] = res
+            self._cache_sig[sid] = self.controller.committed_signature(include_ids)
+            # Fold the run's per-point values into the table + greying (feedback
+            # 2026-07-06): Γ/D now appear, and quality flags become hoverable.
+            self._run_points[sid] = list(getattr(res, 'all_points', None) or [])
+            self._refresh_table(sid)
             self.export_button.setEnabled(True)
             self._fill_results(res)
             self._draw(res)
@@ -1929,8 +2140,8 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self.flag_label.setText(flag)
 
     def _grey_points(self, sid: str) -> None:
-        """Grey × the ok points that are NOT ticked, from the per-measurement
-        enumeration (by item_id, so replicates are disambiguated)."""
+        """Grey × the computed points that are NOT ticked, from the run's per-point
+        values (by item_id, so replicates are disambiguated)."""
         inc = self._included.get(sid, set())
         if self.kind == 'gamma_q2':
             xf, yf, xk, yk = (_disp_factor('scattering_q2'),
@@ -1939,10 +2150,11 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             xf, yf, xk, yk = (_disp_factor('concentration'),
                               _disp_factor('diffusion'),
                               'concentration_g_per_mL', 'd_app_m2_s')
-        for row in self._points.get(sid, []):
-            if not row['ok'] or row['item_id'] in inc or row[xk] is None:
+        for pt in self._run_points.get(sid, []):
+            if (pt['quality'] not in ('ok', 'high_pdi') or pt['item_id'] in inc
+                    or pt[xk] is None or not math.isfinite(pt[xk])):
                 continue
-            self.ax.plot([row[xk] * xf], [row[yk] * yf], 'x', color='#999999',
+            self.ax.plot([pt[xk] * xf], [pt[yk] * yf], 'x', color='#999999',
                          ms=9, mew=2, zorder=4)
 
     def _clear(self, message: str) -> None:
@@ -1969,6 +2181,7 @@ class _DDLSTab(QtWidgets.QWidget):
         self.item_id: Optional[str] = None
         self._runnable = False
         self._cache: Dict[str, tuple] = {}      # sample_id -> (result, info) fitted
+        self._cache_sig: Dict[str, tuple] = {}  # sample_id -> committed-param signature of the fit's inputs
         self._full: Dict[str, tuple] = {}       # sample_id -> (result, info) all angles
         # sample_id -> the INCLUDED paired angles (tick to include, like Γ vs q²);
         # the excluded set passed to the engine is derived as paired − included.
@@ -2091,6 +2304,8 @@ class _DDLSTab(QtWidgets.QWidget):
             self._last_sid = sid                  # remember for keep-last (#15)
             if sid in self._cache:
                 self._draw(*self._cache[sid])
+                if _is_stale(self.controller, self._cache_sig.get(sid)):
+                    self.status.setText(_STALE_HINT)
             else:
                 self._clear_results()
                 self._clear("Run DDLS to pair this sample's VV/VH correlograms.")
@@ -2224,6 +2439,7 @@ class _DDLSTab(QtWidgets.QWidget):
         rod = getattr(self, '_rod_nm', None)
         excl = self._excluded_angles(sid)         # paired − included
         controller = self.controller
+        input_ids = self.selected_item_ids()      # VV/VH ids feeding this fit
         self._run_epoch += 1                # this run supersedes any in flight
         epoch = self._run_epoch
 
@@ -2243,6 +2459,7 @@ class _DDLSTab(QtWidgets.QWidget):
                 return                      # sample/exclusions changed — stale
             (res, info), full = payload
             self._cache[sid] = (res, info)
+            self._cache_sig[sid] = controller.committed_signature(input_ids)
             self._full[sid] = full
             self.export_button.setEnabled(True)
             self._refresh_table(sid)

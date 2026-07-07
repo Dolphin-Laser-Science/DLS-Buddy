@@ -67,6 +67,9 @@ class GammaQ2Result:
     d_se: Optional[float] = None
     rh_se: Optional[float] = None
     se_estimator: str = 'hc3'             # covariance estimator behind the SEs
+    # every eligible measurement's per-point Γ/q²/D_app + quality tag, attached by the
+    # controller run so the GUI table/greying come from the run (feedback 2026-07-06).
+    all_points: Optional[list] = None
 
 
 @dataclass
@@ -90,6 +93,9 @@ class ConcentrationExtrapolationResult:
     rh0_se: Optional[float] = None
     kd_se: Optional[float] = None
     se_estimator: str = 'hc3'             # covariance estimator behind the SEs
+    # every eligible measurement's per-point D_app + quality tag, attached by the
+    # controller run so the GUI table/greying come from the run (feedback 2026-07-06).
+    all_points: Optional[list] = None
 
 
 # ---------------------------------------------------------------------------
