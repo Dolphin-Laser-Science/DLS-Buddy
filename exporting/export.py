@@ -72,6 +72,10 @@ def _fmt(value: Any) -> str:
     """Format a single cell. Non-finite numbers become empty (Origin missing)."""
     if value is None:
         return ''
+    # bool is an int subclass, so this branch must precede the int branch;
+    # matches the 'yes'/'' style used in export_dls_summary's is_average column.
+    if isinstance(value, (bool, np.bool_)):
+        return 'yes' if value else ''
     if isinstance(value, (float, np.floating)):
         if not math.isfinite(float(value)):
             return ''

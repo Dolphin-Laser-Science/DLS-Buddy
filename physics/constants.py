@@ -119,6 +119,11 @@ def scattering_vector_q(
     are typically tens of nm, so qRg is conveniently of order 1.
     The Stokes-Einstein function uses q in m^-1 (see scattering_vector_q_m).
     """
+    if not (0.0 < angle_deg < 180.0):
+        raise ValueError(
+            f"angle_deg must be strictly between 0 and 180, "
+            f"got {angle_deg!r}."
+        )
     angle_rad = math.radians(angle_deg)
     return (4.0 * math.pi * solvent_refractive_index / wavelength_nm) * math.sin(angle_rad / 2.0)
 
@@ -471,7 +476,7 @@ def optical_constant_K(
     dn_dc_mL_per_g: float,
     wavelength_nm: float,
 ) -> float:
-    """Optical constant K for SLS in units of mol*mL^2 / g^2 / cm.
+    """Optical constant K for SLS in units of mol*cm^2 / g^2.
 
     Definition:
         K = 4 * pi^2 * n^2 * (dn/dc)^2 / (Na * lambda^4)
@@ -493,19 +498,19 @@ def optical_constant_K(
     Returns
     -------
     float
-        Optical constant K in mol*mL^2 / (g^2 * cm).
+        Optical constant K in mol*cm^2 / g^2.
 
     Notes
     -----
-    Unit derivation:
+    Unit derivation (using 1 mL = 1 cm^3, so dn/dc in mL/g = cm^3/g):
         lambda is converted from nm to cm internally (1 nm = 1e-7 cm).
-        dn/dc is in mL/g.
+        (dn/dc)^2 is in (cm^3/g)^2 = cm^6 / g^2.
         Na is in mol^-1.
-        Result: [mL/g]^2 / ([mol^-1] * [cm]^4)
-               = mol * mL^2 / (g^2 * cm^4) * cm^4/cm ... simplifies to
-               = mol * mL^2 / (g^2 * cm)
-        This is the conventional unit for K used in the Zimm equation,
-        consistent with c in g/mL and R_theta in cm^-1.
+        Result: [cm^6 / g^2] / ([mol^-1] * [cm^4])
+               = mol * cm^2 / g^2.
+        This is consistent with the Zimm equation Kc/R_theta = 1/Mw + ...:
+        K * c / R_theta = [mol*cm^2/g^2] * [g/cm^3] / [cm^-1] = mol/g = 1/Mw,
+        with c in g/mL (= g/cm^3) and R_theta in cm^-1.
 
     The factor of 4 pi^2 (not 2 pi^2) is the standard form for VV
     (vertically polarised incident and detected) geometry, which is the

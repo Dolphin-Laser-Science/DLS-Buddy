@@ -246,12 +246,15 @@ class SettingsModule(QtWidgets.QWidget):
 
     # ----------------------------------------------------------- actions ---
     @QtCore.Slot()
-    def _apply(self) -> None:
+    def _apply(self) -> bool:
+        """Apply the edited settings. Returns True if applied, False if it was
+        aborted (busy, or a stale-guard prompt cancelled) — `_restore` uses this to
+        fully revert the widgets on cancel."""
         # Settings values seed the analysis defaults a background run reads
         # mid-flight — applying under it could change its numbers (invariant 4).
         if runner().is_busy:
             busy_notice(self)
-            return
+            return False
         new = self._collect()
         # Two independent switches (cumulant method, SE estimator) each make some
         # existing results stale and offer a clear-and-warn. Collect BOTH confirmations
@@ -278,7 +281,7 @@ class SettingsModule(QtWidgets.QWidget):
                     QtWidgets.QMessageBox.StandardButton.Cancel)
                 if resp != QtWidgets.QMessageBox.StandardButton.Yes:
                     self._revert_dropdowns(old_method, old_estimator)
-                    return
+                    return False
                 clear_cumulant = True
 
         if new.se_estimator != old_estimator:
@@ -298,7 +301,7 @@ class SettingsModule(QtWidgets.QWidget):
                     QtWidgets.QMessageBox.StandardButton.Cancel)
                 if resp != QtWidgets.QMessageBox.StandardButton.Yes:
                     self._revert_dropdowns(old_method, old_estimator)
-                    return
+                    return False
                 clear_se = True
 
         # All prompts confirmed — now it is safe to clear and apply.
@@ -308,6 +311,7 @@ class SettingsModule(QtWidgets.QWidget):
             self.controller.clear_se_dependent_results()
         self.controller.apply_settings(new)               # persists to settings.json
         self.applied.emit()
+        return True
 
     def _revert_dropdowns(self, cumulant_method: str, se_estimator: str) -> None:
         """Restore both stale-guarded dropdowns to the still-current settings after a
@@ -323,4 +327,9 @@ class SettingsModule(QtWidgets.QWidget):
             busy_notice(self)     # reset to values that then fail to apply
             return
         self._load_from(SettingsState())                  # factory defaults
-        self._apply()
+        # B7: if a stale-guard prompt cancels the apply, the widgets are still showing
+        # the factory values just loaded — fully reload them from the (unchanged)
+        # applied settings, not just the two guarded dropdowns, so the UI can't be
+        # left displaying defaults that were never applied.
+        if not self._apply():
+            self._load_from(self.controller.settings)

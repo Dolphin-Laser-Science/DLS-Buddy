@@ -245,11 +245,22 @@ def _parse_alv_file(file_path: str) -> _ALVData:
     label = _get(header, 'Samplename')
     label = label.strip().strip('"') if label else ''
 
+    # `is not None` (not `if visc`): a header viscosity of 0.0 is PRESENT-but-invalid,
+    # not absent, so it must reach convert_viscosity to be rejected — and its
+    # ValueError (0/negative, or a bad unit) surfaces as a ParseError, this layer's
+    # contract, rather than a bare ValueError leaking to the caller (B9).
+    try:
+        viscosity_Pa_s = convert_viscosity(visc, 'cp') if visc is not None else None
+    except ValueError as exc:
+        raise ParseError(
+            f"{file_path!r}: invalid viscosity {visc!r} cP in the ALV header ({exc})."
+        ) from exc
+
     return _ALVData(
         instrument=instrument,
         sample_label=label or None,
         temperature_K=_to_float(_get(header, 'Temperature')),
-        viscosity_Pa_s=(convert_viscosity(visc, 'cp') if visc else None),
+        viscosity_Pa_s=viscosity_Pa_s,
         refractive_index=_to_float(_get(header, 'Refractive Index')),
         wavelength_nm=_to_float(_get(header, 'Wavelength')),
         delay_times_s=delay_times_s,

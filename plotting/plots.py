@@ -37,7 +37,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from analysis.dls import distribution_axis
 
@@ -212,10 +213,27 @@ def annotate_decollided(ax, items, *, max_stack: int = 6, fontsize: int = 8,
     return texts
 
 
+def _new_figure(figsize) -> Figure:
+    """Create a Figure on an Agg canvas, OFF pyplot's global ``Gcf`` registry.
+
+    ``plt.subplots`` retains every figure it makes in ``Gcf`` until an explicit
+    ``plt.close(fig)``, so a long-running Qt GUI that re-plots on each
+    interaction would leak figures (steady memory growth + matplotlib's
+    ">20 figures" warning) unless every caller remembered to close them. A
+    GUI-embedded plotting layer instead builds a bare ``Figure`` and attaches a
+    canvas directly: the caller owns it, nothing is parked in the registry.
+    (The GUI tabs pass their own ``ax`` and never hit this path; scripts and
+    tests that let a helper create the axes get a registry-free figure.)"""
+    fig = Figure(figsize=figsize)
+    FigureCanvasAgg(fig)         # sets fig.canvas; enables tight_layout/savefig
+    return fig
+
+
 def _get_ax(ax: Optional[Any], figsize=(6.0, 4.5)):
     """Return (figure, axes, created). Create a figure only if ax is None."""
     if ax is None:
-        fig, ax = plt.subplots(figsize=figsize)
+        fig = _new_figure(figsize)
+        ax = fig.subplots()
         return fig, ax, True
     return ax.figure, ax, False
 
@@ -268,8 +286,9 @@ def plot_correlogram_fit(
 
     created = False
     if ax is None and show_residuals:
-        fig, (ax, residual_ax) = plt.subplots(
-            2, 1, figsize=(6.0, 5.4), sharex=True,
+        fig = _new_figure((6.0, 5.4))
+        ax, residual_ax = fig.subplots(
+            2, 1, sharex=True,
             gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.08})
         created = True
     else:

@@ -440,20 +440,41 @@ def running_average(
         # times_s is monotonically increasing, so use searchsorted for O(n log n)
         lo_idx = np.searchsorted(t, t - half, side='left')
         hi_idx = np.searchsorted(t, t + half, side='right')
-        for i in range(n):
-            window = y[lo_idx[i]:hi_idx[i]]
-            means[i] = window.mean()
-            stds[i] = window.std(ddof=1) if window.size > 1 else 0.0
+        # Each window is a contiguous [lo, hi) slice, so its sum and sum-of-squares
+        # come from prefix sums in O(1) — O(n) overall instead of the per-point
+        # slice .mean()/.std() (which was O(n·w), quadratic on long traces). The
+        # variance is computed on data shifted by the global mean (variance is
+        # translation-invariant): this keeps the one-pass sum-of-squares formula
+        # numerically stable for large count rates, matching np.std(ddof=1).
+        shift = float(y.mean()) if n else 0.0
+        yc = y - shift
+        c1 = np.concatenate(([0.0], np.cumsum(yc)))            # c1[k] = sum(yc[:k])
+        c2 = np.concatenate(([0.0], np.cumsum(yc * yc)))       # c2[k] = sum(yc[:k]^2)
+        counts = (hi_idx - lo_idx).astype(float)               # window always ⊇ point i
+        sw = c1[hi_idx] - c1[lo_idx]
+        s2w = c2[hi_idx] - c2[lo_idx]
+        means = shift + sw / counts
+        with np.errstate(invalid='ignore', divide='ignore'):
+            var = (s2w - sw * sw / counts) / (counts - 1.0)
+        # ddof=1 is undefined for a single-point window (std=0 there, as before);
+        # clamp tiny negative variances from floating-point cancellation.
+        stds = np.where(counts > 1.0, np.sqrt(np.maximum(var, 0.0)), 0.0)
         desc = f"{window_s:g} s"
     else:
         if window_points <= 0:
             raise ValueError(
                 f"window_points must be positive, got {window_points!r}."
             )
-        half = window_points // 2
+        # An interior window spans EXACTLY window_points samples. Using the
+        # symmetric [i-half : i+half+1] made the width 2*half+1, so an even
+        # request (e.g. 10) averaged one point too many (11). The half-open
+        # [i-half : i-half+w] is w wide for any w (even widths are unavoidably
+        # asymmetric by one sample); clamp each end at the trace boundary.
+        w = window_points
+        half = w // 2
         for i in range(n):
             lo = max(0, i - half)
-            hi = min(n, i + half + 1)
+            hi = min(n, i - half + w)
             window = y[lo:hi]
             means[i] = window.mean()
             stds[i] = window.std(ddof=1) if window.size > 1 else 0.0
@@ -736,18 +757,20 @@ def fit_count_rate_histogram(
         # (N_total * P(bin)). Bins narrower than one count get zero mass (c_hi < c_lo).
         try:
             total = counts.sum()
-            poisson_curve = np.empty_like(bin_centers, dtype=float)
-            for i, edge_lo in enumerate(bin_edges[:-1]):
-                edge_hi = bin_edges[i + 1]
-                # integer counts whose rate falls in this bin
-                c_lo = int(math.ceil(edge_lo * integration_time_s))
-                c_hi = int(math.floor(edge_hi * integration_time_s))
-                if c_hi < c_lo:
-                    prob = 0.0
-                else:
-                    ks = np.arange(c_lo, c_hi + 1)
-                    prob = float(np.sum(stats.poisson.pmf(ks, lam)))
-                poisson_curve[i] = total * prob
+            # Each rate bin maps to an inclusive integer-count range [c_lo, c_hi]; the
+            # Poisson mass over it is cdf(c_hi) - cdf(c_lo - 1). Vectorised over all
+            # bins — one pair of cdf() calls instead of a per-bin arange + pmf sum,
+            # which looped over every integer count in the bin (a big win for bright
+            # samples spanning 10^5-10^6 counts). Bins narrower than one count
+            # (c_hi < c_lo) get zero mass; np.where evaluates both cdf branches, but
+            # cdf of a below-range (or negative) count is 0, so that is harmless.
+            c_lo = np.ceil(bin_edges[:-1] * integration_time_s).astype(np.int64)
+            c_hi = np.floor(bin_edges[1:] * integration_time_s).astype(np.int64)
+            prob = np.where(
+                c_hi >= c_lo,
+                stats.poisson.cdf(c_hi, lam) - stats.poisson.cdf(c_lo - 1, lam),
+                0.0)
+            poisson_curve = total * prob
             result.poisson_curve = poisson_curve
             result.poisson_chi2_reduced = _reduced_chi2(counts, poisson_curve, 1)
         except (ValueError, FloatingPointError):

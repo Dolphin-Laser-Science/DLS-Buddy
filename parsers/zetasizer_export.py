@@ -59,6 +59,7 @@ Change history
 
 from __future__ import annotations
 
+import csv
 import os
 import re
 from typing import List, Optional
@@ -177,8 +178,14 @@ class ZetasizerExportParser(BaseDLSParser):
                 f"row plus at least one data row."
             )
 
-        header = lines[0].split(_DELIMITER)
+        # Parse with csv.reader (not str.split) so a comma inside a quoted text
+        # field — a Sample/Material Name like "PS, 900k" — stays one cell instead of
+        # shifting every downstream column for that row (silent misalignment →
+        # wrong correlogram/RI/temperature). Rows are then width-checked below.
+        table = list(csv.reader(lines, delimiter=_DELIMITER))
+        header = table[0]
         norm = [_norm_header(cell) for cell in header]
+        n_cols = len(header)
 
         # --- locate the two required correlation blocks (in header order) ---
         delay_cols = [i for i, h in enumerate(norm) if h.startswith(_PREFIX_DELAY)]
@@ -216,10 +223,19 @@ class ZetasizerExportParser(BaseDLSParser):
         previews: List[DLSFilePreview] = []
         n_bad = 0
 
-        for line in lines[1:]:
-            if not line.strip():
+        for row_no, row in enumerate(table[1:], start=2):
+            if not any(cell.strip() for cell in row):
                 continue
-            row = line.split(_DELIMITER)
+            # A row whose field count differs from the header is misaligned (an
+            # unquoted delimiter in a text field, or a truncated/corrupt row).
+            # Reject it loudly rather than silently shift its columns.
+            if len(row) != n_cols:
+                raise ParseError(
+                    f"{file_path!r}: data row {row_no} has {len(row)} field(s) but "
+                    f"the header has {n_cols}; the row is misaligned (an unquoted "
+                    f"comma in a text field, or a corrupt row). Re-export with "
+                    f"quoted text fields."
+                )
 
             preview = self._row_to_preview(
                 row, abs_path,

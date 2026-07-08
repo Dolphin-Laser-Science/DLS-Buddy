@@ -69,8 +69,16 @@ _FIRST_RECORD_COL = 1    # every column from here on is one record's correlogram
 
 _MICROSECONDS_TO_SECONDS = 1.0e-6   # lag times: µs -> s
 
-# Header column-1 text used to recognise the format (case-insensitive substring).
-_LAG_HEADER_TOKEN = 'lag'
+# Header column-1 text used to recognise the format (case-insensitive). The full
+# phrase 'lag time' (not a bare 'lag' substring) so an unrelated tab file that
+# merely contains the letters "lag" somewhere in its first cell isn't mistaken for
+# Zetasizer clipboard data and read as wholesale NaN. Real clipboard copies write
+# 'X Lag Time'.
+_LAG_HEADER_TOKEN = 'lag time'
+# Reject the file if more than this fraction of its data rows have a non-numeric
+# lag cell — mirrors the generic parsers' guard, so a mostly-non-numeric file that
+# slips past the header sniff fails loudly instead of loading as all-NaN.
+_MAX_BAD_ROW_FRACTION = 0.05
 # 'Record N: <label>' -> capture <label>.
 _RECORD_LABEL_RE = re.compile(r'^\s*Record\s+\d+\s*:\s*(.*)$')
 
@@ -201,12 +209,11 @@ class ZetasizerClipboardParser(BaseDLSParser):
         labels = {i: _extract_label(header_parts[i]) for i in record_cols}
 
         # --- data rows: shared lag axis + one value list per record column ---
+        data_lines = [ln for ln in lines[_DATA_START_ROW:] if ln.strip()]
         lag_us: List[float] = []
         values: dict = {i: [] for i in record_cols}
         n_bad = 0
-        for line in lines[_DATA_START_ROW:]:
-            if not line.strip():
-                continue   # skip blank lines
+        for line in data_lines:
             parts = line.split(_DELIMITER)
             try:
                 t = float(parts[_COL_LAG_TIME].strip())
@@ -222,6 +229,15 @@ class ZetasizerClipboardParser(BaseDLSParser):
                     values[i].append(float(cell))
                 except ValueError:
                     values[i].append(np.nan)
+
+        total = len(data_lines)
+        if total and n_bad / total > _MAX_BAD_ROW_FRACTION:
+            raise ParseError(
+                f"{n_bad} of {total} data rows in {file_path!r} have a non-numeric "
+                f"lag-time cell ({100 * n_bad / total:.0f}%). This does not look "
+                f"like Zetasizer clipboard data (tab-separated, first column the lag "
+                f"axis). If it has header/comment lines, remove them before loading."
+            )
 
         if len(lag_us) == 0:
             raise ParseError(

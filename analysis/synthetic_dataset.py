@@ -254,8 +254,8 @@ def build_count_rate_trace(*, duration_s: float = 120.0, dt_s: float = 0.1,
     rng = np.random.default_rng(seed)
     t = np.arange(0.0, duration_s, dt_s)
     cr = mean_kHz * (1.0 + trace_cv * rng.standard_normal(t.size))
-    if drift and t.size:
-        cr = cr + mean_kHz * drift * (t / t[-1])
+    if drift and t.size and t[-1] > 0:                # t[-1]>0 guards a single-sample
+        cr = cr + mean_kHz * drift * (t / t[-1])      # grid (t=[0.0]) -> 0/0 (B9)
     for _ in range(int(spikes)):
         cr[rng.integers(t.size)] *= rng.uniform(2.0, 3.5)
     cr = np.clip(cr, 1.0, None)
@@ -297,7 +297,7 @@ def build_multi_angle_dls(populations_at_angle, *, angles_deg: Sequence[float],
     for a in angles:
         base = 350.0 * (math.sin(math.radians(95)) / math.sin(math.radians(a))) ** 0.5
         cr = base * (1.0 + trace_cv * rng.standard_normal(t.size))
-        if drift:
+        if drift and t.size and t[-1] > 0:           # guard t=[0.0] -> 0/0 (B9)
             cr = cr + base * drift * (t / t[-1])
         for _ in range(int(spikes)):
             cr[rng.integers(t.size)] *= rng.uniform(2.0, 3.5)

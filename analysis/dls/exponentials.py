@@ -143,9 +143,12 @@ def fit_single_exponential(
             _single_exp_model, tau, g2m1, p0=p0, bounds=bounds, maxfev=20000
         )
         beta, gamma = float(popt[0]), float(popt[1])
-    except (RuntimeError, ValueError):
+    except (RuntimeError, ValueError, TypeError):
+        # D2: on failure NaN the physical params (not the seed p0), so a caller that
+        # forgets to check `success` can't read the starting cumulant estimate as a
+        # fit. NaN propagates to Gamma/D/Rh and the fitted curve/residuals below.
         success = False
-        beta, gamma = p0[0], p0[1]
+        beta, gamma = float('nan'), float('nan')
 
     fitted = _single_exp_model(tau, beta, gamma)
     residuals = g2m1 - fitted
@@ -232,9 +235,9 @@ def fit_double_exponential(
         )
         beta, f1, gamma1, gamma2 = (float(popt[0]), float(popt[1]),
                                     float(popt[2]), float(popt[3]))
-    except (RuntimeError, ValueError):
+    except (RuntimeError, ValueError, TypeError):
         success = False
-        beta, f1, gamma1, gamma2 = p0
+        beta, f1, gamma1, gamma2 = (float('nan'),) * 4   # D2: NaN, not the seed p0
 
     fitted = _double_exp_model(tau, beta, f1, gamma1, gamma2)
     residuals = g2m1 - fitted
@@ -248,8 +251,10 @@ def fit_double_exponential(
 
     def make_mode(frac, gamma):
         d = gamma / q ** 2 if gamma > 0 else float('nan')
+        # `gamma > 0` also excludes NaN (a failed fit, D2), so _decay_rate_to_rh_nm
+        # is never handed a non-positive rate it would reject.
         rh = (_decay_rate_to_rh_nm(gamma, q, measurement.temperature_K, eta)
-              if have_eta else float('nan'))
+              if (have_eta and gamma > 0) else float('nan'))
         return ExponentialMode(amplitude_fraction=frac, gamma_s_inv=gamma,
                                d_m2_s=d, rh_nm=rh)
 
@@ -332,9 +337,9 @@ def fit_kww(
             _kww_model, tau, g2m1, p0=p0, bounds=bounds, maxfev=40000
         )
         beta, tau_c, stretch = float(popt[0]), float(popt[1]), float(popt[2])
-    except (RuntimeError, ValueError):
+    except (RuntimeError, ValueError, TypeError):
         success = False
-        beta, tau_c, stretch = p0
+        beta, tau_c, stretch = (float('nan'),) * 3       # D2: NaN, not the seed p0
 
     fitted = _kww_model(tau, beta, tau_c, stretch)
     residuals = g2m1 - fitted

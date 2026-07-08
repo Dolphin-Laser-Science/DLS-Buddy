@@ -163,6 +163,9 @@ The tracked files above are everything needed to run, read, and build the progra
 - **`plot_controls.py`** — reusable per-axis scale/min/max/autoscale widget placed
   next to a plot.
 - **`export_helper.py`** — tiny shared helper behind the tabs' "Export CSV..." buttons.
+- **`plot_overlays.py`** — shared GUI plot-overlay helpers (grey excluded/masked-point
+  markers + legend re-issue) used by the DLS, DDLS and SLS draw paths so they can't
+  drift apart by hand. Overlays are GUI-owned, never baked into the saved figures.
 - **`stub_module.py`** — placeholder widget (no longer used now all six tabs exist).
 
 ### Tests

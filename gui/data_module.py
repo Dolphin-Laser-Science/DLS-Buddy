@@ -29,7 +29,6 @@ from core.workspace import _DLS_PARAM_KEYS, _SLS_PARAM_KEYS
 from app.controller import _SHARED_PARAM_KEYS
 from app import units as U
 from analysis.uncertainty import format_value_at_uncertainty
-from physics import solvents as solvents_lib
 from gui.help import section_header
 from gui.theme import ThemedLabel, color as theme_color, token as theme_token
 from gui.worker import busy_notice, runner
@@ -325,7 +324,7 @@ class DataModule(QtWidgets.QWidget):
         combo.setEditable(True)
         combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
         combo.addItem('')                                      # a blank/"none" option
-        combo.addItems(solvents_lib.available_solvents('primary'))
+        combo.addItems(self.controller.available_solvents('primary'))
         combo.setToolTip(
             'Solvent for this sample. Choosing a library solvent auto-fills the '
             'refractive index (and, for DLS, the viscosity) from the temperature and '
@@ -724,7 +723,7 @@ class DataModule(QtWidgets.QWidget):
         if not isinstance(name, str) or not name.strip():
             return 'Library value (primary).'
         try:
-            info = solvents_lib.solvent_property_info(name)
+            info = self.controller.solvent_property_info(name)
         except (ValueError, TypeError):
             return 'Library value (primary).'
         temp_K = working.get('temperature_K')
@@ -734,8 +733,8 @@ class DataModule(QtWidgets.QWidget):
                    f"{info['n_temp_min_C']:g}–{info['n_temp_max_C']:g} °C")
             unc = f"±{info['n_uncertainty']:g} (range max)"
             try:
-                sig = solvents_lib.solvent_uncertainty_n(
-                    name, float(lam), float(temp_K) - 273.15)
+                sig = self.controller.solvent_value_n(
+                    name, float(lam), float(temp_K) - 273.15)[1]
                 unc = f"±{sig:.2g} at this T/λ"
             except (TypeError, ValueError):
                 pass
@@ -743,8 +742,11 @@ class DataModule(QtWidgets.QWidget):
             box = (f"valid {info['eta_temp_min_C']:g}–{info['eta_temp_max_C']:g} °C")
             unc = f"±{info['eta_uncertainty_rel'] * 100:g}% (range max)"
             try:
-                sig = solvents_lib.solvent_uncertainty_eta(
+                # solvent_value_eta returns the ABSOLUTE σ_η; the tooltip shows the
+                # relative % (σ_abs / η), matching the box-wide eta_uncertainty_rel.
+                eta_val, sig_abs = self.controller.solvent_value_eta(
                     name, float(temp_K) - 273.15)
+                sig = sig_abs / eta_val
                 unc = f"±{sig * 100:.2g}% at this T"
             except (TypeError, ValueError):
                 pass
@@ -775,7 +777,7 @@ class DataModule(QtWidgets.QWidget):
         solvent = self.controller.workspace.measurements[
             self.item_id].working_params.get(_SOLVENT_KEY)
         try:
-            info = solvents_lib.solvent_property_info(solvent)
+            info = self.controller.solvent_property_info(solvent)
         except (ValueError, TypeError):
             self.autofill_note.setText('')
             return

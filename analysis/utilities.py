@@ -233,6 +233,12 @@ def rho_shape_label(rho: float) -> str:
     return 'rod / extended / aggregated'
 
 
+# Temperature match tolerance for rho's sample-key check (B6): guards float round-off
+# between the DLS and SLS paths without merging distinct set points (>= 0.01 K apart
+# under the grouping key).
+_RHO_TEMPERATURE_TOL_K = 1.0e-6
+
+
 def compute_rho(
     rg_nm: float,
     rh_nm: float,
@@ -285,7 +291,12 @@ def compute_rho(
         keys_matched = (
             rg_sample_key.polymer_name == rh_sample_key.polymer_name
             and rg_sample_key.solvent_name == rh_sample_key.solvent_name
-            and rg_sample_key.temperature_K == rh_sample_key.temperature_K
+            # Tolerance, not exact ==, on temperature (B6): the DLS and SLS paths can
+            # carry the same set-point with sub-µK float drift, and an exact compare
+            # would spuriously refuse a genuine match. Well below any real set-point
+            # separation, so 35 vs 50 C still differ.
+            and math.isclose(rg_sample_key.temperature_K, rh_sample_key.temperature_K,
+                             rel_tol=0.0, abs_tol=_RHO_TEMPERATURE_TOL_K)
         )
         if keys_matched:
             matched_key = rg_sample_key

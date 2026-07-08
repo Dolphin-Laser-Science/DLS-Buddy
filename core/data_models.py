@@ -667,7 +667,12 @@ class SLSMeasurement:
         _require_positive(self.wavelength_nm, "wavelength_nm")
         _require_positive(self.solvent_refractive_index, "solvent_refractive_index")
         _require_non_negative(self.concentration_g_per_mL, "concentration_g_per_mL")
-        if not math.isfinite(self.dn_dc_mL_per_g):
+        # dn/dc is deliberately never defaulted (invariant 3 -- the central
+        # low-contrast vulnerability), so the common "not yet entered" path
+        # arrives here as None. Guard it explicitly, like the DLS build guards
+        # viscosity, so the user sees the clear ValueError below rather than a
+        # TypeError from math.isfinite(None) deep in the build.
+        if self.dn_dc_mL_per_g is None or not math.isfinite(self.dn_dc_mL_per_g):
             raise ValueError(
                 f"dn_dc_mL_per_g must be a finite number, "
                 f"got {self.dn_dc_mL_per_g!r}."

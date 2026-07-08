@@ -9,6 +9,120 @@ window title.
 
 ---
 
+## 0.17.6 — Internal cleanup + minor performance (2026-07-07)
+
+The last of the internal code-review batches: naming/doc/dead-code tidy-up and a few
+redundant-work speedups. **Almost nothing is user-visible** — no scientific number changes.
+The only observable bits:
+
+- **Session files are now strict, portable JSON.** A saved session no longer writes the
+  non-standard `NaN`/`Infinity` tokens (which some external JSON tools reject); non-finite
+  values are written as `null` and reload correctly. Sessions saved by DLS Buddy itself
+  behave exactly as before.
+- **Boolean columns export as `yes`/blank** (consistent with the rest of the export), not
+  `1`/`0`.
+- **Scattering angle is validated.** Passing an out-of-range angle (≤ 0 or ≥ 180°) to the
+  scattering-vector calculation now raises a clear error instead of returning a nonsense
+  value, matching the other physics functions.
+
+Under the hood: de-duplicated the excluded/masked-point plot overlays and the SLS
+draw-vs-click transform (so they can't drift apart), routed the Data-tab solvent library
+readouts through the controller, and vectorised two count-rate trace hot loops
+(running-average, Poisson histogram overlay) — all output-preserving.
+
+## 0.17.5 — Edge-case hardening: robust parsers, honest failed fits, portable sessions (2026-07-07)
+
+Robustness fixes from the internal code-review pass (fourth of several batches). No new
+features; each closes a way an unusual-but-legitimate input could be mis-read or a failed
+result mistaken for a good one. (Follows 0.17.4; versioned to stack on that batch.)
+
+- **Zetasizer files are parsed more robustly.** A comma inside a quoted sample/material name
+  in a Zetasizer *export* no longer shifts that row's columns (wrong correlogram / RI /
+  temperature); a misaligned row is now rejected with a clear message instead of silently
+  misread. A Zetasizer *clipboard* file that is mostly non-numeric — or whose header only
+  loosely resembles one — is now rejected rather than loaded as blank (NaN) data.
+- **A failed fit no longer looks like a good one.** When a DLS fit (single/double/stretched
+  exponential, or the nonlinear cumulant) fails to converge, its size/rate outputs now read
+  **n/a** instead of quietly showing the starting estimate. The nonlinear cumulant no longer
+  substitutes the simpler linear fit under the same row — a failed nonlinear fit is labelled
+  **(failed)**. Check the success/label before trusting a fit.
+- **No impossible negative molecular weight.** A noisy single-concentration Debye fit whose
+  extrapolated intercept goes non-positive now reports Mw as **n/a** (a negative Mw is
+  physically impossible) instead of a negative number. Rg is unaffected.
+- **Cumulant fit-quality (RMS) is comparable across methods.** The linear and nonlinear
+  cumulant now report their RMS residual over the same set of points, so comparing their
+  fit quality is meaningful.
+- **Older builds can open newer session files.** A session saved by a newer version (with an
+  extra field) now loads in an older version instead of failing — the unknown field is
+  ignored. The "portable session" promise holds across versions.
+- **Assorted robustness guards** (none reached in normal use): a size distribution's flat-topped
+  peak counts as one population, not two; the trace running-average window is exactly the
+  requested width; degenerate edge inputs (a zero-length trace, a zero/negative viscosity in an
+  ALV header, a temperature round-off between the DLS and SLS paths, a relative trace view with
+  no baseline) are handled or rejected cleanly rather than producing a wrong or mislabelled
+  result.
+
+## 0.17.4 — Performance: snappier Cross-Sample refresh, responsive Traces tab (2026-07-07)
+
+Speed and responsiveness from the internal code-review pass (third of several batches). No
+new features and **no change to any result** — these are pure performance fixes.
+
+- **Faster Cross-Sample refresh.** Refreshing the Cross-Sample tab used to re-run every DLS
+  Rh fit (cumulant per measurement, Γ-vs-q² per concentration, D-vs-c per angle) several times
+  over — once for the automatic pick and again for each source dropdown. The results are now
+  computed once and reused until an input actually changes, so the tab updates noticeably
+  quicker on samples with many angles/concentrations. (The SLS side already worked this way.)
+- **Responsive Traces tab, no repeated work.** Selecting a trace used to redraw the view two
+  or three times per click and compute the histogram / block-variance diagnostics twice. Each
+  is now computed once and shared, and for a **long trace** the diagnostics run in the
+  background so the window no longer briefly freezes.
+- **No slow memory growth from plotting.** Figures created by the plotting layer no longer
+  accumulate in matplotlib's global registry during a long session.
+
+## 0.17.3 — Reliability fixes: no silently-dropped blanks, fractioned series plottable (2026-07-07)
+
+Bug fixes from the internal code-review pass (second of several batches). No new features.
+
+- **Fixed: a second solvent blank (c = 0) could silently disappear.** If a sample had two
+  solvent-blank series loaded (for example a re-measured blank), the second one used to
+  overwrite the first in the single solvent-reference slot, and the first became invisible —
+  present in the session but unreachable from the SLS tab or analysis, with no warning. Now the
+  **first-loaded blank stays the active reference**, any extra blank is **kept and shown** in the
+  Workspace tree marked *"extra blank (unused)"*, and loading SLS data with more than one blank
+  raises a short notice telling you which blank is in use. Nothing is dropped; remove or re-assign
+  a blank if a different one should be the reference.
+- **Fixed: a molecular-weight series stored entirely in named fractions was missing from the
+  scaling plots.** If a sample's Mw/Rg lived only in named Mw fractions (e.g. "250k", "1M") with
+  no unfractioned result, it was judged ineligible and never offered or plotted in the
+  Cross-Sample Rg–Mw / A₂–Mw scaling views — even though its per-fraction points are perfectly
+  usable. Eligibility and plotting now use the same per-fraction test, so such a series appears
+  and is fitted.
+- **Clearer error when dn/dc hasn't been entered yet.** Running an SLS build before entering
+  dn/dc now gives the intended *"dn/dc must be a finite number"* message instead of a confusing
+  internal `TypeError`. (dn/dc is still never guessed or defaulted — you always enter it.)
+- **Internal:** the regression-uncertainty routines now return "no ±" (rather than crashing) on a
+  rank-deficient fit — e.g. a Zimm/Berry extrapolation attempted from a single angle *and* a
+  single concentration. Such a fit is unidentifiable, so no honest uncertainty exists; the point
+  estimate is still returned and the ± reads as unavailable.
+
+## 0.17.2 — Correctness fixes: A₂ provenance + calibration-free A₂ guard (2026-07-07)
+
+Bug fixes from an internal code-review pass (first of several batches). No new features.
+
+- **Fixed: A₂ uncertainty / calibration label could be left stale after a Zimm/Berry run.**
+  When you ran a Zimm or Berry fit in the SLS tab, the sample's A₂ **value** was updated but its
+  **± uncertainty, calibration flag and description** could keep the values from a previously chosen
+  A₂ — so the Cross-Sample table could show an A₂ paired with the wrong ± and the wrong "uncalibrated"
+  label. The run now refreshes all of them together. (A hand-entered A₂ is still never overwritten.)
+- **Fixed: the calibration-free 2·A₂·Mw could be silently corrupted by a near-zero data point.**
+  In low-contrast systems, a concentration whose solvent-subtracted scattering falls to (or just below)
+  zero — from an over-subtracted solvent reference or the noise floor — used to feed a meaningless value
+  into the calculation with no warning. Such points are now dropped with a warning (as the Berry method
+  already does), and if the *reference* concentration itself is non-positive, or too few points remain,
+  the analysis stops with a clear message instead of returning a wrong number.
+- **Internal:** ticking a sample in the Cross-Sample list while a background fit is running now waits
+  for the fit to finish before updating, closing a rare race that could disturb results mid-analysis.
+
 ## 0.17.1 — Cross-Sample source panel: explicit selection + A₂ picker (2026-07-07)
 
 A redesign of how you pick which fitted values represent each sample in the Cross-Sample
@@ -331,6 +445,11 @@ and the Workspace list on the left reflects it.
   "Plot axis units", since it now governs both plot axes and result tables) — e.g. show Rg/Rh
   in µm or Mw in kg/mol. Values are stored canonically and only converted for display, and a
   value you type is interpreted in the shown unit.
+- **Consistent name for the depolarized dynamic sub-tab.** The DLS sub-tab for depolarized
+  dynamic light scattering is now labelled **"DDLS"** everywhere (it was shown as "DPLS" on
+  the tab while called DDLS in its controls and help). "DDLS" is depolarized *dynamic*
+  scattering (rotational diffusion); the static depolarization calculator in the SLS tab is
+  unchanged. No change to any calculation.
 
 No analysis numbers changed. (Fit results are identical; this release is about how you
 choose what to analyse and how the selection is shown.)
@@ -350,14 +469,6 @@ choose what to analyse and how the selection is shown.)
   inputs). There is **no Cancel** — a running scientific computation can't be safely
   interrupted; if you change the inputs mid-run, the now-stale result is simply discarded
   when it arrives.
-
-## Unreleased
-
-- **Consistent name for the depolarized dynamic sub-tab.** The DLS sub-tab for
-  depolarized dynamic light scattering is now labelled **"DDLS"** everywhere (it was
-  shown as "DPLS" on the tab while called DDLS in its controls and help). "DDLS" is
-  depolarized *dynamic* scattering (rotational diffusion); the static depolarization
-  calculator in the SLS tab is unchanged. No change to any calculation.
 
 ## 0.9.0 — Usability batch (2026-06-30)
 
@@ -701,7 +812,6 @@ before formal version numbers existed. Capabilities as of this release:
   when a histogram bin is empty (chi-squared term). Harmless but noisy; guard pending.
 - **Visual peak picker** in the DLS distribution view is planned (peaks are already
   offered as Rh sources elsewhere, but not click-selectable in the plot).
-- **A2 source picker** in the Cross-Sample tab is planned.
 - **Session JSON is not yet schema-versioned** — old sessions may not load after a
   data-model change.
 - A few library PDFs are **citation "promotion candidates"** not yet formally cited.

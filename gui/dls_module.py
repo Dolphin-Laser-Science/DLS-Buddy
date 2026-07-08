@@ -49,6 +49,7 @@ from gui.plot_controls import (
 )
 from gui.export_helper import export_to_csv
 from gui.help import add_help_to_groupbox, section_header
+from gui.plot_overlays import draw_excluded_markers, reissue_legend_preserving_title
 from gui.theme import ThemedLabel, color as theme_color
 from gui.widgets import roomy_tabs, SelectionModel, MeasurementPicker, GroupTickBar
 from gui.worker import BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, run_when_idle, runner
@@ -1030,7 +1031,9 @@ class _CorrelogramTab(QtWidgets.QWidget):
     def _result_values(key: str, res) -> List[str]:
         """The result-table column values, in `_RESULT_ROWS[key]` order."""
         if key == 'cumulant':
-            method_lbl = res.method + ('' if res.success else ' (linear fallback)')
+            # A failed nonlinear fit now reports NaN outputs (D2), not a linear-fit
+            # substitute — label it '(failed)', and the Rh/Gamma cells read 'n/a'.
+            method_lbl = res.method + ('' if res.success else ' (failed)')
             baseline_lbl = _fmt(res.baseline, 4) if res.method == 'nonlinear' else '—'
             return [_fmt(res.gamma_s_inv, 4), _fmt(res.rh_nm),
                     f'{_fmt(res.pdi)} {"✓" if res.pdi_valid else "⚠>0.3"}',
@@ -2158,9 +2161,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             # The grey ×'s are added AFTER the analysis layer built the legend, so
             # re-issue it (preserving any title, e.g. the D-vs-c k_D title) to give the
             # 'excluded' marker an entry.
-            leg = self.ax.get_legend()
-            title = leg.get_title().get_text() if leg is not None else None
-            self.ax.legend(frameon=False, fontsize=9, title=title or None)
+            reissue_legend_preserving_title(self.ax, fontsize=9)
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)
         self.flag_label.setText(flag)
@@ -2179,16 +2180,11 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             xf, yf, xk, yk = (_disp_factor('concentration'),
                               _disp_factor('diffusion'),
                               'concentration_g_per_mL', 'd_app_m2_s')
-        drew = False
-        for pt in self._run_points.get(sid, []):
-            if (pt['quality'] not in ('ok', 'high_pdi') or pt['item_id'] in inc
-                    or pt[xk] is None or not math.isfinite(pt[xk])):
-                continue
-            self.ax.plot([pt[xk] * xf], [pt[yk] * yf], 'x', color='#999999',
-                         ms=9, mew=2, zorder=4,
-                         label='excluded (unticked)' if not drew else None)
-            drew = True
-        return drew
+        xy = [(pt[xk] * xf, pt[yk] * yf)
+              for pt in self._run_points.get(sid, [])
+              if not (pt['quality'] not in ('ok', 'high_pdi') or pt['item_id'] in inc
+                      or pt[xk] is None or not math.isfinite(pt[xk]))]
+        return draw_excluded_markers(self.ax, xy, zorder=4)
 
     def _clear(self, message: str) -> None:
         self.ax.clear()
@@ -2581,18 +2577,15 @@ class _DDLSTab(QtWidgets.QWidget):
             qf, gf = _disp_factor('scattering_q2'), _disp_factor('decay_rate')
             q2 = np.asarray(full.q2_m2, float) * qf
             ang = np.asarray(full.angles_deg, float)
-            for arr in (full.gamma_vv_s_inv, full.gamma_vh_s_inv):
-                ys = np.asarray(arr, float) * gf
-                for x, y, a in zip(q2, ys, ang, strict=True):
-                    if any(np.isclose(a, e) for e in excl):
-                        self.ax.plot([x], [y], 'x', color='#999999', ms=9, mew=2,
-                                     zorder=5,
-                                     label='excluded (unticked)' if not drew_excluded
-                                     else None)
-                        drew_excluded = True
+            xy = [(x, y)
+                  for arr in (full.gamma_vv_s_inv, full.gamma_vh_s_inv)
+                  for x, y, a in zip(q2, np.asarray(arr, float) * gf, ang, strict=True)
+                  if any(np.isclose(a, e) for e in excl)]
+            drew_excluded = draw_excluded_markers(self.ax, xy, zorder=5)
         if drew_excluded:
             # Re-issue the legend so the grey ×'s (added after plot_ddls built it) show.
-            self.ax.legend(fontsize=8)
+            # plot_ddls sets a titleless, framed legend at fontsize 8; match that.
+            reissue_legend_preserving_title(self.ax, fontsize=8, frameon=True)
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)
 

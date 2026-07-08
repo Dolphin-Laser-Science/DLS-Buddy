@@ -39,6 +39,7 @@ from gui.plot_controls import (
     AxisControlBar, make_split_panels, make_canvas_expanding, make_vertical_plot_stack)
 from gui.export_helper import export_to_csv
 from gui.help import add_help_to_groupbox
+from gui.plot_overlays import reissue_legend_preserving_title
 from gui.widgets import SampleSelector
 from gui.theme import ThemedLabel, span
 from gui.worker import (
@@ -1164,72 +1165,30 @@ class SLSModule(QtWidgets.QWidget):
 
     def _overlay_masked(self, method: str, sid: str) -> None:
         """Draw the hidden points greyed (hollow) at their true plot positions, so
-        you can see what is excluded and toggle it back. Uses the UNMASKED data
-        (run_rayleigh) plus the sample's mask."""
+        you can see what is excluded and toggle it back. Derives the points from the
+        SAME per-method transform the click hit-test uses (``_point_coords``),
+        filtered to the masked ones — so the grey markers and the clickable targets
+        can never land at different positions (code-review D5)."""
         if self.ax is None:
             return
         mask = self.controller.sls_mask(sid, self._fraction)
         if mask.is_empty():
             return
-        # Unmasked series from the last run (cached in _on_run.done), not a fresh
-        # controller call — the draw path stays off the analysis engine.
-        full = self._full_rr.get((sid, self._fraction))
-        if full is None:
-            return
-        xs: List[float] = []
-        ys: List[float] = []
-        if method in ('zimm', 'berry'):
-            berry = (method == 'berry')
-            for r in full:
-                cc = r.concentration_g_per_mL
-                for i, ang in enumerate(r.angles_deg):
-                    if not mask.is_masked(cc, float(ang)):
-                        continue
-                    y = r.kc_over_dR_mol_per_g[i]
-                    if not np.isfinite(y) or (berry and y <= 0):
-                        continue
-                    ys.append(math.sqrt(y) if berry else float(y))
-                    xs.append(float(r.q2_nm2[i]) + self._zimm_k * cc)
-        elif method in ('debye', 'guinier'):
-            cc = self.conc_combo.currentData()
-            r = next((x for x in full if x.concentration_g_per_mL == cc), None)
-            if r is None:
-                return
-            for i, ang in enumerate(r.angles_deg):
-                if not mask.is_masked(cc, float(ang)):
-                    continue
-                if method == 'debye':
-                    y = r.kc_over_dR_mol_per_g[i]
-                else:
-                    dR = r.excess_rayleigh_cm_inv[i]
-                    if not (np.isfinite(dR) and dR > 0):
-                        continue
-                    y = math.log(dR)
-                if not np.isfinite(y):
-                    continue
-                xs.append(float(r.q2_nm2[i]))
-                ys.append(float(y))
-        elif method == 'rayleigh':
-            for r in full:
-                cc = r.concentration_g_per_mL
-                if cc == 0:
-                    continue
-                for i, ang in enumerate(r.angles_deg):
-                    if mask.is_masked(cc, float(ang)) and np.isfinite(
-                            r.excess_rayleigh_cm_inv[i]):
-                        xs.append(float(r.q2_nm2[i]))
-                        ys.append(float(r.excess_rayleigh_cm_inv[i]))
-        else:
-            return
-        if xs:
-            self.ax.scatter(xs, ys, s=42, facecolors='none', edgecolors='#b0b0b0',
-                            linewidths=1.2, zorder=2, label='masked (excluded)')
+        # _point_coords returns (c, angle, x, y) for every point (masked + unmasked)
+        # from the cached unmasked series — no fresh controller call. Keep only the
+        # masked ones for the grey overlay.
+        masked = [(x, y) for (c, ang, x, y) in self._point_coords(method, sid)
+                  if mask.is_masked(c, float(ang))]
+        if masked:
+            xs, ys = zip(*masked, strict=True)
+            self.ax.scatter(list(xs), list(ys), s=42, facecolors='none',
+                            edgecolors='#b0b0b0', linewidths=1.2, zorder=2,
+                            label='masked (excluded)')
             # The hollow markers are added after the method plot built its legend, so
-            # re-issue it (preserving any title) to give 'masked' an entry.
-            leg = self.ax.get_legend()
-            if leg is not None:
-                title = leg.get_title().get_text()
-                self.ax.legend(frameon=False, fontsize=9, title=title or None)
+            # re-issue it (preserving any title) to give 'masked' an entry — but only
+            # when a legend already exists (unchanged from the hand-written block).
+            if self.ax.get_legend() is not None:
+                reissue_legend_preserving_title(self.ax, fontsize=9)
 
     # ------------------------------------------------ click-to-mask points ---
     _CLICKABLE = ('zimm', 'berry', 'debye', 'guinier', 'rayleigh')

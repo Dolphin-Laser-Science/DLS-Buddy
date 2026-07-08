@@ -69,7 +69,11 @@ class CumulantResult:
     fit_tau_s: np.ndarray             # the tau values actually fitted
     fitted_g2m1: np.ndarray           # model g2-1 at fit_tau_s
     residuals: np.ndarray             # data - model over fit_tau_s
-    rms_error: float
+    rms_error: float                  # RMS residual over the cutoff-masked (high-
+    #                                   amplitude, short-lag) support — the SAME for
+    #                                   'linear' and 'nonlinear', so it is comparable
+    #                                   across methods (may differ from RMS of the
+    #                                   full `residuals` array on the nonlinear path)
     n_skipped: int = 0                # leading channels dropped (skip_initial_channels)
     method: str = 'linear'            # 'linear' (Koppel 1972) or 'nonlinear' (Frisken 2001)
     baseline: float = 0.0             # fitted floating baseline B (nonlinear); 0 for linear
@@ -190,7 +194,10 @@ def _fit_cumulants_linear(
     except ValueError:
         rh = float('nan')
 
-    # Model evaluated over the fitted region, for plotting and residuals.
+    # Model evaluated over the fitted region, for plotting and residuals. The fitted
+    # region IS the cutoff-masked (high-amplitude, short-lag) subset — so rms_error
+    # below is over that support, matching the nonlinear path's rms (D3: comparable
+    # goodness-of-fit across methods).
     model_log = np.polyval(coeffs_high_first, t)
     fitted = np.exp(model_log)
     residuals = y - fitted
@@ -322,16 +329,33 @@ def _fit_cumulants_nonlinear(
         elif math.isfinite(rh) and rh < 0.2:
             ok = False
     if not ok:
-        # Graceful fallback: return the linear fit, flagged as a failed nonlinear.
-        fb = _fit_cumulants_linear(
-            measurement, order, fit_cutoff, tau_min_s, tau_max_s, skip_initial_channels)
-        fb.method = 'nonlinear'
-        fb.success = False
-        return fb
+        # D2 (owner decision 2026-07-07): a failed nonlinear fit returns NaN physical
+        # outputs, NOT a linear-fit substitute — so a caller can't read a fit-like
+        # number from a failed fit. (Previously it fell back to the linear fit flagged
+        # success=False; that labelled fallback was dropped in favour of an honest NaN.)
+        nan = float('nan')
+        return CumulantResult(
+            order=order, beta=nan, gamma_s_inv=nan, mu2_s_inv2=nan, mu3_s_inv3=None,
+            pdi=nan, pdi_valid=False, d_m2_s=nan, rh_nm=nan, q_m_inv=q,
+            fit_cutoff=fit_cutoff, n_points_used=int(tau.size),
+            coefficients=np.full(order + 1, nan),
+            fit_tau_s=tau, fitted_g2m1=np.full(tau.shape, nan),
+            residuals=np.full(tau.shape, nan), rms_error=nan,
+            n_skipped=int(skip_initial_channels or 0),
+            method='nonlinear', baseline=nan, success=False)
 
     pdi = mu2 / gamma ** 2 if gamma != 0 else float('nan')
     fitted = f(tau, *popt)
     residuals = g2m1 - fitted
+    # D3: report rms_error over the SAME cutoff-masked (high-amplitude, short-lag)
+    # support the linear path uses, so the two methods' rms are directly comparable.
+    # (The full window is NOT a valid shared support: the linear method's log-poly
+    # model diverges at long lag for order>=2, so its rms can only be defined on the
+    # short-lag region — the nonlinear rms is restricted to match. The `residuals`
+    # field stays the full-window array for plotting.)
+    intercept0 = float(g2m1.max())
+    rms_mask = (g2m1 > fit_cutoff * intercept0) & (g2m1 > 0)
+    rms = _rms_error(residuals[rms_mask]) if rms_mask.any() else _rms_error(residuals)
     # coefficients parity with the linear path: [c0=ln beta, c1=-2 gamma, c2=mu2, ...]
     coeffs = [math.log(beta), -2.0 * gamma]
     if order >= 2:
@@ -356,7 +380,7 @@ def _fit_cumulants_nonlinear(
         fit_tau_s=tau,
         fitted_g2m1=fitted,
         residuals=residuals,
-        rms_error=_rms_error(residuals),
+        rms_error=rms,
         n_skipped=int(skip_initial_channels or 0),
         method='nonlinear',
         baseline=B,

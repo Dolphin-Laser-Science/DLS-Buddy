@@ -482,16 +482,25 @@ def debye_analysis(rayleigh_result: RayleighRatioResult,
     slope, intercept = fit.slope, fit.intercept
     r2 = fit.r_squared
 
-    mw_app = 1.0 / intercept if intercept != 0 else float('nan')
-    # Rg^2 = 3 * slope / intercept  (apparent)
+    # Mw_app = 1/intercept. The intercept (Kc/dR at q->0 = 1/Mw + 2 A2 c) is
+    # physically positive; a noisy NON-POSITIVE intercept would give a negative or
+    # infinite Mw, which is impossible. Guard it to NaN (mirroring the Rg ratio>0
+    # guard) rather than present an unphysical negative Mw as a result.
+    mw_app = 1.0 / intercept if intercept > 0 else float('nan')
+    # Rg^2 = 3 * slope / intercept  (apparent). Also requires a PHYSICAL (positive)
+    # intercept: with both slope and intercept negative, ratio>0 would otherwise report
+    # an Rg extracted from a fit whose intercept was just judged unphysical (voiding Mw)
+    # — guard the whole ratio on the same intercept>0, not just ratio>0.
     ratio = slope / intercept if intercept != 0 else float('nan')
-    rg_app = math.sqrt(3.0 * ratio) if (math.isfinite(ratio) and ratio > 0) else float('nan')
+    rg_app = (math.sqrt(3.0 * ratio)
+              if (math.isfinite(ratio) and ratio > 0 and intercept > 0) else float('nan'))
 
     # Statistical SEs by first-order propagation through the (intercept, slope) cov.
     mw_se = rg_se = None
-    if intercept != 0 and math.isfinite(fit.intercept_se):
-        mw_se = unc.se_or_none(unc.propagate([-1.0 / intercept ** 2, 0.0], fit.cov))
-        if math.isfinite(rg_app) and rg_app > 0 and slope != 0:
+    if math.isfinite(fit.intercept_se):
+        if intercept > 0:                      # only when mw_app is a finite result
+            mw_se = unc.se_or_none(unc.propagate([-1.0 / intercept ** 2, 0.0], fit.cov))
+        if math.isfinite(rg_app) and rg_app > 0 and slope != 0 and intercept != 0:
             jac = [-rg_app / (2.0 * intercept), rg_app / (2.0 * slope)]
             rg_se = unc.se_or_none(unc.propagate(jac, fit.cov))
 
@@ -913,11 +922,10 @@ def calibration_free_a2(
     Parameters
     ----------
     sample_results : sequence
-        Either RayleighRatioResult objects or (concentration, angles_deg,
-        excess_intensity_array) -- anything from which an excess intensity at the
-        chosen angle and the concentration can be read. RayleighRatioResult uses
-        its excess_rayleigh_cm_inv at the chosen angle as the excess-intensity
-        proxy (the calibration constants cancel in Y).
+        Objects exposing ``concentration_g_per_mL``, ``angles_deg`` and
+        ``excess_rayleigh_cm_inv`` (e.g. RayleighRatioResult). The excess Rayleigh
+        ratio at the chosen angle is the excess-intensity proxy; the calibration
+        constants cancel in Y, so their absolute scale is irrelevant.
     angle_deg : float
         Angle at which to form the ratios (ideally the lowest available, closest
         to q -> 0).
@@ -934,7 +942,15 @@ def calibration_free_a2(
     Raises
     ------
     ValueError
-        If fewer than two non-zero concentrations have the requested angle.
+        If fewer than two non-zero concentrations have the requested angle; if
+        the chosen reference concentration has a non-positive excess Rayleigh
+        ratio; or if dropping non-positive excess points leaves fewer than two.
+
+    Warns
+    -----
+    RuntimeWarning
+        If any non-reference point with a non-positive excess Rayleigh ratio is
+        dropped before forming Y(c).
     """
     # Build (c, excess) at the requested angle from each result.
     pts = []
@@ -963,6 +979,40 @@ def calibration_free_a2(
         )
     c_ref = conc[reference_index]
     e_ref = excess[reference_index]
+    # The reference sets the numerator of every ratio; a non-positive (or NaN)
+    # reference excess makes Y meaningless. Reject it explicitly rather than silently
+    # producing a corrupt line (and never silently reindex to another point). `not
+    # (e_ref > 0)` also catches NaN -- e_ref <= 0 would let a NaN fall through (all
+    # NaN comparisons are False), matching the `excess > 0` filter's NaN handling below.
+    if not (e_ref > 0):
+        raise ValueError(
+            f"calibration-free A2: the reference concentration "
+            f"(index {reference_index}, c = {c_ref:g} g/mL) has a non-positive or "
+            f"non-finite excess Rayleigh ratio ({e_ref:g}); its ratio is undefined. "
+            f"Choose a reference concentration with positive excess scattering."
+        )
+
+    # Drop any remaining non-positive excess points before forming Y(c). A negative
+    # or zero excess (noise floor or an over-subtracted solvent reference -- common
+    # in exactly the low-contrast systems this calibration-free estimator targets)
+    # would give a negative or infinite Y and silently corrupt the slope/intercept.
+    # Mirror the Berry non-positive-Kc/dR drop above.
+    pos = excess > 0
+    if not np.all(pos):
+        n_drop = int((~pos).sum())
+        warnings.warn(
+            f"calibration-free A2 dropped {n_drop} point(s) with a non-positive "
+            "excess Rayleigh ratio (noise or over-subtracted solvent reference) "
+            "before forming Y(c). If this removes too many points, the "
+            "calibration-free A2 is unreliable for this dataset.",
+            RuntimeWarning, stacklevel=2,
+        )
+        conc, excess = conc[pos], excess[pos]
+        if conc.size < 2:
+            raise ValueError(
+                "calibration-free A2: after dropping non-positive excess points, "
+                f"only {conc.size} concentration(s) remain (need at least two)."
+            )
 
     # Y(c) = (e_ref / c_ref) / (excess / c)
     Y = (e_ref / c_ref) / (excess / conc)

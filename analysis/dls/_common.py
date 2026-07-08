@@ -220,8 +220,13 @@ def _build_rh_gamma_grid(
     """
     from physics.constants import stokes_einstein_diffusion_coefficient
     rh_grid_nm = np.geomspace(rh_min_nm, rh_max_nm, n_grid)
-    gamma_grid = np.array([
-        stokes_einstein_diffusion_coefficient(rh * 1e-9, temperature_K, viscosity_Pa_s) * q_m_inv ** 2
-        for rh in rh_grid_nm
-    ])
+    if rh_grid_nm.size == 0:
+        return rh_grid_nm, np.array([])
+    # D = kB T / (6π η Rh) ∝ 1/Rh, so compute D once (the physics function guards
+    # scalars, so it can't take the array) at the smallest Rh and scale the rest
+    # exactly — vectorising the former per-point Python loop without duplicating the
+    # Stokes-Einstein formula into the analysis layer.
+    d0 = stokes_einstein_diffusion_coefficient(
+        rh_grid_nm[0] * 1e-9, temperature_K, viscosity_Pa_s)
+    gamma_grid = d0 * (rh_grid_nm[0] / rh_grid_nm) * q_m_inv ** 2
     return rh_grid_nm, gamma_grid

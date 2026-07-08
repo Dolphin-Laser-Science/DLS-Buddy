@@ -447,9 +447,8 @@ class CrossSampleModule(QtWidgets.QWidget):
             return 'n/a'
         return _fmt(U.from_canonical('radius', x, runit))
 
-    def _unit_label(self, sid: str, fraction: Optional[str]) -> str:
-        by_id = {s.sample_id: s for s in self.controller.samples()}
-        base = _sample_label(by_id[sid])
+    def _unit_label(self, sample, fraction: Optional[str]) -> str:
+        base = _sample_label(sample)
         return f'{base} — {fraction}' if fraction is not None else base
 
     def _rebuild_table(self) -> None:
@@ -467,7 +466,7 @@ class CrossSampleModule(QtWidgets.QWidget):
                     self._row_units.append((sid, frac))
         self.table.setRowCount(len(self._row_units))
         for row, (sid, frac) in enumerate(self._row_units):
-            label = self._unit_label(sid, frac)
+            label = self._unit_label(samples[sid], frac)   # samples: the sid→Sample map
             try:
                 rho = self.controller.compute_sample_rho(sid, frac)
                 rho_text = (format_pm(rho.rho, rho.rho_se)
@@ -565,6 +564,14 @@ class CrossSampleModule(QtWidgets.QWidget):
     @QtCore.Slot()
     def _on_selection_changed(self) -> None:
         if self._suppress:
+            return
+        # Ticking a sample runs _auto_select_all, which WRITES SampleResult fields
+        # (the labelled Rg/Rh/Mw/A2 auto-picks) -- it must not race a background fit
+        # writing them too (invariant 4), exactly as refresh() guards. Defer the whole
+        # handler until the worker frees; the tick persists in the live widget, so
+        # re-reading the selection at idle applies it correctly (deferred, not dropped).
+        if runner().is_busy:
+            run_when_idle(self._on_selection_changed)
             return
         newly_included = []
         for i in range(self.sample_list.count()):

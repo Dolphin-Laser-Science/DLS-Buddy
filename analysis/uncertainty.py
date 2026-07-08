@@ -95,7 +95,20 @@ def _ols_cov(X: np.ndarray, y: np.ndarray, beta: np.ndarray) -> np.ndarray:
 
 
 def _cov(X: np.ndarray, y: np.ndarray, beta: np.ndarray, estimator: str = HC3) -> np.ndarray:
-    """Parameter covariance by the selected estimator (default HC3 sandwich; OLS opt-in)."""
+    """Parameter covariance by the selected estimator (default HC3 sandwich; OLS opt-in).
+
+    A rank-deficient design (collinear rows/columns -- e.g. a Zimm/Berry [1, q^2, c]
+    fit at a single angle *and* a single concentration, or q^2 proportional to c)
+    makes X^T X singular, so the np.linalg.inv inside both estimators would raise an
+    uncaught LinAlgError. The parameters are then unidentifiable, so we return a
+    NaN-filled covariance -- the honest "cannot compute here" (invariant 8) -- which
+    flows through se_or_none -> None, a case every caller already handles. We do NOT
+    fall back to np.linalg.pinv: a pseudo-inverse would hand back a small, plausible,
+    UNDER-reported SE for an unidentifiable parameter, the cardinal invariant-8 failure.
+    """
+    p = X.shape[1]
+    if np.linalg.matrix_rank(X) < p:
+        return np.full((p, p), np.nan)
     if estimator == OLS:
         return _ols_cov(X, y, beta)
     if estimator == HC3:

@@ -411,11 +411,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 first_id = first_id or iid
             n_files += 1
             n_meas += len(previews)
-        self._finish_load(first_id, n_files, n_meas, unreadable, 'SLS intensity export')
+        self._finish_load(first_id, n_files, n_meas, unreadable,
+                          'SLS intensity export', warn_blanks=True)
 
     def _finish_load(self, first_id, n_files: int, n_meas: int,
-                     unreadable: list, kind_desc: str) -> None:
-        """Shared post-load: select the first new measurement, refresh, report."""
+                     unreadable: list, kind_desc: str,
+                     warn_blanks: bool = False) -> None:
+        """Shared post-load: select the first new measurement, refresh, report.
+
+        `warn_blanks` (SLS loads only) surfaces a multiple-solvent-blank collision:
+        a DLS load can't create one, so it would only re-nag about a pre-existing
+        collision."""
         if first_id is not None:
             self._set_current(first_id)
             self._refresh_sidebar()
@@ -424,6 +430,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 f'Loaded {n_meas} measurement(s) from {n_files} file(s). Confirm '
                 'parameters in the Data tab and press Update; identity/optics set on '
                 'one measurement apply to the whole sample.')
+            if warn_blanks:
+                self._warn_solvent_reference_collisions()
         if unreadable:
             files = '\n  '.join(unreadable)
             QtWidgets.QMessageBox.warning(
@@ -431,6 +439,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 f'Could not read {len(unreadable)} file(s) as a {kind_desc} in any '
                 f'supported format:\n  {files}\n\nSee the user guide for the '
                 'supported formats.')
+
+    def _warn_solvent_reference_collisions(self) -> None:
+        """If any sample loaded more than one c = 0 solvent blank, tell the user which
+        blank is the active reference and that the extras are kept but unused (A5 --
+        the data model has one reference slot; extras are never silently dropped)."""
+        collisions = self.controller.workspace.solvent_reference_collisions()
+        if not collisions:
+            return
+        n_extra = sum(len(v) for v in collisions.values())
+        QtWidgets.QMessageBox.information(
+            self, 'Multiple solvent blanks',
+            f'{n_extra} extra solvent-blank (c = 0) series in '
+            f'{len(collisions)} sample(s) were loaded beyond the one reference each '
+            'sample uses. The FIRST-loaded blank is the active reference; the extras '
+            'are kept (marked "extra blank (unused)" in the sidebar) but do not enter '
+            'analysis. Remove or re-assign a blank if a different one should be the '
+            'reference.')
 
     # ------------------------------------------------------------- sidebar ---
     def _refresh_sidebar(self) -> None:
@@ -465,6 +490,10 @@ class MainWindow(QtWidgets.QMainWindow):
             sls = ([(s.solvent_reference_item_id, 'solvent ref')]
                    if s.solvent_reference_item_id else [])
             sls += [(iid, '') for iid in s.sls_item_ids]
+            # Extra c = 0 blanks beyond the single reference slot: show them so they
+            # stay visible (never silently dropped -- A5), marked as unused.
+            sls += [(iid, 'extra blank (unused)')
+                    for iid in s.extra_solvent_reference_item_ids]
             if sls:
                 sls_group = self._group_header(parent, 'SLS',
                                                ('group', 'sls', s.sample_id))
@@ -973,7 +1002,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_workspace_changed(self) -> None:
         """The synthetic generator injected data -> rebuild the navigator + Data tab
         (and select the first measurement if nothing is current)."""
-        self._refresh_sidebar()
         self.cross_module.refresh()
         if self.current_item is None:
             for s in self.controller.samples():
@@ -982,8 +1010,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     ids.append(s.solvent_reference_item_id)
                 if ids:
                     self._set_current(ids[0])
-                    self._refresh_sidebar()
                     break
+        # One sidebar refresh, after any auto-selection, instead of one before AND
+        # one after (the marker is painted from self.current_item either way).
+        self._refresh_sidebar()
 
     # ------------------------------------------------------ sidebar scope ---
     @QtCore.Slot(int)

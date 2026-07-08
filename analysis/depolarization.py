@@ -429,7 +429,7 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
     # T and eta are needed ONLY for the Stokes-Einstein radius Rh_t; D_t, D_r and
     # the rotational time do not use them, so they are optional (Rh_t -> nan if
     # either is missing or non-positive).
-    have_se_inputs = (temperature_K is not None and viscosity_Pa_s is not None
+    have_t_and_eta = (temperature_K is not None and viscosity_Pa_s is not None
                       and temperature_K > 0 and viscosity_Pa_s > 0)
 
     angles = np.array([p.angle_deg for p in pts], dtype=float)
@@ -468,7 +468,7 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
 
     # Stokes-Einstein radius from D_t (translational), and the VH relaxation time.
     rh_t_nm = (stokes_einstein_rh(d_t, temperature_K, viscosity_Pa_s) * 1e9
-               if (have_se_inputs and d_t > 0) else float('nan'))
+               if (have_t_and_eta and d_t > 0) else float('nan'))
     rotational_time_s = (1.0 / (6.0 * d_r)) if d_r > 0 else float('nan')
 
     # qL single-exponential guard (only if a rod length is known).

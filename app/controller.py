@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -224,7 +224,12 @@ class CalibrationState:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'CalibrationState':
-        return cls(**d) if d else cls()
+        # Forward-compatible: drop unknown keys so a session written by a newer build
+        # (extra calibration field) still loads in an older one (D1).
+        if not d:
+            return cls()
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 # ===========================================================================
@@ -327,6 +332,27 @@ class ScalingData:
     n_excluded: int                  # samples dropped (no Mw, or non-positive y)
 
 
+def _json_sanitize(obj):
+    """Recursively replace non-finite floats (NaN / ±Inf) with ``None`` so a session
+    serialises to strict, portable JSON (``allow_nan=False``) rather than the
+    non-standard ``NaN``/``Infinity`` tokens strict/external readers reject (D8).
+
+    ``None`` is a safe stand-in: every serialised field that can hold a non-finite
+    float is Optional, and its readers already treat a missing value the same as a
+    non-finite one — e.g. the one intended NaN, an unconfirmed sample's grouping
+    ``temperature_K``, is guarded downstream by ``is not None and np.isfinite(...)``.
+    Raw float arrays reload their NaNs anyway (numpy coerces a JSON ``null`` back to
+    ``nan`` on ``dtype=float``), so no field-targeted restoration is needed on read.
+    ``np.float64`` is a ``float`` subclass, so it is covered by the ``float`` check."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_sanitize(v) for v in obj]
+    return obj
+
+
 # ===========================================================================
 # Controller
 # ===========================================================================
@@ -361,6 +387,20 @@ class Controller:
         # Zimm/Debye/Guinier fits 3-5x per fraction (auto-select + source panel), so this
         # collapses them to one until an input changes. See _sls_cached.
         self._sls_candidate_cache: Dict[tuple, Any] = {}
+        # Memoized DLS Rh-candidate computations for the Cross-Sample tab, keyed by the
+        # full dls_run_signature (code-review C2): the same auto-select + source-panel
+        # refresh that hammers the SLS cache also calls dls_rh_candidates 3-5x per
+        # fraction, each re-running a cumulant fit per measurement + a Γ-q² per
+        # concentration + a D-vs-c per angle. See _dls_cached / dls_run_signature.
+        self._dls_candidate_cache: Dict[tuple, Any] = {}
+        # Monotonic version stamps for stored distribution results (CONTIN/NNLS), keyed
+        # by their results key ('distribution', item_id, method). dls_run_signature uses
+        # the stamp — NOT id(res) — to detect a re-fit: a freed result's id can be
+        # reused by a later re-run (CPython ABA), which would let a stale Cross-Sample
+        # signature falsely match and serve outdated peak candidates. A strictly
+        # increasing counter is never reused, so a re-run always moves the signature.
+        self._distribution_stamp_counter = 0
+        self._distribution_stamps: Dict[tuple, int] = {}
         # Undo history: a stack of committed-state snapshots, one pushed before each
         # Update that actually changes something. `undo` steps back through these
         # previously-applied parameter sets (feedback 2026-06-29 #5).
@@ -610,6 +650,19 @@ class Controller:
         eta = solvents_lib.viscosity_solvent(name, temperature_C)
         return eta, solvents_lib.solvent_uncertainty_eta(name, temperature_C) * eta
 
+    def solvent_property_info(self, name: str) -> dict:
+        """Library metadata record for ``name`` (validity boxes, tier, box-wide
+        uncertainties, has_viscosity). A thin pass-through so the GUI reads solvent
+        descriptors through the controller boundary rather than importing
+        physics.solvents directly (invariant 5). Raises ``ValueError``/``TypeError``
+        for an unknown or invalid name."""
+        return solvents_lib.solvent_property_info(name)
+
+    def available_solvents(self, tier: str = 'primary') -> list:
+        """The library's solvent names at ``tier`` (for the Data-tab dropdown). Thin
+        pass-through keeping physics.solvents behind the controller (invariant 5)."""
+        return solvents_lib.available_solvents(tier)
+
     def _solvent_sample_box(self, lo: float, hi: float, compute):
         """Grid ``compute`` over ``[lo, hi]`` (SOLVENT_CURVE_POINTS), keeping only the
         points where it evaluates. The per-point guard drops an exact box-edge point
@@ -774,6 +827,53 @@ class Controller:
                    sample.result_for(fraction).mw_source))
         return (self.committed_signature(ids), mask_sig, cal_sig,
                 self.settings.se_estimator, self.settings.guinier_qrg_max, mw_sig)
+
+    def dls_run_signature(self, sample_id: str,
+                          fraction: Optional[str] = None) -> tuple:
+        """A hashable signature of every input `dls_rh_candidates` reads for
+        (sample, fraction). Two signatures compare equal iff a re-run would produce
+        the identical candidate list — so `_dls_cached` can serve a memoized list and
+        MISS exactly when a recompute would change it. Enumerated to be a *complete*
+        invalidation key (an incomplete one would serve a stale Rh — worse than no
+        cache), the inputs are:
+
+        - the committed params of the fraction's DLS measurements (feed the tier-1
+          cumulant, tier-2 Γ-q², tier-3 D-vs-c fits — all via `lm.build()`);
+        - `settings.skip_initial_channels` (the ONLY settings input: the tier-1
+          cumulant reads it; tiers 2/3 are called with hard-coded defaults, so the
+          se-estimator toggle etc. do NOT reach this path — this cache is
+          estimator-independent, unlike the SLS one);
+        - the replicate-averaged Rh rows for this (sample, fraction) — durable
+          `sample_rh_rows` the candidate list surfaces but does not compute;
+        - the version stamp of each distribution result (CONTIN/NNLS) this sample's
+          measurements have in `self.results` — the peak-picker candidates read them.
+          The stamp (not `id(res)`) is the change key: a freed result's id can be
+          reused by a later re-run (CPython ABA), which would let a stale signature
+          falsely match; the strictly-increasing `_distribution_stamps` counter is
+          never reused, so a re-fit always moves the signature and misses.
+
+        The raw correlogram data is not keyed: it is immutable once loaded, and a
+        reload clears every cache."""
+        lms = [lm for lm in self.workspace.sample_measurements(sample_id, 'dls')
+               if lm.committed_params.get('mw_fraction') == fraction]
+        dls_ids = [lm.item_id for lm in lms]
+        committed = self.committed_signature(dls_ids)
+        # replicate-averaged Rh rows this list surfaces (tier 1). Capture the fields
+        # that reach the candidate so an edited/removed/added row misses.
+        rep = tuple(sorted(
+            (r.source_set, r.rh_nm, r.rh_se, bool(r.is_apparent), r.from_label)
+            for r in self.workspace.sample_rh_rows.values()
+            if r.sample_id == sample_id and r.fraction == fraction
+            and r.source_kind == 'replicate_avg'))
+        # distribution results feeding the peak-picker candidates (only this
+        # sample's measurements).
+        dls_id_set = set(dls_ids)
+        dist = tuple(sorted(
+            (k[1], k[2], self._distribution_stamps.get(k, 0))
+            for k in self.results
+            if isinstance(k, tuple) and len(k) == 3 and k[0] == 'distribution'
+            and k[1] in dls_id_set))
+        return (committed, self.settings.skip_initial_channels, rep, dist)
 
     def commit(self) -> None:
         """Adopt all working edits as committed and re-group. Runs no analysis."""
@@ -1127,7 +1227,12 @@ class Controller:
             kw.setdefault('alpha_method', self.settings.contin_alpha_method)
             kw.setdefault('ftest_prob_reject', self.settings.contin_ftest_prob_reject)
             res = dls_engine.fit_contin(m, **kw)
-        self.results[('distribution', item_id, method)] = res
+        key = ('distribution', item_id, method)
+        self.results[key] = res
+        # Bump the never-reused version stamp so a re-fit moves dls_run_signature
+        # (guards the DLS candidate cache against id() reuse — see __init__).
+        self._distribution_stamp_counter += 1
+        self._distribution_stamps[key] = self._distribution_stamp_counter
         self._snapshot_distribution(item_id, method, res)
         return res
 
@@ -1828,8 +1933,18 @@ class Controller:
             s.rg_label = (
                 f"{method.capitalize()} extrapolation, {n_conc} concentrations "
                 f"(thermodynamic, R² = {_fmt_r2(float(res.r_squared))})")
-        s.a2_mol_mL_per_g2 = res.a2_mol_mL_per_g2
-        s.a2_source = 'computed'
+        if s.a2_source != 'user':       # nor a hand-set A2 (reserved external path)
+            # Write the whole A2 bundle atomically, mirroring set_sample_a2 — an SE,
+            # calibration flag and label must never be left stale beside a new value
+            # (invariant 8: a uncertainty never travels with the wrong estimate).
+            s.a2_mol_mL_per_g2 = res.a2_mol_mL_per_g2
+            s.a2_source = 'computed'
+            s.a2_se = unc.se_or_none(getattr(res, 'a2_se', None))
+            s.a2_calibrated = res.calibrated
+            a2_cal_note = '' if res.calibrated else '; UNCALIBRATED — arbitrary scale'
+            s.a2_label = (
+                f"{method.capitalize()} extrapolation, {n_conc} concentrations "
+                f"(thermodynamic{a2_cal_note}, R² = {_fmt_r2(float(res.r_squared))})")
         return res
 
     def set_manual_mw(self, sample_id: str, mw_g_per_mol: float,
@@ -2221,6 +2336,18 @@ class Controller:
 
     def dls_rh_candidates(self, sample_id: str,
                           fraction: Optional[str] = None) -> List[ResultCandidate]:
+        """Available DLS-derived Rh values for a sample/fraction, each with provenance
+        (memoized by `_dls_cached` under `dls_run_signature` — see
+        `_dls_rh_candidates_uncached` for the computation)."""
+        # Return a shallow copy so a caller sorting/filtering in place can't poison the
+        # memo — the load-bearing "cache never changes a result" rule (mirrors
+        # sls_rg_candidates).
+        return list(self._dls_cached(
+            sample_id, fraction,
+            lambda: self._dls_rh_candidates_uncached(sample_id, fraction)))
+
+    def _dls_rh_candidates_uncached(self, sample_id: str,
+                                    fraction: Optional[str] = None) -> List[ResultCandidate]:
         """Available DLS-derived Rh values for a sample/fraction, each with provenance.
 
         Three kinds, in increasing physical preference (higher tier = preferred):
@@ -2454,6 +2581,28 @@ class Controller:
             return cache[key]
         val = compute()
         for stale in [k for k in cache if k[:3] == (kind, sample_id, fraction)]:
+            del cache[stale]                 # evict the same slot under an older signature
+        cache[key] = val
+        return val
+
+    def _dls_cached(self, sample_id: str, fraction: Optional[str], compute):
+        """Memoize the DLS Rh-candidate computation for (sample, fraction) under the
+        full `dls_run_signature` — the DLS analogue of `_sls_cached`. The Cross-Sample
+        refresh calls `dls_rh_candidates` several times per fraction (auto-select +
+        the source panel) and each re-runs a cumulant fit per measurement, a Γ-q² per
+        concentration, and a D-vs-c per angle; this returns the first result until an
+        input changes. Keyed on the run signature, so a commit / param edit / seed
+        change / new distribution fit / replicate-row change simply MISSES — no
+        explicit invalidation needed (measurement removal purges the slot in
+        `remove_measurements`, only to keep the cache bounded). Bounded: only the
+        current signature is kept per (sample, fraction)."""
+        sig = self.dls_run_signature(sample_id, fraction)
+        key = (sample_id, fraction, sig)
+        cache = self._dls_candidate_cache
+        if key in cache:
+            return cache[key]
+        val = compute()
+        for stale in [k for k in cache if k[:2] == (sample_id, fraction)]:
             del cache[stale]                 # evict the same slot under an older signature
         cache[key] = val
         return val
@@ -2835,18 +2984,41 @@ class Controller:
     # ----------------------------------------------------------------------
     # Cross-sample scaling plots (Rg-Mw, A2-Mw)
     # ----------------------------------------------------------------------
-    def samples_for_scaling(self, quantity: str = 'rg') -> List[str]:
-        """Sample ids with an Mw and a positive y (Rg, or A2 for the A2 plot).
+    @staticmethod
+    def _scaling_point(res, quantity: str):
+        """The (Mw, y) pair a fraction contributes to a `quantity` scaling plot, or
+        None if it contributes no point. y is Rg / Rh / A2 by quantity. A log-log
+        scaling fit needs a positive finite Mw and a positive finite y -- A2 can be
+        negative in a poor solvent (no point), and a non-positive Mw is meaningless --
+        so both must be positive.
 
-        A2 can be negative (poor solvent); only positive A2 can sit on a log-log
-        scaling plot, so such samples are not eligible for the A2 plot.
+        This is the single source of truth for "does this fraction sit on the scaling
+        plot?", shared by samples_for_scaling (eligibility) and compute_scaling (the
+        points it emits), so the offered set and the plotted set can never diverge.
+        """
+        m = res.effective_mw()
+        yv = (res.rg_nm if quantity == 'rg'
+              else res.rh_nm if quantity == 'rh'
+              else res.a2_mol_mL_per_g2)
+        if (m is not None and np.isfinite(m) and m > 0
+                and yv is not None and np.isfinite(yv) and yv > 0):
+            return float(m), float(yv)
+        return None
+
+    def samples_for_scaling(self, quantity: str = 'rg') -> List[str]:
+        """Sample ids with at least one fraction yielding a usable scaling point
+        (a positive Mw and a positive y: Rg, Rh, or A2 for the A2 plot).
+
+        Consults the SAME per-fraction enumeration compute_scaling emits points from
+        (via the shared _scaling_point helper): a Mw series stored entirely in named
+        fractions ("250k", "1M", ...) with an empty None fraction is still offered --
+        it is eligible if ANY fraction contributes a point, not only the None fraction.
         """
         out = []
-        for sid, s in self.workspace.samples.items():
-            mw = s.result.effective_mw()
-            y = s.result.rg_nm if quantity == 'rg' else s.result.a2_mol_mL_per_g2
-            if (mw is not None and np.isfinite(mw) and mw > 0
-                    and y is not None and np.isfinite(y) and y > 0):
+        for sid in self.workspace.samples:
+            s = self.workspace.samples[sid]
+            if any(self._scaling_point(s.result_for(frac), quantity) is not None
+                   for frac in self.sample_fractions(sid, 'sls')):
                 out.append(sid)
         return out
 
@@ -2873,18 +3045,15 @@ class Controller:
             s = self.workspace.samples[sid]
             for frac in self.sample_fractions(sid, 'sls'):
                 res = s.result_for(frac)
-                m = res.effective_mw()
-                yv = (res.rg_nm if quantity == 'rg'
-                      else res.rh_nm if quantity == 'rh'
-                      else res.a2_mol_mL_per_g2)
-                if not (m is not None and np.isfinite(m) and m > 0
-                        and yv is not None and np.isfinite(yv) and yv > 0):
+                point = self._scaling_point(res, quantity)   # shared eligibility test
+                if point is None:
                     excluded += 1
                     continue
+                m, yv = point
                 ids.append(sid)
                 labels.append(self._sample_label(sid, frac))
-                mw.append(float(m))
-                y.append(float(yv))
+                mw.append(m)
+                y.append(yv)
                 if res.mw_source != 'user' and res.calibrated is False:
                     uncalibrated = True
         fit = fit_power_law(mw, y, estimator=self.settings.se_estimator)
@@ -3270,6 +3439,16 @@ class Controller:
         # keeps it bounded).
         self._sls_candidate_cache = {
             k: v for k, v in self._sls_candidate_cache.items() if k[1] not in dead}
+        # The DLS candidate memo is keyed (sample_id, fraction, sig); drop any entry
+        # for a vanished sample. (A surviving sample that merely lost a measurement is
+        # invalidated by the signature — its committed_signature no longer includes
+        # the gone id — so it would miss anyway; this is the bounded-ness sweep.)
+        self._dls_candidate_cache = {
+            k: v for k, v in self._dls_candidate_cache.items() if k[0] not in dead}
+        # Drop version stamps for distribution results just pruned above (their keys
+        # are ('distribution', item_id, method); item_id in dead) — keeps it bounded.
+        self._distribution_stamps = {
+            k: v for k, v in self._distribution_stamps.items() if k[1] not in dead}
         if vanished:
             # sls_masks is keyed by (sample_id, fraction); drop every fraction of a
             # vanished sample.
@@ -3295,6 +3474,12 @@ class Controller:
     def build_trace(self, trace_id: str):
         """The IntensityTrace for a stored trace id (for plotting)."""
         return self.workspace.traces[trace_id].build()
+
+    def trace_point_count(self, trace_id: str) -> int:
+        """Number of samples in a stored trace (O(1); no array build). The GUI uses
+        it to decide whether a trace is long enough to compute diagnostics off the
+        UI thread."""
+        return len(self.workspace.traces[trace_id].count_rates_cps)
 
     # --- richer trace diagnostics (thin engine wrappers; seed from settings) ---
     def flag_trace_outliers(self, trace_id: str, k: Optional[float] = None):
@@ -3339,7 +3524,9 @@ class Controller:
             {'sample_id': sid, 'fraction': frac, 'mask': m.to_dict()}
             for (sid, frac), m in self.sls_masks.items() if not m.is_empty()]
         with open(file_path, 'w') as fh:
-            json.dump(payload, fh, indent=2, allow_nan=True)
+            # Sanitize non-finite floats to null and forbid the NaN/Infinity tokens
+            # (allow_nan=False), so the file is strict, externally-portable JSON.
+            json.dump(_json_sanitize(payload), fh, indent=2, allow_nan=False)
         return file_path
 
     def load_session(self, file_path: str) -> None:
@@ -3367,6 +3554,8 @@ class Controller:
                 for sid, d in raw_masks.items()}
         self.results.clear()
         self._sls_candidate_cache.clear()   # the memo belongs to the old workspace
+        self._dls_candidate_cache.clear()   # (same — keyed to the old measurements)
+        self._distribution_stamps.clear()   # stamps belong to the old results
         # The undo history belongs to the previous session's measurements; drop it so
         # Undo can't step back into a no-longer-loaded state.
         self._commit_history.clear()

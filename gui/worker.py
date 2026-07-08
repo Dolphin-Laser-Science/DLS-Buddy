@@ -123,7 +123,12 @@ class AnalysisRunner(QtCore.QObject):
         drives only the cursor/status affordance; deferred ``run_when_idle``
         callbacks are drained separately, *after* the job's own on_done."""
         if self._current is None or self._current[0] != job_id:
-            return None          # superseded job — drop the payload
+            # Defensive only: try_submit refuses new work while a job is in flight
+            # and _current is cleared solely here, so exactly one job is ever live
+            # and the delivered id always matches. This branch is not the staleness
+            # mechanism — result staleness from a superseded analysis is handled by
+            # each caller's _run_epoch guard, not by dropping the payload here.
+            return None
         cur = self._current
         self._current = None
         for w in cur[4]:
@@ -155,27 +160,48 @@ class AnalysisRunner(QtCore.QObject):
         if first_exc is not None:
             raise first_exc
 
+    def _drain_after(self, primary_exc: Optional[BaseException]) -> None:
+        """Drain the deferred idle queue after the finishing job's own callback.
+
+        The primary callback (on_done / on_fail) is the *report*: if it already
+        raised, a later drain error must not mask it (a plain `finally: drain()`
+        would — the finally's exception replaces the original). So we always drain,
+        but re-raise the primary exception if there was one; only when the primary
+        succeeded does a drain error surface on its own."""
+        try:
+            self._drain_idle()
+        except Exception:                     # noqa: BLE001
+            if primary_exc is None:
+                raise
+            # primary_exc is the real failure; swallow the drain error so it wins.
+        if primary_exc is not None:
+            raise primary_exc
+
     @QtCore.Slot(int, object)
     def _deliver_finished(self, job_id: int, result: Any) -> None:
         cur = self._finish(job_id)
         if cur is None:
             return
+        primary_exc: Optional[BaseException] = None
         try:
             cur[1](result)          # the finishing job's own on_done runs FIRST
-        finally:
-            self._drain_idle()      # then the deferred refreshes it may depend on
+        except BaseException as exc:   # noqa: BLE001 — re-raised after the drain
+            primary_exc = exc
+        self._drain_after(primary_exc)  # then the deferred refreshes it may depend on
 
     @QtCore.Slot(int, object)
     def _deliver_failed(self, job_id: int, exc: BaseException) -> None:
         cur = self._finish(job_id)
         if cur is None:
             return
+        primary_exc: Optional[BaseException] = None
         try:
             if cur[2] is None:
                 raise exc
             cur[2](exc)
-        finally:
-            self._drain_idle()
+        except BaseException as e:      # noqa: BLE001 — re-raised after the drain
+            primary_exc = e
+        self._drain_after(primary_exc)
 
     # -- test helper ---------------------------------------------------------
     def wait_for_idle(self, timeout_ms: int = 30000) -> bool:

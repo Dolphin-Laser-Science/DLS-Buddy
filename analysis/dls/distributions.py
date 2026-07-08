@@ -183,7 +183,7 @@ def _distribution_summary(
     fitted_norm = A @ x
     fitted_g2m1 = beta * fitted_norm + baseline
     residuals = g2m1_data - fitted_g2m1
-    residual_norm = float(np.sum((A @ x - y) ** 2))
+    residual_norm = float(np.sum((fitted_norm - y) ** 2))   # reuse A@x (computed once)
     solution_norm = float(np.sum(x ** 2))
     return DistributionResult(
         method=method, alpha=alpha,
@@ -677,14 +677,25 @@ def find_distribution_peaks(
         return []
 
     n = w.size
-    # local maxima, including the endpoints if they rise above their neighbour
+    # Local maxima, including the endpoints if they rise above their neighbour. A
+    # flat-topped peak (a run of consecutive EQUAL heights, e.g. [...,1,1,...]) is
+    # ONE population, not two: scan by runs of equal weight and report the run's
+    # centre, so an exact plateau isn't split into two spurious peaks.
     maxima: List[int] = []
-    for i in range(n):
+    i = 0
+    while i < n:
+        if not (w[i] > 0):
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and w[j + 1] == w[i]:   # extend the equal-height run [i..j]
+            j += 1
         left_ok = (i == 0) or (w[i] >= w[i - 1])
-        right_ok = (i == n - 1) or (w[i] >= w[i + 1])
-        strictly = ((i > 0 and w[i] > w[i - 1]) or (i < n - 1 and w[i] > w[i + 1]))
-        if left_ok and right_ok and strictly and w[i] > 0:
-            maxima.append(i)
+        right_ok = (j == n - 1) or (w[j] >= w[j + 1])
+        strictly = ((i > 0 and w[i] > w[i - 1]) or (j < n - 1 and w[j] > w[j + 1]))
+        if left_ok and right_ok and strictly:
+            maxima.append((i + j) // 2)         # centre of the plateau (grid index)
+        i = j + 1
     if not maxima:
         maxima = [int(np.argmax(w))]
 

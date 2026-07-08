@@ -31,7 +31,7 @@ Change history
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -43,6 +43,15 @@ from core.data_models import DLSMeasurement, IntensityTrace, SLSMeasurement
 # temperatures differ only in the 5th decimal are the same sample. 35.0 and
 # 50.0 C are different samples; 298.15 and 298.150001 K are not.
 _TEMPERATURE_GROUP_DECIMALS = 2   # round Kelvin to 0.01 K for grouping
+
+
+def _known_only(cls, d: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Keep only keys that are fields of dataclass `cls`. Makes a `from_dict` forward-
+    compatible (D1): a session written by a NEWER build (with an extra field) loads in
+    an older one — the unknown key is ignored rather than raising `TypeError`. Mirrors
+    `SettingsState.from_dict` / `Workspace.from_dict`."""
+    known = {f.name for f in fields(cls)}
+    return {k: v for k, v in (d or {}).items() if k in known}
 
 
 # ===========================================================================
@@ -294,7 +303,7 @@ class SampleResult:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'SampleResult':
-        return cls(**d)
+        return cls(**_known_only(cls, d))
 
 
 # ===========================================================================
@@ -333,7 +342,7 @@ class MeasurementResultRow:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'MeasurementResultRow':
-        return cls(**d)
+        return cls(**_known_only(cls, d))
 
 
 @dataclass
@@ -364,7 +373,7 @@ class SampleRhRow:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'SampleRhRow':
-        return cls(**d)
+        return cls(**_known_only(cls, d))
 
 
 # ===========================================================================
@@ -386,6 +395,13 @@ class Sample:
     dls_item_ids: List[str] = field(default_factory=list)
     sls_item_ids: List[str] = field(default_factory=list)       # non-zero concentration
     solvent_reference_item_id: Optional[str] = None             # the c = 0 SLS reference
+    # Extra c = 0 (solvent-blank) SLS series beyond the single reference slot. The
+    # data model keeps ONE reference by design, so a second blank (e.g. a re-measured
+    # blank) would otherwise overwrite the slot and orphan the first. regroup keeps the
+    # FIRST-loaded blank in solvent_reference_item_id and parks the rest here, so they
+    # stay retrievable and can be surfaced -- never silently dropped. NOT pushed into
+    # sls_item_ids (Zimm/Debye assume c > 0 and would choke on a c = 0 series).
+    extra_solvent_reference_item_ids: List[str] = field(default_factory=list)
     # One SampleResult per molecular-weight fraction label. The key None is the
     # unfractioned default (the common single-sample case). A Mw series stores one
     # result per fraction ("250k", "1M", ...) so each fraction is an independent
@@ -428,6 +444,8 @@ class Sample:
             'dls_item_ids': list(self.dls_item_ids),
             'sls_item_ids': list(self.sls_item_ids),
             'solvent_reference_item_id': self.solvent_reference_item_id,
+            'extra_solvent_reference_item_ids': list(
+                self.extra_solvent_reference_item_ids),
             # Serialised as a list (JSON object keys can't be null) of
             # {fraction: <label|null>, result: {...}}.
             'fraction_results': [
@@ -451,6 +469,8 @@ class Sample:
             dls_item_ids=list(d.get('dls_item_ids', [])),
             sls_item_ids=list(d.get('sls_item_ids', [])),
             solvent_reference_item_id=d.get('solvent_reference_item_id'),
+            extra_solvent_reference_item_ids=list(
+                d.get('extra_solvent_reference_item_ids', [])),
             fraction_results=fr,
         )
 
@@ -571,7 +591,13 @@ class Workspace:
             else:  # sls
                 conc = p.get('concentration_g_per_mL', None)
                 if conc is not None and conc == 0:
-                    samp.solvent_reference_item_id = item_id
+                    # First-loaded blank wins the single reference slot; any further
+                    # c = 0 series is parked as an extra so it can't silently vanish
+                    # (A5). Measurements iterate in load order, so "first" is stable.
+                    if samp.solvent_reference_item_id is None:
+                        samp.solvent_reference_item_id = item_id
+                    else:
+                        samp.extra_solvent_reference_item_ids.append(item_id)
                 else:
                     samp.sls_item_ids.append(item_id)
 
@@ -608,6 +634,18 @@ class Workspace:
     def solvent_reference(self, sample_id: str) -> Optional[LoadedMeasurement]:
         ref_id = self.samples[sample_id].solvent_reference_item_id
         return self.measurements.get(ref_id) if ref_id else None
+
+    def solvent_reference_collisions(self) -> Dict[str, List[str]]:
+        """sample_id -> the extra c = 0 solvent-blank series that did NOT get the
+        single reference slot, for every sample that loaded more than one blank.
+
+        Empty when no sample has a collision (the common case). The GUI reads this
+        to warn the user that a second blank isn't the active reference -- the model
+        keeps the first-loaded one, and the extras stay here so they are never
+        silently dropped (A5)."""
+        return {sid: list(s.extra_solvent_reference_item_ids)
+                for sid, s in self.samples.items()
+                if s.extra_solvent_reference_item_ids}
 
     def any_dirty(self) -> bool:
         return any(m.is_dirty() for m in self.measurements.values())

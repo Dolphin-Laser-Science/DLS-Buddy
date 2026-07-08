@@ -83,6 +83,12 @@ _TRACE_PARSERS = [ALVTraceParser, BrookhavenTraceParser]
 _DEFAULT_OUTLIER_K = 3.0
 _DEFAULT_RUNAVG_WINDOW = 0     # 0 → auto (≈ n/20 points)
 
+# At/above this sample count the focus trace's histogram + block-variance
+# diagnostics are computed on the worker thread (like the ADF test) so a long
+# trace never freezes the UI; shorter traces stay synchronous — backgrounding a
+# cheap compute would only add latency/flicker.
+_HEAVY_TRACE_POINTS = 20_000
+
 
 # Synthetic-data generator field groups: (key, label, default).
 # Conditions are shared by DLS + SLS; the size populations drive DLS Rh, while the
@@ -141,9 +147,17 @@ class UtilitiesModule(QtWidgets.QWidget):
         super().__init__(parent)
         self.controller = controller
         self.sample_id: Optional[str] = None
-        # Staleness token for the backgrounded ADF stationarity test (the sole
-        # slow call on the trace path); bumped whenever the trace view refreshes.
-        self._adf_epoch = 0
+        # Staleness token for every backgrounded trace-view computation (the ADF
+        # stationarity test and, for long traces, the histogram/block-variance
+        # diagnostics); bumped whenever the trace view refreshes so a late result
+        # from a superseded view is dropped.
+        self._trace_epoch = 0
+        # Per-trace diagnostics memo: (trace_id, 'hist'|'bv') -> result. The
+        # histogram and block-variance are pure functions of the (immutable) trace
+        # data, so each is computed ONCE and shared by the text line and the
+        # sub-plot (they were recomputed for each). Cleared when the trace list is
+        # rebuilt (refresh_traces).
+        self._diag_cache: dict = {}
         self._isin_refresh_pending = False   # dedup deferred I·sinθ refreshes
         self._build_ui()
         self.set_measurement(None)
@@ -222,8 +236,12 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.trace_list = QtWidgets.QListWidget()
         self.trace_list.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        # ONE signal drives the redraw. itemSelectionChanged (not currentItemChanged)
+        # is the right one: the plot overlays the whole selection, and Select all /
+        # none change the selection set without moving the current item. Connecting
+        # both fired _update_trace twice per click (double redraw + a doubled epoch
+        # bump); the epoch guard kept the output right but the work was wasted.
         self.trace_list.itemSelectionChanged.connect(self._update_trace)
-        self.trace_list.currentItemChanged.connect(lambda *_: self._update_trace())
         left.addWidget(self.trace_list, 1)
         selrow = QtWidgets.QHBoxLayout()
         btn_all = QtWidgets.QPushButton('Select all')
@@ -320,7 +338,9 @@ class UtilitiesModule(QtWidgets.QWidget):
         drow.addWidget(QtWidgets.QLabel('Diagnostic:'))
         self.diag_combo = QtWidgets.QComboBox()
         self.diag_combo.addItems(['Count-rate histogram', 'Block variance'])
-        self.diag_combo.currentIndexChanged.connect(self._update_diag)
+        # Switching the sub-plot type reuses the cached diagnostics (or backgrounds
+        # them for a long trace) rather than recomputing on the UI thread.
+        self.diag_combo.currentIndexChanged.connect(self._on_diag_view_changed)
         drow.addWidget(self.diag_combo)
         drow.addStretch(1)
         blay.addLayout(drow)
@@ -336,6 +356,11 @@ class UtilitiesModule(QtWidgets.QWidget):
     def refresh_traces(self, select_id: Optional[str] = None) -> None:
         """Rebuild the trace list from the workspace (call after a load or a
         session load). Selects `select_id` if given, else keeps/clears selection."""
+        self._diag_cache.clear()             # trace set changed — drop the memo
+        # Signals stay blocked through the programmatic setCurrentRow so it does not
+        # fire itemSelectionChanged; the single explicit _update_trace() below does
+        # the one redraw (and always redraws, even if the current row is unchanged
+        # but the underlying data reloaded).
         self.trace_list.blockSignals(True)
         self.trace_list.clear()
         for t in self.controller.traces():
@@ -343,7 +368,6 @@ class UtilitiesModule(QtWidgets.QWidget):
             item = QtWidgets.QListWidgetItem(f'{label}  [{t.trace_id}]')
             item.setData(QtCore.Qt.ItemDataRole.UserRole, t.trace_id)
             self.trace_list.addItem(item)
-        self.trace_list.blockSignals(False)
         if select_id is not None:
             for i in range(self.trace_list.count()):
                 if self.trace_list.item(i).data(QtCore.Qt.ItemDataRole.UserRole) == select_id:
@@ -351,6 +375,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                     break
         elif self.trace_list.count():
             self.trace_list.setCurrentRow(0)
+        self.trace_list.blockSignals(False)
         self._update_trace()
 
     def _current_trace_id(self) -> Optional[str]:
@@ -377,8 +402,9 @@ class UtilitiesModule(QtWidgets.QWidget):
         return max(3, n_points // 20) if w == 0 else max(3, w)
 
     def _update_trace(self) -> None:
-        # A refresh supersedes any in-flight ADF from a previous view.
-        self._adf_epoch += 1
+        # A refresh supersedes any in-flight backgrounded work (ADF, or a long
+        # trace's diagnostics) from the previous view.
+        self._trace_epoch += 1
         self.trace_ax.clear()
         tids = self._selected_trace_ids()
         focus = self._current_trace_id()
@@ -395,8 +421,14 @@ class UtilitiesModule(QtWidgets.QWidget):
             return
         mode = 'relative' if self.trace_rel.isChecked() else 'absolute'
         single = len(tids) == 1
+        # Gather the buildable traces + stats first, so a relative view can fall back
+        # to absolute UNIFORMLY when any shown trace lacks a usable baseline — B8:
+        # never plot absolute data under a 'relative' axis (which the per-trace
+        # `if baseline` fallback in _cr_transform did silently), and keep every
+        # overlaid curve on the same scale.
+        shown = []
         focus_stats = None
-        for idx, tid in enumerate(tids):
+        for tid in tids:
             try:
                 stats = self.controller.run_trace_statistics(tid)
                 trace = self.controller.build_trace(tid)
@@ -406,13 +438,22 @@ class UtilitiesModule(QtWidgets.QWidget):
                 continue
             if tid == focus:
                 focus_stats = stats
+            shown.append((tid, trace, stats))
+
+        # Relative only when EVERY shown trace has a positive baseline; otherwise the
+        # axis (and its label) fall back to absolute so the two never disagree.
+        relative_requested = mode == 'relative'
+        relative_ok = relative_requested and all(s.baseline_cps for _, _, s in shown)
+        eff_mode = 'relative' if relative_ok else 'absolute'
+
+        for idx, (tid, trace, stats) in enumerate(shown):
             if single:
-                plot_intensity_trace(trace, mode=mode,
+                plot_intensity_trace(trace, mode=eff_mode,
                                      baseline_cps=stats.baseline_cps, ax=self.trace_ax)
             else:
                 # Overlay raw curves only (per-trace flag/running overlays are
                 # single-trace detail — they'd be unreadable stacked).
-                disp = self._cr_transform(mode, stats.baseline_cps)
+                disp = self._cr_transform(eff_mode, stats.baseline_cps)
                 t = np.asarray(trace.times_s, dtype=float)
                 cr = np.asarray(trace.count_rates_cps, dtype=float)
                 self.trace_ax.plot(t, disp(cr), lw=0.8,
@@ -420,19 +461,27 @@ class UtilitiesModule(QtWidgets.QWidget):
                                    label=self._trace_label(tid))
             # GUI-owned overlays only when a single trace is focused.
             if single:
-                self._draw_trace_overlays(tid, trace, stats, mode)
+                self._draw_trace_overlays(tid, trace, stats, eff_mode)
         if not single:
             self.trace_ax.set_xlabel('Time (s)')
+            downgraded = '' if relative_ok or not relative_requested else ' (no baseline)'
             self.trace_ax.set_ylabel(
-                'Count rate / baseline' if mode == 'relative'
-                else f'Count rate ({_plot_unit("intensity")})')
+                'Count rate / baseline' if eff_mode == 'relative'
+                else f'Count rate ({_plot_unit("intensity")}){downgraded}')
             self.trace_ax.legend(frameon=False, fontsize=8)
         self.trace_fig.tight_layout()
         self.trace_canvas.draw_idle()
+        # Diagnostics (text line + sub-plot) for the focus trace. Both consume the
+        # SAME cached histogram/block-variance (computed once), and for a long trace
+        # that compute is dispatched to the worker so the UI stays responsive.
         if focus is not None and focus_stats is not None:
             prefix = '' if single else f'{len(tids)} traces · focused: '
-            self._set_diag_text(focus, focus_stats, prefix=prefix)
-        self._update_diag()
+            self._ensure_focus_diag(
+                focus,
+                lambda: (self._set_diag_text(focus, focus_stats, prefix=prefix),
+                         self._update_diag()))
+        else:
+            self._update_diag()
 
     def _cr_transform(self, mode: str, baseline_cps):
         """Map a canonical (cps) count-rate array to the plot's current y-scale: in
@@ -472,6 +521,85 @@ class UtilitiesModule(QtWidgets.QWidget):
             except Exception:
                 pass
 
+    # -- shared / backgrounded trace diagnostics (histogram + block variance) --
+    def _focus_histogram(self, tid: str):
+        """Count-rate histogram for `tid`, memoized per trace (computed once, shared
+        by the Fano text and the histogram sub-plot). Computes on the calling thread
+        on a miss — the background path pre-warms this cache for long traces."""
+        key = (tid, 'hist')
+        if key not in self._diag_cache:
+            self._diag_cache[key] = self.controller.trace_histogram(tid)
+        return self._diag_cache[key]
+
+    def _focus_block_variance(self, tid: str):
+        """Block-variance analysis for `tid`, memoized per trace (shared by the
+        correlation text and the block-variance sub-plot)."""
+        key = (tid, 'bv')
+        if key not in self._diag_cache:
+            self._diag_cache[key] = self.controller.trace_block_variance(tid)
+        return self._diag_cache[key]
+
+    def _trace_is_heavy(self, tid: str) -> bool:
+        """True if the trace is long enough that its diagnostics should compute on
+        the worker thread rather than block the UI."""
+        try:
+            return self.controller.trace_point_count(tid) >= _HEAVY_TRACE_POINTS
+        except Exception:
+            return False
+
+    def _ensure_focus_diag(self, tid: Optional[str], then) -> None:
+        """Ensure `tid`'s histogram + block-variance are cached, then run `then`
+        (which renders the diagnostics text + sub-plot from that cache).
+
+        Short traces compute synchronously; a long trace's two heavy diagnostics are
+        computed together on the worker thread — busy-guarded and epoch-dropped like
+        the ADF test — so the UI never freezes. `then` reads only the memo, so it is
+        identical whether reached synchronously or from the worker's completion."""
+        if tid is None:
+            then()
+            return
+        if (tid, 'hist') in self._diag_cache and (tid, 'bv') in self._diag_cache:
+            then()                       # already computed — nothing to wait for
+            return
+        if not self._trace_is_heavy(tid):
+            self._focus_histogram(tid)   # warm the memo synchronously (cheap)
+            self._focus_block_variance(tid)
+            then()
+            return
+
+        epoch = self._trace_epoch
+        controller = self.controller
+
+        def compute():
+            return (controller.trace_histogram(tid),
+                    controller.trace_block_variance(tid))
+
+        def done(res) -> None:
+            if epoch != self._trace_epoch:
+                return                   # the view moved on — drop this result
+            self._diag_cache[(tid, 'hist')], self._diag_cache[(tid, 'bv')] = res
+            then()
+
+        def fail(_exc) -> None:
+            if epoch != self._trace_epoch:
+                return
+            then()                       # let `then` surface the error inline (guarded)
+
+        if runner().try_submit(compute, done, fail,
+                               description='trace diagnostics'):
+            self.trace_stats.setText('Computing trace diagnostics…')
+        else:
+            # The worker is busy (a fit or ADF holds it): retry once it frees,
+            # unless the view changed by then (parity with the ADF pending notice).
+            self.trace_stats.setText('Computing trace diagnostics… (queued)')
+            run_when_idle(lambda: self._ensure_focus_diag(tid, then)
+                          if epoch == self._trace_epoch else None)
+
+    def _on_diag_view_changed(self) -> None:
+        """Diag sub-plot type changed: re-render it (reusing the cache, or
+        backgrounding for a long trace). The trace/text line is unaffected."""
+        self._ensure_focus_diag(self._current_trace_id(), self._update_diag)
+
     def _set_diag_text(self, tid: str, stats, prefix: str = '') -> None:
         """One-line summary: trace stats + Fano factor + correlation + ADF verdict.
         The fast parts render immediately; the ADF stationarity test (the one slow
@@ -483,11 +611,11 @@ class UtilitiesModule(QtWidgets.QWidget):
             f'baseline {stats.baseline_cps:,.0f} cps',
         ]
         try:
-            parts.append(f'Fano {self.controller.trace_histogram(tid).fano_factor:.2f}')
+            parts.append(f'Fano {self._focus_histogram(tid).fano_factor:.2f}')
         except Exception:
             pass
         try:
-            bv = self.controller.trace_block_variance(tid)
+            bv = self._focus_block_variance(tid)
             parts.append('correlated' if bv.correlations_detected else 'uncorrelated')
         except Exception:
             pass
@@ -497,7 +625,7 @@ class UtilitiesModule(QtWidgets.QWidget):
     def _dispatch_adf(self, tid: str, base: str) -> None:
         """Run the ADF stationarity test in the background and append its verdict
         to the stats line `base`. Superseded (epoch) if the view changes first."""
-        epoch = self._adf_epoch
+        epoch = self._trace_epoch
         controller = self.controller
 
         def verdict_text(adf) -> str:
@@ -505,12 +633,12 @@ class UtilitiesModule(QtWidgets.QWidget):
                     f"(ADF p={adf.p_value:.3f})")
 
         def done(adf) -> None:
-            if epoch != self._adf_epoch:
+            if epoch != self._trace_epoch:
                 return
             self.trace_stats.setText(base + '   ·   ' + verdict_text(adf))
 
         def fail(_exc) -> None:
-            if epoch != self._adf_epoch:
+            if epoch != self._trace_epoch:
                 return
             self.trace_stats.setText(base + '   ·   ADF n/a')
 
@@ -523,7 +651,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             self.trace_stats.setText(base + '   ·   ADF: pending…')
             run_when_idle(
                 lambda: self._dispatch_adf(tid, base)
-                if epoch == self._adf_epoch else None)
+                if epoch == self._trace_epoch else None)
 
     def _update_diag(self) -> None:
         self.diag_ax.clear()
@@ -533,11 +661,9 @@ class UtilitiesModule(QtWidgets.QWidget):
             return
         try:
             if self.diag_combo.currentText().startswith('Count-rate'):
-                plot_count_rate_histogram(self.controller.trace_histogram(tid),
-                                          ax=self.diag_ax)
+                plot_count_rate_histogram(self._focus_histogram(tid), ax=self.diag_ax)
             else:
-                plot_block_variance(self.controller.trace_block_variance(tid),
-                                    ax=self.diag_ax)
+                plot_block_variance(self._focus_block_variance(tid), ax=self.diag_ax)
         except Exception as exc:
             self.diag_ax.text(0.5, 0.5, str(exc), ha='center', va='center',
                               fontsize=8, wrap=True, transform=self.diag_ax.transAxes)
