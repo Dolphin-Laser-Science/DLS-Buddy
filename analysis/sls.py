@@ -21,7 +21,7 @@ The basic SLS equation (Zimm; Brookhaven BIZPW manual Eq. 3; Takahashi et al.
 
     K c / dR(theta, c) = (1 / Mw) [1 + q^2 Rg^2 / 3] + 2 A2 c + ...
 
-with the optical constant (VV / vertical polarisation, the factor-4 form)
+with the optical constant (VV / vertical polarization, the factor-4 form)
 
     K = 4 pi^2 n^2 (dn/dc)^2 / (Na lambda^4)
 
@@ -159,7 +159,7 @@ def compute_calibration_constant(
     constants are never used; compute your own here.
 
     The standard's Rayleigh ratio must be supplied in the SAME scattering geometry
-    in which the calibrant was measured (e.g. R_VU for a no-analyser instrument).
+    in which the calibrant was measured (e.g. R_VU for a no-analyzer instrument).
     Get it from physics.constants.rayleigh_ratio_toluene(wavelength, T, geometry).
 
     Parameters
@@ -418,7 +418,7 @@ class SingleAngleResult:
 class GuinierResult:
     """Single-concentration Guinier analysis: ln(dR) vs q^2.
 
-    The Guinier approximation dR(q) = dR(0) exp(-q^2 Rg^2 / 3) linearises as
+    The Guinier approximation dR(q) = dR(0) exp(-q^2 Rg^2 / 3) linearizes as
     ln(dR) = ln(dR(0)) - (Rg^2/3) q^2, so a straight-line fit gives Rg from the
     SLOPE (Rg = sqrt(-3*slope)) and an apparent Mw from the INTERCEPT
     (dR(0) = K c Mw). Like Debye, Rg is scale-independent -- it comes from the
@@ -652,11 +652,11 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
 #
 # Berry uses sqrt(Kc/dR) = a' + b' q^2 + d' c with
 #     a' = 1/sqrt(Mw),  b' = a' Rg^2/6,  d' = A2 sqrt(Mw),
-# so Mw = 1/a'^2,  Rg = sqrt(6 b'/a'),  A2 = d' a'. Berry linearises the high-qRg
+# so Mw = 1/a'^2,  Rg = sqrt(6 b'/a'),  A2 = d' a'. Berry linearizes the high-qRg
 # regime (Mw above ~1 MDa) better than Zimm.
 #
 # The per-concentration and per-angle line fits used by the classic Zimm grid
-# plot are also returned, for visualisation and as a cross-check on the global fit.
+# plot are also returned, for visualization and as a cross-check on the global fit.
 
 
 @dataclass
@@ -735,7 +735,7 @@ def _collect_zimm_points(rayleigh_results: Sequence[RayleighRatioResult]):
         c_all.append(np.full(int(good.sum()), r.concentration_g_per_mL))
         y_all.append(r.kc_over_dR_mol_per_g[good])
     if not q2_all:
-        raise ValueError("No non-zero-concentration data to analyse.")
+        raise ValueError("No non-zero-concentration data to analyze.")
     return (np.concatenate(q2_all), np.concatenate(c_all), np.concatenate(y_all))
 
 

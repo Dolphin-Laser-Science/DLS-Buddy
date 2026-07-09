@@ -4,21 +4,21 @@ core/workspace.py
 
 The workspace data model: the framework-agnostic state that the controller
 manages and the GUI displays. Contains NO GUI code and NO matplotlib; it is plain
-Python so it can be unit-tested headless and serialised to a session file.
+Python so it can be unit-tested headless and serialized to a session file.
 
 A loaded data file becomes a `LoadedMeasurement` -- the raw arrays plus an
 editable parameter set (working) and the parameter set last used for analysis
 (committed). Measurements are grouped into `Sample`s by their sample identity
 (polymer, solvent, rounded temperature); concentration and angle are axes WITHIN
-a sample, not identity. Each sample carries labelled DLS / SLS / solvent-reference
+a sample, not identity. Each sample carries labeled DLS / SLS / solvent-reference
 slots and a `SampleResult` holding Mw, Rg, A2, Rh -- which may be computed by the
-engine OR entered by hand (e.g. a PVP molecular weight characterised in water, to
+engine OR entered by hand (e.g. a PVP molecular weight characterized in water, to
 avoid the co-solvent adsorption bias of a reline measurement).
 
 Grouping is the hybrid model: the sample key PROPOSES a grouping, and a manual
 override map lets the user reassign a measurement to a different sample.
 
-Serialisation is self-contained (the numerical data is embedded) and also records
+Serialization is self-contained (the numerical data is embedded) and also records
 the original source path, so a session can either stand alone or offer
 reload-from-source. JSON is used rather than pickle: inspectable, portable, and
 not a security or version-fragility risk.
@@ -26,7 +26,7 @@ not a security or version-fragility risk.
 Change history
 --------------
 2026-06-13  workspace.py v1: LoadedMeasurement, SampleResult, Sample, Workspace;
-            hybrid grouping; JSON session serialise/deserialise.
+            hybrid grouping; JSON session serialize/deserialize.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def _known_only(cls, d: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 # ===========================================================================
 
 # The physical parameters a user confirms or edits for a measurement. Kept as a
-# plain dict so change-tracking is a dict comparison and serialisation is trivial.
+# plain dict so change-tracking is a dict comparison and serialization is trivial.
 _DLS_PARAM_KEYS = (
     'label',
     'polymer_name', 'solvent_name', 'concentration_g_per_mL', 'temperature_K',
@@ -96,12 +96,12 @@ class LoadedMeasurement:
     """
     item_id: str
     kind: str                          # 'dls' or 'sls'
-    raw: Dict[str, List[float]]        # the raw arrays (lists, for serialisation)
+    raw: Dict[str, List[float]]        # the raw arrays (lists, for serialization)
     working_params: Dict[str, Any]
     committed_params: Dict[str, Any]
     source_path: Optional[str] = None
     # ---- provenance for DERIVED measurements (not loaded from a file) ----
-    # A measurement the program synthesised from others (e.g. the channel-by-channel
+    # A measurement the program synthesized from others (e.g. the channel-by-channel
     # mean of a replicate set) records what it came from. `derived_kind` tags HOW it
     # was made ('replicate_average'); `derived_from` lists the source item_ids.
     # Both None for an ordinary loaded measurement.
@@ -160,7 +160,7 @@ class LoadedMeasurement:
                 solvent_refractive_index=p['solvent_refractive_index'],
                 viscosity_Pa_s=p.get('viscosity_Pa_s'),
                 mw_fraction=p.get('mw_fraction'),
-                # Forward-ready (depolarised dynamic analysis); .get keeps it from
+                # Forward-ready (depolarized dynamic analysis); .get keeps it from
                 # being dropped once the VV/VH tagging is wired through the params.
                 analyzer_geometry=p.get('analyzer_geometry'),
             )
@@ -174,13 +174,13 @@ class LoadedMeasurement:
                 solvent_refractive_index=p['solvent_refractive_index'],
                 dn_dc_mL_per_g=p.get('dn_dc_mL_per_g'),
                 mw_fraction=p.get('mw_fraction'),
-                # Forward-ready: None until the depolarisation wiring (GUI VV/VH/VU
+                # Forward-ready: None until the depolarization wiring (GUI VV/VH/VU
                 # picker + param capture) lands; .get keeps it from being dropped once set.
                 analyzer_geometry=p.get('analyzer_geometry'),
             )
         raise ValueError(f"Unknown measurement kind {self.kind!r}.")
 
-    # ---- serialisation ----
+    # ---- serialization ----
     def to_dict(self) -> Dict[str, Any]:
         return {
             'item_id': self.item_id, 'kind': self.kind, 'raw': self.raw,
@@ -263,7 +263,7 @@ class SampleResult:
     Each quantity records its provenance: 'computed' (from an analysis run) or
     'user' (entered by hand). The user override matters for systems where the
     measured Mw is biased -- e.g. PVP in a deep eutectic solvent, where co-solvent
-    adsorption skews Mw, so the trustworthy value is the one characterised in
+    adsorption skews Mw, so the trustworthy value is the one characterized in
     water and entered manually. Cross-sample scaling plots (Rg-Mw, A2-Mw) should
     prefer the user value when present.
     """
@@ -384,7 +384,7 @@ class SampleRhRow:
 class Sample:
     """A group of measurements sharing (polymer, solvent, rounded temperature).
 
-    Concentration and angle vary WITHIN a sample. The labelled slots make the
+    Concentration and angle vary WITHIN a sample. The labeled slots make the
     eventual DLS+SLS pairing (for rho = Rg/Rh) a property of the sample -- "this
     sample has both" -- rather than a separate matching pass.
     """
@@ -446,7 +446,7 @@ class Sample:
             'solvent_reference_item_id': self.solvent_reference_item_id,
             'extra_solvent_reference_item_ids': list(
                 self.extra_solvent_reference_item_ids),
-            # Serialised as a list (JSON object keys can't be null) of
+            # Serialized as a list (JSON object keys can't be null) of
             # {fraction: <label|null>, result: {...}}.
             'fraction_results': [
                 {'fraction': frac, 'result': res.to_dict()}
@@ -550,11 +550,11 @@ class Workspace:
         Auto-grouped ids always look like 'poly|solv|tempK' (they contain '|', see
         _sid_for_key), so the 'override-####' form here can never collide with an
         auto key. The shared monotonic counter keeps it unique and stable across a
-        save -> reload (the counter is serialised with the workspace)."""
+        save -> reload (the counter is serialized with the workspace)."""
         self._counter += 1
         return f'override-{self._counter:04d}'
 
-    # ---- grouping (hybrid: auto-propose, honour overrides) ----
+    # ---- grouping (hybrid: auto-propose, honor overrides) ----
     def regroup(self) -> None:
         """Rebuild `samples` from the committed parameters of all measurements.
 
@@ -683,7 +683,7 @@ class Workspace:
         self.sample_rh_rows = {k: v for k, v in self.sample_rh_rows.items()
                                if v.sample_id in live_samples}
 
-    # ---- serialisation (self-contained JSON-ready dict) ----
+    # ---- serialization (self-contained JSON-ready dict) ----
     def to_dict(self) -> Dict[str, Any]:
         return {
             'format': SESSION_FORMAT, 'version': SESSION_VERSION,

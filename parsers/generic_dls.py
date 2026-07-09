@@ -218,7 +218,7 @@ class GenericDLSFilePreview(DLSFilePreview):
         # has confirmed the unit and data form.
         self._raw_delay_times: Optional[np.ndarray] = kwargs.pop('_raw_delay_times', None)
         self._raw_col2: Optional[np.ndarray] = kwargs.pop('_raw_col2', None)
-        # Initialise the parent dataclass (uses object.__setattr__ because
+        # Initialize the parent dataclass (uses object.__setattr__ because
         # dataclasses with eq=False can be tricky with __init__ overrides).
         super().__init__(**kwargs)
         # Overwrite the parent's data arrays with None; they will be filled

@@ -5,3 +5,8 @@
 *.command text eol=lf
 *.sh      text eol=lf
 *.bat     text eol=crlf
+
+# PDFs are binary — never apply line-ending normalization (autocrlf would corrupt
+# the byte stream on checkout). Covers the committed docs/*.pdf and the generated
+# illustrated guide. `-text` keeps the system `diff: astextplain` textconv intact.
+*.pdf     -text

@@ -312,6 +312,9 @@ class SampleRho:
     rho_se: Optional[float] = None  # statistical SE (only when both Rg and Rh have one)
     se_estimator: Optional[str] = None  # covariance estimator behind rho_se (Rg/Rh
     #                                     regression SEs); None when rho_se is None
+    rg_se: Optional[float] = None   # regression SE of Rg (None if Rg has no honest ±),
+    rh_se: Optional[float] = None   # and of Rh — carried so the display can round each
+    #                                 value to the place its own σ supports (invariant 8)
 
 
 @dataclass
@@ -334,10 +337,10 @@ class ScalingData:
 
 def _json_sanitize(obj):
     """Recursively replace non-finite floats (NaN / ±Inf) with ``None`` so a session
-    serialises to strict, portable JSON (``allow_nan=False``) rather than the
+    serializes to strict, portable JSON (``allow_nan=False``) rather than the
     non-standard ``NaN``/``Infinity`` tokens strict/external readers reject (D8).
 
-    ``None`` is a safe stand-in: every serialised field that can hold a non-finite
+    ``None`` is a safe stand-in: every serialized field that can hold a non-finite
     float is Optional, and its readers already treat a missing value the same as a
     non-finite one — e.g. the one intended NaN, an unconfirmed sample's grouping
     ``temperature_K``, is guarded downstream by ``is not None and np.isfinite(...)``.
@@ -364,7 +367,7 @@ class Controller:
         self.workspace = Workspace()
         # Global user preferences (seed defaults + appearance), loaded from the
         # settings.json at the repo root (or defaults if absent). "Seed, never
-        # override": GUI controls initialise from these, analysis methods fall back
+        # override": GUI controls initialize from these, analysis methods fall back
         # to them when the caller passes None; the per-run value still wins.
         self.settings = SettingsState.load()
         # Session-wide calibration (the default for every sample). Its geometry is
@@ -416,7 +419,7 @@ class Controller:
         """Register a parsed measurement. `params` seeds both working & committed.
 
         The GUI's confirmation table edits the working set afterwards; nothing is
-        analysed until commit. Returns the new item_id.
+        analyzed until commit. Returns the new item_id.
         """
         item_id = self.workspace.new_item_id()
         lm = LoadedMeasurement(
@@ -1246,12 +1249,12 @@ class Controller:
 
         `kind` is 'gamma_q2' (rows sorted by angle) or 'conc_extrap' (sorted by
         concentration). Each dict: item_id, angle_deg, concentration_g_per_mL,
-        mw_fraction, reason, ok. `reason` explains eligibility so the GUI can grey a
+        mw_fraction, reason, ok. `reason` explains eligibility so the GUI can gray a
         row and say *why*:
           'ok'             — buildable (parameters confirmed); tickable.
           'unbuilt'        — parameters not confirmed yet (`build()` fails).
           'other_fraction' — a different Mw fraction than the focused one (a single fit
-                             must not mix fractions), shown greyed rather than hidden.
+                             must not mix fractions), shown grayed rather than hidden.
         `ok == (reason == 'ok')`. Non-ok rows sort after the ok rows.
         """
         lms = self.workspace.sample_measurements(sample_id, 'dls')
@@ -1390,7 +1393,7 @@ class Controller:
         (feedback 2026-06-30 #11/#12). `None` = every eligible measurement.
 
         The result also carries `all_points` — every eligible measurement's per-point
-        Γ/q²/D_app + quality (feedback 2026-07-06), so the tab can fill its table and grey
+        Γ/q²/D_app + quality (feedback 2026-07-06), so the tab can fill its table and gray
         the excluded points from the run itself rather than a separate on-focus fit. Only
         fit-usable ticked points (quality 'ok'/'high_pdi', finite) enter the line fit."""
         points = self._dls_run_points(sample_id, fraction)
@@ -1635,7 +1638,7 @@ class Controller:
         `method` is one of 'cumulant', 'single', 'double', 'kww' (parametric) or
         'nnls', 'contin', 'lognormal' (distribution). For the parametric methods
         with a single unambiguous Rh (cumulant, single, kww) the averaged Rh +/- SE
-        is written into the sample's SampleResult (provenance-labelled, never
+        is written into the sample's SampleResult (provenance-labeled, never
         overwriting a hand-entered Rh). Double-exponential (two modes) and the
         distribution methods (variable peak count) are reported in the returned
         summary only. The distribution methods average their peaks positionally
@@ -1949,7 +1952,7 @@ class Controller:
 
     def set_manual_mw(self, sample_id: str, mw_g_per_mol: float,
                       fraction: Optional[str] = None) -> None:
-        """Record a hand-entered Mw for a sample (e.g. characterised in water).
+        """Record a hand-entered Mw for a sample (e.g. characterized in water).
 
         Marks the provenance 'user' so later runs do not overwrite it and scaling
         plots can prefer it -- the correct path for PVP in a deep eutectic solvent,
@@ -1970,26 +1973,26 @@ class Controller:
                                dark_count: float = 0.0,
                                i_vv_se: Optional[float] = None,
                                i_vh_se: Optional[float] = None):
-        """Static depolarization analysis (assumes vertically polarised incident light).
+        """Static depolarization analysis (assumes vertically polarized incident light).
 
         Provide EITHER the VV and VH intensities (in the SLS file's own units; only
-        their ratio matters), OR a depolarisation ratio rho_v directly. Returns a
+        their ratio matters), OR a depolarization ratio rho_v directly. Returns a
         DepolarizationResult (rho_v, rho_u, delta^2, Cabannes factor, validity).
         Pure pass-through to analysis.depolarization -- no state is changed.
         """
         if rho_v is not None:
-            # A direct ratio: analyse with unit VV so I_VH / I_VV = rho_v exactly.
+            # A direct ratio: analyze with unit VV so I_VH / I_VV = rho_v exactly.
             return depol_engine.analyze_depolarization(1.0, float(rho_v))
         if i_vv is None or i_vh is None:
             raise ValueError(
-                "Provide both VV and VH intensities, or a depolarisation ratio rho_v.")
+                "Provide both VV and VH intensities, or a depolarization ratio rho_v.")
         return depol_engine.analyze_depolarization(
             float(i_vv), float(i_vh), dark_count=float(dark_count),
             i_vv_se=i_vv_se, i_vh_se=i_vh_se)
 
     # --- depolarized light scattering (dynamic, Phase 2) ---
     def ddls_correlogram_summary(self, sample_id: str) -> List[Dict[str, Any]]:
-        """The sample's DLS correlograms with their polarisation tag, for the UI.
+        """The sample's DLS correlograms with their polarization tag, for the UI.
 
         Returns one dict per correlogram: item_id, angle_deg, geometry ('VV'/'VH'/
         'VU'/None), and `paired` (True if its angle has both a VV and a VH). Sorted
@@ -2025,7 +2028,7 @@ class Controller:
                  cumulant_order: int = 2, exclude_angles=()):
         """Pair a sample's VV/VH correlograms and extract rotational diffusion D_r.
 
-        Gathers the sample's DLS correlograms, groups them by polarisation tag
+        Gathers the sample's DLS correlograms, groups them by polarization tag
         (analyzer_geometry), pairs a VV with a VH at each shared angle, fits each
         with the cumulant engine to its field decay rate Gamma, and runs
         analyze_ddls (D_r = (Gamma_VH - Gamma_VV)/6; D_t from the VV channel).
@@ -2063,7 +2066,7 @@ class Controller:
         if not paired_angles:
             raise ValueError(
                 "No angle has both a VV and a VH correlogram. Tag each correlogram's "
-                "polarisation (VV/VH) in the Data tab; DDLS pairs them by angle.")
+                "polarization (VV/VH) in the Data tab; DDLS pairs them by angle.")
         # Drop user-excluded outlier angles (feedback 2026-06-26 #9).
         if exclude_angles:
             paired_angles = [a for a in paired_angles
@@ -2213,7 +2216,7 @@ class Controller:
     def _rayleigh_at_concentration(self, sample_id: str,
                                   concentration_g_per_mL: float,
                                   fraction: Optional[str] = None):
-        # Use the masked results so Debye/Guinier honour hidden angles/points and
+        # Use the masked results so Debye/Guinier honor hidden angles/points and
         # refuse a concentration that has been hidden entirely.
         for r in self.masked_rayleigh(sample_id, fraction):
             if r.concentration_g_per_mL == concentration_g_per_mL:
@@ -2268,7 +2271,7 @@ class Controller:
         """Per-concentration RayleighRatioResults with the (sample, fraction) mask
         applied: masked points -> NaN (dropped by the engine's finite filters); a
         wholly masked concentration is omitted. Used for analysis and the Zimm grid.
-        The unmasked results (for greying hidden points on a plot) come from
+        The unmasked results (for graying hidden points on a plot) come from
         run_rayleigh."""
         results = self._rayleigh_for_sample(sample_id, fraction)
         mask = self.sls_masks.get((sample_id, fraction))
@@ -2293,8 +2296,8 @@ class Controller:
     def sample_fractions(self, sample_id: str,
                          kind: str = 'sls') -> List[Optional[str]]:
         """Distinct molecular-weight fraction labels among a sample's measurements
-        (of the given kind). Returns [None] when nothing is labelled (the common
-        single-fraction case). Sorted with None (unlabelled) first."""
+        (of the given kind). Returns [None] when nothing is labeled (the common
+        single-fraction case). Sorted with None (unlabeled) first."""
         fracs = {lm.committed_params.get('mw_fraction')
                  for lm in self.workspace.sample_measurements(sample_id, kind)}
         if not fracs:
@@ -2330,7 +2333,7 @@ class Controller:
     # ----------------------------------------------------------------------
     # Rg flows into the SampleResult from the SLS Zimm/Berry run (thermodynamic).
     # Rh has several possible DLS sources, so it is chosen from candidates: the
-    # default is a labelled, deterministic pick (most-extrapolated first), and the
+    # default is a labeled, deterministic pick (most-extrapolated first), and the
     # GUI can override it or accept a hand-entered value. See ResultCandidate /
     # select_default_candidate in analysis.utilities for the selection contract.
 
@@ -2534,7 +2537,7 @@ class Controller:
 
         Never overwrites a hand-entered Rh ('user') or an explicit pick ('picked');
         returns the stored-or-chosen candidate, or None if no DLS Rh is available. The
-        default is labelled -- the GUI shows where the value came from; never silent.
+        default is labeled -- the GUI shows where the value came from; never silent.
         """
         r = self.workspace.samples[sample_id].result_for(fraction)
         cands = self.dls_rh_candidates(sample_id, fraction)
@@ -2548,7 +2551,7 @@ class Controller:
     def set_manual_rh(self, sample_id: str, rh_nm: float,
                       is_apparent: bool = False,
                       fraction: Optional[str] = None) -> None:
-        """Record a hand-entered Rh (e.g. from external characterisation).
+        """Record a hand-entered Rh (e.g. from external characterization).
 
         Marked provenance 'user' so a re-selection does not silently replace it.
         `is_apparent` lets the user say whether their value is an infinite-dilution
@@ -2587,7 +2590,7 @@ class Controller:
 
     def _dls_cached(self, sample_id: str, fraction: Optional[str], compute):
         """Memoize the DLS Rh-candidate computation for (sample, fraction) under the
-        full `dls_run_signature` — the DLS analogue of `_sls_cached`. The Cross-Sample
+        full `dls_run_signature` — the DLS analog of `_sls_cached`. The Cross-Sample
         refresh calls `dls_rh_candidates` several times per fraction (auto-select +
         the source panel) and each re-runs a cumulant fit per measurement, a Γ-q² per
         concentration, and a D-vs-c per angle; this returns the first result until an
@@ -2715,7 +2718,7 @@ class Controller:
         """Pick and store the default Rg for a sample (most-extrapolated first).
 
         Never overwrites a hand-entered Rg ('user') or an explicit pick ('picked');
-        returns the chosen candidate, or None if no SLS Rg is available. Labelled,
+        returns the chosen candidate, or None if no SLS Rg is available. Labeled,
         never silent.
         """
         r = self.workspace.samples[sample_id].result_for(fraction)
@@ -2729,7 +2732,7 @@ class Controller:
     def set_manual_rg(self, sample_id: str, rg_nm: float,
                       is_apparent: bool = False,
                       fraction: Optional[str] = None) -> None:
-        """Record a hand-entered Rg (e.g. from external characterisation).
+        """Record a hand-entered Rg (e.g. from external characterization).
 
         Marked provenance 'user' so a re-selection or a later Zimm run does not
         silently replace it. `is_apparent` defaults to thermodynamic (a hand-entered
@@ -2761,7 +2764,7 @@ class Controller:
         tier 2  Debye or Guinier per concentration (apparent).
         Unlike Rg, **Mw is calibration-dependent** -- an uncalibrated run gives an
         arbitrary-scale Mw, flagged in the label. For scaling plots the trustworthy
-        Mw is usually the hand-entered one (e.g. characterised in water); that is
+        Mw is usually the hand-entered one (e.g. characterized in water); that is
         offered separately as the 'user' value and preferred by the defaults.
         """
         cands: List[ResultCandidate] = []
@@ -2923,7 +2926,7 @@ class Controller:
         """Pick and store the default A2 (best-tier Zimm/Berry fit) for the A2-Mw
         scaling plot; never overwrites a hand-set A2 ('user', reserved for a future
         external-value path) or an explicit pick ('picked'). Returns the stored A2, or
-        None if none could be computed. Labelled via `set_sample_a2`, never silent."""
+        None if none could be computed. Labeled via `set_sample_a2`, never silent."""
         r = self.workspace.samples[sample_id].result_for(fraction)
         if r.a2_source in ('user', 'picked'):
             return r.a2_mol_mL_per_g2
@@ -2955,7 +2958,7 @@ class Controller:
         is_apparent = bool(r.rg_apparent) or bool(r.rh_apparent)
         # rho_se is a ratio of the Rg and Rh REGRESSION SEs, so it inherits the
         # selected covariance estimator (a single global setting). Carry that
-        # provenance so an OLS-derived rho ± is never shown unlabelled (invariant 8
+        # provenance so an OLS-derived rho ± is never shown unlabeled (invariant 8
         # clause A). Only meaningful when rho_se exists.
         rho_estimator = self.settings.se_estimator if rr.rho_se is not None else None
         return SampleRho(
@@ -2964,7 +2967,8 @@ class Controller:
             rg_label=(r.rg_label or 'Rg'), rh_label=(r.rh_label or 'Rh'),
             rg_source=r.rg_source, rh_source=r.rh_source,
             is_apparent=is_apparent, interpretation=rr.interpretation,
-            shape=rr.shape, rho_se=rr.rho_se, se_estimator=rho_estimator)
+            shape=rr.shape, rho_se=rr.rho_se, se_estimator=rho_estimator,
+            rg_se=unc.se_or_none(r.rg_se), rh_se=unc.se_or_none(r.rh_se))
 
     def samples_pairable_rho(self) -> List[str]:
         """Sample ids that have both DLS and SLS (rho = Rg/Rh is possible)."""
@@ -3151,7 +3155,7 @@ class Controller:
                            ticked_only_ids: Optional[List[str]] = None) -> str:
         """Export the DLS Summary store as ONE long/tidy CSV: one row per result
         or distribution peak (NOT the wide on-screen shape), with separate numeric
-        columns so Origin/pandas can plot them. The per-measurement rows honour the
+        columns so Origin/pandas can plot them. The per-measurement rows honor the
         ticked filter; sample-level rows are always included."""
         allow = set(ticked_only_ids) if ticked_only_ids is not None else None
         records: List[Dict[str, Any]] = []
@@ -3518,7 +3522,7 @@ class Controller:
         payload['sample_calibrations'] = {
             sid: cc.to_dict()
             for sid, cc in self.sample_calibration_committed.items()}
-        # Masks are keyed by (sample_id, fraction); serialise as a list since JSON
+        # Masks are keyed by (sample_id, fraction); serialize as a list since JSON
         # object keys can't be tuples.
         payload['sls_masks'] = [
             {'sample_id': sid, 'fraction': frac, 'mask': m.to_dict()}
@@ -3532,26 +3536,36 @@ class Controller:
     def load_session(self, file_path: str) -> None:
         with open(file_path) as fh:
             payload = json.load(fh)
-        self.workspace = Workspace.from_dict(payload)
-        self.calibration_committed = CalibrationState.from_dict(
+        # Build the whole new state in LOCALS first, and only assign it to self after
+        # every parse step succeeds — so a malformed or schema-mismatched session can't
+        # leave a HALF-loaded controller (a new workspace beside stale/default calibration
+        # + masks). The GUI reopen-last-session path relies on this "all or nothing":
+        # on any parse failure self is untouched, so its fail-soft catch truly starts empty.
+        workspace = Workspace.from_dict(payload)
+        calibration_committed = CalibrationState.from_dict(
             payload.get('calibration', {}))
-        self.calibration_working = CalibrationState(
-            **self.calibration_committed.to_dict())
-        self.sample_calibration_committed = {
+        sample_calibration_committed = {
             sid: CalibrationState.from_dict(d)
             for sid, d in payload.get('sample_calibrations', {}).items()}
-        self.sample_calibration_working = {
-            sid: CalibrationState(**cc.to_dict())
-            for sid, cc in self.sample_calibration_committed.items()}
         raw_masks = payload.get('sls_masks', [])
         if isinstance(raw_masks, list):     # current (sample, fraction) format
-            self.sls_masks = {
+            sls_masks = {
                 (e['sample_id'], e.get('fraction')): SLSMask.from_dict(e['mask'])
                 for e in raw_masks}
         else:                               # back-compat: {sample_id: mask}
-            self.sls_masks = {
+            sls_masks = {
                 (sid, None): SLSMask.from_dict(d)
                 for sid, d in raw_masks.items()}
+        # All parsed cleanly — commit the new state atomically.
+        self.workspace = workspace
+        self.calibration_committed = calibration_committed
+        self.calibration_working = CalibrationState(
+            **self.calibration_committed.to_dict())
+        self.sample_calibration_committed = sample_calibration_committed
+        self.sample_calibration_working = {
+            sid: CalibrationState(**cc.to_dict())
+            for sid, cc in self.sample_calibration_committed.items()}
+        self.sls_masks = sls_masks
         self.results.clear()
         self._sls_candidate_cache.clear()   # the memo belongs to the old workspace
         self._dls_candidate_cache.clear()   # (same — keyed to the old measurements)

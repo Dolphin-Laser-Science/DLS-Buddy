@@ -54,19 +54,19 @@ Change history
             solvent_name is now a required field on DLSMeasurement and
             SLSMeasurement and a fourth field in SampleKey, so the same
             polymer in different solvents no longer collides. Solvent names
-            are normalised against a controlled vocabulary
-            (normalize_solvent_name); unrecognised names are used as-is with
+            are normalized against a controlled vocabulary
+            (normalize_solvent_name); unrecognized names are used as-is with
             a one-time warning. IntensityTrace does not carry a solvent.
 2026-06-19  Added analyzer_geometry to SLSMeasurement. (data_models v3)
-            Optional polarisation geometry ('VV'/'VH'/'VU' or None), the bridge
-            for static depolarised light scattering: a VV and a VH series sharing
+            Optional polarization geometry ('VV'/'VH'/'VU' or None), the bridge
+            for static depolarized light scattering: a VV and a VH series sharing
             sample identity + angle pair into the Cabannes correction and the
-            depolarisation ratio (analysis/depolarization.py). Optional with a None
-            default -> non-breaking; all existing polarised workflows are unchanged.
+            depolarization ratio (analysis/depolarization.py). Optional with a None
+            default -> non-breaking; all existing polarized workflows are unchanged.
             DLSMeasurement gains the same field when the dynamic DPLS phase begins.
 2026-06-19  Added analyzer_geometry to DLSMeasurement. (data_models v4)
             The same optional 'VV'/'VH'/'VU' field on the correlogram object, for
-            the DYNAMIC depolarised analysis: a VV and a VH correlogram at one angle
+            the DYNAMIC depolarized analysis: a VV and a VH correlogram at one angle
             pair into the rotational diffusion coefficient D_r = (Gamma_VH -
             Gamma_VV)/6 (analysis/depolarization.analyze_ddls). Non-breaking (None
             default); workspace.build() forwards it.
@@ -104,14 +104,14 @@ class SampleKey(NamedTuple):
 
     It is a NamedTuple, which means two SampleKeys are equal (and hash equal,
     so they work as dictionary keys) when all four fields match. That is
-    exactly the behaviour a join key needs.
+    exactly the behavior a join key needs.
 
     Fields: (polymer, solvent, concentration, temperature).
     Solvent is part of sample identity because the same polymer at the same
     concentration and temperature in two different solvents is two physically
     different samples (different chain conformation, different solvent quality).
     Including solvent lets you compare, e.g., PVP in water vs PVP in reline
-    without their keys colliding. Solvent names are normalised against a small
+    without their keys colliding. Solvent names are normalized against a small
     controlled vocabulary (see normalize_solvent_name) so that "water", "Water",
     and "H2O" all map to the same key.
 
@@ -122,7 +122,7 @@ class SampleKey(NamedTuple):
 
     IMPORTANT: build these with make_sample_key(), not by calling SampleKey(...)
     directly. The factory rounds the floating-point fields so that values which
-    are "the same number" in physical terms compare as equal, and normalises the
+    are "the same number" in physical terms compare as equal, and normalizes the
     solvent name against the controlled vocabulary.
     """
     polymer_name: str
@@ -135,10 +135,10 @@ class SampleKey(NamedTuple):
 # Solvent name controlled vocabulary
 # ---------------------------------------------------------------------------
 #
-# Solvent names are normalised against this table before being placed in a
+# Solvent names are normalized against this table before being placed in a
 # SampleKey, so that common spelling/casing variants map to one canonical form
 # and do not break joins. The table maps a lowercased input string to its
-# canonical name. To add a solvent, add its variants here. Unrecognised names
+# canonical name. To add a solvent, add its variants here. Unrecognized names
 # are used as-is (lowercased + stripped) with a one-time warning -- the program
 # stays usable, the user just gets nudged toward a canonical name.
 
@@ -214,7 +214,7 @@ _SOLVENT_ALIASES = {
     'cs2': 'cs2',
 }
 
-# Tracks which unrecognised solvent names have already triggered a warning,
+# Tracks which unrecognized solvent names have already triggered a warning,
 # so the user is warned once per unique name rather than once per measurement.
 _warned_unrecognized_solvents: set = set()
 
@@ -223,7 +223,7 @@ def normalize_solvent_name(raw_name: str) -> str:
     """Return the canonical form of a solvent name (silent; no warning).
 
     Strips whitespace, lowercases, and looks up the controlled vocabulary.
-    If the name is not recognised, returns the cleaned (stripped + lowercased)
+    If the name is not recognized, returns the cleaned (stripped + lowercased)
     string unchanged. This function never warns; it is safe to call repeatedly
     (e.g. on every sample_key access). Use is_recognized_solvent() to decide
     whether to warn.
@@ -251,7 +251,7 @@ def _warn_if_unrecognized_solvent(raw_name: str) -> None:
         return
     _warned_unrecognized_solvents.add(canonical)
     warnings.warn(
-        f"Solvent name {raw_name!r} is not in the recognised solvent "
+        f"Solvent name {raw_name!r} is not in the recognized solvent "
         f"vocabulary; using {canonical!r} as-is for the sample key. If this "
         f"is a real solvent you use often, add it to _SOLVENT_ALIASES in "
         f"core/data_models.py to silence this warning and ensure consistent "
@@ -284,11 +284,11 @@ def make_sample_key(
 ) -> SampleKey:
     """Canonical constructor for SampleKey. Always use this, never SampleKey().
 
-    Normalisation applied:
+    Normalization applied:
       - polymer_name: surrounding whitespace stripped; case preserved.
-      - solvent_name: normalised against the controlled vocabulary
+      - solvent_name: normalized against the controlled vocabulary
         (stripped, lowercased, mapped to canonical form). This function does
-        NOT warn on unrecognised solvents; the measurement classes warn once
+        NOT warn on unrecognized solvents; the measurement classes warn once
         at construction via _warn_if_unrecognized_solvent.
       - concentration and temperature: rounded to SAMPLE_KEY_SIG_FIGS
         significant figures so floating-point noise cannot break a join.
@@ -309,7 +309,7 @@ def make_sample_key(
 # Small validation helpers (private to this module)
 # ---------------------------------------------------------------------------
 #
-# Centralising these means each dataclass validates itself the same way, with
+# Centralizing these means each dataclass validates itself the same way, with
 # clear error messages, instead of repeating checks inline. Failing loudly at
 # construction time -- the moment bad data enters the system -- is far easier
 # to debug than a confusing error deep inside an analysis function later.
@@ -359,13 +359,13 @@ def _require_non_empty_string(value, field_name: str) -> None:
         )
 
 
-# Polarisation/analyser geometry of a measurement, as (incident, analyser):
-#   VV  vertical incident, vertical analyser     -- ordinary polarised intensity
-#   VH  vertical incident, horizontal analyser   -- depolarised intensity (DPLS)
-#   VU  vertical incident, no analyser           -- e.g. the BI-200SM
+# Polarization/analyzer geometry of a measurement, as (incident, analyzer):
+#   VV  vertical incident, vertical analyzer     -- ordinary polarized intensity
+#   VH  vertical incident, horizontal analyzer   -- depolarized intensity (DPLS)
+#   VU  vertical incident, no analyzer           -- e.g. the BI-200SM
 # None means the geometry was not recorded (legacy / unspecified). This vocabulary
 # matches the Rayleigh-geometry codes in physics/constants.py; it is duplicated here
-# (not imported) to keep core/ free of any physics/ dependency. The depolarisation
+# (not imported) to keep core/ free of any physics/ dependency. The depolarization
 # analysis pairs a VV measurement with a VH measurement by sample identity + angle.
 ANALYZER_GEOMETRIES = ('VV', 'VH', 'VU')
 
@@ -396,7 +396,7 @@ class IntensityTrace:
     """A count-rate-vs-time record from a scattering experiment.
 
     This is a first-class, independent object. It can be loaded from a count
-    rate file and analysed on its own (drift, stationarity, dust spikes,
+    rate file and analyzed on its own (drift, stationarity, dust spikes,
     basic statistics) with no correlogram present at all. When it does belong
     to a correlogram, the association is optional and made via measurement_id.
 
@@ -439,7 +439,7 @@ class IntensityTrace:
     def __repr__(self) -> str:
         # A compact repr keeps the console and debugger readable
         # instead of dumping the full arrays.
-        label = self.sample_label if self.sample_label is not None else "unlabelled"
+        label = self.sample_label if self.sample_label is not None else "unlabeled"
         return (
             f"IntensityTrace(label={label!r}, "
             f"n_points={self.times_s.size}, "
@@ -513,11 +513,11 @@ class DLSMeasurement:
 
     # --- optional ---
     viscosity_Pa_s: Optional[float] = None
-    # Polarisation/analyser geometry of this correlogram, as (incident, analyser):
-    # 'VV' (polarised), 'VH' (depolarised), 'VU' (no analyser), or None if not
-    # recorded. The depolarised dynamic analysis pairs a VV with a VH correlogram
+    # Polarization/analyzer geometry of this correlogram, as (incident, analyzer):
+    # 'VV' (polarized), 'VH' (depolarized), 'VU' (no analyzer), or None if not
+    # recorded. The depolarized dynamic analysis pairs a VV with a VH correlogram
     # (same sample identity + angle) to extract the rotational diffusion coefficient
-    # D_r = (Gamma_VH - Gamma_VV)/6. None leaves all existing (polarised) DLS
+    # D_r = (Gamma_VH - Gamma_VV)/6. None leaves all existing (polarized) DLS
     # workflows unchanged.
     analyzer_geometry: Optional[str] = None
     # Free-text molecular-weight fraction label (e.g. "250k", "1M"). A WITHIN-sample
@@ -636,12 +636,12 @@ class SLSMeasurement:
     standard_rayleigh_ratio_file: Optional[float] = None
     standard_refractive_index: Optional[float] = None
 
-    # --- optional polarisation geometry ---
-    # Analyser/incident polarisation of this intensity series, as (incident,
-    # analyser): 'VV' (polarised), 'VH' (depolarised), 'VU' (no analyser), or None
-    # if not recorded. Used by the depolarisation analysis to pair a VV series with
+    # --- optional polarization geometry ---
+    # Analyzer/incident polarization of this intensity series, as (incident,
+    # analyzer): 'VV' (polarized), 'VH' (depolarized), 'VU' (no analyzer), or None
+    # if not recorded. Used by the depolarization analysis to pair a VV series with
     # a VH series (same sample identity + angle) for the Cabannes correction and the
-    # depolarisation ratio. None leaves all existing (polarised) workflows unchanged.
+    # depolarization ratio. None leaves all existing (polarized) workflows unchanged.
     analyzer_geometry: Optional[str] = None
 
     # --- optional provenance ---

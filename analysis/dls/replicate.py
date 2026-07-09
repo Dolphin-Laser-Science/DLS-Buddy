@@ -63,7 +63,7 @@ def average_replicate_correlograms(
     by the floating beta in the subsequent fit.
 
     Identical lag grids are REQUIRED, not interpolated to: resampling onto a
-    common grid would blend neighbouring lag channels (which are already
+    common grid would blend neighboring lag channels (which are already
     correlated, Schaetzel 1990) and would silently let non-replicates be averaged,
     defeating the "true replicates only" guard.
 

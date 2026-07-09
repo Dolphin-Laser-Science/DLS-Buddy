@@ -71,7 +71,7 @@ class SettingsModule(QtWidgets.QWidget):
         # SettingsState fields. The fields are retained (and round-tripped through
         # _collect) so Apply/Restore never silently zeroes them.
 
-        form.addRow(self._header('DLS analysis defaults'))
+        form.addRow(self._header('DLS Analysis Defaults'))
         self.cumulant_method = QtWidgets.QComboBox()
         self.cumulant_method.addItem('Nonlinear', 'nonlinear')
         self.cumulant_method.addItem('Linear', 'linear')
@@ -83,34 +83,38 @@ class SettingsModule(QtWidgets.QWidget):
             '• Linear: weighted polynomial fit of ln(g₂−1).\n'
             'Switching this clears existing cumulant-based results (you will be asked '
             'to confirm).')
-        form.addRow('Cumulant method', self.cumulant_method)
+        form.addRow('Cumulant method:', self.cumulant_method)
         self.skip_channels = QtWidgets.QSpinBox()
         self.skip_channels.setRange(0, 50)
         self.skip_channels.setToolTip(
-            'Drop this many leading correlator channels (the shortest lags) from '
-            'every DLS fit, to remove detector afterpulsing / dead-time artefacts. '
-            '0 = keep all channels. Applies to cumulant and distribution methods '
-            'alike, and composes with a delay-window minimum (the later of the two '
-            'wins). Keep it small for distribution fits — over-skipping can erase a '
-            'genuine small-particle population.')
-        form.addRow('Skip initial lag channels', self.skip_channels)
+            'Drop this many leading correlator channels (shortest lags) from every DLS '
+            'fit to remove afterpulsing / dead-time artifacts; keep it small so a real '
+            'small-particle mode is not erased. See the Advanced Guide.')
+        form.addRow('Skip initial lag channels:', self.skip_channels)
 
-        form.addRow(self._header('SLS defaults'))
+        form.addRow(self._header('SLS Defaults'))
         self.geometry = QtWidgets.QComboBox()
         self.geometry.addItems(['VU', 'VV', 'VH'])
-        form.addRow('Standard geometry', self.geometry)
+        self.geometry.setToolTip(
+            'Scattering geometry of the calibration standard: VV = polarized, '
+            'VH = depolarized, VU = no analyzer (e.g. the BI-200SM). '
+            'See the Advanced Guide.')
+        form.addRow('Standard geometry:', self.geometry)
         self.qrg_max = QtWidgets.QDoubleSpinBox()
         self.qrg_max.setRange(0.5, 3.0)
         self.qrg_max.setSingleStep(0.1)
-        form.addRow('Guinier qRg validity limit', self.qrg_max)
+        self.qrg_max.setToolTip(
+            'Maximum qRg for a valid Guinier fit; above it the Guinier expansion '
+            'breaks down. See the Advanced Guide (Guinier).')
+        form.addRow('Guinier qRg validity limit:', self.qrg_max)
 
-        form.addRow(self._header('Solvent library'))
+        form.addRow(self._header('Solvent Library'))
         self.default_solvent = QtWidgets.QComboBox()
         self.default_solvent.addItems(solvents_lib.available_solvents('primary'))
         self.default_solvent.setToolTip(
             'The solvent the Solvent Explorer (a Utilities sub-tab) starts on. A '
             'convenience default only — it never sets a value in any analysis.')
-        form.addRow('Default solvent', self.default_solvent)
+        form.addRow('Default solvent:', self.default_solvent)
 
         form.addRow(self._header('Uncertainty'))
         self.se_estimator = QtWidgets.QComboBox()
@@ -133,7 +137,7 @@ class SettingsModule(QtWidgets.QWidget):
                 'spreadsheet like-for-like. It can under-report (~10% low on a short, '
                 'high-leverage concentration ladder), which is why it is not the default.',
                 'The choice is global, persists across restart, and is recorded on '
-                'each result and written into the export (an OLS ± is labelled '
+                'each result and written into the export (an OLS ± is labeled '
                 '“SE: classical OLS”). Point estimates (Mw, Rg, D, Rh) are unaffected.',
                 'Detail and formulas: Advanced Guide §15.1.',
             ])
@@ -143,7 +147,7 @@ class SettingsModule(QtWidgets.QWidget):
         est_lay.addWidget(self.se_estimator)
         est_lay.addWidget(est_help)
         est_lay.addStretch(1)
-        form.addRow('Regression SE estimator', est_row)
+        form.addRow('Regression SE estimator:', est_row)
 
         # NB: the synthetic-generator (β/noise/points) and intensity-trace (outlier
         # k, running-average window) defaults used to live here. Per feedback
@@ -151,7 +155,7 @@ class SettingsModule(QtWidgets.QWidget):
         # generator / Traces) as plain session fields, so they no longer clutter
         # this global tab.
 
-        form.addRow(self._header('Display units'))
+        form.addRow(self._header('Display Units'))
         plot_note = ThemedLabel(
             'Display units for plot axes AND the Cross-Sample result tables (Rg/Rh, Mw). '
             'Everything is stored in canonical units and only converted for display; '
@@ -164,27 +168,83 @@ class SettingsModule(QtWidgets.QWidget):
             combo = QtWidgets.QComboBox()
             combo.addItems(U.unit_options(q))
             self.plot_unit_combos[q] = combo
-            form.addRow(label, combo)
+            form.addRow(f'{label}:', combo)
+
+        form.addRow(self._header('Result Formatting'))
+        self.no_unc_sig_figs = QtWidgets.QSpinBox()
+        self.no_unc_sig_figs.setRange(1, 4)
+        self.no_unc_sig_figs.setToolTip(
+            'Significant figures for EVERY result that has no honest uncertainty — '
+            'a single correlogram, an NNLS/CONTIN distribution, a single-angle Mw, and '
+            'derived numbers like Γ, PDI, R², and qRg. A value that HAS a ± is always '
+            'rounded to the place its ± supports — this never changes that.')
+        sig_help = HelpBadge(
+            'How many digits to show for a result that carries no ±.',
+            bullets=[
+                'A value that <b>has</b> an uncertainty is shown to the precision that ± '
+                'supports (a ±1 nm SE is not reported to the tenths place — that would '
+                'imply confidence the data does not support). This setting does '
+                '<b>not</b> touch those.',
+                'A value with <b>no</b> uncertainty — a single-correlogram fit, an '
+                'NNLS/CONTIN peak, a single-angle Mw, and every derived number that '
+                'carries no ± (Γ, PDI, R², qRg, …) — has no uncertainty to set its '
+                'precision, so a fixed number of significant figures is used instead. '
+                'This one knob controls all of them, uniformly.',
+                'Default 3. Lower it (e.g. to 2) for a more conservative look — note that '
+                'coarsens everything without a ±, including R²/qRg, so their trailing '
+                'digits are lost. The app never fabricates a ± to show more digits.',
+            ])
+        sig_row = QtWidgets.QWidget()
+        sig_lay = QtWidgets.QHBoxLayout(sig_row)
+        sig_lay.setContentsMargins(0, 0, 0, 0)
+        sig_lay.addWidget(self.no_unc_sig_figs)
+        sig_lay.addWidget(sig_help)
+        sig_lay.addStretch(1)
+        form.addRow('No-uncertainty precision (sig. figs):', sig_row)
 
         form.addRow(self._header('Appearance'))
         self.theme = QtWidgets.QComboBox()
         self.theme.addItems(['system', 'light', 'dark'])
         self.theme.setToolTip(
             "'system' follows your OS; 'light'/'dark' override it.")
-        form.addRow('Theme', self.theme)
+        form.addRow('Theme:', self.theme)
         self.palette = QtWidgets.QComboBox()
         self.palette.addItems(['okabe_ito', 'tab10', 'grayscale'])
-        form.addRow('Plot palette', self.palette)
+        self.palette.setToolTip(
+            'Series colors for every plot. "okabe_ito" (default) is a colorblind-safe '
+            'palette; series also vary by marker/linestyle so they stay distinct in '
+            'grayscale and for colorblind readers.')
+        form.addRow('Plot palette:', self.palette)
+        self.plot_match_theme = QtWidgets.QCheckBox('Match plot to app theme (dark)')
+        self.plot_match_theme.setToolTip(
+            'When on and the app theme is dark, the on-screen plots use a dark '
+            'background too. Saved/exported images always stay white for clean, '
+            'print-parity figures — this only affects what you see on screen.')
+        form.addRow('Plot theme:', self.plot_match_theme)
+        self.ui_density = QtWidgets.QComboBox()
+        self.ui_density.addItem('Compact', 'compact')
+        self.ui_density.addItem('Comfortable', 'comfortable')
+        self.ui_density.addItem('Large', 'large')
+        self.ui_density.setToolTip(
+            'Application-wide text size / density. "Large" aids readability; "Compact" '
+            'fits more on screen. Applied app-wide and persists across restarts.')
+        form.addRow('UI density:', self.ui_density)
         self.show_tooltips = QtWidgets.QCheckBox('Show tooltips on hover')
         self.show_tooltips.setToolTip(
             'Passive hover tooltips throughout the app. The "?" help buttons still '
             'work on click when this is off.')
-        form.addRow('Tooltips', self.show_tooltips)
+        form.addRow('Tooltips:', self.show_tooltips)
+        self.reopen_last_session = QtWidgets.QCheckBox('Reopen last session on startup')
+        self.reopen_last_session.setToolTip(
+            'When on, the current workspace is auto-saved when you close the program '
+            'and reopened the next time you launch it. If the saved session is missing '
+            'or cannot be read, the program starts empty. Off by default.')
+        form.addRow('Session:', self.reopen_last_session)
 
         outer.addWidget(host)
 
         btns = QtWidgets.QHBoxLayout()
-        apply_btn = QtWidgets.QPushButton('Apply')
+        apply_btn = QtWidgets.QPushButton('Update')
         apply_btn.clicked.connect(self._apply)
         reset_btn = QtWidgets.QPushButton('Restore defaults')
         reset_btn.clicked.connect(self._restore)
@@ -197,8 +257,9 @@ class SettingsModule(QtWidgets.QWidget):
     @staticmethod
     def _header(text: str) -> QtWidgets.QLabel:
         # ThemedLabel so the header follows the theme (a plain stylesheet without a
-        # `color` froze to the build-time palette → unreadable light-grey on the light
-        # theme). Kept sentence-case + bold; no all-caps (feedback 2026-06-30 #2).
+        # `color` froze to the build-time palette → unreadable light-gray on the light
+        # theme). Title Case + bold; no all-caps (feedback 2026-06-30 #2; casing per
+        # style guide §9).
         return ThemedLabel(text, role='header', bold=True, extra='margin-top:8px;')
 
     # ----------------------------------------------------------- transfer ---
@@ -222,9 +283,17 @@ class SettingsModule(QtWidgets.QWidget):
         self.se_estimator.setCurrentIndex(j if j >= 0 else 0)
         for q, combo in self.plot_unit_combos.items():
             combo.setCurrentText(s.plot_units.get(q, U.default_unit(q)))
+        self.no_unc_sig_figs.setValue(s.no_uncertainty_sig_figs)
+        # last_session_path is managed by the shell (autosave on exit), not edited here;
+        # retain it so Apply round-trips it instead of blanking the stored path.
+        self._retained_last_session_path = s.last_session_path
         self.theme.setCurrentText(s.theme)
         self.palette.setCurrentText(s.plot_palette)
+        self.plot_match_theme.setChecked(s.plot_match_theme)
+        d = self.ui_density.findData(s.ui_density)
+        self.ui_density.setCurrentIndex(d if d >= 0 else 1)
         self.show_tooltips.setChecked(s.show_tooltips)
+        self.reopen_last_session.setChecked(s.reopen_last_session)
 
     def _collect(self) -> SettingsState:
         return SettingsState(
@@ -239,16 +308,21 @@ class SettingsModule(QtWidgets.QWidget):
             se_estimator=self.se_estimator.currentData(),
             plot_units={q: combo.currentText()
                         for q, combo in self.plot_unit_combos.items()},
+            no_uncertainty_sig_figs=self.no_unc_sig_figs.value(),
             theme=self.theme.currentText(),
+            ui_density=self.ui_density.currentData(),
             plot_palette=self.palette.currentText(),
+            plot_match_theme=self.plot_match_theme.isChecked(),
             show_tooltips=self.show_tooltips.isChecked(),
+            reopen_last_session=self.reopen_last_session.isChecked(),
+            last_session_path=self._retained_last_session_path,
         )
 
     # ----------------------------------------------------------- actions ---
     @QtCore.Slot()
     def _apply(self) -> bool:
         """Apply the edited settings. Returns True if applied, False if it was
-        aborted (busy, or a stale-guard prompt cancelled) — `_restore` uses this to
+        aborted (busy, or a stale-guard prompt canceled) — `_restore` uses this to
         fully revert the widgets on cancel."""
         # Settings values seed the analysis defaults a background run reads
         # mid-flight — applying under it could change its numbers (invariant 4).
@@ -258,7 +332,7 @@ class SettingsModule(QtWidgets.QWidget):
         new = self._collect()
         # Two independent switches (cumulant method, SE estimator) each make some
         # existing results stale and offer a clear-and-warn. Collect BOTH confirmations
-        # up front and only mutate after every prompt is confirmed — otherwise cancelling
+        # up front and only mutate after every prompt is confirmed — otherwise canceling
         # the second prompt would leave the first's clear already done (results gone) but
         # the Apply aborted, a dropdown/setting mismatch. Any Cancel reverts every dropdown
         # and applies nothing.
@@ -315,7 +389,7 @@ class SettingsModule(QtWidgets.QWidget):
 
     def _revert_dropdowns(self, cumulant_method: str, se_estimator: str) -> None:
         """Restore both stale-guarded dropdowns to the still-current settings after a
-        cancelled Apply, so no uncommitted choice lingers in the UI."""
+        canceled Apply, so no uncommitted choice lingers in the UI."""
         j = self.cumulant_method.findData(cumulant_method)
         self.cumulant_method.setCurrentIndex(j if j >= 0 else 0)
         k = self.se_estimator.findData(se_estimator)

@@ -97,7 +97,7 @@ from core.data_models import DLSMeasurement, IntensityTrace, SLSMeasurement
 _DELAY_TIME_FACTORS = {
     's':  1.0,
     'ms': 1.0e-3,
-    'us': 1.0e-6,   # also written µs; parsers normalise the string first
+    'us': 1.0e-6,   # also written µs; parsers normalize the string first
     'µs': 1.0e-6,
     'ns': 1.0e-9,
 }
@@ -168,14 +168,14 @@ def convert_delay_times(
     Raises
     ------
     ValueError
-        If from_unit is not recognised.
+        If from_unit is not recognized.
     """
     key = from_unit.strip().lower()
-    # Normalise common unicode variant
+    # Normalize common unicode variant
     key = key.replace('μ', 'µ')
     if key not in _DELAY_TIME_FACTORS:
         raise ValueError(
-            f"Unrecognised delay time unit {from_unit!r}. "
+            f"Unrecognized delay time unit {from_unit!r}. "
             f"Accepted: {sorted(_DELAY_TIME_FACTORS)}."
         )
     return np.asarray(values, dtype=float) * _DELAY_TIME_FACTORS[key]
@@ -203,7 +203,7 @@ def convert_temperature(
     Raises
     ------
     ValueError
-        If from_unit is not recognised, or if the resulting kelvin value
+        If from_unit is not recognized, or if the resulting kelvin value
         is non-positive (physically impossible).
     """
     unit = from_unit.strip().lower()
@@ -213,7 +213,7 @@ def convert_temperature(
         temp_K = float(value)
     else:
         raise ValueError(
-            f"Unrecognised temperature unit {from_unit!r}. "
+            f"Unrecognized temperature unit {from_unit!r}. "
             f"Use 'C' for Celsius or 'K' for kelvin."
         )
     if not (temp_K > 0):
@@ -246,7 +246,7 @@ def convert_concentration(
     Raises
     ------
     ValueError
-        If from_unit is not recognised, or if the value is negative.
+        If from_unit is not recognized, or if the value is negative.
     """
     key = from_unit.strip()
     # Try case-insensitive match
@@ -257,7 +257,7 @@ def convert_concentration(
             break
     if matched is None:
         raise ValueError(
-            f"Unrecognised concentration unit {from_unit!r}. "
+            f"Unrecognized concentration unit {from_unit!r}. "
             f"Accepted: {list(_CONCENTRATION_FACTORS)}."
         )
     result = float(value) * _CONCENTRATION_FACTORS[matched]
@@ -290,12 +290,12 @@ def convert_viscosity(
     Raises
     ------
     ValueError
-        If from_unit is not recognised or value is non-positive.
+        If from_unit is not recognized or value is non-positive.
     """
     key = from_unit.strip().lower()
     if key not in _VISCOSITY_FACTORS:
         raise ValueError(
-            f"Unrecognised viscosity unit {from_unit!r}. "
+            f"Unrecognized viscosity unit {from_unit!r}. "
             f"Accepted: {sorted(_VISCOSITY_FACTORS)}."
         )
     result = float(value) * _VISCOSITY_FACTORS[key]
@@ -328,12 +328,12 @@ def convert_count_rate(
     Raises
     ------
     ValueError
-        If from_unit is not recognised.
+        If from_unit is not recognized.
     """
     key = from_unit.strip().lower()
     if key not in _COUNT_RATE_FACTORS:
         raise ValueError(
-            f"Unrecognised count-rate unit {from_unit!r}. "
+            f"Unrecognized count-rate unit {from_unit!r}. "
             f"Accepted: {sorted(_COUNT_RATE_FACTORS)}."
         )
     return np.asarray(values, dtype=float) * _COUNT_RATE_FACTORS[key]
@@ -362,12 +362,12 @@ def convert_trace_times(
     Raises
     ------
     ValueError
-        If from_unit is not recognised.
+        If from_unit is not recognized.
     """
     key = from_unit.strip().lower()
     if key not in _TRACE_TIME_FACTORS:
         raise ValueError(
-            f"Unrecognised trace-time unit {from_unit!r}. "
+            f"Unrecognized trace-time unit {from_unit!r}. "
             f"Accepted: {sorted(_TRACE_TIME_FACTORS)}."
         )
     return np.asarray(values, dtype=float) * _TRACE_TIME_FACTORS[key]

@@ -305,7 +305,7 @@ class ALVCorrelatorParser(BaseDLSParser):
 class ALVTraceParser(BaseTraceParser):
     """ALV ``.ASC`` -> one ``TraceFilePreview`` per active angle (count-rate trace).
 
-    Each trace is labelled with its angle so the user can pair it with the matching
+    Each trace is labeled with its angle so the user can pair it with the matching
     correlogram (the ``measurement_id`` back-reference is left for the confirmation
     step). Count rates are converted kHz -> cps.
     """

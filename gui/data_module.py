@@ -53,14 +53,14 @@ _PARAM_LABELS = {
     'analyzer_geometry': 'Polarization (DDLS)',
 }
 _STRING_KEYS = {'label', 'polymer_name', 'solvent_name', 'mw_fraction'}
-# Polarisation/analyser geometry: a dropdown, not a typed value. The blank label
-# means "unspecified" (None) -- ordinary polarised DLS, ignored by the depolarised
+# Polarization/analyzer geometry: a dropdown, not a typed value. The blank label
+# means "unspecified" (None) -- ordinary polarized DLS, ignored by the depolarized
 # analysis. Only VV + VH correlograms pair into D_r; VU is record-only.
 _GEOMETRY_KEY = 'analyzer_geometry'
 _GEOMETRY_BLANK = '—'
 _GEOMETRY_OPTIONS = (_GEOMETRY_BLANK, 'VV', 'VH', 'VU')
 # Solvent name: an EDITABLE dropdown over the primary-tier library solvents (free
-# text is preserved for non-library solvents + the existing alias/normalise path).
+# text is preserved for non-library solvents + the existing alias/normalize path).
 # Picking / editing it re-derives n and (for DLS) viscosity from the library.
 _SOLVENT_KEY = 'solvent_name'
 # The two auto-fillable, provenance-tagged fields, and their sidecar source keys
@@ -80,7 +80,7 @@ _QUANTITY = {
 }
 # Numeric params with a single fixed unit (already human-scale): shown, not chosen.
 _FIXED_UNIT = {
-    'angle_deg': 'deg',
+    'angle_deg': '°',
     'wavelength_nm': 'nm',
     'dn_dc_mL_per_g': 'mL/g',
 }
@@ -89,12 +89,11 @@ _FIXED_UNIT = {
 def _fmt_num(x: float) -> str:
     """Clean numeric display: no float-noise tail (0.00089, not 0.000890000…1)."""
     return f'{x:.10g}'
-# A changed-but-uncommitted cell is flagged yellow. We also force a dark text
-# colour: under the dark theme the default text is near-white, which is invisible
-# on yellow (the value you just typed disappears). Black-on-yellow is readable in
-# both themes.
-_DIRTY_BG = QtCore.Qt.GlobalColor.yellow
-_DIRTY_FG = QtCore.Qt.GlobalColor.black
+# A changed-but-uncommitted cell is flagged with a calm, theme-aware tint from the
+# `edited_bg`/`edited_fg` tokens (never a raw `Qt.GlobalColor.yellow`, which freezes on a
+# theme switch and fails contrast in dark mode — style guide §1 R1.4, §2 R2.4). The tint
+# is resolved at paint time in `_refresh_dirty`; the meaning is ALSO carried by a
+# non-colour cue (italic cell text) so it survives colour-blindness (§10 R10.1).
 
 
 class _EnterAdvanceDelegate(QtWidgets.QStyledItemDelegate):
@@ -143,7 +142,7 @@ class DataModule(QtWidgets.QWidget):
         layout.addWidget(self.header)
 
         layout.addWidget(section_header(
-            'Physical parameters — edit, then Update to apply',
+            'Physical Parameters — edit, then Update to apply',
             'Which parameters each analysis needs:',
             bullets=[
                 '<b>All:</b> solute &amp; solvent name, temperature, wavelength, '
@@ -195,7 +194,7 @@ class DataModule(QtWidgets.QWidget):
         # Provenance legend (the ONE place the dot's meaning + the never-overwrite
         # rule live as always-visible text; the per-cell tooltips carry only cell
         # facts). A plain QLabel renders the inline teal-dot HTML; it is re-rendered
-        # on a theme switch by changeEvent (a stylesheet colour would freeze).
+        # on a theme switch by changeEvent (a stylesheet color would freeze).
         self.legend = QtWidgets.QLabel()
         self.legend.setWordWrap(True)
         lf = self.legend.font()
@@ -211,7 +210,7 @@ class DataModule(QtWidgets.QWidget):
 
         row = QtWidgets.QHBoxLayout()
         self.update_button = QtWidgets.QPushButton('Update')
-        self.update_button.setToolTip('Apply the edited parameters to the sample.')
+        self.update_button.setToolTip('Update the edited parameters to the sample.')
         self.update_button.clicked.connect(self._on_update)
         self.undo_button = QtWidgets.QPushButton('Undo')
         self.undo_button.setToolTip(
@@ -252,10 +251,14 @@ class DataModule(QtWidgets.QWidget):
             self._set_enabled(False)
             self.pending.setText('')
             self.autofill_note.setText('')
+            # The provenance legend is data-dependent chrome (R8.2): hide it on an empty
+            # table so an unpopulated tab doesn't explain a dot that isn't there.
+            self.legend.hide()
             return
 
         lm = self.controller.workspace.measurements[item_id]
         self.keys = _DLS_PARAM_KEYS if lm.kind == 'dls' else _SLS_PARAM_KEYS
+        self.legend.show()
         self._build_rows()
         self._populate()
         self.header.setText(
@@ -303,22 +306,22 @@ class DataModule(QtWidgets.QWidget):
         self._suppress = False
 
     def _build_geometry_cell(self, row: int) -> None:
-        """Value column for the polarisation row: a VV/VH/VU/— dropdown."""
+        """Value column for the polarization row: a VV/VH/VU/— dropdown."""
         combo = QtWidgets.QComboBox()
         combo.addItems(_GEOMETRY_OPTIONS)
         combo.setToolTip(
-            'Polarisation/analyser geometry of this correlogram (incident, '
-            'analyser): VV = polarised, VH = depolarised, VU = no analyser, '
+            'Polarization/analyzer geometry of this correlogram (incident, '
+            'analyzer): VV = polarized, VH = depolarized, VU = no analyzer, '
             '— = unspecified. The DDLS sub-tab pairs a VV with a VH '
             'at each angle to extract rotational diffusion. Leave — for ordinary '
-            'polarised DLS.')
+            'polarized DLS.')
         combo.currentTextChanged.connect(self._on_geometry_changed)
         self.table.setCellWidget(row, 1, combo)
 
     def _build_solvent_cell(self, row: int) -> None:
         """Value column for the solvent row: an EDITABLE dropdown over the primary-tier
         library solvents. Editable keeps free-text entry for non-library solvents and
-        the existing normalise/alias path; picking or typing one re-derives n/viscosity
+        the existing normalize/alias path; picking or typing one re-derives n/viscosity
         from the library (via the controller)."""
         combo = QtWidgets.QComboBox()
         combo.setEditable(True)
@@ -542,7 +545,7 @@ class DataModule(QtWidgets.QWidget):
         self._advance_to_next_field()
 
     def _on_geometry_changed(self, text: str) -> None:
-        """Polarisation dropdown changed: store the per-measurement geometry."""
+        """Polarization dropdown changed: store the per-measurement geometry."""
         if self._suppress or self.item_id is None:
             return
         value = None if text == _GEOMETRY_BLANK else text
@@ -643,19 +646,29 @@ class DataModule(QtWidgets.QWidget):
         if self.item_id is None:
             return
         dirty = set(self.controller.dirty_keys(self.item_id))
+        # Resolve the tint at paint time from the tokens (theme-aware; a raw color would
+        # freeze on a theme switch). Italic is the colour-independent "edited" cue.
+        bg = theme_color(self, 'edited_bg')
+        fg = theme_color(self, 'edited_fg')
+        bg_hex, fg_hex = bg.name(), fg.name()
         self._suppress = True
         for r, key in enumerate(self.keys):
+            is_dirty = key in dirty
             if key in (_GEOMETRY_KEY, _SOLVENT_KEY):
                 # The value cell holds a combo widget; tint it (not the hidden item).
                 combo = self.table.cellWidget(r, 1)
                 if combo is not None:
                     combo.setStyleSheet(
-                        'background:yellow;color:black;' if key in dirty else '')
+                        f'background:{bg_hex};color:{fg_hex};font-style:italic;'
+                        if is_dirty else '')
                 continue
             cell = self.table.item(r, 1)
-            if key in dirty:
-                cell.setBackground(_DIRTY_BG)
-                cell.setForeground(_DIRTY_FG)
+            font = cell.font()
+            font.setItalic(is_dirty)
+            cell.setFont(font)
+            if is_dirty:
+                cell.setBackground(bg)
+                cell.setForeground(fg)
             else:
                 cell.setData(QtCore.Qt.ItemDataRole.BackgroundRole, None)
                 cell.setData(QtCore.Qt.ItemDataRole.ForegroundRole, None)
@@ -670,8 +683,8 @@ class DataModule(QtWidgets.QWidget):
         reads "teal dot + yellow bg = library value, pending commit". Only two states
         on the Data tab — teal (``library:primary``) or no dot (user / absent); the
         estimate-tier violet lives on the Solvent Explorer, not here. Every dot is
-        backed by the cell tooltip (§2d) so colour is never the only signal
-        (colourblind-safe). Bulk-grade dn/dT is deliberately NOT flagged here (Spec 1
+        backed by the cell tooltip (§2d) so color is never the only signal
+        (colorblind-safe). Bulk-grade dn/dT is deliberately NOT flagged here (Spec 1
         decision #5 — it is a docs-only caveat)."""
         if self.item_id is None:
             return
@@ -695,7 +708,7 @@ class DataModule(QtWidgets.QWidget):
         self._suppress = False
 
     def _dot_pixmap(self, role: str) -> QtGui.QPixmap:
-        """A small filled-circle pixmap in the theme colour for ``role`` (rebuilt on
+        """A small filled-circle pixmap in the theme color for ``role`` (rebuilt on
         each paint so it re-themes on a light/dark switch)."""
         size = 10
         pm = QtGui.QPixmap(size, size)
@@ -713,7 +726,7 @@ class DataModule(QtWidgets.QWidget):
         + the PER-CONDITION uncertainty at this sample's committed T/λ (Spec 3 — the
         same σ the auto-fill rounding used, so the tooltip's ± always matches the
         cell's precision; falls back to the box-wide figure if the condition can't be
-        evaluated). The shared behaviour (auto-fill / re-derive / never-overwrite) is
+        evaluated). The shared behavior (auto-fill / re-derive / never-overwrite) is
         stated once in the section ? help + the legend, not here. No citations
         (doc-rule #8) — 'sources: Advanced Guide'."""
         name = working.get(_SOLVENT_KEY)
@@ -756,7 +769,7 @@ class DataModule(QtWidgets.QWidget):
 
     def _render_legend(self) -> None:
         """(Re)render the provenance legend with the current theme's teal so the dot
-        colour tracks a light/dark switch (a QLabel stylesheet colour would freeze)."""
+        color tracks a light/dark switch (a QLabel stylesheet color would freeze)."""
         teal = theme_token(self, 'lib_primary')
         self.legend.setText(
             f'<span style="color:{teal}">●</span> library value (auto-filled)'
@@ -795,13 +808,14 @@ class DataModule(QtWidgets.QWidget):
 
     def changeEvent(self, ev: QtCore.QEvent) -> None:
         # A theme switch (app.setPalette) delivers PaletteChange: re-render the legend
-        # dot and repaint the cell provenance dots in the new theme's colours (a
-        # stylesheet colour would freeze — see gui.theme).
+        # dot and repaint the cell provenance dots in the new theme's colors (a
+        # stylesheet color would freeze — see gui.theme).
         # `hasattr` guards a PaletteChange that arrives before _build_ui finishes.
         if ev.type() == QtCore.QEvent.Type.PaletteChange and hasattr(self, 'legend'):
             self._render_legend()
             if self.item_id is not None:
                 self._refresh_provenance()
+                self._refresh_dirty()      # re-resolve the edited-cell tint for the theme
         super().changeEvent(ev)
 
     def _refresh_pending(self) -> None:

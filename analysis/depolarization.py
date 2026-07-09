@@ -14,7 +14,7 @@ correlation-function decay rates) is a later phase and lives elsewhere.
 What it computes
 ----------------
 Given the polarized (VV) and depolarized (VH) scattered intensities measured with
-VERTICALLY polarised incident light -- the geometry of essentially every modern
+VERTICALLY polarized incident light -- the geometry of essentially every modern
 instrument:
 
   rho_v   = I_VH / I_VV                     depolarization ratio (the primary obs.)
@@ -32,12 +32,12 @@ intensities, applies validity flags and provenance, and returns a result object.
 
 Convention (pinned here, used everywhere)
 -----------------------------------------
-Two-letter subscripts are (incident, analyser): VV = vertical incident + vertical
-analyser; VH = vertical incident + horizontal analyser. This matches Sivokhin &
+Two-letter subscripts are (incident, analyzer): VV = vertical incident + vertical
+analyzer; VH = vertical incident + horizontal analyzer. This matches Sivokhin &
 Kazantsev (2021) and physics/constants.py's Rayleigh-geometry codes. NOTE: Chu
-(1991) writes the depolarised ratio as R_HV with the OPPOSITE letter order
+(1991) writes the depolarized ratio as R_HV with the OPPOSITE letter order
 (scattered, incident) -- it is the same physical quantity as our I_VH. We use the
-(incident, analyser) order throughout.
+(incident, analyzer) order throughout.
 
 Uncertainty (per CLAUDE.md invariant 8)
 ---------------------------------------
@@ -51,7 +51,7 @@ delta method. No SE is invented from one shot.
 References (in project knowledge)
 ---------------------------------
   Chu 1991, Laser Light Scattering, 2nd ed., Sec. 8.4.1.A (Eqs. 8.4.7-8.4.10):
-      vertically-polarised-incident depolarization correction; delta^2.
+      vertically-polarized-incident depolarization correction; delta^2.
   Coumou, Mackor & Hijmans 1964 (natural-light Cabannes factor; via constants.py).
   Sivokhin & Kazantsev 2021 (toluene rho_v; rho_u <-> rho_v; via constants.py).
 
@@ -96,11 +96,11 @@ from physics.constants import (
 class DepolarizationResult:
     """Static depolarization analysis from one VV/VH intensity pair.
 
-    All quantities assume VERTICALLY polarised incident light (the modern default).
+    All quantities assume VERTICALLY polarized incident light (the modern default).
     `physically_valid` is False when rho_v falls outside [0, 3/4]; in that case the
     derived quantities are clamped/NaN and `note` explains why, rather than the
     analysis raising -- a slightly-out-of-range rho_v is usually instrumental
-    (stray depolarised light from polariser/analyser leakage, reflections, or an
+    (stray depolarized light from polarizer/analyzer leakage, reflections, or an
     over-subtracted dark count), which is a data-quality flag, not a crash.
     """
     # primary observable
@@ -126,17 +126,17 @@ class DepolarizationResult:
 # ===========================================================================
 
 def depolarization_ratio(i_vv: float, i_vh: float, dark_count: float = 0.0) -> float:
-    """Depolarization ratio rho_v = I_VH / I_VV for vertically polarised incident light.
+    """Depolarization ratio rho_v = I_VH / I_VV for vertically polarized incident light.
 
     Parameters
     ----------
     i_vv : float
-        Polarized (vertical analyser) scattered intensity, vertical incident.
+        Polarized (vertical analyzer) scattered intensity, vertical incident.
     i_vh : float
-        Depolarized (horizontal analyser) scattered intensity, vertical incident.
+        Depolarized (horizontal analyzer) scattered intensity, vertical incident.
     dark_count : float, optional
         Detector dark count / baseline subtracted from BOTH intensities before the
-        ratio (default 0). The depolarised channel is weak, so an un-subtracted
+        ratio (default 0). The depolarized channel is weak, so an un-subtracted
         dark count biases rho_v high; subtract it when known.
 
     Returns
@@ -172,7 +172,7 @@ def analyze_depolarization(
 
     Computes rho_v and, from it, the natural-light ratio rho_u, the optical
     anisotropy delta^2, and the Cabannes isotropic factor f (R_iso = R_VV * f).
-    Assumes vertically polarised incident light.
+    Assumes vertically polarized incident light.
 
     Parameters
     ----------
@@ -195,8 +195,8 @@ def analyze_depolarization(
     rho_v outside [0, 3/4] does not raise: it sets physically_valid=False, records
     why in `note`, and leaves delta^2 = nan (and the Cabannes factor still computed
     from the linear form, which stays finite). rho_v <= 0 means no resolvable
-    depolarisation; rho_v > 3/4 is unphysical for an anisotropic scatterer and
-    signals instrumental stray depolarised light.
+    depolarization; rho_v > 3/4 is unphysical for an anisotropic scatterer and
+    signals instrumental stray depolarized light.
     """
     rho_v = depolarization_ratio(i_vv, i_vh, dark_count=dark_count)
     vv = i_vv - dark_count
@@ -220,14 +220,14 @@ def analyze_depolarization(
         delta_sq = float('nan')
         if rho_v >= _RHO_V_DEPOLARIZATION_LIMIT:
             notes.append(
-                f"rho_v = {rho_v:.4g} is at/above the depolarisation limit 3/4; the "
+                f"rho_v = {rho_v:.4g} is at/above the depolarization limit 3/4; the "
                 f"isotropic scattering vanishes and delta^2 diverges -- check for "
-                f"stray depolarised light (polariser/analyser leakage, reflections)."
+                f"stray depolarized light (polarizer/analyzer leakage, reflections)."
             )
     if rho_v < 0.0:
         notes.append(
             f"rho_v = {rho_v:.4g} is negative -- I_VH below the dark count or an "
-            f"over-subtracted baseline; no resolvable depolarisation."
+            f"over-subtracted baseline; no resolvable depolarization."
         )
 
     # Cabannes factor uses the linear form 1 - (4/3) rho_v, finite for any rho_v;
@@ -264,10 +264,10 @@ def analyze_depolarization(
 def isotropic_rayleigh_ratio(r_vv: float, rho_v: float) -> float:
     """Isotropic excess Rayleigh ratio from the measured VV ratio (Cabannes correction).
 
-    R_iso = R_VV * (1 - (4/3) rho_v)    [vertically polarised incident light]
+    R_iso = R_VV * (1 - (4/3) rho_v)    [vertically polarized incident light]
 
     This is the value the Zimm / Debye / Berry Mw-Rg-A2 analysis should use when the
-    scatterer is optically anisotropic: it strips the depolarised contribution that
+    scatterer is optically anisotropic: it strips the depolarized contribution that
     otherwise inflates the apparent molecular weight (Mw_app = Mw (1 + (4/5) delta^2);
     Chu 1991 Eq. 8.4.8). For an isotropic scatterer rho_v = 0 and R_iso = R_VV.
 
@@ -276,7 +276,7 @@ def isotropic_rayleigh_ratio(r_vv: float, rho_v: float) -> float:
     r_vv : float
         Measured VV excess Rayleigh ratio (any units; the factor is dimensionless).
     rho_v : float
-        Vertical-incident depolarisation ratio, 0 <= rho_v <= 3/4.
+        Vertical-incident depolarization ratio, 0 <= rho_v <= 3/4.
 
     Returns
     -------
@@ -299,8 +299,8 @@ def isotropic_rayleigh_ratio(r_vv: float, rho_v: float) -> float:
 # correlation decay rates are (Zero & Pecora 1982, Eqs. III.1/III.2; the
 # rotational 6*Theta term from Pecora 1964):
 #
-#     Gamma_VV = q^2 D_t                 (polarised; translation only)
-#     Gamma_VH = q^2 D_t + 6 D_r         (depolarised; + rotational diffusion)
+#     Gamma_VV = q^2 D_t                 (polarized; translation only)
+#     Gamma_VH = q^2 D_t + 6 D_r         (depolarized; + rotational diffusion)
 #
 # so the rotational diffusion coefficient is D_r = (Gamma_VH - Gamma_VV) / 6, and
 # a multi-angle plot of Gamma_VV vs q^2 gives D_t (slope, through the origin).
@@ -331,7 +331,7 @@ _DDLS_QL_SINGLE_EXP_LIMIT: float = 3.0
 
 @dataclass
 class DDLSRatePoint:
-    """One angle's fitted FIELD decay rates for the polarised/depolarised pair.
+    """One angle's fitted FIELD decay rates for the polarized/depolarized pair.
 
     Built by the controller from a VV and a VH correlogram measured at the same
     angle (each fitted with the cumulant engine to its field rate Gamma). The pure
@@ -522,7 +522,7 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
 # closed-form power law (delta method). The rod inverse is nonlinear with no closed
 # form, so its SEs are propagated by MONTE CARLO (sample D_t, D_r from their SEs,
 # invert each, take the spread) -- which is the sampling SD directly, so there is no
-# linearisation to validate separately (CLAUDE.md invariant 8).
+# linearization to validate separately (CLAUDE.md invariant 8).
 
 
 @dataclass
@@ -629,7 +629,7 @@ def rod_dimensions_from_diffusion(
     Solves the 2-D problem via the 1-D reduction in `_solve_rod_pld`. When both SEs
     are given, the dimension SEs are propagated by Monte Carlo: sample D_t, D_r from
     independent normals, invert each, and take the spread (the sampling SD -- no
-    linearisation). `in_valid_range` is False when the recovered p falls outside the
+    linearization). `in_valid_range` is False when the recovered p falls outside the
     Tirado-fitted 2 < p < 30 (the dimensions are then extrapolated); `converged` is
     False when no rod reproduces both coefficients (the rod model does not fit).
     """

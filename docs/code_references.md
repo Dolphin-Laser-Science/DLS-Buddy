@@ -166,7 +166,7 @@ in-source; listed so a forker can find where each lives.
 | **Zimm / Berry / Debye** plots | `analysis/sls.py` (Zimm/Berry `:497–664`, Debye `:404–445`) | Berry = √-ordinate variant for high `qRg` |
 | **Guinier** plot | `analysis/sls.py` (`guinier_analysis`) | ln(ΔR) vs q²; Rg from slope (Guinier 1939) |
 | **Kohlrausch–Williams–Watts (KWW)** | `analysis/dls/exponentials.py` (`fit_kww`) | stretched exponential |
-| **Tikhonov regularisation** | `analysis/dls/distributions.py` (CONTIN, `fit_contin`) | 2nd-difference operator; L-curve corner |
+| **Tikhonov regularization** | `analysis/dls/distributions.py` (CONTIN, `fit_contin`) | 2nd-difference operator; L-curve corner |
 | **Non-negative least squares (NNLS)** | `analysis/dls/distributions.py` (`fit_nnls`) | `scipy.optimize.nnls` |
 | **Freedman–Diaconis** rule | `analysis/trace_analysis.py` (`_freedman_diaconis_bins`) | histogram bin width |
 | **Sturges'** rule | `analysis/trace_analysis.py` (`_sturges_bins`) | histogram bin fallback |

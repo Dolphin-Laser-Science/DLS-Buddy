@@ -9,6 +9,154 @@ window title.
 
 ---
 
+## 0.20.0 — Uncertainty-driven result precision (2026-07-09)
+
+Results are now shown to the precision their uncertainty actually supports — no more digits
+than the ± justifies. The numbers themselves are unchanged; only how many are displayed.
+
+- **A value with a ± is rounded to the place its ± supports.** If an Rh, Rg, or Mw carries a
+  standard error, the displayed value is rounded to the last digit that error can stand
+  behind (e.g. a Rg with a ±2 nm SE shows as `42 nm`, not `41.7 nm` — reporting the tenths
+  would imply confidence the data doesn't support). This now applies across the Cross-Sample
+  ρ table (Rg/Rh), the DLS Summary sample-level Rh table, and the SLS results.
+- **The ± is shown at the same place**, so value and uncertainty always agree (`42 ± 2`, never
+  `41.7 ± 1.9`).
+- **Results with no honest uncertainty keep an honest, modest precision.** Any result without a
+  defensible ± — a size from a single correlogram, an NNLS/CONTIN distribution peak, a
+  single-angle Mw, and every derived number that carries no ± (Γ, PDI, R², qRg, distribution
+  weights, …) — is shown at a fixed number of significant figures instead (none is invented).
+  **3 by default**, adjustable under **Settings → Result Formatting → No-uncertainty precision**;
+  this one setting controls all of them uniformly. It *only* affects results with no ± — it never
+  changes the precision of a value that has a ± (that stays driven by the uncertainty). Note that
+  lowering it also coarsens R²/qRg.
+- **Consistent scientific notation.** Large/small numbers now render the same way everywhere
+  (e.g. `1.23e6`), whether or not the value carries a ±.
+
+## 0.19.0 — Unified "current sample" selection (2026-07-09)
+
+One sample is "active" at a time, and **every tab follows it** — no more tabs disagreeing
+about which sample you're looking at. No analysis or numbers change.
+
+- **The Workspace tree is now a real navigator for every tab.** Click a sample (or a
+  measurement, or a DLS/SLS heading) and Data, DLS, SLS, Cross-Sample, and I·sin θ all
+  switch to it. Previously the SLS / I·sin θ tabs kept their own last sample and
+  Cross-Sample ignored the tree entirely.
+- **The in-tab sample dropdowns and the sidebar are two ways to drive one choice.** Picking
+  a sample in a tab's dropdown moves the sidebar and the other tabs too; clicking in the
+  sidebar updates the dropdowns. One source of truth.
+- **A sample a tab can't show reads cleanly.** Focusing, say, a DLS-only sample while on the
+  SLS tab now shows "No SLS data for <sample>" (with the dropdown noting the same), instead
+  of silently staying on a different sample. Nothing is lost — your calibration and last
+  result are kept, so returning to the sample restores them.
+- Per-measurement ticking (the DLS overlay/fit checklists) is unchanged — that's a separate
+  choice from "which sample is active".
+
+## 0.18.0 — Accessibility floor (2026-07-08)
+
+Meets the accessibility floor: colour is never the only signal, text/UI contrast meets
+WCAG AA in both themes, and there are new appearance/interface settings. No analysis or
+numbers change.
+
+- **Colorblind-safe by default, and colour is never the sole cue.** Overlaid plot series
+  (co-plotted correlograms, Zimm concentrations) now differ by **marker shape / line
+  style** as well as colour, so they stay distinct for colorblind readers and in grayscale.
+  The default plot palette (Okabe–Ito) is colorblind-safe; the palette control notes this.
+- **Contrast pass.** A few theme colors were nudged so every text/label/marker color clears
+  WCAG AA against its background in both light and dark themes.
+- **Match plot to app theme (opt-in).** A new Settings option themes the on-screen plots to
+  a dark background when the app theme is dark. **Saved/exported images always stay white**
+  for clean, print-parity figures — this only changes what you see on screen.
+- **UI density.** A new Compact / Comfortable / Large setting scales the application text
+  size app-wide — larger for readability, compact for screen real-estate.
+- **Reopen last session on startup (off by default).** When enabled, the workspace is
+  auto-saved when you close the program and restored on the next launch; if the saved
+  session is missing or unreadable, the program starts empty.
+
+## 0.17.10 — Empty-state onboarding + layout polish (2026-07-08)
+
+Onboards a newcomer on the first screen and fixes the layout/polish defects that made the
+app look unfinished. No analysis or numbers change.
+
+- **Empty workspace onboards.** With nothing loaded, the Data / DLS / SLS / Cross-Sample
+  tabs now show a single centred call-to-action — "← Load a DLS correlogram or SLS
+  intensities to begin" — instead of full chrome over blank tables and plots. The DLS
+  correlogram no longer draws empty satellite/residual boxes before a curve exists, and the
+  Data provenance legend is hidden until a measurement is loaded.
+- **Distribution picker fixed.** The "Select all/none" and "Tick all at concentration/angle"
+  rows no longer overlap the measurement checklist — the list keeps a sensible minimum
+  height so the bulk-select rows always sit below it.
+- **Calmer "changed field" highlight.** An edited-but-unsaved parameter cell is now a calm,
+  theme-aware tint (readable in light and dark) with the value shown in italic — replacing
+  the hard full-yellow fill that was hard to read in dark mode.
+- **Correlogram title no longer clipped.** The "Correlogram — lin-log" title now clears the
+  y-axis gutter; the "double-click a side view to promote" hint moved below the plot. The
+  linear-scale side views are pinned to a sensible range so a very long delay window no
+  longer crushes the decay against the origin.
+- **Uncalibrated Mw reads honestly.** When there is no calibration, the absolute Mw is shown
+  as "— (uncalibrated)" at the value (not a meaningless large number). Rg and the
+  calibration-free 2·A₂·Mw product are unaffected — they remain valid without calibration.
+
+## 0.17.9 — In-program help: consistent tiers, fuller coverage (2026-07-08)
+
+A help-only pass; no analysis or numbers change. Brings the `?` badges and hover tooltips
+into one consistent system.
+
+- **No literature citations in the UI.** The CONTIN α-selection help no longer prints
+  author-year citations — the plain-language description stays and points to the Advanced
+  Guide, where the references live.
+- **New `?` help buttons** on the **Traces** and **Synthetic Generator** tabs (previously
+  the only tabs without one).
+- **Clearer SLS help.** The Data Mask and Depolarization boxes now put their how-to on a
+  `?` button (with a short hover note), instead of a long always-on paragraph.
+- **More tooltips where they were missing:** the VU/VV/VH standard-geometry selector (both
+  the SLS calibration panel and Settings), the calibration fields, the Guinier qRg limit,
+  the SLS method selector, and the Traces diagnostic selector.
+- **Trimmed the longest tooltips** to a sentence or two that point to the Advanced Guide.
+
+## 0.17.8 — Terminology & casing normalized (2026-07-08)
+
+A text-only consistency pass so the app reads as one voice — one verb per action, one
+spelling, one casing, one unit rendering. No logic, analysis, or exported numbers change;
+only user-facing labels.
+
+- **One word for "commit edits": Update.** The SLS "Apply parameters" button and the
+  Settings "Apply" button are now **Update** (matching the Data tab); the SLS pending note
+  reads "press Update".
+- **One word for "run an analysis": Run.** "Run fit", "Run DDLS", "Run analysis", and
+  "Compute depolarization" are all just **Run** now. ("Generate" for synthetic data is a
+  different action and keeps its name.)
+- **American spelling throughout** — analyse→analyze, normalised→normalized, grey→gray,
+  labelled→labeled, and the polarization/analyzer geometry tooltip.
+- **Consistent casing** — Title Case for tab and section titles ("Synthetic Generator",
+  "Physical Parameters", "Data Mask (Hide / Show)"); Sentence case for buttons and form
+  labels, each ending in a colon.
+- **One degree rendering** — "(deg)" in labels is now "(°)"; the Data table's angle unit
+  shows "°".
+- "Show all (clear mask)" on the SLS tab is now **Clear mask**.
+
+## 0.17.7 — Consistent warning tiers across DLS + Cross-Sample (2026-07-08)
+
+A visual-only pass that makes the two-tier warning system (settled in 0.11.1 "Calmer
+warnings") consistent everywhere. No analysis, thresholds, or wording changed — only which
+tier a flag is painted in, so the red alarm channel is spent only on genuine problems.
+
+- **Neutral DLS notes are now calm, not alarm-red.** On the Γ vs q² / D vs c and DDLS
+  views, an expected qualifier like "± statistical only" now renders as a steel-blue **ⓘ**
+  note instead of a bold red **⚠** — matching how the SLS tab already treats "apparent" /
+  "± statistical". A genuine problem (a non-diffusive Γ-q², or an unphysical rotational
+  diffusion D_r ≤ 0) still shows the red **⚠**.
+- **The Cross-Sample "uncalibrated" badges are now red, not amber.** The Mw / A₂ badges and
+  the panel banner flagged an uncalibrated (arbitrary-scale) value in amber; that condition
+  is a genuine data-quality problem and now uses the same red **⚠** as the SLS tab and the
+  amber tier goes back to meaning only "pending update".
+- **A skipped run reads the same everywhere.** In the size-distribution (NNLS/CONTIN) view a
+  measurement that failed to fit is now shown on the red flag line, the same channel the
+  cumulant/exponential view already uses, instead of being tucked into the muted status line.
+
+Under the hood: all these flags now route through one shared renderer that picks the colour
+tier *and* the matching ⚠/ⓘ glyph in a single place, so a flag's glyph and colour can never
+disagree.
+
 ## 0.17.6 — Internal cleanup + minor performance (2026-07-07)
 
 The last of the internal code-review batches: naming/doc/dead-code tidy-up and a few

@@ -22,14 +22,42 @@ from typing import Optional
 
 from PySide6 import QtCore, QtWidgets
 from matplotlib.lines import Line2D
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 
 from gui.widgets import GripSplitter
 
-# Colour of the drawn residual-resize grip line. Plots render on a white background
-# (plot-background theming is deferred), so a fixed mid-grey reads on both themes.
-_GRIP_COLOUR = '#888888'
+# Color of the drawn residual-resize grip line. Plots render on a white background
+# (plot-background theming is deferred), so a fixed mid-gray reads on both themes.
+_GRIP_COLOR = '#888888'
 
 from gui.theme import ThemedLabel
+
+
+class _WhiteSaveToolbar(NavigationToolbar2QT):
+    """A matplotlib navigation toolbar whose Save button always writes a WHITE figure,
+    regardless of the on-screen "match app theme" setting (locked export policy, style
+    guide R10.3). It recolours the live figure to white via
+    `plotting.plots.apply_figure_theme`, reuses matplotlib's own save dialog + savefig,
+    then restores the on-screen theme. When the plot is already white (the default) this
+    is a harmless no-op recolour."""
+
+    def save_figure(self, *args):
+        from plotting.plots import apply_figure_theme, onscreen_plot_dark
+        fig = self.canvas.figure
+        prev_dark = onscreen_plot_dark()
+        apply_figure_theme(fig, dark=False)
+        try:
+            super().save_figure(*args)          # mpl's file dialog + savefig (white bg)
+        finally:
+            apply_figure_theme(fig, dark=prev_dark)
+            self.canvas.draw_idle()
+
+
+def themed_navtoolbar(canvas, parent):
+    """A matplotlib `NavigationToolbar` whose Save always exports white (see
+    `_WhiteSaveToolbar`). Drop-in replacement for `NavigationToolbar(canvas, parent)`
+    at every embedded-plot site."""
+    return _WhiteSaveToolbar(canvas, parent)
 
 
 def make_canvas_expanding(canvas, min_height: int = 170,
@@ -107,7 +135,11 @@ def make_vertical_plot_stack(widgets, sizes=None, min_heights=None):
     for i, w in enumerate(widgets):
         splitter.addWidget(w)
         if min_heights is not None and i < len(min_heights):
-            w.setMinimumHeight(min_heights[i])
+            # Floor the requested minimum at the widget's own content minimum so a caller
+            # can never specify a value that lets the splitter squeeze a pane UNDER its
+            # children (which made the Distribution picker's bulk-select rows overlap the
+            # checklist — finding 5.1, style guide R3.2).
+            w.setMinimumHeight(max(min_heights[i], w.minimumSizeHint().height()))
     if sizes is not None:
         splitter.setSizes(list(sizes))
     return splitter
@@ -152,7 +184,7 @@ class _ResidualResizer:
         # draw) and painted on top in the draw_event via blitting, so it always tracks
         # the current gap position without triggering a redraw.
         self._grip = Line2D([0.45, 0.55], [0.5, 0.5], transform=fig.transFigure,
-                            color=_GRIP_COLOUR, lw=3.0, solid_capstyle='round',
+                            color=_GRIP_COLOR, lw=3.0, solid_capstyle='round',
                             zorder=12, animated=True, visible=False)
         fig.add_artist(self._grip)
         canvas.mpl_connect('button_press_event', self._press)

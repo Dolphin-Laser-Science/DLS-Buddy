@@ -10,7 +10,7 @@ Inner tabs (all built):
     Relative scale, outlier + running-average overlays, a histogram+Fano /
     block-variance sub-plot, ADF stationarity in the summary line).
   * **I·sin θ** — an optical-quality / alignment check over a sample's SLS
-    measurements, with an Absolute / Relative (normalised) scale toggle. For an
+    measurements, with an Absolute / Relative (normalized) scale toggle. For an
     ideal isotropic, dust-free scattering volume the curve is flat across angle.
   * **Synthetic data** — the synthetic-dataset generator (correlogram / trace /
     multi-angle DLS / SLS slices) with per-artifact Preview + Save.
@@ -31,16 +31,15 @@ from typing import List, Optional
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
-from matplotlib.backends.backend_qtagg import (
-    FigureCanvasQTAgg as FigureCanvas,
-    NavigationToolbar2QT as NavigationToolbar,
-)
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from app import units as U
 from gui.plot_controls import (
     make_split_panels, make_canvas_expanding, make_vertical_plot_stack,
+    themed_navtoolbar,
 )
+from gui.help import add_help_to_groupbox, section_header
 from gui.solvent_explorer_module import SolventExplorerModule
 from gui.theme import ThemedLabel
 from gui.widgets import roomy_tabs, SampleSelector, value_unit_row as _value_unit_row
@@ -66,7 +65,7 @@ from parsers.alv_asc import ALVTraceParser
 from parsers.brookhaven_dls import BrookhavenTraceParser
 from parsers.generic_trace import GenericTraceParser
 
-_OUTLIER_COLOUR = '#D55E00'   # Okabe-Ito vermilion, for the GUI-owned flag overlay
+_OUTLIER_COLOR = '#D55E00'   # Okabe-Ito vermilion, for the GUI-owned flag overlay
 _TRACE_CYCLE = ['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#E69F00',
                 '#56B4E9', '#F0E442', '#000000']   # Okabe-Ito, for overlays
 
@@ -101,7 +100,7 @@ _SYNTH_CONDITIONS = [
     ('solvent_refractive_index', 'n (solvent)', '1.33'),
 ]
 _SYNTH_DLS = [
-    ('angle_deg', 'Angle, single (deg)', '90'),
+    ('angle_deg', 'Angle, single (°)', '90'),
     ('beta', 'β (coherence)', '0.8'),
     ('noise_level', 'Noise level', '0.0'),
     ('n_points', 'Points', '200'),
@@ -142,6 +141,9 @@ class UtilitiesModule(QtWidgets.QWidget):
     # to the main window).
     workspaceChanged = QtCore.Signal()
     selectionChanged = QtCore.Signal()   # emitted when the I·sinθ sample changes (mirror)
+    # Emitted when the USER picks a sample in the I·sinθ dropdown, so the shell makes it
+    # the single active sample and fans it out to every tab + the sidebar (UI Batch 7).
+    sampleFocusRequested = QtCore.Signal(str)
 
     def __init__(self, controller, parent=None) -> None:
         super().__init__(parent)
@@ -170,7 +172,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         outer.addWidget(self.inner)
         self.inner.addTab(self._build_traces_tab(), 'Traces')
         self.inner.addTab(self._build_isin_tab(), 'I·sin θ')
-        self.inner.addTab(self._build_synth_tab(), 'Synthetic generator')
+        self.inner.addTab(self._build_synth_tab(), 'Synthetic Generator')
         # The Solvent Explorer is a self-contained global calculator; it seeds its
         # own solvent in its __init__ and ignores the sample selection by design.
         self.solvent_explorer = SolventExplorerModule(self.controller)
@@ -181,9 +183,10 @@ class UtilitiesModule(QtWidgets.QWidget):
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
 
-        # The tab owns its sample: pick it here rather than inheriting the sidebar
-        # focus (the sidebar only navigates). Only SLS-bearing samples can produce an
-        # I·sin θ plot (it needs the c = 0 angular intensities).
+        # The I·sin θ dropdown is a mirror/override of the shell's single active sample
+        # (UI Batch 7): picking here sets the active sample everywhere; the sidebar drives
+        # it too. Only SLS-bearing samples can produce an I·sin θ plot (it needs the c = 0
+        # angular intensities); an incompatible active sample shows a named empty-state.
         self.isin_selector = SampleSelector(
             self.controller,
             predicate=lambda s: s.has_sls or bool(s.solvent_reference_item_id),
@@ -198,7 +201,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel('Scale:'))
         self.isin_abs = QtWidgets.QRadioButton('Absolute')
-        self.isin_rel = QtWidgets.QRadioButton('Relative (normalised)')
+        self.isin_rel = QtWidgets.QRadioButton('Relative (normalized)')
         self.isin_abs.setChecked(True)
         group = QtWidgets.QButtonGroup(self)
         group.addButton(self.isin_abs)
@@ -214,7 +217,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.isin_fig = Figure(figsize=(4.7, 3.4))
         self.isin_canvas = make_canvas_expanding(FigureCanvas(self.isin_fig))
         self.isin_ax = self.isin_fig.add_subplot(111)
-        v.addWidget(NavigationToolbar(self.isin_canvas, w))
+        v.addWidget(themed_navtoolbar(self.isin_canvas, w))
         v.addWidget(self.isin_canvas, 1)
 
         self.isin_note = ThemedLabel('', role='hint', size=11)
@@ -229,7 +232,15 @@ class UtilitiesModule(QtWidgets.QWidget):
         w = QtWidgets.QWidget()
         _, left, right = make_split_panels(w, left_min_width=220, sizes=(220, 580))
 
-        left.addWidget(QtWidgets.QLabel('Traces to plot'))
+        left.addWidget(section_header('Traces to plot', 'Inspect count-rate traces '
+                                      'for drift, dust and stationarity.', bullets=[
+            'Tick one or more traces to overlay them; the focused trace drives the '
+            'stats line and the diagnostic sub-plot.',
+            '<b>Absolute</b> vs <b>Relative (baseline-normalized)</b> scale.',
+            'Overlays: flagged outliers and a running average.',
+            'The <b>Diagnostic</b> combo picks the sub-plot (count-rate histogram + '
+            'Fano check, or block-variance).',
+        ]))
         # A multi-select checklist (Select all/none), matching the DLS correlogram
         # tab's measurement selector (feedback 2026-06-26 #4): tick several traces to
         # overlay them. The focused trace drives the stats line + secondary diagnostic.
@@ -265,7 +276,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         trow = QtWidgets.QHBoxLayout()
         trow.addWidget(QtWidgets.QLabel('Scale:'))
         self.trace_abs = QtWidgets.QRadioButton('Absolute')
-        self.trace_rel = QtWidgets.QRadioButton('Relative (baseline-normalised)')
+        self.trace_rel = QtWidgets.QRadioButton('Relative (baseline-normalized)')
         self.trace_abs.setChecked(True)
         scale_group = QtWidgets.QButtonGroup(self)
         scale_group.addButton(self.trace_abs)
@@ -324,7 +335,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.trace_fig = Figure(figsize=(5.2, 3.4))
         self.trace_canvas = make_canvas_expanding(FigureCanvas(self.trace_fig))
         self.trace_ax = self.trace_fig.add_subplot(111)
-        tlay.addWidget(NavigationToolbar(self.trace_canvas, w))
+        tlay.addWidget(themed_navtoolbar(self.trace_canvas, w))
         tlay.addWidget(self.trace_canvas, 1)
         self.trace_stats = ThemedLabel(
             'Load a count-rate trace (ALV .ASC, or a two-column CSV).',
@@ -338,6 +349,10 @@ class UtilitiesModule(QtWidgets.QWidget):
         drow.addWidget(QtWidgets.QLabel('Diagnostic:'))
         self.diag_combo = QtWidgets.QComboBox()
         self.diag_combo.addItems(['Count-rate histogram', 'Block variance'])
+        self.diag_combo.setToolTip(
+            'Secondary diagnostic plotted below the trace: the count-rate histogram '
+            '(with a Poisson/Fano check) or the block-variance vs block-size curve. '
+            'See the Advanced Guide.')
         # Switching the sub-plot type reuses the cached diagnostics (or backgrounds
         # them for a long trace) rather than recomputing on the UI thread.
         self.diag_combo.currentIndexChanged.connect(self._on_diag_view_changed)
@@ -503,7 +518,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                 fl = self.controller.flag_trace_outliers(tid, k=self.outlier_k.value())
                 mask = np.asarray(fl.flagged_mask, dtype=bool)
                 self.trace_ax.plot(t[mask], disp(cr[mask]), 'o',
-                                   color=_OUTLIER_COLOUR, ms=4,
+                                   color=_OUTLIER_COLOR, ms=4,
                                    label=f'{fl.n_flagged} outliers (±{fl.k:g}√mean)')
                 self.trace_ax.legend(frameon=False, fontsize=8)
             except Exception:
@@ -691,7 +706,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                 continue
             if not previews:                     # no instrument matched → generic
                 previews = self._load_generic_trace(path)
-                if previews is None:             # user cancelled the units prompt
+                if previews is None:             # user canceled the units prompt
                     return
                 if not previews:
                     unreadable.append(os.path.basename(path))
@@ -724,7 +739,7 @@ class UtilitiesModule(QtWidgets.QWidget):
 
     def _load_generic_trace(self, path: str):
         """Parse a plain two-column trace and prompt for its units. Returns the
-        previews, [] if not a numeric table, or None if the user cancelled."""
+        previews, [] if not a numeric table, or None if the user canceled."""
         try:
             previews = GenericTraceParser().parse(path)
         except (ParseError, FileNotFoundError):
@@ -740,7 +755,7 @@ class UtilitiesModule(QtWidgets.QWidget):
 
     def _ask_trace_units(self):
         """Prompt for the time + count-rate units of a generic (plain-text) trace.
-        Returns (time_unit, count_rate_unit) or None if cancelled."""
+        Returns (time_unit, count_rate_unit) or None if canceled."""
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle('Trace units')
         form = QtWidgets.QFormLayout(dlg)
@@ -813,27 +828,36 @@ class UtilitiesModule(QtWidgets.QWidget):
         h.addWidget(scroll, 0)
 
         # Conditions (shared by DLS + SLS)
-        cond_box = QtWidgets.QGroupBox('Conditions (shared)')
+        cond_box = QtWidgets.QGroupBox('Conditions (Shared)')
+        add_help_to_groupbox(cond_box, 'Generate synthetic data from the inputs below.',
+                             bullets=[
+            'Produces DLS correlograms (from the size populations) and SLS Zimm sets '
+            '(from Mw / Rg / A₂), from the program’s own forward model.',
+            'These <b>Conditions</b> (wavelength, n, temperature, viscosity) are shared '
+            'by both.',
+            'Each artifact can be Previewed, Saved to a loadable file, or added to the '
+            'workspace.',
+        ])
         cform = QtWidgets.QFormLayout(cond_box)
         self.syn_cond = {}
         for key, label, default in _SYNTH_CONDITIONS:
             e = QtWidgets.QLineEdit(default)
             self.syn_cond[key] = e
-            cform.addRow(label, e)
+            cform.addRow(f'{label}:', e)
         # Temperature + viscosity with selectable units (feedback #14: default °C,
         # mPa·s). Stored in human units; converted to canonical (K, Pa·s) on read.
         self.syn_temp = QtWidgets.QLineEdit('25')
         self.syn_temp_unit = QtWidgets.QComboBox()
         self.syn_temp_unit.addItems(U.unit_options('temperature'))   # °C default
-        cform.addRow('Temperature', _value_unit_row(self.syn_temp, self.syn_temp_unit))
+        cform.addRow('Temperature:', _value_unit_row(self.syn_temp, self.syn_temp_unit))
         self.syn_visc = QtWidgets.QLineEdit('0.89')
         self.syn_visc_unit = QtWidgets.QComboBox()
         self.syn_visc_unit.addItems(U.unit_options('viscosity'))     # mPa·s default
-        cform.addRow('Viscosity', _value_unit_row(self.syn_visc, self.syn_visc_unit))
+        cform.addRow('Viscosity:', _value_unit_row(self.syn_visc, self.syn_visc_unit))
         left.addWidget(cond_box)
 
         # DLS sizes: populations + correlogram controls
-        dls_box = QtWidgets.QGroupBox('DLS sizes')
+        dls_box = QtWidgets.QGroupBox('DLS Sizes')
         dv = QtWidgets.QVBoxLayout(dls_box)
         dv.addWidget(QtWidgets.QLabel('Size populations (Rh drives the correlogram)'))
         self.pop_table = QtWidgets.QTableWidget(1, 3)
@@ -857,27 +881,27 @@ class UtilitiesModule(QtWidgets.QWidget):
         for key, label, default in _SYNTH_DLS:
             e = QtWidgets.QLineEdit(default)
             self.syn_dls[key] = e
-            dform.addRow(label, e)
+            dform.addRow(f'{label}:', e)
         dv.addLayout(dform)
         left.addWidget(dls_box)
 
         # SLS sample (Mw / Rg / A2 / dn-dc)
-        sls_box = QtWidgets.QGroupBox('SLS sample (thermodynamic)')
+        sls_box = QtWidgets.QGroupBox('SLS Sample (Thermodynamic)')
         sform = QtWidgets.QFormLayout(sls_box)
         self.syn_sls = {}
         for key, label, default in _SYNTH_SLS:
             e = QtWidgets.QLineEdit(default)
             self.syn_sls[key] = e
-            sform.addRow(label, e)
+            sform.addRow(f'{label}:', e)
         left.addWidget(sls_box)
 
         # Angle / concentration grid + calibration
-        grid_box = QtWidgets.QGroupBox('SLS / multi-angle grid')
+        grid_box = QtWidgets.QGroupBox('SLS / Multi-Angle Grid')
         gform = QtWidgets.QFormLayout(grid_box)
         self.syn_angles = QtWidgets.QLineEdit('35, 50, 65, 80, 95, 110, 125, 140')
         self.syn_concs = QtWidgets.QLineEdit('0.2, 0.4, 0.6, 1.0, 1.4')
-        gform.addRow('Angles (deg)', self.syn_angles)
-        gform.addRow('Concentrations (mg/mL)', self.syn_concs)
+        gform.addRow('Angles (°):', self.syn_angles)
+        gform.addRow('Concentrations (mg/mL):', self.syn_concs)
         crow = QtWidgets.QHBoxLayout()
         self.syn_cal_default = QtWidgets.QRadioButton('Default')
         self.syn_cal_uncal = QtWidgets.QRadioButton('Uncalibrated')
@@ -888,30 +912,30 @@ class UtilitiesModule(QtWidgets.QWidget):
         crow.addWidget(self.syn_cal_default)
         crow.addWidget(self.syn_cal_uncal)
         crow.addStretch(1)
-        gform.addRow('Calibration', crow)
+        gform.addRow('Calibration:', crow)
         left.addWidget(grid_box)
 
         # What to generate (Preview / Save per artifact)
-        gen_box = QtWidgets.QGroupBox('What to generate')
+        gen_box = QtWidgets.QGroupBox('What to Generate')
         gl = QtWidgets.QGridLayout(gen_box)
         gl.addWidget(QtWidgets.QLabel('Artifact'), 0, 0)
         gl.addWidget(QtWidgets.QLabel('Preview'), 0, 1)
         gl.addWidget(QtWidgets.QLabel('Save'), 0, 2)
         self.syn_preview = {}
         self.syn_save = {}
-        centre = QtCore.Qt.AlignmentFlag.AlignCenter
+        center = QtCore.Qt.AlignmentFlag.AlignCenter
         for r, (key, label, can_prev, can_save) in enumerate(_SYNTH_ARTIFACTS, 1):
             gl.addWidget(QtWidgets.QLabel(label), r, 0)
             if can_prev:
                 cb = QtWidgets.QCheckBox()
                 self.syn_preview[key] = cb
-                gl.addWidget(cb, r, 1, alignment=centre)
+                gl.addWidget(cb, r, 1, alignment=center)
             else:
-                gl.addWidget(QtWidgets.QLabel('–'), r, 1, alignment=centre)
+                gl.addWidget(QtWidgets.QLabel('–'), r, 1, alignment=center)
             if can_save:
                 cb = QtWidgets.QCheckBox()
                 self.syn_save[key] = cb
-                gl.addWidget(cb, r, 2, alignment=centre)
+                gl.addWidget(cb, r, 2, alignment=center)
         self.syn_preview['correlogram'].setChecked(True)   # a sensible default
         note = ThemedLabel(
             'Ticking Preview or Save generates that artifact; the workspace toggle '
@@ -967,7 +991,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.syn_fig = Figure(figsize=(4.3, 3.2))
         self.syn_canvas = make_canvas_expanding(FigureCanvas(self.syn_fig))
         self.syn_ax = self.syn_fig.add_subplot(111)
-        right.addWidget(NavigationToolbar(self.syn_canvas, w))
+        right.addWidget(themed_navtoolbar(self.syn_canvas, w))
         right.addWidget(self.syn_canvas, 1)
         self.syn_truth = ThemedLabel('Choose artifacts and Generate.',
                                      role='muted', size=11)
@@ -1316,28 +1340,37 @@ class UtilitiesModule(QtWidgets.QWidget):
         self._update_trace()
 
     def set_measurement(self, item_id: Optional[str]) -> None:
-        """Sidebar focus is a SOFT seed for the I·sinθ sample: adopt the focused
-        sample only if it can produce an I·sinθ plot, else keep the tab's own pick (the
-        selector is the source of truth — the sidebar merely navigates)."""
+        """Follow the shell's active sample (UI Batch 7): always adopt the focused
+        measurement's sample; an incompatible one shows a named empty-state, not the old
+        keep-last."""
         sid = self.controller.sample_id_of(item_id) if item_id is not None else None
+        self.show_active_sample(sid)
+
+    def show_active_sample(self, sid: Optional[str]) -> None:
+        """Point I·sin θ at the active sample `sid`: mirror the dropdown to it when it can
+        plot, else show a neutral placeholder there; `_update_isin` renders the plot or the
+        named empty-state."""
         self.isin_selector.refresh()
+        self.sample_id = sid
         if sid is not None and self.isin_selector.has_sample(sid):
             self.isin_selector.set_current_sample_id(sid)
-        self.sample_id = self.isin_selector.current_sample_id()
+        elif sid is not None:
+            self.isin_selector.show_incompatible('(active sample has no intensity data)')
         self._update_isin()
         self.selectionChanged.emit()          # repaint the sidebar mirror
 
     @QtCore.Slot(str)
     def _on_isin_sample(self, sid: str) -> None:
-        """The user picked a sample in the I·sinθ selector."""
-        self.sample_id = sid or None
-        self._update_isin()
-        self.selectionChanged.emit()
+        """The user picked a sample in the I·sinθ dropdown → ask the shell to make it the
+        single active sample (it fans back to `show_active_sample` + the sidebar)."""
+        self.sampleFocusRequested.emit(sid or '')
 
     def selected_item_ids(self) -> list:
         """The measurements of the I·sinθ sample (sidebar-mirror contract). Traces are a
-        separate store and are not mirrored here."""
-        if self.sample_id is None:
+        separate store and are not mirrored here. An INCOMPATIBLE active sample (showing
+        the named empty-state, not eligible in the selector) mirrors nothing — the tab
+        isn't plotting it, matching the SLS tab's behaviour (focused-review)."""
+        if self.sample_id is None or not self.isin_selector.has_sample(self.sample_id):
             return []
         s = self.controller.workspace.samples.get(self.sample_id)
         if s is None:
@@ -1362,7 +1395,18 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.isin_ax.clear()
         if self.sample_id is None:
             self.isin_note.setText(
-                'Select a measurement in the sidebar to choose a sample.')
+                'Pick a sample in the Workspace list (or the dropdown above).')
+            self.isin_canvas.draw_idle()
+            return
+        # An active sample that can't produce I·sin θ (no SLS / solvent reference): named
+        # empty-state, not a caught run error (UI Batch 7). `has_sample` is False for it
+        # (only the neutral placeholder is selected in the dropdown).
+        if not self.isin_selector.has_sample(self.sample_id):
+            s = self.controller.workspace.samples.get(self.sample_id)
+            label = _sample_label(s) if s is not None else self.sample_id
+            self.isin_note.setText(
+                f'No angular intensity data for {label} — I·sin θ needs SLS or a '
+                'solvent-reference curve. Pick another sample.')
             self.isin_canvas.draw_idle()
             return
         mode = 'normalized' if self.isin_rel.isChecked() else 'absolute'

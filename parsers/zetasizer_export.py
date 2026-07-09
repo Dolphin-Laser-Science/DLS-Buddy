@@ -35,7 +35,7 @@ Column -> field mapping
 -----------------------
     Sample Name       -> sample_label
     Material Name     -> polymer_name
-    Dispersant Name   -> solvent_name        (normalised against the vocabulary)
+    Dispersant Name   -> solvent_name        (normalized against the vocabulary)
     Dispersant RI     -> solvent_refractive_index
     Temperature (°C)  -> temperature_K        (+273.15)
     Viscosity (cP)    -> viscosity_Pa_s       (x 1e-3)

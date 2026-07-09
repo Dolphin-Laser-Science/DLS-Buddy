@@ -6,7 +6,7 @@ Shared multi-angle / multi-concentration front-end. These functions combine the
 single-measurement fits (cumulant / single-exponential) across angle (to test
 whether motion is diffusive and extract D) and across concentration (to extrapolate
 to infinite dilution). They also provide the public Rh <-> Gamma converters used by
-the visualisation layer.
+the visualization layer.
 
 Uncertainty (invariant 8): each angle / each concentration is an independent
 measurement, so the regression standard errors here ARE defensible (statistical
@@ -68,7 +68,7 @@ class GammaQ2Result:
     rh_se: Optional[float] = None
     se_estimator: str = 'hc3'             # covariance estimator behind the SEs
     # every eligible measurement's per-point Γ/q²/D_app + quality tag, attached by the
-    # controller run so the GUI table/greying come from the run (feedback 2026-07-06).
+    # controller run so the GUI table/graying come from the run (feedback 2026-07-06).
     all_points: Optional[list] = None
 
 
@@ -94,12 +94,12 @@ class ConcentrationExtrapolationResult:
     kd_se: Optional[float] = None
     se_estimator: str = 'hc3'             # covariance estimator behind the SEs
     # every eligible measurement's per-point D_app + quality tag, attached by the
-    # controller run so the GUI table/greying come from the run (feedback 2026-07-06).
+    # controller run so the GUI table/graying come from the run (feedback 2026-07-06).
     all_points: Optional[list] = None
 
 
 # ---------------------------------------------------------------------------
-# Rh <-> Gamma converters (for the visualisation toggle and general use)
+# Rh <-> Gamma converters (for the visualization toggle and general use)
 # ---------------------------------------------------------------------------
 
 def gamma_to_rh_nm(gamma_s_inv, q_m_inv, temperature_K, viscosity_Pa_s):
@@ -181,12 +181,12 @@ def analyze_gamma_q2(
     cumulant_method: str = 'linear',
     estimator: str = 'hc3',
 ) -> GammaQ2Result:
-    """Analyse Gamma vs q^2 across angles for one sample.
+    """Analyze Gamma vs q^2 across angles for one sample.
 
     Fits a decay rate at each angle, then examines its dependence on q^2.
     Translational diffusion gives Gamma = D q^2 (a line through the origin); the
     through-origin slope is the diffusion coefficient. Linearity diagnostics
-    flag non-diffusive behaviour.
+    flag non-diffusive behavior.
 
     Parameters
     ----------

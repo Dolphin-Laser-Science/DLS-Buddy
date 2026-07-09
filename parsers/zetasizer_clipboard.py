@@ -69,7 +69,7 @@ _FIRST_RECORD_COL = 1    # every column from here on is one record's correlogram
 
 _MICROSECONDS_TO_SECONDS = 1.0e-6   # lag times: µs -> s
 
-# Header column-1 text used to recognise the format (case-insensitive). The full
+# Header column-1 text used to recognize the format (case-insensitive). The full
 # phrase 'lag time' (not a bare 'lag' substring) so an unrelated tab file that
 # merely contains the letters "lag" somewhere in its first cell isn't mistaken for
 # Zetasizer clipboard data and read as wholesale NaN. Real clipboard copies write
@@ -183,7 +183,7 @@ class ZetasizerClipboardParser(BaseDLSParser):
                 f"row plus at least one data row."
             )
 
-        # --- recognise the format from the first column of the header row ---
+        # --- recognize the format from the first column of the header row ---
         header_parts = lines[_HEADER_ROW].split(_DELIMITER)
         header_col0 = header_parts[0].strip().lower() if header_parts else ''
         if _LAG_HEADER_TOKEN not in header_col0:

@@ -16,7 +16,7 @@ Origin reads as missing values. The Parameters row carries per-column metadata -
 for a wide-format Zimm table, for example, it encodes each column's concentration.
 
 This is an I/O module: its functions write files and return the path written. It
-contains no analysis logic; it only serialises result objects produced elsewhere.
+contains no analysis logic; it only serializes result objects produced elsewhere.
 
 Design notes
 ------------
@@ -25,7 +25,7 @@ Design notes
   exporter builds a list of these and calls it, so the format lives in one place.
 - Scalar results (Mw, Rg, A2, fit settings, calibration flags) are written as
   length-1 columns with their own Long Name and Units, so they import alongside
-  the data with full labelling rather than as an opaque comment block.
+  the data with full labeling rather than as an opaque comment block.
 - NaN/None are written as empty cells (Origin's missing-value convention).
 
 Change history
@@ -187,7 +187,7 @@ def export_correlogram_fit(measurement, result, file_path: str,
     """Export a parametric DLS fit (cumulant / single / double / KWW).
 
     Writes the fitted delay times, the measured g2-1 over that window, the model
-    curve, and the residuals, followed by the fit's scalar outputs as labelled
+    curve, and the residuals, followed by the fit's scalar outputs as labeled
     length-1 columns. Works for any result object exposing fit_tau_s,
     fitted_g2m1, residuals (all four parametric DLS results do).
 
@@ -267,7 +267,7 @@ def export_distribution(result, file_path: str, axis: str = 'rh',
                         ftest_prob_reject: Optional[float] = None) -> str:
     """Export an NNLS or CONTIN distribution (DistributionResult).
 
-    Writes the size/rate grid and the normalised weights. With axis='rh' the
+    Writes the size/rate grid and the normalized weights. With axis='rh' the
     grid is hydrodynamic radius (nm); with axis='gamma' it is decay rate (1/s).
     Both grids are always included so either can be plotted. The reconstructed
     correlogram fit and residuals are written alongside, plus scalar summaries.
@@ -301,7 +301,7 @@ def export_distribution(result, file_path: str, axis: str = 'rh',
         OriginColumn('Residual', '', 'data - fit', np.asarray(result.residuals, dtype=float)),
     ]
     # CONTIN records how alpha was chosen in the alpha column's Comments cell, so a
-    # distribution is never ambiguous about its regularisation (mirrors the SLS
+    # distribution is never ambiguous about its regularization (mirrors the SLS
     # provenance-in-Comments convention). NNLS/lognormal pass no selection method.
     if alpha_selection_method == 'ftest':
         alpha_note = (f'alpha by F-test, p_reject={ftest_prob_reject:.2f}'
@@ -330,7 +330,7 @@ def export_distribution(result, file_path: str, axis: str = 'rh',
 def export_lcurve(lcurve, file_path: str, delimiter: str = ',') -> str:
     """Export a CONTIN L-curve sweep (LCurveResult) for inspection."""
     columns = [
-        OriginColumn('alpha', '', 'regularisation parameter',
+        OriginColumn('alpha', '', 'regularization parameter',
                      np.asarray(lcurve.alphas, dtype=float)),
         OriginColumn('Residual norm', '', '||A x - y||^2',
                      np.asarray(lcurve.residual_norms, dtype=float)),
@@ -375,7 +375,7 @@ def export_ddls(result, file_path: str, *, shapes=None,
     and qL when a rod length was given) followed by the combined scalars (D_t, D_r
     with their SEs, Rh_t, the rotational time, ...). When `shapes` is supplied (the
     dict from controller.ddls_shape: 'rod' and/or 'sphere'), the model-derived
-    dimensions are appended as labelled scalar columns whose Comments cell records
+    dimensions are appended as labeled scalar columns whose Comments cell records
     that they assume a shape -- not a direct measurement.
     """
     columns = [
@@ -606,7 +606,7 @@ def export_zimm(rayleigh_results, zimm_result, file_path: str,
     Produces a wide table: q^2 in the first column, then one Kc/dR column per
     concentration (the Parameters row encoding each concentration), matching the
     Origin Zimm-plot workflow. The thermodynamic results from `zimm_result` are
-    appended as labelled scalar columns. The per-concentration and per-angle
+    appended as labeled scalar columns. The per-concentration and per-angle
     extrapolated intercepts are also written, for drawing the Zimm grid lines.
 
     Parameters

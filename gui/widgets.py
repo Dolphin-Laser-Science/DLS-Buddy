@@ -30,7 +30,7 @@ from typing import Callable, Iterable, Optional, Sequence
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from gui.help import section_header
-from gui.theme import color
+from gui.theme import color, ThemedLabel
 
 # Extra horizontal room added to every tab's size hint, in device-independent px.
 # Tunable: bump it if a label still clips on a particular font/DPI.
@@ -48,6 +48,38 @@ def value_unit_row(value_widget: QtWidgets.QWidget,
     holder = QtWidgets.QWidget()
     holder.setLayout(row)
     return holder
+
+
+# ---------------------------------------------------------------------------
+# Empty-state call-to-action (style guide §8, R8.1)
+# ---------------------------------------------------------------------------
+# The first-launch workspace CTA: it names the two sidebar Load buttons a newcomer must
+# find. Reused across the data-scoped tabs' content areas so an empty workspace onboards
+# instead of showing full chrome over blank tables/plots (findings 4.1, 4.2).
+LOAD_CTA = '← Load a DLS correlogram or SLS intensities to begin'
+
+
+class EmptyState(QtWidgets.QWidget):
+    """A centred, theme-aware call-to-action shown in a tab's content area (or any empty
+    panel) when there is nothing to show yet (style guide §8, R8.1).
+
+    Physics-free presentation only. One shared class, reused with tab-appropriate wording;
+    the workspace first-launch CTA is :data:`LOAD_CTA`. The message follows the theme (via
+    :class:`gui.theme.ThemedLabel`) so it re-colors on a light/dark switch."""
+
+    def __init__(self, text: str = LOAD_CTA,
+                 parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        v = QtWidgets.QVBoxLayout(self)
+        v.addStretch(1)
+        self._label = ThemedLabel(text, role='muted', size=15)
+        self._label.setWordWrap(True)
+        self._label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self._label)
+        v.addStretch(1)
+
+    def setText(self, text: str) -> None:
+        self._label.setText(text)
 
 
 class RoomyTabBar(QtWidgets.QTabBar):
@@ -80,7 +112,7 @@ def roomy_tabs(tab_widget: QtWidgets.QTabWidget) -> QtWidgets.QTabWidget:
 class _GripHandle(QtWidgets.QSplitterHandle):
     """A splitter handle that paints three centered grip dots over the default handle.
     Dots run across the handle's short axis (a vertical column for a horizontal splitter,
-    a horizontal row for a vertical one). The colour follows the theme (palette `Mid`)."""
+    a horizontal row for a vertical one). The color follows the theme (palette `Mid`)."""
 
     _DOT_RADIUS = 1.6
     _DOT_GAP = 5.0
@@ -95,15 +127,15 @@ class _GripHandle(QtWidgets.QSplitterHandle):
         cx, cy = r.center().x(), r.center().y()
         for k in (-1, 0, 1):
             if self.orientation() == QtCore.Qt.Orientation.Horizontal:
-                centre = QtCore.QPointF(cx, cy + k * self._DOT_GAP)   # vertical handle
+                center = QtCore.QPointF(cx, cy + k * self._DOT_GAP)   # vertical handle
             else:
-                centre = QtCore.QPointF(cx + k * self._DOT_GAP, cy)   # horizontal handle
-            p.drawEllipse(centre, self._DOT_RADIUS, self._DOT_RADIUS)
+                center = QtCore.QPointF(cx + k * self._DOT_GAP, cy)   # horizontal handle
+            p.drawEllipse(center, self._DOT_RADIUS, self._DOT_RADIUS)
         p.end()
 
     def changeEvent(self, ev) -> None:
         if ev.type() == QtCore.QEvent.Type.PaletteChange:
-            self.update()                    # recolour the dots on a theme switch
+            self.update()                    # recolor the dots on a theme switch
         super().changeEvent(ev)
 
 
@@ -123,7 +155,7 @@ class GripSplitter(QtWidgets.QSplitter):
 # ---------------------------------------------------------------------------
 # Shared measurement-selection layer (SelectionModel + MeasurementPicker)
 # ---------------------------------------------------------------------------
-# One idiom for "which measurements is this tab analysing?", used by every analysis
+# One idiom for "which measurements is this tab analyzing?", used by every analysis
 # tab: real checkboxes, INCLUDE-semantics (tick = use it), select-all/none, grouped by
 # sample. The model is GUI-side only (not persisted — architecture invariant #5: the
 # controller stays Qt-free/stateless about selection; analysis calls take the ticked
@@ -136,18 +168,28 @@ class SelectionModel(QtCore.QObject):
     analysis. Emits ``changed`` on any mutation so a bound :class:`MeasurementPicker`
     (or the sidebar mirror) re-syncs without manual bookkeeping.
 
-    Generalised from the DLS-only ``_OverlaySelection``. Insertion order is preserved so
-    each measurement keeps a stable overlay colour (`colour_for`) across tabs. Pass the
-    plotting colour cycle in via ``colour_cycle`` when overlay colours are needed (kept
+    Generalized from the DLS-only ``_OverlaySelection``. Insertion order is preserved so
+    each measurement keeps a stable overlay color (`color_for`) across tabs. Pass the
+    plotting color cycle in via ``color_cycle`` when overlay colors are needed (kept
     an argument so this module imports no plotting/physics)."""
 
     changed = QtCore.Signal()
 
     def __init__(self, parent: Optional[QtCore.QObject] = None, *,
-                 colour_cycle: Optional[Sequence[str]] = None) -> None:
+                 color_cycle=None, marker_cycle=None, linestyle_cycle=None) -> None:
         super().__init__(parent)
         self._ids: list[str] = []                       # ordered, unique
-        self._cycle = list(colour_cycle) if colour_cycle else None
+        # Each cycle may be a fixed sequence OR a zero-arg callable returning the current
+        # sequence — pass a callable (e.g. plotting.plots.cycle) when the source can change
+        # at runtime (a plot-palette switch rebinds the colour cycle), so this stays live
+        # instead of freezing a copy. `_resolve` normalises the two forms at read time.
+        self._cycle = color_cycle
+        # Parallel marker / linestyle cycles (injected so this module imports no
+        # plotting) so an overlaid series is distinguishable by SHAPE, not colour alone
+        # (WCAG 1.4.1 / greyscale — UI Batch 5). Keyed by the same insertion index as
+        # color_for, so each measurement keeps a stable (colour, marker, linestyle).
+        self._markers = marker_cycle
+        self._linestyles = linestyle_cycle
 
     def ids(self) -> list[str]:
         return list(self._ids)
@@ -177,7 +219,7 @@ class SelectionModel(QtCore.QObject):
             self.changed.emit()
 
     def set_only(self, iid: Optional[str]) -> None:
-        """Radio behaviour: make ``iid`` the sole ticked id (empty when None/''). Used by
+        """Radio behavior: make ``iid`` the sole ticked id (empty when None/''). Used by
         single-select pickers."""
         new = [iid] if iid else []
         if new != self._ids:
@@ -203,13 +245,31 @@ class SelectionModel(QtCore.QObject):
             self._ids = []
             self.changed.emit()
 
-    def colour_for(self, iid: str) -> Optional[str]:
-        """A stable palette colour keyed by the id's position, or None if no colour cycle
-        was supplied."""
-        if not self._cycle:
-            return None
-        idx = self._ids.index(iid) if iid in self._ids else len(self._ids)
-        return self._cycle[idx % len(self._cycle)]
+    def _index_of(self, iid: str) -> int:
+        return self._ids.index(iid) if iid in self._ids else len(self._ids)
+
+    @staticmethod
+    def _resolve(cyc):
+        """A cycle, whether it was supplied as a fixed sequence or a live callable."""
+        return cyc() if callable(cyc) else cyc
+
+    def color_for(self, iid: str) -> Optional[str]:
+        """A stable palette color keyed by the id's position, or None if no color cycle
+        was supplied. Re-reads the (possibly callable) cycle each call so a live palette
+        swap is reflected on the next redraw."""
+        cyc = self._resolve(self._cycle)
+        return cyc[self._index_of(iid) % len(cyc)] if cyc else None
+
+    def marker_for(self, iid: str) -> Optional[str]:
+        """A stable marker SHAPE keyed by the id's position (parallel to color_for), or
+        None if no marker cycle was supplied."""
+        cyc = self._resolve(self._markers)
+        return cyc[self._index_of(iid) % len(cyc)] if cyc else None
+
+    def linestyle_for(self, iid: str):
+        """A stable linestyle keyed by the id's position, or None if none supplied."""
+        cyc = self._resolve(self._linestyles)
+        return cyc[self._index_of(iid) % len(cyc)] if cyc else None
 
 
 class GroupTickBar(QtWidgets.QWidget):
@@ -298,7 +358,7 @@ class MeasurementPicker(QtWidgets.QWidget):
 
     Physics-free: the caller injects ``label_fn(lm) -> str`` and ``header_fn(sample) ->
     str`` so DLS/SLS/Utilities each supply their own row/group labels. ``kinds`` filters
-    which measurement kinds are eligible. ``single=True`` gives radio behaviour (ticking
+    which measurement kinds are eligible. ``single=True`` gives radio behavior (ticking
     one unticks the rest) for the sample-scoped tabs. Emits ``selectionChanged`` whenever
     the ticked set changes (a re-emit of the model's ``changed``)."""
 
@@ -308,7 +368,7 @@ class MeasurementPicker(QtWidgets.QWidget):
                  kinds: Sequence[str] = ('dls',),
                  label_fn: Callable[[object], str],
                  header_fn: Callable[[object], str],
-                 title: str = 'Measurements to plot',
+                 title: str = 'Measurements to Plot',
                  help_text: str = '', help_bullets: Optional[Sequence[str]] = None,
                  single: bool = False,
                  group_fields: Sequence[tuple] = (),
@@ -457,7 +517,7 @@ class MeasurementPicker(QtWidgets.QWidget):
 
     # -- theme --------------------------------------------------------------
     def _apply_palette(self) -> None:
-        """Recolour group headers and tint the ticked rows with `marker_selected` for the
+        """Recolor group headers and tint the ticked rows with `marker_selected` for the
         current theme. Named `_apply_palette` so `gui.theme.retheme` re-runs it on a theme
         switch (alongside the per-widget PaletteChange below)."""
         for i in range(self._list.count()):
@@ -468,7 +528,7 @@ class MeasurementPicker(QtWidgets.QWidget):
             elif it.checkState() == QtCore.Qt.CheckState.Checked:
                 it.setForeground(color(self._list, 'marker_selected'))
             else:
-                it.setForeground(QtGui.QBrush())   # reset → follow palette text colour
+                it.setForeground(QtGui.QBrush())   # reset → follow palette text color
 
     def changeEvent(self, ev: QtCore.QEvent) -> None:
         if ev.type() == QtCore.QEvent.Type.PaletteChange:
@@ -477,11 +537,17 @@ class MeasurementPicker(QtWidgets.QWidget):
 
 
 class SampleSelector(QtWidgets.QWidget):
-    """A labelled dropdown of SAMPLES for the sample-scoped analysis tabs (SLS, I·sinθ),
+    """A labeled dropdown of SAMPLES for the sample-scoped analysis tabs (SLS, I·sinθ),
     the sample-level analog of :class:`MeasurementPicker`. Lists the samples matching a
     ``predicate`` (e.g. "has SLS data"); emits ``sampleChanged(sample_id)`` (``''`` when
-    none) on a user pick. The tab owns its sample here rather than inheriting the shell's
-    focus — the sidebar merely navigates.
+    none) on a user pick.
+
+    Since UI Batch 7 the combo is a **mirror/override of the shell's single active sample**,
+    not an independent model: a user pick drives the active sample (the shell fans it out to
+    every tab + the sidebar); a sidebar focus is pushed back here via
+    :meth:`set_current_sample_id` (no emit). When the active sample is one this tab can't
+    display, :meth:`show_incompatible` puts a neutral placeholder here while the tab body
+    shows a named empty-state.
 
     ``predicate(sample) -> bool`` filters eligibility; ``label_fn(sample) -> str`` labels
     each row. A "?" help badge satisfies doc-rule #8."""
@@ -537,6 +603,25 @@ class SampleSelector(QtWidgets.QWidget):
                 self._combo.setCurrentIndex(i)
                 self._combo.blockSignals(False)
                 return
+
+    def show_incompatible(self, text: str) -> None:
+        """Show a neutral, non-selectable placeholder (`text`) for an active sample this
+        tab can't display — so the dropdown mirrors "the active sample has no data here"
+        instead of a stale, still-eligible pick (UI Batch 7). Selected WITHOUT emitting;
+        cleared by the next :meth:`refresh`. No-op when there are no eligible samples at
+        all (the combo already reads "(no eligible samples)"). The combo stays enabled so
+        the user can still open it and pick an eligible sample to leave the empty-state."""
+        if not self._combo.isEnabled():          # no eligible samples → keep that message
+            return
+        self._combo.blockSignals(True)
+        self._combo.addItem(text, None)
+        idx = self._combo.count() - 1
+        model = self._combo.model()
+        item = model.item(idx) if hasattr(model, 'item') else None
+        if item is not None:                     # grey it out in the drop-down list
+            item.setEnabled(False)
+        self._combo.setCurrentIndex(idx)
+        self._combo.blockSignals(False)
 
     def _on_changed(self, _i: int) -> None:
         self.sampleChanged.emit(self.current_sample_id() or '')

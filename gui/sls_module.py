@@ -4,7 +4,7 @@ gui/sls_module.py
 
 The SLS tab: static light scattering analysis for the selected SAMPLE. Unlike the
 DLS tab (one measurement), SLS is inherently per-sample — a Zimm set is a solvent
-reference (c = 0) plus a concentration series, analysed together. Selecting any
+reference (c = 0) plus a concentration series, analyzed together. Selecting any
 measurement in the sidebar makes this tab operate on its whole sample.
 
 It contains the visible **calibration panel** (manual entry of one calibrant point
@@ -12,9 +12,9 @@ It contains the visible **calibration panel** (manual entry of one calibrant poi
 Debye / single-angle / calibration-free A₂ / excess Rayleigh ratio). Everything is
 routed through the controller; no analysis or physics here.
 
-Commit model: calibration and parameters are session/working state. "Apply
-(commit)" commits them (and recomputes k_c); "Run analysis" uses the COMMITTED
-state. Soft flags (uncalibrated, apparent) are GUI overlays, never on the figure.
+Commit model: calibration and parameters are session/working state. "Update"
+commits them (and recomputes k_c); "Run" uses the COMMITTED state. Soft flags
+(uncalibrated, apparent) are GUI overlays, never on the figure.
 """
 
 from __future__ import annotations
@@ -25,10 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
-from matplotlib.backends.backend_qtagg import (
-    FigureCanvasQTAgg as FigureCanvas,
-    NavigationToolbar2QT as NavigationToolbar,
-)
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from plotting.plots import (
@@ -36,19 +33,25 @@ from plotting.plots import (
     plot_calibration_free_a2,
 )
 from gui.plot_controls import (
-    AxisControlBar, make_split_panels, make_canvas_expanding, make_vertical_plot_stack)
+    AxisControlBar, make_split_panels, make_canvas_expanding, make_vertical_plot_stack,
+    themed_navtoolbar)
 from gui.export_helper import export_to_csv
 from gui.help import add_help_to_groupbox
 from gui.plot_overlays import reissue_legend_preserving_title
 from gui.widgets import SampleSelector
-from gui.theme import ThemedLabel, span
+from gui.theme import ThemedLabel, set_flag, span
 from gui.worker import (
     BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, busy_notice, runner)
-from analysis.uncertainty import format_pm
+from analysis.uncertainty import format_fixed_sig, format_pm
 
 # Reminder appended where a calibration-dependent quantity (Mw, absolute A₂) is
 # shown with a ±: the SE is statistical (regression) only.
 _STAT_CAVEAT = ' (± statistical; excludes calibration & dn/dc)'
+
+# An absolute Mw from an uncalibrated run is on an arbitrary scale — not a meaningful
+# number. Rendered AT the value (not just in a below-fold flag) so the caveat travels with
+# it (finding 5.4). Rg and the calibration-free 2·A₂·Mw product survive and stay shown.
+_UNCAL_MW = '— (uncalibrated)'
 
 # Shown when a redisplayed (cached) SLS fit no longer matches its committed params /
 # mask / calibration / estimator — the same explicit-Run + staleness-hint contract the
@@ -88,7 +91,7 @@ _SLS_METHODS: List[Tuple[str, str]] = [
 # Calibration line-edit fields: (attribute, label, allow_blank_as_None).
 _CAL_FIELDS = [
     ('calibrant_intensity', 'Calibrant intensity', True),
-    ('calibrant_angle_deg', 'Calibrant angle (deg)', False),
+    ('calibrant_angle_deg', 'Calibrant angle (°)', False),
     ('standard_wavelength_nm', 'Standard wavelength (nm)', False),
     ('standard_temperature_C', 'Standard temperature (°C)', False),
     ('standard_refractive_index', 'Standard refractive index', True),
@@ -105,20 +108,28 @@ _CAL_TOOLTIPS = {
     'dark_count_rate':
         'Detector dark count, in the SAME units as your SLS intensity file; it is '
         'subtracted from each intensity before the Rayleigh ratio.',
+    'calibrant_angle_deg':
+        'Scattering angle at which the calibrant intensity was measured.',
+    'standard_wavelength_nm':
+        'Laser wavelength used for the calibration standard (normally the same as '
+        'the sample measurement).',
+    'standard_temperature_C':
+        'Temperature of the calibration standard; it sets the standard’s Rayleigh '
+        'ratio (toluene’s is temperature-dependent). See the Advanced Guide.',
+    'standard_refractive_index':
+        'Refractive index of the calibration standard at this wavelength and '
+        'temperature; enters the (n_solvent/n_standard)² correction.',
 }
-
-
-def _fmt(x: Optional[float], sig: int = 3) -> str:
-    if x is None or not (isinstance(x, (int, float)) and math.isfinite(x)):
-        return 'n/a'
-    return f'{x:.{sig}g}'
 
 
 class SLSModule(QtWidgets.QWidget):
     """Per-sample SLS analysis with a calibration panel."""
 
     committed = QtCore.Signal()   # emitted after Apply (grouping/k_c may change)
-    selectionChanged = QtCore.Signal()   # emitted when the analysed sample changes (mirror)
+    selectionChanged = QtCore.Signal()   # emitted when the analyzed sample changes (mirror)
+    # Emitted when the USER picks a sample in this tab's dropdown, so the shell makes it
+    # the single active sample and fans it out to every tab + the sidebar (UI Batch 7).
+    sampleFocusRequested = QtCore.Signal(str)
 
     def __init__(self, controller, parent=None) -> None:
         super().__init__(parent)
@@ -143,7 +154,7 @@ class SLSModule(QtWidgets.QWidget):
         self._fraction: Optional[str] = None
         self._suppress_fraction = False
         # Last-run memory (within-session) keyed by (sample_id, fraction): which
-        # method + axis points were last analysed, so switching samples/fractions
+        # method + axis points were last analyzed, so switching samples/fractions
         # and back restores the view. SLS re-runs cheaply from committed state (+
         # persisted masks), so we replay the run rather than caching result objects.
         self._last_run_by_sample: Dict[tuple, Dict] = {}
@@ -159,16 +170,17 @@ class SLSModule(QtWidgets.QWidget):
         # has long calibration labels and a wide button, so it keeps a minimum width.
         _, left, right = make_split_panels(self, left_min_width=340)
 
-        # The tab OWNS its sample: pick it here (samples that have SLS data) rather
-        # than inheriting the sidebar focus — the sidebar only navigates. A whole
-        # Zimm set (solvent ref + concentration series) is analysed per sample.
+        # The SLS dropdown is a mirror/override of the shell's single active sample
+        # (UI Batch 7): picking here sets the active sample everywhere; clicking a sample
+        # in the sidebar drives this too. A whole Zimm set (solvent ref + concentration
+        # series) is analyzed per sample.
         self.sls_selector = SampleSelector(
             self.controller, predicate=lambda s: s.has_sls,
-            label_fn=_sample_label, title='SLS sample',
-            help_text='Choose which sample to analyse (its whole Zimm set).',
+            label_fn=_sample_label, title='SLS Sample',
+            help_text='Choose which sample to analyze (its whole Zimm set).',
             help_bullets=['Only samples that have SLS intensity data appear.',
-                          'Selecting a sample here (not the sidebar) sets what SLS '
-                          'analyses.'])
+                          'Picking here — or clicking a sample in the Workspace — sets '
+                          'the active sample for every tab.'])
         self.sls_selector.sampleChanged.connect(self._on_sls_sample)
         left.addWidget(self.sls_selector)
 
@@ -212,7 +224,7 @@ class SLSModule(QtWidgets.QWidget):
 
         self.figure = Figure(figsize=(5.5, 4.6))
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
-        self.nav_toolbar = NavigationToolbar(self.canvas, self)
+        self.nav_toolbar = themed_navtoolbar(self.canvas, self)
         right.addWidget(self.nav_toolbar)
         right.addWidget(self.canvas, 1)
         self.axis_bar = AxisControlBar(self.canvas)
@@ -261,6 +273,10 @@ class SLSModule(QtWidgets.QWidget):
 
         self.geometry_combo = QtWidgets.QComboBox()
         self.geometry_combo.addItems(['VU', 'VV', 'VH'])
+        self.geometry_combo.setToolTip(
+            'Scattering geometry of the calibration standard: VV = polarized, '
+            'VH = depolarized, VU = no analyzer (e.g. the BI-200SM). '
+            'See the Advanced Guide.')
         self.geometry_combo.currentTextChanged.connect(self._on_geometry_changed)
         form.addRow('Standard geometry:', self.geometry_combo)
 
@@ -270,7 +286,7 @@ class SLSModule(QtWidgets.QWidget):
         # the Rayleigh-ratio-per-intensity calibration constant, not the q²+k·c grid k.
         form.addRow('Calibration k_c:', self.kc_label)
 
-        self.apply_button = QtWidgets.QPushButton('Apply parameters')
+        self.apply_button = QtWidgets.QPushButton('Update')
         self.apply_button.clicked.connect(self._on_apply)
         form.addRow(self.apply_button)
         return box
@@ -288,7 +304,7 @@ class SLSModule(QtWidgets.QWidget):
             'expected qualifier (e.g. “apparent”, “± statistical only”) — not a problem; '
             'a bold red <b>⚠</b> is a genuine data-quality issue (uncalibrated, or the '
             'two extrapolation routes disagree by &gt;10%).',
-            '<b>Run analysis</b> is the only thing that computes a fit. Switching sample '
+            '<b>Run</b> is the only thing that computes a fit. Switching sample '
             'or fraction, or committing a parameter, redisplays the last fit and — if the '
             'inputs changed — flags it “press Run to refresh” rather than silently '
             'recomputing. Hiding/showing a point (mask) refits immediately.',
@@ -299,7 +315,7 @@ class SLSModule(QtWidgets.QWidget):
 
         # Molecular-weight fraction selector. A Mw series shares one solvent
         # reference but holds several fractions ("250k", "1M", ...); each is its own
-        # Zimm fit. Hidden/disabled when a sample has just one (unlabelled) fraction.
+        # Zimm fit. Hidden/disabled when a sample has just one (unlabeled) fraction.
         self.fraction_combo = QtWidgets.QComboBox()
         self.fraction_combo.currentIndexChanged.connect(self._on_fraction_changed)
         self.fraction_label = QtWidgets.QLabel('Mw fraction:')
@@ -308,6 +324,10 @@ class SLSModule(QtWidgets.QWidget):
         self.method_combo = QtWidgets.QComboBox()
         for label, key in _SLS_METHODS:
             self.method_combo.addItem(label, key)
+        self.method_combo.setToolTip(
+            'Zimm / Berry: thermodynamic Mw, Rg and A₂ (extrapolated to zero angle and '
+            'zero concentration). Debye / Guinier / single-angle: apparent (one '
+            'condition). Calibration-free 2·A₂·Mw needs no calibration.')
         self.method_combo.currentIndexChanged.connect(self._on_method_changed)
         form.addRow('Method:', self.method_combo)
 
@@ -347,7 +367,7 @@ class SLSModule(QtWidgets.QWidget):
         self.mw_display = ThemedLabel('', role='muted')
         form.addRow('', self.mw_display)
 
-        self.run_button = QtWidgets.QPushButton('Run analysis')
+        self.run_button = QtWidgets.QPushButton('Run')
         self.run_button.setToolTip(BACKGROUND_RUN_TOOLTIP)
         self.run_button.clicked.connect(self._on_run)
         form.addRow(self.run_button)
@@ -360,7 +380,13 @@ class SLSModule(QtWidgets.QWidget):
         return box
 
     def _build_mask_group(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox('Data mask (hide / show)')
+        box = QtWidgets.QGroupBox('Data Mask (Hide / Show)')
+        add_help_to_groupbox(box, 'Hide points from the fit.', bullets=[
+            'Untick an angle or concentration to hide all of its points.',
+            'Or click a single point on the plot to hide/show just it.',
+            'Hidden points show as hollow gray “masked” markers; the fit re-runs '
+            'on the shown points.',
+        ])
         v = QtWidgets.QVBoxLayout(box)
         lists = QtWidgets.QHBoxLayout()
         acol = QtWidgets.QVBoxLayout()
@@ -378,14 +404,11 @@ class SLSModule(QtWidgets.QWidget):
         lists.addLayout(acol)
         lists.addLayout(ccol)
         v.addLayout(lists)
-        self.clear_mask_button = QtWidgets.QPushButton('Show all (clear mask)')
+        self.clear_mask_button = QtWidgets.QPushButton('Clear mask')
         self.clear_mask_button.clicked.connect(self._on_clear_masks)
         v.addWidget(self.clear_mask_button)
-        hint = ThemedLabel('Untick an angle or concentration to hide it; the '
-                           'analysis re-runs on the shown points (hidden ones '
-                           'show as hollow grey markers, labelled "masked" in the '
-                           'legend). Or click a point on the plot to '
-                           'hide/show just that point.', role='hint', size=11)
+        hint = ThemedLabel('Untick to hide, or click a point on the plot.',
+                           role='hint', size=11)
         hint.setWordWrap(True)
         v.addWidget(hint)
         return box
@@ -393,17 +416,24 @@ class SLSModule(QtWidgets.QWidget):
     def _build_depolarization_group(self) -> QtWidgets.QGroupBox:
         # Static depolarized light scattering (DPLS Phase 1). A standalone calculator:
         # enter the VV and VH intensities (or rho_v directly) and read off the
-        # depolarisation ratio, optical anisotropy, and the Cabannes correction that
-        # strips anisotropy inflation from Mw. Assumes vertically polarised incident
+        # depolarization ratio, optical anisotropy, and the Cabannes correction that
+        # strips anisotropy inflation from Mw. Assumes vertically polarized incident
         # light (the modern default). Not yet tied to loaded VV/VH series -- that
-        # pairing waits for a real depolarised-acquisition path.
-        box = QtWidgets.QGroupBox('Depolarization (anisotropy correction)')
+        # pairing waits for a real depolarized-acquisition path.
+        box = QtWidgets.QGroupBox('Depolarization (Anisotropy Correction)')
+        add_help_to_groupbox(
+            box,
+            'Static depolarized light scattering (assumes vertically polarized '
+            'incident light).',
+            bullets=[
+                'Choose “VV & VH intensities” to enter both, or “Depolarization ratio '
+                'ρv” to enter ρv directly.',
+                'Reads out ρv, the optical anisotropy δ², and the Cabannes factor.',
+                'The Cabannes factor removes anisotropy inflation from Mw.',
+            ])
         box.setToolTip(
-            'Static depolarized light scattering. From the VV (polarized) and VH '
-            '(depolarized) intensities — or the depolarization ratio ρv directly — '
-            'compute ρv, the optical anisotropy δ², and the Cabannes factor that '
-            'removes anisotropy inflation from Mw (R_iso = R_VV·(1 − 4ρv/3)). '
-            'Assumes vertically polarized incident light.')
+            'The Cabannes correction removes anisotropy inflation from a depolarizing '
+            'solute’s Mw. See the Advanced Guide (depolarization).')
         form = QtWidgets.QFormLayout(box)
         _adapt_form(form)      # wrap long rows + grow fields so nothing clips (#8)
 
@@ -446,7 +476,7 @@ class SLSModule(QtWidgets.QWidget):
         self.depol_stack.addWidget(ratio_page)   # index 1 -> 'ratio'
         form.addRow(self.depol_stack)
 
-        self.depol_compute_button = QtWidgets.QPushButton('Compute depolarization')
+        self.depol_compute_button = QtWidgets.QPushButton('Run')
         self.depol_compute_button.clicked.connect(self._on_compute_depol)
         form.addRow(self.depol_compute_button)
 
@@ -491,27 +521,31 @@ class SLSModule(QtWidgets.QWidget):
         self._show_depol_result(res)
 
     def _show_depol_result(self, res) -> None:
-        rv = _fmt(res.rho_v, 4)
-        if res.rho_v_se is not None:
-            rv += f' ± {_fmt(res.rho_v_se, 2)}'
+        # ρ_v carries an honest ratio SE (unc.ratio_se of independent VH/VV intensities),
+        # so it goes through the σ-driven formatter — its ± sets the displayed precision
+        # (invariant 8 / ui_style_guide §9). The other depol quantities have no SE, so
+        # they use the one no-uncertainty knob (`sig`), never a separate fixed convention.
+        sig = self.controller.settings.no_uncertainty_sig_figs
+        rv = format_pm(res.rho_v, res.rho_v_se)
         rows = [
             ('ρ_v', rv),
-            ('ρ_u', _fmt(res.rho_u, 4)),
-            ('δ²', _fmt(res.optical_anisotropy_sq, 4)),
-            ('Cabannes f', _fmt(res.cabannes_isotropic_factor, 4)),
-            ('anisotropic %', _fmt(res.anisotropic_fraction * 100, 3)),
+            ('ρ_u', format_fixed_sig(res.rho_u, sig)),
+            ('δ²', format_fixed_sig(res.optical_anisotropy_sq, sig)),
+            ('Cabannes f', format_fixed_sig(res.cabannes_isotropic_factor, sig)),
+            ('anisotropic %', format_fixed_sig(res.anisotropic_fraction * 100, sig)),
         ]
         if not res.physically_valid:
             note_role, note_text = 'error', f'⚠ {res.note}'
         else:
-            # Show the Mw correction when the current sample has an analysed Mw.
+            # Show the Mw correction when the current sample has an analyzed Mw.
             if self.sample_id is not None:
                 corr = self.controller.cabannes_corrected_mw(
                     self.sample_id, self._fraction, res.cabannes_isotropic_factor)
                 if corr is not None:
                     mw_app, mw_corr, src = corr
                     rows.append(('Isotropic-corrected Mw (g/mol)',
-                                 f'{_fmt(mw_corr, 4)} (from {_fmt(mw_app, 4)}, {src})'))
+                                 f'{format_fixed_sig(mw_corr, sig)} '
+                                 f'(from {format_fixed_sig(mw_app, sig)}, {src})'))
             note_role, note_text = 'hint', (
                 'R_iso = R_VV(1 − 4ρv/3) — apply to the Zimm/Debye Mw. '
                 'Display only; not written to the sample.')
@@ -526,7 +560,7 @@ class SLSModule(QtWidgets.QWidget):
         self.depol_note.setText(note_text)
 
     def _zimm_spacing(self, rr) -> float:
-        """The k in q^2 + k*c that plot_zimm uses (replicated so the greyed overlay
+        """The k in q^2 + k*c that plot_zimm uses (replicated so the grayed overlay
         lands at the same grid positions)."""
         nonzero = sorted((r for r in rr if r.concentration_g_per_mL != 0),
                          key=lambda r: r.concentration_g_per_mL)
@@ -538,27 +572,30 @@ class SLSModule(QtWidgets.QWidget):
 
     # ---------------------------------------------------------- selection ---
     def set_measurement(self, item_id: Optional[str]) -> None:
-        """Sidebar focus is a SOFT seed for the SLS sample. The selector owns the
-        sample (the sidebar only navigates), so: adopt the focused sample ONLY if it
-        has SLS data; otherwise keep whatever the tab is already showing (this replaces
-        the old keep-last guard — nothing blanks). If nothing is loaded yet, reflect the
-        selector's current pick."""
-        self.sls_selector.refresh()
+        """Follow the shell's active sample (UI Batch 7): always adopt the focused
+        measurement's sample. If that sample has no SLS data, show a clean named
+        empty-state (not the old keep-last) — no work is lost, since calibration/masks
+        are controller-backed and the last run is cached per (sample, fraction)."""
         sid = self.controller.sample_id_of(item_id) if item_id is not None else None
+        self.show_active_sample(sid)
+
+    def show_active_sample(self, sid: Optional[str]) -> None:
+        """Point the tab at the active sample `sid`. Mirrors the dropdown to it when the
+        sample has SLS data, else shows a neutral placeholder there; `_load_sample`
+        renders the analysis or the named "no SLS data" empty-state."""
+        self.sls_selector.refresh()
         sample = self.controller.workspace.samples.get(sid) if sid else None
         if sample is not None and sample.has_sls:
             self.sls_selector.set_current_sample_id(sid)
-            self._load_sample(sid)
-        elif self.sample_id is None or not self.sls_selector.has_sample(self.sample_id):
-            # Nothing loaded yet, or the shown sample vanished (removed/regrouped) —
-            # fall back to whatever the selector now points at.
-            self._load_sample(self.sls_selector.current_sample_id())
-        # else: an incompatible focus with a sample already shown → keep it (no-op).
+        elif sid is not None:
+            self.sls_selector.show_incompatible('(active sample has no SLS data)')
+        self._load_sample(sid)
 
     @QtCore.Slot(str)
     def _on_sls_sample(self, sid: str) -> None:
-        """The user picked a sample in the SLS selector."""
-        self._load_sample(sid or None)
+        """The user picked a sample in the SLS dropdown → ask the shell to make it the
+        single active sample (it fans back to `show_active_sample` + the sidebar)."""
+        self.sampleFocusRequested.emit(sid or '')
 
     def _load_sample(self, sid: Optional[str]) -> None:
         """Point the tab at `sid` (a sample id, or None) and rebuild its per-sample
@@ -568,11 +605,16 @@ class SLSModule(QtWidgets.QWidget):
         self._clear_result_table()       # stale result clears on a sample switch (#14)
         runnable = False
         if sid is None:
-            header = 'Pick an SLS sample above.'
+            header = 'Pick a sample in the Workspace list (or the dropdown above).'
         else:
             sample = self.controller.workspace.samples.get(sid)
-            if sample is None or not sample.has_sls:
-                header = 'That sample has no SLS data yet — load an SLS intensity file.'
+            if sample is None:
+                header = 'Pick a sample in the Workspace list (or the dropdown above).'
+            elif not sample.has_sls:
+                # Named empty-state for an active sample with no SLS data (UI Batch 7 —
+                # replaces the old keep-last; nothing is lost, state is controller-backed).
+                header = (f'No SLS data for <b>{_sample_label(sample)}</b> — load an SLS '
+                          'intensity file, or pick another sample.')
             else:
                 self.sample_id = sid
                 runnable = True
@@ -600,7 +642,7 @@ class SLSModule(QtWidgets.QWidget):
         self.selectionChanged.emit()          # repaint the sidebar mirror
 
     def selected_item_ids(self) -> list:
-        """The SLS measurements of the analysed sample (sidebar-mirror contract): SLS
+        """The SLS measurements of the analyzed sample (sidebar-mirror contract): SLS
         works on a whole sample, so the mirror lights that sample's SLS rows + its
         solvent reference."""
         if self.sample_id is None:
@@ -697,7 +739,7 @@ class SLSModule(QtWidgets.QWidget):
         self.flag_label.clear()
         self.flag_label.setToolTip('')
         self.flag_label.setRole('error')   # reset the tier so a stale qualifier
-        self.flag_label.setBold(True)      # colour never survives a state switch
+        self.flag_label.setBold(True)      # color never survives a state switch
         if not runnable:
             self.export_button.setEnabled(False)
             self._export = None
@@ -707,13 +749,13 @@ class SLSModule(QtWidgets.QWidget):
     # ------------------------------------------------------------ fraction ---
     def _populate_fraction_combo(self) -> None:
         """Fill the Mw-fraction selector from the sample's distinct labels and set
-        the active fraction. Hidden when a sample has a single (unlabelled) one."""
+        the active fraction. Hidden when a sample has a single (unlabeled) one."""
         self._suppress_fraction = True
         self.fraction_combo.clear()
         fractions = ([None] if self.sample_id is None
                      else self.controller.sample_fractions(self.sample_id))
         for frac in fractions:
-            self.fraction_combo.addItem('(unlabelled)' if frac is None else frac, frac)
+            self.fraction_combo.addItem('(unlabeled)' if frac is None else frac, frac)
         self._fraction = fractions[0]
         multi = len(fractions) > 1
         self.fraction_combo.setVisible(multi)
@@ -819,7 +861,7 @@ class SLSModule(QtWidgets.QWidget):
         else:
             pending = (committed is None or abs((preview or 0) - (committed or 0))
                        > 1e-30 * max(1.0, abs(preview)))
-            note = '  ● pending — Apply to commit' if pending else ''
+            note = '  ● pending — press Update' if pending else ''
             self.kc_label.setText(
                 f'[{scope}] preview = {preview:.4e}; committed = '
                 f'{("none" if committed is None else f"{committed:.4e}")}{note}')
@@ -864,6 +906,11 @@ class SLSModule(QtWidgets.QWidget):
         r = self.controller.workspace.samples[self.sample_id].result_for(self._fraction)
         if r.mw_g_per_mol is None:
             self.mw_display.setText('Mw: not yet determined')
+        elif r.mw_source != 'user' and r.calibrated is False:
+            # A computed/picked Mw from an uncalibrated run is on an arbitrary scale —
+            # don't present it as a real number (finding 5.4). A hand-entered ('user')
+            # Mw is a trusted value and is always shown.
+            self.mw_display.setText(f'Mw: {_UNCAL_MW}')
         else:
             self.mw_display.setText(
                 f'Mw = {r.mw_g_per_mol:.3e} g/mol  ({r.mw_source})')
@@ -930,7 +977,7 @@ class SLSModule(QtWidgets.QWidget):
             QtWidgets.QMessageBox.critical(
                 self, 'Analysis failed',
                 f'Could not run {method_text!r}.\n\n{exc}\n\n'
-                'Confirm parameters (Data tab) and the calibration, then Apply.')
+                'Confirm parameters (Data tab) and the calibration, then Update.')
             self.status.setText('Analysis failed — see dialog.')
 
         def done(payload) -> None:
@@ -1046,6 +1093,7 @@ class SLSModule(QtWidgets.QWidget):
         precomputed results (payload['rr'] / ['res']); makes no controller fit
         calls itself (the masked-point overlay reads the cached full series)."""
         c = self.controller
+        sig = c.settings.no_uncertainty_sig_figs    # ±-less results (R², qRg, single-angle Mw)
         self._export = None
         self.flag_label.setToolTip('')      # cleared per display; set per-method below
         if method in ('zimm', 'berry'):
@@ -1064,12 +1112,14 @@ class SLSModule(QtWidgets.QWidget):
             self._setup_axes()
             plot_debye(res, ax=self.ax)
             self.ax.set_title('Debye plot (single concentration)')
+            mw_app = (format_pm(res.mw_apparent_g_per_mol,
+                                getattr(res, 'mw_apparent_se', None))
+                      if res.calibrated else _UNCAL_MW)
             self._fill_result_table([
-                ('Mw_app (g/mol)', format_pm(res.mw_apparent_g_per_mol,
-                                             getattr(res, 'mw_apparent_se', None))),
+                ('Mw_app (g/mol)', mw_app),
                 ('Rg_app (nm)', format_pm(res.rg_apparent_nm,
                                           getattr(res, 'rg_apparent_se', None))),
-                ('R²', _fmt(res.r_squared)),
+                ('R²', format_fixed_sig(res.r_squared, sig)),
             ])
             self._set_flag(self._apparent_flag(res.calibrated) + _STAT_CAVEAT,
                            problem=not res.calibrated)
@@ -1081,8 +1131,8 @@ class SLSModule(QtWidgets.QWidget):
             self.ax.set_title('Guinier plot (single concentration)')
             self._fill_result_table([
                 ('Rg_app (nm)', format_pm(res.rg_nm, getattr(res, 'rg_se', None))),
-                ('qRg(max)', _fmt(res.qrg_max, 2)),
-                ('R²', _fmt(res.r_squared)),
+                ('qRg(max)', format_fixed_sig(res.qrg_max, sig)),
+                ('R²', format_fixed_sig(res.r_squared, sig)),
             ])
             # Tier tracks severity: the plain "apparent" note is a neutral qualifier;
             # an out-of-regime qRg(max) is a genuine caution (red). _set_flag adds the glyph.
@@ -1091,18 +1141,22 @@ class SLSModule(QtWidgets.QWidget):
                     'concentration effects — extrapolate over c for the '
                     'thermodynamic Rg.')
             if problem:
-                flag += (f'  qRg(max) = {_fmt(res.qrg_max, 2)} > 1.3 is outside the '
-                         'Guinier regime — treat Rg with caution (Berry/Zimm '
-                         'linearise the high-qRg regime better).')
+                flag += (f'  qRg(max) = {format_fixed_sig(res.qrg_max, sig)} > 1.3 is '
+                         'outside the Guinier regime — treat Rg with caution (Berry/Zimm '
+                         'linearize the high-qRg regime better).')
             self._set_flag(flag, problem=problem)
         elif method == 'single':
             res = payload['res']
             self._export = (f'{sid}_single_angle.csv',
                             lambda p: c.export_single_angle(res, p))
             self._clear_plot()
-            mw_mark = '' if res.mw_reliable else '  [unreliable — uncalibrated]'
+            # Single angle + single concentration = one datum, so Mw_app has no honest ±
+            # (invariant 8) — the documented fixed-sig fallback, never a fabricated ±.
+            mw_app = (format_fixed_sig(res.mw_apparent_g_per_mol,
+                                       self.controller.settings.no_uncertainty_sig_figs)
+                      if res.mw_reliable else _UNCAL_MW)
             self._fill_result_table([
-                ('Mw_app (g/mol)', _fmt(res.mw_apparent_g_per_mol) + mw_mark),
+                ('Mw_app (g/mol)', mw_app),
                 ('Angle', f'{res.angle_deg:.0f}°'),
                 ('c (mg/mL)', f'{res.concentration_g_per_mL * 1000:.3g}'),
             ])
@@ -1132,12 +1186,9 @@ class SLSModule(QtWidgets.QWidget):
             if getattr(res, 'two_a2_mw_se', None) is not None:
                 self._set_flag('± statistical only', problem=False)
                 self.flag_label.setToolTip(
-                    'No calibration or dn/dc enters this estimator — they cancel in the '
-                    'intensity ratio, so 2·A₂·Mw is systematics-free by construction; the '
-                    '± is the statistical (regression) SE. Being a ratio of two fitted '
-                    'coefficients on a short concentration ladder, it is conservative — it '
-                    'meets or exceeds the true spread and never under-reports, and tightens '
-                    'with more concentration points or repeat runs. See the Advanced Guide §15.1.')
+                    'No calibration or dn/dc enters 2·A₂·Mw (they cancel in the intensity '
+                    'ratio); the ± is a conservative statistical SE that never under-reports '
+                    'and tightens with more concentration points. See the Advanced Guide §15.1.')
             else:
                 self._set_flag('', problem=False)
                 self.flag_label.setToolTip('')   # no SE → drop the §15.1 hover
@@ -1164,10 +1215,10 @@ class SLSModule(QtWidgets.QWidget):
         self.axis_bar.attach(self.ax)      # single-angle method leaves ax None
 
     def _overlay_masked(self, method: str, sid: str) -> None:
-        """Draw the hidden points greyed (hollow) at their true plot positions, so
+        """Draw the hidden points grayed (hollow) at their true plot positions, so
         you can see what is excluded and toggle it back. Derives the points from the
         SAME per-method transform the click hit-test uses (``_point_coords``),
-        filtered to the masked ones — so the grey markers and the clickable targets
+        filtered to the masked ones — so the gray markers and the clickable targets
         can never land at different positions (code-review D5)."""
         if self.ax is None:
             return
@@ -1176,7 +1227,7 @@ class SLSModule(QtWidgets.QWidget):
             return
         # _point_coords returns (c, angle, x, y) for every point (masked + unmasked)
         # from the cached unmasked series — no fresh controller call. Keep only the
-        # masked ones for the grey overlay.
+        # masked ones for the gray overlay.
         masked = [(x, y) for (c, ang, x, y) in self._point_coords(method, sid)
                   if mask.is_masked(c, float(ang))]
         if masked:
@@ -1286,16 +1337,23 @@ class SLSModule(QtWidgets.QWidget):
         self.result_table.setRowCount(0)
 
     def _summarize_zimm(self, res) -> None:
-        mw_mark = '' if res.mw_reliable else '  [unreliable — uncalibrated]'
+        sig = self.controller.settings.no_uncertainty_sig_figs   # ±-less: R², two-route Mw
         mw_se = getattr(res, 'mw_se', None)
         rg_se = getattr(res, 'rg_se', None)
         a2_se = getattr(res, 'a2_se', None)
+        # Uncalibrated Mw AND absolute A₂ are both on an arbitrary scale (Mw_app = Mw/f,
+        # A₂_app = f·A₂) — dash BOTH at the value rather than show a meaningless number
+        # (finding 5.4). Only Rg (scale-free) survives here; the calibration-free
+        # 2·A₂·Mw product is a separate method/table. Matches the below-fold flag, which
+        # calls Mw AND absolute A₂ unreliable.
+        mw_value = (format_pm(res.mw_g_per_mol, mw_se) if res.mw_reliable else _UNCAL_MW)
+        a2_value = (format_pm(res.a2_mol_mL_per_g2, a2_se) if res.a2_reliable else _UNCAL_MW)
         self._fill_result_table([
             ('Method', res.method.capitalize()),
-            ('Mw (g/mol)', format_pm(res.mw_g_per_mol, mw_se) + mw_mark),
+            ('Mw (g/mol)', mw_value),
             ('Rg (nm)', format_pm(res.rg_nm, rg_se)),
-            ('A₂ (mol·mL/g²)', format_pm(res.a2_mol_mL_per_g2, a2_se)),
-            ('R²', _fmt(res.r_squared)),
+            ('A₂ (mol·mL/g²)', a2_value),
+            ('R²', format_fixed_sig(res.r_squared, sig)),
         ])
         flag = (
             '' if res.calibrated else
@@ -1310,8 +1368,8 @@ class SLSModule(QtWidgets.QWidget):
         mq0 = getattr(res, 'mw_from_q0_g_per_mol', None)
         route_disagrees = False
         if agree is not None and math.isfinite(agree) and mc0 is not None and mq0 is not None:
-            note = (f'Mw from the two extrapolation routes — c→0: {_fmt(mc0)}, '
-                    f'q→0: {_fmt(mq0)} g/mol — differ by {agree * 100:.0f}%')
+            note = (f'Mw from the two extrapolation routes — c→0: {format_fixed_sig(mc0, sig)}, '
+                    f'q→0: {format_fixed_sig(mq0, sig)} g/mol — differ by {agree * 100:.0f}%')
             if agree > 0.10:
                 route_disagrees = True
                 note += ' >10% — check curvature/extrapolation'
@@ -1325,24 +1383,15 @@ class SLSModule(QtWidgets.QWidget):
         self._set_flag(flag, problem=problem)
 
     def _set_flag(self, text: str, *, problem: bool = True) -> None:
-        """Set the shared flag label, choosing its visual tier by severity.
+        """Set this tab's flag label via the shared two-tier renderer.
 
         ``problem=True`` → a genuine data-quality issue (uncalibrated, >10 % route
         disagreement …): bold red ``error``, message led with ⚠.
         ``problem=False`` → a neutral, expected result-type qualifier (apparent /
         ± statistical): a calm non-bold ``qualifier`` accent, message led with ⓘ.
-        Both stay visible (invariant 7 — apparent is never hidden); only the alarm
-        level differs. Empty text falls back to the default (red/bold) so no stale
-        qualifier colour lingers behind a later message.
-
-        The leading tier glyph is added HERE from ``problem`` — callers pass
-        glyph-less text — so the glyph and the colour tier can never disagree."""
-        alarm = problem or not text
-        self.flag_label.setRole('error' if alarm else 'qualifier')
-        self.flag_label.setBold(alarm)
-        if text:
-            text = f"{'⚠' if problem else 'ⓘ'} {text}"
-        self.flag_label.setText(text)
+        See :func:`gui.theme.set_flag` — the one place glyph + color are chosen so
+        they can never disagree (style guide §5, R5.1)."""
+        set_flag(self.flag_label, text, problem=problem)
 
     @staticmethod
     def _apparent_flag(calibrated: bool) -> str:

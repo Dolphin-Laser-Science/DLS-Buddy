@@ -10,7 +10,7 @@ What lives here
 ---------------
 * **Forward models** (pure): the same optical-constant / Rayleigh / Zimm physics
   the analysis code uses, run *forwards* (parameters → intensities/correlograms),
-  so that loading and analysing the output recovers the ground truth.
+  so that loading and analyzing the output recovers the ground truth.
 * **Builders** (pure): assemble the artifacts the GUI offers — a single
   correlogram (delegated to :func:`analysis.utilities.generate_synthetic_correlogram`),
   a multi-angle DLS set, an SLS intensity set (a full Zimm grid or a single-angle
@@ -28,7 +28,7 @@ What lives here
 
 Deliberately **no plotting and no analysis-engine imports** — preview figures are
 drawn by the plotting layer from the GUI, and the ground-truth round-trip is
-validated by the test harness, not by this module analysing its own output.
+validated by the test harness, not by this module analyzing its own output.
 
 The default constants describe the canonical test system (PEG in water, calibrated
 against a toluene VU standard at 532 nm). They are defaults only: every builder
@@ -61,7 +61,7 @@ DEFAULT_N_SOLVENT = 1.33
 DEFAULT_VISCOSITY_CP = 0.89
 DEFAULT_VISCOSITY_PA_S = 0.89e-3
 DEFAULT_N_STANDARD = 1.496                 # toluene at 532 nm
-DEFAULT_GEOMETRY = 'VU'                     # BI-200SM: no analyser
+DEFAULT_GEOMETRY = 'VU'                     # BI-200SM: no analyzer
 DEFAULT_DN_DC = 0.135
 DEFAULT_CALIBRANT_INTENSITY = 1.0e5        # toluene count rate at 90° (a.u.)
 DEFAULT_SOLVENT_INTENSITY_90 = 6000.0      # water baseline at 90° (a.u.)

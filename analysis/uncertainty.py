@@ -209,7 +209,7 @@ def multilinear_fit(X: np.ndarray, y: Sequence[float], estimator: str = HC3) -> 
 # ---------------------------------------------------------------------------
 
 def se_or_none(x: Optional[float]) -> Optional[float]:
-    """Normalise a standard error: return None unless it is a finite positive number
+    """Normalize a standard error: return None unless it is a finite positive number
     (so 'no defensible uncertainty' is a clean None throughout, and NaN from a
     too-small fit never leaks into a displayed ±)."""
     if x is None or not math.isfinite(x) or x < 0:
@@ -339,6 +339,38 @@ def round_to_uncertainty(value: Optional[float],
     return round(value, _pdg_decimals(sigma))
 
 
+def _format_sig(value: float, sig: int) -> str:
+    """Render a finite ``value`` at ``sig`` significant figures in the house
+    convention: scientific notation with a BARE integer exponent when
+    ``|value| >= 1e5`` or ``0 < |value| < 1e-3`` — the SAME threshold and exponent
+    style ``format_pm`` uses for a ± value — otherwise fixed-point. Trailing zeros
+    are stripped: a value with no σ has nothing to make them confident (unlike
+    ``format_value_at_uncertainty``, whose trailing zeros ARE σ-backed).
+
+    This is the shared engine for every ±-less bare-value display, so a no-±
+    result never renders '1.23e+06' next to a ± result's '(1.23 ± …)e6'.
+    """
+    if value == 0:
+        return '0'
+    # Round to `sig` significant figures FIRST (as format_pm rounds the value to the SE
+    # place first), so a large value never shows MORE digits than `sig` — e.g. 3421.7 at
+    # 3 sig -> 3420, not 3422 — then decide sci vs fixed on the ROUNDED magnitude (a value
+    # that rounds up across 1e5, e.g. 99999 -> 1.00e5, then renders in scientific form).
+    exp10 = math.floor(math.log10(abs(value)))
+    ndig = sig - 1 - exp10                            # sig-fig rounding place (may be <= 0)
+    r = round(value, ndig)
+    if r == 0:
+        return '0'
+    mag = abs(r)
+    if mag >= 1e5 or mag < 1e-3:
+        # %e re-expresses the already-rounded value with correct carry (9.999e5 -> 1e6).
+        mant, _, e = f'{r:.{sig - 1}e}'.partition('e')
+        mant = mant.rstrip('0').rstrip('.')
+        return f'{mant}e{int(e)}'                     # int() drops the '+' and zero-padding
+    s = f'{r:.{max(0, ndig)}f}'                       # sig figs -> decimal places
+    return s.rstrip('0').rstrip('.') if '.' in s else s
+
+
 def format_pm(value: Optional[float], se: Optional[float], unit: str = '') -> str:
     """Format 'value +/- se' with the precision set by the uncertainty.
 
@@ -353,7 +385,7 @@ def format_pm(value: Optional[float], se: Optional[float], unit: str = '') -> st
     if not has_val:
         return 'n/a'
     if not has_se:
-        s = f'{value:.4g}'
+        s = _format_sig(value, 4)                   # ±-less fallback: house sig-fig render
         return f'{s} {unit}' if unit else s
 
     exp = math.floor(math.log10(se))            # SE's order (sci-notation fallback)
@@ -375,6 +407,32 @@ def format_pm(value: Optional[float], se: Optional[float], unit: str = '') -> st
     return f'{body} {unit}' if unit else body
 
 
+def format_fixed_sig(value: Optional[float], sig: int = 3) -> str:
+    """Format ``value`` at a fixed number of significant figures — the display rule
+    for **every result that has no honest uncertainty** (invariant #8).
+
+    Used wherever an SE is genuinely unavailable, not merely absent from the display:
+    a single-correlogram dynamic fit (correlated lag channels, Schaetzel 1990), an
+    ill-posed inversion (NNLS/CONTIN), a single datum (single-angle Mw), and every
+    other ±-less reported quantity (Γ, β, τ, PDI, ρ, δ², R², qRg, …). We must NOT
+    fabricate a ± just to drive the σ-aware formatter (``format_value_at_uncertainty``);
+    instead we show a modest, fixed precision that carries no confidence claim — the
+    number's honesty is carried by its apparent/±-omitted qualifier (invariant #7),
+    the digit count by this rule.
+
+    Standing policy (see the Advanced Guide §15.6): a value that HAS an uncertainty is
+    set by that uncertainty and never comes here; a value WITHOUT one is set by ``sig``,
+    which is user-configurable (Settings → the no-uncertainty precision knob, default 3).
+    Because any sig-fig choice for an unquantified number is inherently arbitrary, that is
+    no invariant-8 violation — nothing is shown as more certain than its ± supports.
+    Rendering (scientific-notation threshold + bare exponent) is shared with ``format_pm``
+    via ``_format_sig``. Returns 'n/a' for a missing/non-finite value.
+    """
+    if value is None or not (isinstance(value, (int, float)) and math.isfinite(value)):
+        return 'n/a'
+    return _format_sig(float(value), sig)
+
+
 def format_value_at_uncertainty(value: Optional[float],
                                 sigma: Optional[float]) -> str:
     """Format ``value`` at the decimal place ``sigma`` stands behind, KEEPING the
@@ -394,7 +452,7 @@ def format_value_at_uncertainty(value: Optional[float],
     has_sig = sigma is not None and math.isfinite(sigma) and sigma > 0
     if not has_sig:
         return f'{value:.10g}'
-    # Round at the σ place FIRST (honouring a negative ndigits for a coarse σ, e.g.
+    # Round at the σ place FIRST (honoring a negative ndigits for a coarse σ, e.g.
     # σ≈60 -> the tens place), exactly as round_to_uncertainty/format_pm do, THEN
     # show that place — so the two can never drift. `max(0, dec)` only clips the
     # DISPLAY decimals (a place at/left of the units digit shows no fractional part).

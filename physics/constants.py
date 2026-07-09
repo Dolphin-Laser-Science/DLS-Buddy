@@ -53,7 +53,7 @@ Change history
             mismatch correction, optical constant K.
 2026-06-19  Depolarized light scattering (static) helpers. (constants.py v2)
             Depolarization-ratio conversions (rho_u <-> rho_v), the Cabannes
-            isotropic factor for vertically polarised incident light
+            isotropic factor for vertically polarized incident light
             (R_iso = R_VV (1 - 4/3 rho_v); Chu 1991 Sec. 8.4.1.A) and for
             natural light ((6-7 rho_u)/(6+6 rho_u); Coumou et al. 1964), and the
             optical-anisotropy parameter delta^2 = 5 rho_v / (3 - 4 rho_v).
@@ -264,24 +264,24 @@ def stokes_einstein_diffusion_coefficient(
 # Static light scattering — toluene Rayleigh ratio (geometry-aware)
 # ---------------------------------------------------------------------------
 #
-# The Rayleigh ratio of toluene depends on scattering GEOMETRY (the polarisation
+# The Rayleigh ratio of toluene depends on scattering GEOMETRY (the polarization
 # of the incident and detected light) because toluene is optically anisotropic.
-# For a vertically polarised laser the three relevant geometries are:
-#   VV  vertical incident, vertical analyser           R_VV
-#   VU  vertical incident, NO analyser (e.g. BI-200SM) R_VU = R_VV (1 + rho_v)
-#   VH  vertical incident, horizontal analyser         R_VH = R_VV rho_v
-# where rho_v = I_VH/I_VV is the (vertical) depolarisation ratio. These follow
+# For a vertically polarized laser the three relevant geometries are:
+#   VV  vertical incident, vertical analyzer           R_VV
+#   VU  vertical incident, NO analyzer (e.g. BI-200SM) R_VU = R_VV (1 + rho_v)
+#   VH  vertical incident, horizontal analyzer         R_VH = R_VV rho_v
+# where rho_v = I_VH/I_VV is the (vertical) depolarization ratio. These follow
 # from R_VU = V_v + H_v with V_v = R_VV and H_v = R_VH = rho_v R_VV
 # (Brookhaven BI-200SM manual Sec. VIII; Wu 2010). The geometry MUST match the
 # geometry in which the calibrant intensity was measured, or the absolute scale
 # is wrong by a factor of (1 + rho_v) ~ 1.35 for toluene.
 #
-# Base values are the POLARISED ratio R_VV at 25 °C:
+# Base values are the POLARIZED ratio R_VV at 25 °C:
 #   532 nm: 2.34e-5 cm^-1  -- Takahashi, Takano, Kinugasa & Sakurai,
 #           Anal. Sci. 2019, 35, 1045 (metrology redetermination via certified
 #           reference polymers; the authoritative 532 nm value).
 #   660 nm: 8.456e-6 cm^-1 -- Sivokhin & Kazantsev, ChemistrySelect 2021, 6,
-#           9499 (Table 2). Also the source of the depolarisation and temperature
+#           9499 (Table 2). Also the source of the depolarization and temperature
 #           data below.
 # Other wavelengths can be added with a properly sourced R_VV; do not interpolate
 # (the wavelength dependence is steep, ~lambda^-4.2; Wu, Chem. Phys. 2010).
@@ -297,7 +297,7 @@ _TOLUENE_RVV_25C: dict = {
 # fractional coefficient at all wavelengths.
 _TOLUENE_RVV_TEMP_COEFFICIENT: float = 0.0043   # per °C  (relative, positive)
 
-# Vertical depolarisation ratio of toluene, rho_v = I_VH / I_VV.
+# Vertical depolarization ratio of toluene, rho_v = I_VH / I_VV.
 # Sivokhin & Kazantsev 2021, Table 1: 0.346 at 25 °C (measured at 660 nm),
 # decreasing ~linearly with temperature (0.364 at 10 °C to 0.310 at 50 °C).
 # rho_v is only weakly wavelength-dependent; this 660 nm value is used at other
@@ -320,16 +320,16 @@ def rayleigh_ratio_toluene(
 ) -> float:
     """Rayleigh ratio of toluene in cm^-1, for a chosen scattering geometry.
 
-    Computed from the polarised value R_VV (Takahashi et al. 2019 at 532 nm;
+    Computed from the polarized value R_VV (Takahashi et al. 2019 at 532 nm;
     Sivokhin & Kazantsev 2021 at 660 nm), temperature-corrected, then converted
-    to the requested geometry using toluene's depolarisation ratio. This is the
+    to the requested geometry using toluene's depolarization ratio. This is the
     value to use for SLS calibration; the value embedded in instrument software
     must NOT be used in its place.
 
-    Geometry conversions (vertically polarised incident light):
-        VV : R_VV                       (vertical analyser)
-        VU : R_VV * (1 + rho_v)         (NO analyser; e.g. the BI-200SM)
-        VH : R_VV * rho_v               (horizontal analyser)
+    Geometry conversions (vertically polarized incident light):
+        VV : R_VV                       (vertical analyzer)
+        VU : R_VV * (1 + rho_v)         (NO analyzer; e.g. the BI-200SM)
+        VH : R_VV * rho_v               (horizontal analyzer)
     The geometry MUST match the geometry in which the calibrant intensity was
     measured; otherwise the absolute scale is wrong by ~(1 + rho_v) ~ 1.35.
 
@@ -341,7 +341,7 @@ def rayleigh_ratio_toluene(
         Measurement temperature in degrees Celsius.
     geometry : str
         'VV' (default), 'VU', or 'VH'. Use 'VU' for an instrument with a
-        vertically polarised laser and no polarisation analyser.
+        vertically polarized laser and no polarization analyzer.
     depolarization_ratio_v : float, optional
         rho_v = I_VH / I_VV for toluene. If omitted, the temperature-dependent
         value from Sivokhin & Kazantsev 2021 is used (0.346 at 25 C). Supply your
@@ -388,14 +388,14 @@ def rayleigh_ratio_toluene(
             f"to support a new wavelength."
         )
 
-    # Temperature-corrected polarised value R_VV(T).
+    # Temperature-corrected polarized value R_VV(T).
     dT = temperature_C - _TOLUENE_RAYLEIGH_REF_TEMP_C
     r_vv = _TOLUENE_RVV_25C[best_match] * (1.0 + _TOLUENE_RVV_TEMP_COEFFICIENT * dT)
 
     if geometry == 'VV':
         return r_vv
 
-    # Depolarisation ratio (temperature-dependent default, or user-supplied).
+    # Depolarization ratio (temperature-dependent default, or user-supplied).
     if depolarization_ratio_v is None:
         rho_v = _TOLUENE_DEPOL_V_25C + _TOLUENE_DEPOL_V_TEMP_COEFFICIENT * dT
     else:
@@ -513,9 +513,9 @@ def optical_constant_K(
         with c in g/mL (= g/cm^3) and R_theta in cm^-1.
 
     The factor of 4 pi^2 (not 2 pi^2) is the standard form for VV
-    (vertically polarised incident and detected) geometry, which is the
+    (vertically polarized incident and detected) geometry, which is the
     default for most modern light scattering instruments. If your
-    instrument uses a different polarisation geometry, K must be modified.
+    instrument uses a different polarization geometry, K must be modified.
     """
     wavelength_cm = wavelength_nm * 1.0e-7   # nm -> cm
     numerator = 4.0 * math.pi ** 2 * solvent_refractive_index ** 2 * dn_dc_mL_per_g ** 2
@@ -529,16 +529,16 @@ def optical_constant_K(
 # ---------------------------------------------------------------------------
 #
 # An optically anisotropic scatterer (a molecule or particle whose polarisability
-# is not the same in every direction) rotates the polarisation of some of the
-# light it scatters. With VERTICALLY polarised incident light -- the default for
-# essentially every modern instrument -- this shows up as a horizontally polarised
-# ("depolarised") component in the scattered light. Two quantities describe it:
+# is not the same in every direction) rotates the polarization of some of the
+# light it scatters. With VERTICALLY polarized incident light -- the default for
+# essentially every modern instrument -- this shows up as a horizontally polarized
+# ("depolarized") component in the scattered light. Two quantities describe it:
 #
-#   rho_v = I_VH / I_VV   depolarisation ratio, vertically polarised incident light
-#                         (I_VH = horizontal analyser, I_VV = vertical analyser).
+#   rho_v = I_VH / I_VV   depolarization ratio, vertically polarized incident light
+#                         (I_VH = horizontal analyzer, I_VV = vertical analyzer).
 #                         This is the quantity modern instruments measure and the
 #                         one physics/constants.py already carries for toluene.
-#   rho_u = I_h  / I_v    depolarisation ratio, UNPOLARISED (natural) incident
+#   rho_u = I_h  / I_v    depolarization ratio, UNPOLARIZED (natural) incident
 #                         light. The older light-scattering literature (Coumou,
 #                         Cabannes) is written in terms of rho_u.
 #
@@ -551,43 +551,43 @@ def optical_constant_K(
 # Rayleigh ratio, so an uncorrected Mw comes out too high (Mw_app = Mw (1 + 4/5
 # delta^2); Chu 1991 Eq. 8.4.8). The Cabannes factor removes that inflation,
 # recovering the ISOTROPIC Rayleigh ratio that the Zimm/Debye analysis actually
-# wants. For vertically polarised incident light the factor is 1 - (4/3) rho_v
+# wants. For vertically polarized incident light the factor is 1 - (4/3) rho_v
 # (derived below); for natural light it is the classic (6 - 7 rho_u)/(6 + 6 rho_u).
 #
-# Physical range: for vertically polarised incident light rho_v lies in [0, 3/4].
-# rho_v = 0 is an optically isotropic scatterer (no depolarisation, no
+# Physical range: for vertically polarized incident light rho_v lies in [0, 3/4].
+# rho_v = 0 is an optically isotropic scatterer (no depolarization, no
 # correction). The upper limit rho_v = 3/4 is the fully-anisotropic limit, where
 # the isotropic part vanishes (delta^2 -> infinity, Cabannes factor -> 0). Small
 # flexible polymer coils sit very near 0; small anisotropic molecules like toluene
 # are ~0.3-0.35; rigid rods and many particles fall in between.
 
-# Largest physically meaningful rho_v for vertically polarised incident light.
+# Largest physically meaningful rho_v for vertically polarized incident light.
 # At this value the isotropic scattering vanishes (see module notes above).
 _RHO_V_DEPOLARIZATION_LIMIT: float = 0.75
 
 
 def depolarization_ratio_unpolarized(rho_v: float) -> float:
-    """Unpolarised depolarisation ratio rho_u from the vertical ratio rho_v.
+    """Unpolarized depolarization ratio rho_u from the vertical ratio rho_v.
 
     Definition:
         rho_u = 2 rho_v / (1 + rho_v)
 
-    Converts a measured vertical-incident depolarisation ratio (what modern
-    instruments report) to the natural/unpolarised-incident depolarisation ratio
+    Converts a measured vertical-incident depolarization ratio (what modern
+    instruments report) to the natural/unpolarized-incident depolarization ratio
     used throughout the classical light-scattering literature (Coumou, Cabannes).
     The relation is exact, not an approximation.
 
     Parameters
     ----------
     rho_v : float
-        Depolarisation ratio for vertically polarised incident light,
+        Depolarization ratio for vertically polarized incident light,
         rho_v = I_VH / I_VV. Must satisfy 0 <= rho_v <= 3/4 (the physical range;
         see module notes).
 
     Returns
     -------
     float
-        Depolarisation ratio rho_u for unpolarised incident light.
+        Depolarization ratio rho_u for unpolarized incident light.
 
     Raises
     ------
@@ -602,13 +602,13 @@ def depolarization_ratio_unpolarized(rho_v: float) -> float:
     if not (0.0 <= rho_v <= _RHO_V_DEPOLARIZATION_LIMIT):
         raise ValueError(
             f"rho_v must be in [0, {_RHO_V_DEPOLARIZATION_LIMIT}] for vertically "
-            f"polarised incident light, got {rho_v!r}."
+            f"polarized incident light, got {rho_v!r}."
         )
     return 2.0 * rho_v / (1.0 + rho_v)
 
 
 def depolarization_ratio_vertical(rho_u: float) -> float:
-    """Vertical depolarisation ratio rho_v from the unpolarised ratio rho_u.
+    """Vertical depolarization ratio rho_v from the unpolarized ratio rho_u.
 
     Inverse of depolarization_ratio_unpolarized():
         rho_v = rho_u / (2 - rho_u)
@@ -619,13 +619,13 @@ def depolarization_ratio_vertical(rho_u: float) -> float:
     Parameters
     ----------
     rho_u : float
-        Depolarisation ratio for unpolarised incident light. Must satisfy
+        Depolarization ratio for unpolarized incident light. Must satisfy
         0 <= rho_u <= 6/7 (the image of [0, 3/4] under the forward relation).
 
     Returns
     -------
     float
-        Depolarisation ratio rho_v for vertically polarised incident light.
+        Depolarization ratio rho_v for vertically polarized incident light.
 
     Raises
     ------
@@ -641,7 +641,7 @@ def depolarization_ratio_vertical(rho_u: float) -> float:
 
 
 def cabannes_isotropic_factor(rho_v: float) -> float:
-    """Cabannes isotropic factor for VERTICALLY polarised incident light.
+    """Cabannes isotropic factor for VERTICALLY polarized incident light.
 
     Definition:
         f = 1 - (4/3) rho_v
@@ -650,8 +650,8 @@ def cabannes_isotropic_factor(rho_v: float) -> float:
     ISOTROPIC excess Rayleigh ratio (the part that carries Mw / Rg / A2):
         R_iso = R_VV * (1 - (4/3) rho_v).
 
-    Derivation (Chu 1991, Sec. 8.4.1.A). With vertically polarised incident
-    light the apparent molecular weight and the depolarised Rayleigh ratio are
+    Derivation (Chu 1991, Sec. 8.4.1.A). With vertically polarized incident
+    light the apparent molecular weight and the depolarized Rayleigh ratio are
         Mw_app    = Mw (1 + (4/5) delta^2)            (Chu Eq. 8.4.8)
         R_HV/(Hc) = (3/5) delta^2 Mw     (c,K -> 0)   (Chu Eq. 8.4.10)
     so rho_v = R_HV / R_VV = (3/5) delta^2 / (1 + (4/5) delta^2). Eliminating
@@ -663,13 +663,13 @@ def cabannes_isotropic_factor(rho_v: float) -> float:
     Parameters
     ----------
     rho_v : float
-        Vertical-incident depolarisation ratio, 0 <= rho_v <= 3/4.
+        Vertical-incident depolarization ratio, 0 <= rho_v <= 3/4.
 
     Returns
     -------
     float
         Isotropic factor f in [0, 1]. f = 1 when rho_v = 0 (no anisotropy, no
-        correction); f -> 0 at the depolarisation limit rho_v = 3/4.
+        correction); f -> 0 at the depolarization limit rho_v = 3/4.
 
     Raises
     ------
@@ -678,7 +678,7 @@ def cabannes_isotropic_factor(rho_v: float) -> float:
 
     Notes
     -----
-    This is the vertically-polarised-incident analogue of the classical natural-
+    This is the vertically-polarized-incident analog of the classical natural-
     light Cabannes factor (6 - 7 rho_u)/(6 + 6 rho_u); see
     cabannes_isotropic_factor_natural(). For small rho_v the two agree to first
     order. The anisotropic FRACTION removed is 1 - f = (4/3) rho_v.
@@ -691,22 +691,22 @@ def cabannes_isotropic_factor(rho_v: float) -> float:
 
 
 def cabannes_isotropic_factor_natural(rho_u: float) -> float:
-    """Cabannes isotropic factor for UNPOLARISED (natural) incident light.
+    """Cabannes isotropic factor for UNPOLARIZED (natural) incident light.
 
     Definition (the classical Cabannes factor):
         f = (6 - 7 rho_u) / (6 + 6 rho_u)
 
-    Multiply a total Rayleigh ratio measured with unpolarised incident light at
+    Multiply a total Rayleigh ratio measured with unpolarized incident light at
     90 degrees by this factor to recover the isotropic part:
         R_iso = R_total * (6 - 7 rho_u) / (6 + 6 rho_u).
 
     Provided for completeness and for reading older (natural-light) datasets;
-    modern vertically-polarised instruments use cabannes_isotropic_factor().
+    modern vertically-polarized instruments use cabannes_isotropic_factor().
 
     Parameters
     ----------
     rho_u : float
-        Unpolarised-incident depolarisation ratio, 0 <= rho_u <= 6/7.
+        Unpolarized-incident depolarization ratio, 0 <= rho_u <= 6/7.
 
     Returns
     -------
@@ -732,18 +732,18 @@ def cabannes_isotropic_factor_natural(rho_u: float) -> float:
 
 
 def optical_anisotropy_squared(rho_v: float) -> float:
-    """Optical-anisotropy parameter delta^2 from the vertical depolarisation ratio.
+    """Optical-anisotropy parameter delta^2 from the vertical depolarization ratio.
 
     Definition (inverting Chu 1991 rho_v = (3/5) delta^2 / (1 + (4/5) delta^2)):
         delta^2 = 5 rho_v / (3 - 4 rho_v)
 
-    delta^2 is the mean-square optical anisotropy in Chu's parametrisation: 0 for
+    delta^2 is the mean-square optical anisotropy in Chu's parametrization: 0 for
     an optically isotropic scatterer, growing without bound as rho_v -> 3/4.
 
     Parameters
     ----------
     rho_v : float
-        Vertical-incident depolarisation ratio, 0 <= rho_v < 3/4. (rho_v = 3/4 is
+        Vertical-incident depolarization ratio, 0 <= rho_v < 3/4. (rho_v = 3/4 is
         excluded: delta^2 diverges there.)
 
     Returns
@@ -758,9 +758,9 @@ def optical_anisotropy_squared(rho_v: float) -> float:
 
     Notes
     -----
-    This is Chu's delta^2; other texts use a differently normalised anisotropy
+    This is Chu's delta^2; other texts use a differently normalized anisotropy
     (e.g. gamma^2 with the per-molecule I_VV ~ abar^2 + (4/45) gamma^2 form).
-    Convert via the depolarisation ratio, which is convention-independent, not by
+    Convert via the depolarization ratio, which is convention-independent, not by
     equating delta^2 and gamma^2 directly.
     """
     if not (0.0 <= rho_v < _RHO_V_DEPOLARIZATION_LIMIT):
@@ -776,7 +776,7 @@ def optical_anisotropy_squared(rho_v: float) -> float:
 # ---------------------------------------------------------------------------
 #
 # These map a particle's GEOMETRY to its diffusion coefficients (the forward
-# direction). The depolarised dynamic analysis runs them BACKWARDS -- given the
+# direction). The depolarized dynamic analysis runs them BACKWARDS -- given the
 # measured D_t and D_r, solve for the dimensions -- which is a model-dependent
 # inverse problem and lives in analysis/depolarization.py. These forward formulas
 # (and their algebraic inverses) are the only physics; the solver only calls them.
@@ -855,7 +855,7 @@ def rod_length_from_translational_diffusion(diffusion_coefficient_m2_per_s: floa
 
         L = kT (ln p + nu(p)) / (3 pi eta D_t)
 
-    The algebraic inverse of rod_translational_diffusion for fixed p. The depolarised
+    The algebraic inverse of rod_translational_diffusion for fixed p. The depolarized
     rod inversion uses it to reduce the 2-D (L, d) solve to a 1-D root find in p.
     """
     if not (diffusion_coefficient_m2_per_s > 0):
@@ -879,7 +879,7 @@ def sphere_rotational_diffusion(radius_m: float, temperature_K: float,
 
         D_r = kT / (8 pi eta R^3)
 
-    The rotational analogue of Stokes-Einstein. Used by the depolarised analysis as
+    The rotational analog of Stokes-Einstein. Used by the depolarized analysis as
     the simple (single-unknown) shape model for an anisotropic NEAR-spherical
     particle (Balog et al. 2015).
     """

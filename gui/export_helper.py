@@ -13,7 +13,7 @@ never import the `exporting/` layer directly (they go through the controller).
         self.status.setText(status)
 
 `do_export(path)` should call the matching controller export method and return
-the path written. Returns a short status string, or None if the user cancelled.
+the path written. Returns a short status string, or None if the user canceled.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ def export_to_csv(parent, default_name: str,
     """Prompt for a path and run `do_export(path)`; report the outcome.
 
     Returns a status string on success/failure, or None if the dialog was
-    cancelled (so the caller can leave its status line untouched).
+    canceled (so the caller can leave its status line untouched).
     """
     path, _ = QtWidgets.QFileDialog.getSaveFileName(
         parent, 'Export to CSV', default_name,

@@ -40,7 +40,7 @@ The file is a flat list of "key,value" rows. There are three regions:
         Intensity - Concentration 1 - Angle 1,153006
         Intensity - Concentration 1 - Angle 2,123982
         ...
-     The N x M grid is serialised concentration-major (all angles of
+     The N x M grid is serialized concentration-major (all angles of
      concentration 1, then all angles of concentration 2, ...).
 
 What the parser extracts vs. what the user must supply
@@ -101,7 +101,7 @@ _DELIMITER = ','
 
 _INSTRUMENT_NAME = 'Brookhaven Particle Explorer'
 
-# Exact metadata keys as they appear in the file. Centralising them here means
+# Exact metadata keys as they appear in the file. Centralizing them here means
 # that if Brookhaven changes a label in a future software version, there is one
 # obvious place to update.
 _KEY_SAMPLE_ID = 'Sample ID'

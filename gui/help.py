@@ -106,16 +106,16 @@ class HelpBadge(QtWidgets.QToolButton):
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.setAccessibleName('Help')
         self._applying = False
-        # A subtle, theme-following look. The colour is re-applied on every theme switch
+        # A subtle, theme-following look. The color is re-applied on every theme switch
         # (see changeEvent) rather than captured once — the old code read the palette in
         # __init__ and froze, leaving the badge faint on the dark theme.
         self._apply_palette()
-        # Hover preview via the normal tooltip system (so it honours the global gate).
+        # Hover preview via the normal tooltip system (so it honors the global gate).
         self.setToolTip(self._html)
         self.clicked.connect(self._popup)
 
     def _apply_palette(self) -> None:
-        """(Re)compute the badge colours from the live theme and apply the QSS."""
+        """(Re)compute the badge colors from the live theme and apply the QSS."""
         if self._applying:        # guard: setStyleSheet re-enters changeEvent (see ThemedLabel)
             return
         self._applying = True
@@ -127,7 +127,7 @@ class HelpBadge(QtWidgets.QToolButton):
             self._applying = False
 
     def changeEvent(self, ev: QtCore.QEvent) -> None:
-        # A theme switch delivers PaletteChange; recolour so the badge never freezes.
+        # A theme switch delivers PaletteChange; recolor so the badge never freezes.
         if ev.type() == QtCore.QEvent.Type.PaletteChange:
             self._apply_palette()
         super().changeEvent(ev)

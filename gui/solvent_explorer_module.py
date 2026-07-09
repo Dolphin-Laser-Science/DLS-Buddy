@@ -43,26 +43,23 @@ from typing import Optional
 
 from PySide6 import QtCore, QtWidgets
 
-from matplotlib.backends.backend_qtagg import (
-    FigureCanvasQTAgg as FigureCanvas,
-    NavigationToolbar2QT as NavigationToolbar,
-)
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from analysis.uncertainty import format_pm
 from app import units as U
 from physics import solvents as solvents_lib
 from gui.help import section_header
-from gui.plot_controls import AxisControlBar, make_canvas_expanding
+from gui.plot_controls import AxisControlBar, make_canvas_expanding, themed_navtoolbar
 from gui.theme import ThemedLabel, token as theme_token
 from gui.widgets import value_unit_row as _value_unit_row
 
 
 # Curve hues (plots render on a white background — plot-background theming is deferred
-# app-wide — so fixed Okabe-Ito colours read on both themes). Deliberately NOT red:
+# app-wide — so fixed Okabe-Ito colors read on both themes). Deliberately NOT red:
 # red is the reserved error token (§5), so a confidence band must never be red.
-_RI_COLOUR = '#0072B2'     # blue
-_ETA_COLOUR = '#009E73'    # bluish green
+_RI_COLOR = '#0072B2'     # blue
+_ETA_COLOR = '#009E73'    # bluish green
 _BAND_ALPHA = 0.18
 
 
@@ -100,7 +97,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
         self.solvent_combo = QtWidgets.QComboBox()
         self._populate_solvent_combo()
         self.solvent_combo.currentIndexChanged.connect(self._recompute)
-        form.addRow('Solvent', self.solvent_combo)
+        form.addRow('Solvent:', self.solvent_combo)
 
         self.temp_edit = QtWidgets.QLineEdit('25')
         self.temp_edit.editingFinished.connect(self._recompute)
@@ -108,20 +105,20 @@ class SolventExplorerModule(QtWidgets.QWidget):
         self.temp_unit.addItems(U.unit_options('temperature'))     # °C default
         # Track the previous unit so a unit switch CONVERTS the shown value (keeping the
         # physical temperature), rather than reinterpreting the same number in the new
-        # unit — matching the Data tab's _on_unit_changed behaviour.
+        # unit — matching the Data tab's _on_unit_changed behavior.
         self._temp_unit_prev = self.temp_unit.currentText()
         self.temp_unit.currentIndexChanged.connect(self._on_temp_unit_changed)
-        form.addRow('Temperature', _value_unit_row(self.temp_edit, self.temp_unit))
+        form.addRow('Temperature:', _value_unit_row(self.temp_edit, self.temp_unit))
 
         self.wl_edit = QtWidgets.QLineEdit('532')
         self.wl_edit.editingFinished.connect(self._recompute)
         wl_unit = QtWidgets.QLabel('nm')     # wavelength has no alternative unit
-        form.addRow('Wavelength', _value_unit_row(self.wl_edit, wl_unit))
+        form.addRow('Wavelength:', _value_unit_row(self.wl_edit, wl_unit))
         top.addWidget(form_box, 0)
 
-        read_box = QtWidgets.QGroupBox('Value at this condition')
+        read_box = QtWidgets.QGroupBox('Value at This Condition')
         rv = QtWidgets.QVBoxLayout(read_box)
-        # Rich-text QLabels: the tier badge is an inline coloured ● regenerated on each
+        # Rich-text QLabels: the tier badge is an inline colored ● regenerated on each
         # recompute (and on a theme switch, since _recompute re-runs) so it re-themes.
         self.n_readout = QtWidgets.QLabel()
         self.n_readout.setTextFormat(QtCore.Qt.TextFormat.RichText)
@@ -147,7 +144,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
         pv.setContentsMargins(0, 0, 0, 0)
         self.figure = Figure(figsize=(9.6, 3.4), constrained_layout=True)
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
-        pv.addWidget(NavigationToolbar(self.canvas, plots))
+        pv.addWidget(themed_navtoolbar(self.canvas, plots))
         pv.addWidget(self.canvas, 1)
         # One axis-control bar per y-axis, all on the one canvas (the T-cell's twin
         # axes share x, so editing x on either is consistent, not conflicting). The η
@@ -161,9 +158,9 @@ class SolventExplorerModule(QtWidgets.QWidget):
         self._eta_yscale = 'log'
         self.a_bar_eta.y_scale.currentTextChanged.connect(
             lambda s: setattr(self, '_eta_yscale', s))
-        pv.addWidget(self._labelled_bar('η axis (left):', self.a_bar_eta))
-        pv.addWidget(self._labelled_bar('RI axis (right):', self.a_bar_ri))
-        pv.addWidget(self._labelled_bar('RI vs λ axis:', self.b_bar))
+        pv.addWidget(self._labeled_bar('η axis (left):', self.a_bar_eta))
+        pv.addWidget(self._labeled_bar('RI axis (right):', self.a_bar_ri))
+        pv.addWidget(self._labeled_bar('RI vs λ axis:', self.b_bar))
         outer.addWidget(plots, 1)
 
         self.band_note = ThemedLabel(
@@ -175,7 +172,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
         outer.addWidget(self.band_note)
 
     @staticmethod
-    def _labelled_bar(text: str, bar: AxisControlBar) -> QtWidgets.QWidget:
+    def _labeled_bar(text: str, bar: AxisControlBar) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(w)
         row.setContentsMargins(0, 0, 0, 0)
@@ -184,7 +181,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
         return w
 
     def _populate_solvent_combo(self) -> None:
-        """Fill the combo from all library solvents; estimate-tier rows are labelled
+        """Fill the combo from all library solvents; estimate-tier rows are labeled
         '(estimate)'. The canonical name rides itemData so the label is cosmetic."""
         self.solvent_combo.blockSignals(True)
         self.solvent_combo.clear()
@@ -212,8 +209,8 @@ class SolventExplorerModule(QtWidgets.QWidget):
     # ------------------------------------------------------------ compute ---
     def changeEvent(self, ev) -> None:
         # A theme switch delivers PaletteChange: re-run _recompute so the inline tier-
-        # badge colours (plain-QLabel HTML spans) re-theme. The current solvent /
-        # condition are preserved — this only recolours + redraws.
+        # badge colors (plain-QLabel HTML spans) re-theme. The current solvent /
+        # condition are preserved — this only recolors + redraws.
         if ev.type() == QtCore.QEvent.Type.PaletteChange and hasattr(self, 'n_readout'):
             self._recompute()
         super().changeEvent(ev)
@@ -252,11 +249,11 @@ class SolventExplorerModule(QtWidgets.QWidget):
             return None
 
     def _tier_badge(self, tier: str) -> str:
-        """An inline coloured ● + tier word (teal primary / violet estimate), themed."""
+        """An inline colored ● + tier word (teal primary / violet estimate), themed."""
         role = 'lib_primary' if tier == 'primary' else 'lib_estimate'
-        colour = theme_token(self, role)
-        return (f'<span style="color:{colour}">●</span> '
-                f'<span style="color:{colour}"><b>{tier}</b></span>')
+        color = theme_token(self, role)
+        return (f'<span style="color:{color}">●</span> '
+                f'<span style="color:{color}"><b>{tier}</b></span>')
 
     def _recompute(self, *args) -> None:
         """Recompute the numeric readout and both plots for the current inputs."""
@@ -343,18 +340,18 @@ class SolventExplorerModule(QtWidgets.QWidget):
         ax_ri = ax_eta.twinx()                       # RI rides the right axis
         ax_lam = self.figure.add_subplot(gs[0, 1])
         ax_eta.set_xlabel('Temperature (°C)')
-        ax_eta.set_ylabel('Viscosity η (mPa·s)', color=_ETA_COLOUR)
-        ax_ri.set_ylabel('Refractive index n', color=_RI_COLOUR)
-        ax_eta.tick_params(axis='y', colors=_ETA_COLOUR)
-        ax_ri.tick_params(axis='y', colors=_RI_COLOUR)
+        ax_eta.set_ylabel('Viscosity η (mPa·s)', color=_ETA_COLOR)
+        ax_ri.set_ylabel('Refractive index n', color=_RI_COLOR)
+        ax_eta.tick_params(axis='y', colors=_ETA_COLOR)
+        ax_ri.tick_params(axis='y', colors=_RI_COLOR)
 
         # η curve (T only; may be absent).
         eta_drawn = False
         try:
             te, e, be = self.controller.solvent_curve_eta_vs_T(name)
             e_mpa, be_mpa = e * 1e3, be * 1e3
-            ax_eta.plot(te, e_mpa, color=_ETA_COLOUR, lw=1.6, label='η')
-            ax_eta.fill_between(te, e_mpa - be_mpa, e_mpa + be_mpa, color=_ETA_COLOUR,
+            ax_eta.plot(te, e_mpa, color=_ETA_COLOR, lw=1.6, label='η')
+            ax_eta.fill_between(te, e_mpa - be_mpa, e_mpa + be_mpa, color=_ETA_COLOR,
                                 alpha=_BAND_ALPHA, linewidth=0)
             eta_drawn = True
         except ValueError:
@@ -364,8 +361,8 @@ class SolventExplorerModule(QtWidgets.QWidget):
         if lam is not None:
             try:
                 t, n, band = self.controller.solvent_curve_n_vs_T(name, lam)
-                ax_ri.plot(t, n, color=_RI_COLOUR, lw=1.6, label='n')
-                ax_ri.fill_between(t, n - band, n + band, color=_RI_COLOUR,
+                ax_ri.plot(t, n, color=_RI_COLOR, lw=1.6, label='n')
+                ax_ri.fill_between(t, n - band, n + band, color=_RI_COLOR,
                                    alpha=_BAND_ALPHA, linewidth=0)
                 ri_drawn = True
             except ValueError:
@@ -373,10 +370,10 @@ class SolventExplorerModule(QtWidgets.QWidget):
 
         # User-selection dots (hidden for a property that is out of range at t_c).
         if eta_drawn and eta_sel is not None and t_c is not None:
-            ax_eta.plot([t_c], [eta_sel * 1e3], 'o', color=_ETA_COLOUR, ms=7,
+            ax_eta.plot([t_c], [eta_sel * 1e3], 'o', color=_ETA_COLOR, ms=7,
                         markeredgecolor='white', zorder=5)
         if ri_drawn and n_sel is not None and t_c is not None:
-            ax_ri.plot([t_c], [n_sel], 'o', color=_RI_COLOUR, ms=7,
+            ax_ri.plot([t_c], [n_sel], 'o', color=_RI_COLOR, ms=7,
                        markeredgecolor='white', zorder=5)
 
         # Degenerate branches: a missing curve blanks ITS OWN axis's ticks (η-absent
@@ -395,14 +392,14 @@ class SolventExplorerModule(QtWidgets.QWidget):
         if t_c is not None:
             try:
                 w, n, band = self.controller.solvent_curve_n_vs_lambda(name, t_c)
-                ax_lam.plot(w, n, color=_RI_COLOUR, lw=1.6)
-                ax_lam.fill_between(w, n - band, n + band, color=_RI_COLOUR,
+                ax_lam.plot(w, n, color=_RI_COLOR, lw=1.6)
+                ax_lam.fill_between(w, n - band, n + band, color=_RI_COLOR,
                                     alpha=_BAND_ALPHA, linewidth=0)
                 lam_drawn = True
             except ValueError:
                 pass
         if lam_drawn and n_sel is not None and lam is not None:
-            ax_lam.plot([lam], [n_sel], 'o', color=_RI_COLOUR, ms=7,
+            ax_lam.plot([lam], [n_sel], 'o', color=_RI_COLOR, ms=7,
                         markeredgecolor='white', zorder=5)
 
         self.canvas.draw_idle()

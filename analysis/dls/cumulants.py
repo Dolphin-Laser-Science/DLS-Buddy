@@ -277,7 +277,7 @@ def _fit_cumulants_nonlinear(
     B0 = float(np.mean(tail))
     # The baseline is small drift around the (already ~0) long-time value, NOT a
     # free amplitude sink: bound it near the tail so the fit cannot absorb the
-    # decay into B and chase a short-lag artefact (which would give a spurious
+    # decay into B and chase a short-lag artifact (which would give a spurious
     # Rh ~ 0).
     dB = max(5.0 * float(np.std(tail)), 0.05)
     B_lo, B_hi = B0 - dB, B0 + dB
@@ -323,7 +323,7 @@ def _fit_cumulants_nonlinear(
         except ValueError:
             rh = float('nan')
         # Reject degenerate solutions: non-finite, collapsed coherence, or an
-        # unphysically tiny Rh (the fit chased a short-lag artefact into Gamma).
+        # unphysically tiny Rh (the fit chased a short-lag artifact into Gamma).
         if not (math.isfinite(gamma) and gamma > 0 and math.isfinite(beta) and beta > 0):
             ok = False
         elif math.isfinite(rh) and rh < 0.2:
@@ -332,7 +332,7 @@ def _fit_cumulants_nonlinear(
         # D2 (owner decision 2026-07-07): a failed nonlinear fit returns NaN physical
         # outputs, NOT a linear-fit substitute — so a caller can't read a fit-like
         # number from a failed fit. (Previously it fell back to the linear fit flagged
-        # success=False; that labelled fallback was dropped in favour of an honest NaN.)
+        # success=False; that labeled fallback was dropped in favor of an honest NaN.)
         nan = float('nan')
         return CumulantResult(
             order=order, beta=nan, gamma_s_inv=nan, mu2_s_inv2=nan, mu3_s_inv3=None,

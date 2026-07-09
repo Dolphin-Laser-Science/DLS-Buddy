@@ -247,7 +247,7 @@ class BrookhavenDLSParser(BaseDLSParser):
         FileNotFoundError
             If file_path does not exist.
         ParseError
-            If the file format is not recognised, or fewer than one
+            If the file format is not recognized, or fewer than one
             valid data row is found after stripping padding.
         """
         lines = _read_lines(file_path, _ENCODING)
@@ -387,7 +387,7 @@ class BrookhavenTraceParser(BaseTraceParser):
         FileNotFoundError
             If file_path does not exist.
         ParseError
-            If the file format is not recognised, or no valid data rows
+            If the file format is not recognized, or no valid data rows
             are found.
         """
         # Count rate files are plain ASCII; no encoding surprises expected,

@@ -7,17 +7,22 @@ tabs (Data/DLS/SLS) operate on the one measurement picked in the shell sidebar,
 this tab reads results ACROSS samples: the ρ = Rg/Rh pairing and the log–log
 scaling plots (Rg–Mw, A₂–Mw) are both built here.
 
-Selection model (two distinct things, both in-tab — Item 10)
-------------------------------------------------------------
+Selection model (two distinct things — Item 10; focus unified in UI Batch 7)
+---------------------------------------------------------------------------
 This is the only AGGREGATE tab, so it needs two selections a sample-scoped tab
-collapses into one, and both are made explicitly in the tab (never via the shell
-tree, which only read-only *mirrors* the focused sample):
+collapses into one:
 
 * **Membership** — the left include/exclude list: which samples enter the ρ table
-  and scaling regressions. All SLS samples start included; untick to exclude.
-* **Focus** — the source panel's own **Sample + Fraction** combos: which one
-  sample/fraction the source rows edit. Explicit — not a side effect of clicking a
-  list row or a ρ-table row (that hidden coupling was removed).
+  and scaling regressions. All SLS samples start included; untick to exclude. This is
+  in-tab only (never driven by the sidebar).
+* **Focus** — which one sample/fraction the source rows edit. The **Fraction** combo
+  is in-tab; the **Sample** focus is now the shell's single **active sample** (UI Batch
+  7): it is driven by the in-tab Sample combo **or** by clicking a sample in the
+  Workspace tree (`set_focused_sample`, called from the shell's `_focus_sample`) — the
+  two are mirrors of one choice. (For a non-SLS active sample, which isn't in the Cross
+  universe, the focus keeps its last value — Cross is aggregate over SLS-bearing
+  samples.) Focus is still NOT a side effect of clicking a membership-list row or a
+  ρ-table row (that hidden coupling was removed).
 
 Layout
 ------
@@ -26,7 +31,7 @@ Layout
 * Right — inner tabs: **ρ = Rg/Rh** (read-only table, one row per included sample
   that can pair ρ) and **Scaling** (log–log Rg–Mw and A₂–Mw plots). Beneath them a
   shared **source panel**: Sample/Fraction focus combos, then Rg (SLS), Rh (DLS),
-  Mw (SLS) and A₂ (SLS) source pickers. Each combo is a labelled default (best tier)
+  Mw (SLS) and A₂ (SLS) source pickers. Each combo is a labeled default (best tier)
   the user can override; Rg/Rh/Mw also allow a hand-entered value. **A₂ is picker-
   only** — a solvent/T-specific coefficient with no external standard, and the very
   y-axis the A₂–Mw plot fits. Candidates are grouped by result type with the
@@ -60,7 +65,8 @@ from gui.theme import ThemedLabel
 from gui.widgets import roomy_tabs
 from gui.worker import busy_notice, run_when_idle, runner
 from analysis.utilities import interpret_scaling_exponent, select_default_candidate
-from analysis.uncertainty import format_pm
+from analysis.uncertainty import (format_fixed_sig, format_pm,
+                                  format_value_at_uncertainty)
 from app import units as U
 
 
@@ -105,9 +111,12 @@ _HEADER_SENTINEL = '__HEADER__'
 class CrossSampleModule(QtWidgets.QWidget):
     """Aggregate ρ = Rg/Rh across samples, with per-sample source selection."""
 
-    # Emitted when the in-tab focused sample changes, so the shell can read-only
-    # mirror it onto the Workspace tree (the tab selects in-tab, not via the tree).
+    # Emitted when the focused sample changes, so the shell read-only mirrors it onto
+    # the Workspace tree.
     selectionChanged = QtCore.Signal()
+    # Emitted when the USER picks a sample in the in-tab dropdown, so the shell makes it
+    # the single active sample and fans it out to every tab + the sidebar (UI Batch 7).
+    sampleFocusRequested = QtCore.Signal(str)
 
     def __init__(self, controller, parent=None) -> None:
         super().__init__(parent)
@@ -134,7 +143,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         left = QtWidgets.QVBoxLayout()
         outer.addLayout(left, 0)
         left.addWidget(section_header(
-            'Samples (include / exclude)',
+            'Samples (Include / Exclude)',
             'Compare results across samples:',
             bullets=[
                 'Tick the samples to include in the ρ table and scaling plots.',
@@ -150,8 +159,9 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.sample_list.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         # The left list is MEMBERSHIP only (tick = included in the aggregate views).
-        # Which sample the source panel edits ("focus") is chosen explicitly by the
-        # in-tab Sample combo below — not by clicking here, and not by ρ-table rows.
+        # Which sample the source panel edits ("focus") is the shell's active sample —
+        # driven by the in-tab Sample combo below OR a Workspace tree click (UI Batch 7),
+        # never by clicking a row in THIS membership list or a ρ-table row.
         self.sample_list.itemSelectionChanged.connect(self._on_selection_changed)
         left.addWidget(self.sample_list, 1)
         sel_row = QtWidgets.QHBoxLayout()
@@ -227,7 +237,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         right.addWidget(self._build_source_panel())
 
     def _build_source_panel(self) -> QtWidgets.QWidget:
-        self.source_box = QtWidgets.QGroupBox('Source selection')
+        self.source_box = QtWidgets.QGroupBox('Source Selection')
         grid = QtWidgets.QGridLayout(self.source_box)
 
         # ---- header: explicit Sample + Fraction selectors (the focus, in-tab) -----
@@ -297,7 +307,10 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.mw_manual.setPlaceholderText(self._mw_unit())
         self.mw_manual.setFixedWidth(70)
         grid.addWidget(self.mw_manual, 3, 2)
-        self.mw_badge = ThemedLabel('', role='pending', size=11, bold=True)
+        # Uncalibrated = arbitrary scale is a genuine problem, not a "pending" state:
+        # the error tier (bold red ⚠) matches the SLS tab's treatment of the identical
+        # condition and keeps color aligned with the ⚠ glyph (style guide §5 R5.2).
+        self.mw_badge = ThemedLabel('', role='error', size=11, bold=True)
         self.mw_badge.setToolTip(
             'Mw is scale-dependent: an uncalibrated fit gives an arbitrary-scale Mw.')
         grid.addWidget(self.mw_badge, 3, 3)
@@ -322,7 +335,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         grid.addWidget(self.a2_combo, 4, 1)
         self.a2_unit_label = QtWidgets.QLabel('mol·mL/g²')
         grid.addWidget(self.a2_unit_label, 4, 2)
-        self.a2_badge = ThemedLabel('', role='pending', size=11, bold=True)
+        self.a2_badge = ThemedLabel('', role='error', size=11, bold=True)
         self.a2_badge.setToolTip(
             'A₂ is scale-dependent: an uncalibrated fit gives an arbitrary-scale A₂.')
         grid.addWidget(self.a2_badge, 4, 3)
@@ -337,7 +350,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         grid.addWidget(self.show_all_check, 5, 1, 1, 4)
 
         # Panel-level banner: fires when the chosen Mw and/or A2 is uncalibrated.
-        self.cal_banner = ThemedLabel('', role='pending', size=11)
+        self.cal_banner = ThemedLabel('', role='error', size=11)
         self.cal_banner.setWordWrap(True)
         grid.addWidget(self.cal_banner, 6, 0, 1, 5)
 
@@ -366,7 +379,7 @@ class CrossSampleModule(QtWidgets.QWidget):
     def refresh(self) -> None:
         """Rebuild from the workspace. Called by the shell when this tab is shown
         or after a commit (the sample set or its results may have changed)."""
-        # refresh() runs the labelled Rg/Rh/Mw/A2 auto-picks, which WRITE
+        # refresh() runs the labeled Rg/Rh/Mw/A2 auto-picks, which WRITE
         # SampleResult fields — so it must not run while a background fit is
         # writing them too (invariant 4). Defer until the worker frees.
         if runner().is_busy:
@@ -395,7 +408,7 @@ class CrossSampleModule(QtWidgets.QWidget):
                 f'{len(universe)} sample(s) with SLS. Untick to exclude from the '
                 'views; pick the sample to edit in the panel below.')
 
-        # Default Rg / Rh / Mw for each included sample's fractions (labelled; never
+        # Default Rg / Rh / Mw for each included sample's fractions (labeled; never
         # clobbers a hand-entered value). Rh is a no-op for an SLS-only sample.
         for sid, inc in self._included.items():
             if inc:
@@ -408,7 +421,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         self._populate_sample_combo()
 
     def _auto_select_all(self, sid: str) -> None:
-        """Run the labelled default Rg/Rh/Mw/A2 picks for every fraction of a sample
+        """Run the labeled default Rg/Rh/Mw/A2 picks for every fraction of a sample
         (the union of its SLS and DLS fraction labels)."""
         fracs = set(self.controller.sample_fractions(sid, 'sls'))
         fracs |= set(self.controller.sample_fractions(sid, 'dls'))
@@ -441,11 +454,22 @@ class CrossSampleModule(QtWidgets.QWidget):
         cols[1], cols[2] = f'Rg ({ru})', f'Rh ({ru})'
         return cols
 
-    def _disp_radius(self, x: Optional[float], runit: str) -> str:
-        """Format a canonical (nm) radius in the active display unit; 'n/a' if missing."""
+    def _disp_radius(self, x: Optional[float], se: Optional[float], runit: str) -> str:
+        """Format a canonical (nm) radius in the active display unit, at the decimal
+        place its σ supports; 'n/a' if missing.
+
+        Honour the display unit FIRST, then round at the (converted) σ place — a radius
+        unit change is a pure linear scale, so the σ converts with the value and the
+        place stays correct (invariant 8). With no honest σ, fall back to the documented
+        fixed-sig precision (Settings → no-uncertainty precision); we never fabricate a ±.
+        """
         if x is None or not (isinstance(x, (int, float)) and math.isfinite(x)):
             return 'n/a'
-        return _fmt(U.from_canonical('radius', x, runit))
+        v_disp = U.from_canonical('radius', x, runit)
+        if se is not None and math.isfinite(se) and se > 0:
+            se_disp = U.from_canonical('radius', se, runit)
+            return format_value_at_uncertainty(v_disp, se_disp)
+        return format_fixed_sig(v_disp, self.controller.settings.no_uncertainty_sig_figs)
 
     def _unit_label(self, sample, fraction: Optional[str]) -> str:
         base = _sample_label(sample)
@@ -470,7 +494,9 @@ class CrossSampleModule(QtWidgets.QWidget):
             try:
                 rho = self.controller.compute_sample_rho(sid, frac)
                 rho_text = (format_pm(rho.rho, rho.rho_se)
-                            if rho.rho_se is not None else _fmt(rho.rho))
+                            if rho.rho_se is not None
+                            else format_fixed_sig(
+                                rho.rho, self.controller.settings.no_uncertainty_sig_figs))
                 est_note = (' [SE: classical OLS]'
                             if rho.se_estimator == 'ols' else '')
                 rho_tip = (rho.interpretation if rho.rho_se is None else
@@ -478,8 +504,8 @@ class CrossSampleModule(QtWidgets.QWidget):
                            'Rg and Rh regression fits; excludes systematics.'
                            + est_note + ')')
                 cells = [label,
-                         self._disp_radius(rho.rg_nm, runit),
-                         self._disp_radius(rho.rh_nm, runit),
+                         self._disp_radius(rho.rg_nm, rho.rg_se, runit),
+                         self._disp_radius(rho.rh_nm, rho.rh_se, runit),
                          rho_text, rho.shape,
                          'apparent' if rho.is_apparent else 'thermodynamic']
                 tips = [rho.interpretation, rho.rg_label, rho.rh_label,
@@ -566,7 +592,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         if self._suppress:
             return
         # Ticking a sample runs _auto_select_all, which WRITES SampleResult fields
-        # (the labelled Rg/Rh/Mw/A2 auto-picks) -- it must not race a background fit
+        # (the labeled Rg/Rh/Mw/A2 auto-picks) -- it must not race a background fit
         # writing them too (invariant 4), exactly as refresh() guards. Defer the whole
         # handler until the worker frees; the tick persists in the live widget, so
         # re-reading the selection at idle applies it correctly (deferred, not dropped).
@@ -623,21 +649,21 @@ class CrossSampleModule(QtWidgets.QWidget):
     def _populate_fraction_combo(self, sid: str,
                                  prefer: Optional[str] = None) -> Optional[str]:
         """Fill the Fraction combo with the sample's SLS fractions; return the chosen
-        one. Hidden when the sample has a single unlabelled fraction (nothing to pick)."""
+        one. Hidden when the sample has a single unlabeled fraction (nothing to pick)."""
         fracs = list(self.controller.sample_fractions(sid, 'sls')) or [None]
         self._suppress = True
         self.fraction_combo.clear()
         for frac in fracs:
-            self.fraction_combo.addItem('(unlabelled)' if frac is None else str(frac))
+            self.fraction_combo.addItem('(unlabeled)' if frac is None else str(frac))
             self.fraction_combo.setItemData(
                 self.fraction_combo.count() - 1, frac,
                 QtCore.Qt.ItemDataRole.UserRole)
         chosen = prefer if prefer in fracs else fracs[0]
         self.fraction_combo.setCurrentIndex(max(fracs.index(chosen), 0))
         self._suppress = False
-        single_unlabelled = (len(fracs) == 1 and fracs[0] is None)
-        self.fraction_label.setVisible(not single_unlabelled)
-        self.fraction_combo.setVisible(not single_unlabelled)
+        single_unlabeled = (len(fracs) == 1 and fracs[0] is None)
+        self.fraction_label.setVisible(not single_unlabeled)
+        self.fraction_combo.setVisible(not single_unlabeled)
         return chosen
 
     def _focus_sample(self, sid: str, fraction: Optional[str] = None) -> None:
@@ -660,7 +686,16 @@ class CrossSampleModule(QtWidgets.QWidget):
         sid = self.sample_combo.currentData(QtCore.Qt.ItemDataRole.UserRole)
         if sid is None:
             return
-        self._focus_sample(sid)                      # new sample → first fraction
+        # A user pick here drives the shell's single active sample (UI Batch 7); the shell
+        # fans it out to every tab + the sidebar and calls back set_focused_sample.
+        self.sampleFocusRequested.emit(sid)
+
+    def set_focused_sample(self, sid: Optional[str]) -> None:
+        """Focus `sid` in the source panel to follow the shell's active sample. No-op if
+        the sample isn't in the Cross universe (no SLS data) — Cross is aggregate over
+        SLS-bearing samples, and its include/exclude membership is unchanged."""
+        if sid and self._sample_combo_index(sid) >= 0:
+            self._focus_sample(sid)                  # new sample → first fraction
 
     @QtCore.Slot(int)
     def _on_fraction_combo(self, _index: int) -> None:
@@ -738,7 +773,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.show_all_check.setEnabled(bool(hidden) or self._show_all_single)
 
         self.source_box.setEnabled(True)
-        self.source_box.setTitle('Source selection')
+        self.source_box.setTitle('Source Selection')
         try:
             rho = self.controller.compute_sample_rho(sid, fraction)
             flag = ('  [apparent ρ — at least one input is a single-condition '
@@ -749,7 +784,7 @@ class CrossSampleModule(QtWidgets.QWidget):
 
     def _set_cal_badge(self, badge: ThemedLabel, calibrated: Optional[bool],
                        source: str, value: Optional[float]) -> None:
-        """Show a colourblind-safe (symbol + text) uncalibrated badge when a chosen,
+        """Show a colorblind-safe (symbol + text) uncalibrated badge when a chosen,
         scale-dependent value (Mw/A2) is uncalibrated. Blank when calibrated, unknown,
         hand-entered (trusted), or absent."""
         show = (calibrated is False and source != 'user'

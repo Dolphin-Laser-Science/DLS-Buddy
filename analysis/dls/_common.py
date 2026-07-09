@@ -87,7 +87,7 @@ def _apply_tau_window(
 
       1. `skip_initial_channels` -- drop the first N correlator channels by INDEX
          (the shortest, finest-spaced lags). These leading channels are where
-         detector afterpulsing and correlator dead-time artefacts live, regardless
+         detector afterpulsing and correlator dead-time artifacts live, regardless
          of their absolute lag time, so this is an instrumental cleanup, not a
          physical window. Default 0 leaves the correlogram untouched.
       2. `[tau_min_s, tau_max_s]` -- the user's physical delay-time window
@@ -184,7 +184,7 @@ def _estimate_baseline(tau: np.ndarray, g2m1: np.ndarray,
 
 def _estimate_beta(tau: np.ndarray, g2m1: np.ndarray,
                    baseline: float) -> float:
-    """Estimate the coherence factor beta (intercept) for normalisation.
+    """Estimate the coherence factor beta (intercept) for normalization.
 
     Uses a short second-order cumulant-style log-polynomial extrapolation of the
     baseline-subtracted signal to tau = 0. Robust and cheap; the user can always
@@ -224,7 +224,7 @@ def _build_rh_gamma_grid(
         return rh_grid_nm, np.array([])
     # D = kB T / (6π η Rh) ∝ 1/Rh, so compute D once (the physics function guards
     # scalars, so it can't take the array) at the smallest Rh and scale the rest
-    # exactly — vectorising the former per-point Python loop without duplicating the
+    # exactly — vectorizing the former per-point Python loop without duplicating the
     # Stokes-Einstein formula into the analysis layer.
     d0 = stokes_einstein_diffusion_coefficient(
         rh_grid_nm[0] * 1e-9, temperature_K, viscosity_Pa_s)

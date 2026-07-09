@@ -48,7 +48,7 @@ class SolventProps:
     """Sourced coefficient record for one solvent, keyed by canonical name.
 
     The refractive-index block is always present; the viscosity block is optional
-    (a record may carry n but no eta), signalled by ``eta_vft_A_Pa_s is None``.
+    (a record may carry n but no eta), signaled by ``eta_vft_A_Pa_s is None``.
     Per-solvent source provenance lives in the code comment beside each row in
     ``_SOLVENT_PROPS`` (mirroring ``constants.py:_TOLUENE_RVV_25C``); there are
     deliberately **no citation fields** on the record and none reach the UI.
@@ -379,7 +379,7 @@ _SOLVENT_PROPS: Dict[str, SolventProps] = {
     ),
     # Carbon tetrachloride [estimate]. RI: Moreels 1984 (measured). eta:
     #   CRC 95th bulk table (VFT). CCl4 has a strong tetrahedral-symmetry
-    #   depolarisation -- a good SLS calibrant candidate.
+    #   depolarization -- a good SLS calibrant candidate.
     'ccl4': SolventProps(
         tier='estimate',
         n_cauchy_A=1.4470358189788315, n_cauchy_B_um2=0.0045805855873710275, n_cauchy_C_um4=5.199773869387237e-05,
@@ -630,7 +630,7 @@ _C_TO_K = 273.15
 
 
 def _lookup(name: str) -> SolventProps:
-    """Canonicalise ``name`` and return its record, or raise a helpful ValueError."""
+    """Canonicalize ``name`` and return its record, or raise a helpful ValueError."""
     canonical = normalize_solvent_name(name)
     rec = _SOLVENT_PROPS.get(canonical)
     if rec is None:

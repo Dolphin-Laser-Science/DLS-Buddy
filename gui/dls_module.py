@@ -3,7 +3,7 @@ gui/dls_module.py
 =================
 
 The DLS tab: analysis only (reads COMMITTED parameters; the Data tab owns editing).
-It is organised as an inner set of sub-tabs, each a persistent full-size view with
+It is organized as an inner set of sub-tabs, each a persistent full-size view with
 its own controls, so switching method or measurement never wipes another view:
 
   * Correlogram  — parametric fits (cumulant / single / double / KWW) shown on a
@@ -30,30 +30,29 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from matplotlib.backends.backend_qtagg import (
-    FigureCanvasQTAgg as FigureCanvas,
-    NavigationToolbar2QT as NavigationToolbar,
-)
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from plotting.plots import (
     plot_correlogram_scaled, plot_distribution,
-    plot_gamma_q2, plot_concentration_extrapolation, plot_ddls, _CYCLE,
+    plot_gamma_q2, plot_concentration_extrapolation, plot_ddls,
+    cycle as _plot_cycle, _MARKER_CYCLE, _LINESTYLE_CYCLE,
     annotate_decollided,
     display_factor as _disp_factor, display_unit as _disp_unit,
 )
 from app import units as U
 from gui.plot_controls import (
     AxisControlBar, make_split_panels, make_canvas_expanding,
-    make_vertical_plot_stack, attach_residual_resizer,
+    make_vertical_plot_stack, attach_residual_resizer, themed_navtoolbar,
 )
 from gui.export_helper import export_to_csv
 from gui.help import add_help_to_groupbox, section_header
 from gui.plot_overlays import draw_excluded_markers, reissue_legend_preserving_title
-from gui.theme import ThemedLabel, color as theme_color
+from gui.theme import ThemedLabel, color as theme_color, set_flag
 from gui.widgets import roomy_tabs, SelectionModel, MeasurementPicker, GroupTickBar
 from gui.worker import BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, run_when_idle, runner
-from analysis.uncertainty import format_pm
+from analysis.uncertainty import (format_fixed_sig, format_pm,
+                                  format_value_at_uncertainty)
 from analysis.dls import CUMULANT_PDI_VALIDITY_LIMIT
 
 
@@ -77,23 +76,23 @@ class _AnalysisRegion:
         self.tau_max_s: Optional[float] = None
         self.base_lo_s: Optional[float] = None
         self.base_hi_s: Optional[float] = None
-        self._initialised = False
+        self._initialized = False
 
     def init_from_data(self, tau: np.ndarray) -> None:
         """Seed sensible defaults once: window = full range, baseline = last 25 %
         (matching the engine's default tail estimate)."""
-        if self._initialised or tau.size == 0:
+        if self._initialized or tau.size == 0:
             return
         lo, hi = float(tau.min()), float(tau.max())
         self.tau_min_s, self.tau_max_s = lo, hi
         self.base_lo_s = float(np.quantile(tau, 0.75))
         self.base_hi_s = hi
-        self._initialised = True
+        self._initialized = True
 
     def force_reseed(self) -> None:
         """Drop the seeded defaults so the next init_from_data re-seeds from data
         (used by the Correlogram tab's 'Reset window + baseline')."""
-        self._initialised = False
+        self._initialized = False
 
     def window_kwargs(self) -> Dict[str, float]:
         kw: Dict[str, float] = {}
@@ -122,12 +121,6 @@ _DIST_METHODS: List[Tuple[str, str]] = [
     ('NNLS', 'nnls'),
     ('CONTIN', 'contin'),
 ]
-
-
-def _fmt(x: Optional[float], sig: int = 3) -> str:
-    if x is None or not (isinstance(x, (int, float)) and math.isfinite(x)):
-        return 'n/a'
-    return f'{x:.{sig}g}'
 
 
 # Shown when a displayed fit was computed from parameters that have since been
@@ -302,7 +295,7 @@ _AVERAGE_METHODS = [
 
 def ask_average_method(parent) -> Optional[str]:
     """Ask which dynamic fit to run on each replicate. Returns the method key, or
-    None if the user cancelled. Cumulant is the default (the ISO 22412 z-average
+    None if the user canceled. Cumulant is the default (the ISO 22412 z-average
     sizing basis)."""
     labels = [lbl for lbl, _ in _AVERAGE_METHODS]
     choice, ok = QtWidgets.QInputDialog.getItem(
@@ -372,18 +365,18 @@ def show_average_summary(parent, summary: dict) -> None:
 # The DLS overlay selection + checklist were promoted to the shared, framework-side
 # `SelectionModel` + `MeasurementPicker` in `gui/widgets.py` (used by every analysis
 # tab now, with real checkboxes and one visual idiom). `DLSModule` builds one shared
-# `SelectionModel(colour_cycle=_CYCLE)` so overlay colours stay stable, and the
+# `SelectionModel(color_cycle=cycle)` so overlay colors stay stable, and the
 # Correlogram / Distribution / Summary tabs each embed a `MeasurementPicker` bound to it.
 # `_meas_label` / `_sample_header` (above) are injected as the picker's label callables.
 
 # Help shown on the "?" badge of the DLS measurement pickers (how-to-use, doc-rule #8).
-_PICKER_HELP = 'Tick the measurements to analyse and overlay.'
+_PICKER_HELP = 'Tick the measurements to analyze and overlay.'
 _PICKER_BULLETS = [
     'Ticked measurements are fit and co-plotted together.',
     'Grouped by sample — you can tick across samples to compare.',
     '<b>Select all / none</b> toggles the whole list at once.',
     'Selecting in the Workspace sidebar only navigates; the tick boxes here '
-    'decide what is analysed.',
+    'decide what is analyzed.',
 ]
 _SUMMARY_PICKER_BULLETS = [
     'Ticks pick which measurements the table shows when '
@@ -423,7 +416,7 @@ _RESULT_ROWS = {
 class _CorrelogramTab(QtWidgets.QWidget):
     """Parametric-fit view: four correlogram scales + residuals + result tables,
     over ONE or MANY co-plotted measurements (ticked in the checklist). All share
-    one τ-window / baseline; each measurement gets a stable colour and a results
+    one τ-window / baseline; each measurement gets a stable color and a results
     column."""
 
     def __init__(self, controller, region, selection, parent=None) -> None:
@@ -458,9 +451,9 @@ class _CorrelogramTab(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox('Parametric fit')
         add_help_to_groupbox(box, 'Fit the correlogram to get a size (Rh).', bullets=[
             'Pick a <b>method</b>, set the <b>delay window</b> (the τ range fitted), '
-            'then <b>Run fit</b>.',
+            'then <b>Run</b>.',
             'Drag the markers on the plot, or type values. The <b>window</b> handles '
-            '(green carets) sit at the <b>top</b>; the <b>baseline</b> handles (grey '
+            '(green carets) sit at the <b>top</b>; the <b>baseline</b> handles (gray '
             'carets) at the <b>bottom</b> — so grab the top or bottom half to pick one '
             'when they overlap.',
             'The <b>baseline region</b> sets where g₂−1 → 0 is estimated (used by the '
@@ -507,7 +500,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         for edit in (self.tau_min, self.tau_max, self.base_lo, self.base_hi):
             edit.editingFinished.connect(self._on_field_edit)
         self.tau_unit.currentTextChanged.connect(lambda _t: self._fields_from_region())
-        self.run_button = QtWidgets.QPushButton('Run fit')
+        self.run_button = QtWidgets.QPushButton('Run')
         self.run_button.clicked.connect(self._on_run)
         form.addRow(self.run_button)
 
@@ -557,7 +550,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self.main_ax = self.figure.add_subplot(self._gs[0:3, 0])
         self.resid_ax = self.figure.add_subplot(self._gs[3, 0])
         self.side_axes = [self.figure.add_subplot(self._gs[i, 1]) for i in range(3)]
-        self.nav_toolbar = NavigationToolbar(self.canvas, self)
+        self.nav_toolbar = themed_navtoolbar(self.canvas, self)
         self.canvas.mpl_connect('button_press_event', self._on_press)
         self.canvas.mpl_connect('motion_notify_event', self._on_motion)
         self.canvas.mpl_connect('button_release_event', self._on_release)
@@ -567,6 +560,14 @@ class _CorrelogramTab(QtWidgets.QWidget):
             self._apply_resid_ratio)
         right.addWidget(self.nav_toolbar)
         right.addWidget(self.canvas, 1)
+        # The "promote a side view" instruction lives here, not in the axis title: the
+        # main axis is narrow (3/4 width minus the side stack), so a long title overflowed
+        # into the y-label gutter and clipped its leading "C" (finding 5.3).
+        promote_hint = ThemedLabel(
+            'Double-click a side view to promote it to the main plot.',
+            role='hint', size=10)
+        promote_hint.setWordWrap(True)
+        right.addWidget(promote_hint)
 
     def _apply_resid_ratio(self, frac: float) -> None:
         """Resize the residual vs the fit (draggable handle). The first three row
@@ -880,7 +881,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
     # top, baseline carets at the bottom (the disambiguation described above).
     # _BASE_HANDLE_Y is kept a touch above the bottom so the caret never lands in
     # the residual-resize gap band below main_ax.
-    _WIN_COLOUR, _BASE_COLOUR = '#2ca02c', '#888'
+    _WIN_COLOR, _BASE_COLOR = '#2ca02c', '#888'
     _WIN_HANDLE_Y, _BASE_HANDLE_Y = 0.96, 0.05
 
     def _draw_markers(self) -> None:
@@ -899,61 +900,106 @@ class _CorrelogramTab(QtWidgets.QWidget):
         # Carets use a blended transform: x in data units, y in axes fraction.
         htrans = self.main_ax.get_xaxis_transform()
 
-        def _caret(x, marker, colour, y):
+        def _caret(x, marker, color, y):
             return self.main_ax.plot(
-                [x], [y], marker=marker, color=colour, markersize=10,
+                [x], [y], marker=marker, color=color, markersize=10,
                 markeredgewidth=0, transform=htrans, clip_on=False, zorder=6)[0]
 
         # Only the first line of each kind carries a legend label, so the legend
         # shows one "τ window" and one "baseline region" entry (feedback B4).
         if r.tau_min_s is not None:
             self._markers['tau_min'] = self.main_ax.axvline(
-                r.tau_min_s * tfac, color=self._WIN_COLOUR, ls=':', lw=1.4,
+                r.tau_min_s * tfac, color=self._WIN_COLOR, ls=':', lw=1.4,
                 label='τ window (fit range)')
             self._handle_glyphs['tau_min'] = _caret(
-                r.tau_min_s * tfac, 'v', self._WIN_COLOUR, self._WIN_HANDLE_Y)
+                r.tau_min_s * tfac, 'v', self._WIN_COLOR, self._WIN_HANDLE_Y)
         if r.tau_max_s is not None:
             self._markers['tau_max'] = self.main_ax.axvline(
-                r.tau_max_s * tfac, color=self._WIN_COLOUR, ls=':', lw=1.4)
+                r.tau_max_s * tfac, color=self._WIN_COLOR, ls=':', lw=1.4)
             self._handle_glyphs['tau_max'] = _caret(
-                r.tau_max_s * tfac, 'v', self._WIN_COLOUR, self._WIN_HANDLE_Y)
+                r.tau_max_s * tfac, 'v', self._WIN_COLOR, self._WIN_HANDLE_Y)
         if r.base_lo_s is not None and r.base_hi_s is not None:
             lo, hi = sorted((r.base_lo_s * tfac, r.base_hi_s * tfac))
             self._base_span = self.main_ax.axvspan(lo, hi, color='#999', alpha=0.12,
                                                    label='baseline region')
             self._markers['base_lo'] = self.main_ax.axvline(
-                r.base_lo_s * tfac, color=self._BASE_COLOUR, ls='--', lw=1.2)
+                r.base_lo_s * tfac, color=self._BASE_COLOR, ls='--', lw=1.2)
             self._handle_glyphs['base_lo'] = _caret(
-                r.base_lo_s * tfac, '^', self._BASE_COLOUR, self._BASE_HANDLE_Y)
+                r.base_lo_s * tfac, '^', self._BASE_COLOR, self._BASE_HANDLE_Y)
             self._markers['base_hi'] = self.main_ax.axvline(
-                r.base_hi_s * tfac, color=self._BASE_COLOUR, ls='--', lw=1.2)
+                r.base_hi_s * tfac, color=self._BASE_COLOR, ls='--', lw=1.2)
             self._handle_glyphs['base_hi'] = _caret(
-                r.base_hi_s * tfac, '^', self._BASE_COLOUR, self._BASE_HANDLE_Y)
+                r.base_hi_s * tfac, '^', self._BASE_COLOR, self._BASE_HANDLE_Y)
+
+    def _linear_x_clamp_display(self) -> Optional[float]:
+        """Upper x-limit (display units) for a LINEAR-x correlogram view so a very long
+        lag range (e.g. τ_max ~ 1e6 µs) doesn't crush the decay against the origin
+        (finding 5.5). Returns None when the decay already fills most of the range
+        (the normal case), so the clamp only ever SHRINKS an over-wide linear view and
+        never touches a well-scaled one."""
+        tfac = _disp_factor('time')
+        decay_end = 0.0
+        data_max = 0.0
+        for tau, g2 in self._raw.values():
+            tau = np.asarray(tau, dtype=float)
+            g2 = np.asarray(g2, dtype=float)
+            if tau.size == 0 or not np.isfinite(g2).any():
+                continue
+            g0 = np.nanmax(g2)
+            data_max = max(data_max, float(tau.max()))
+            if not (g0 > 0):
+                continue
+            # Last delay where the signal is still above ~1 % of its peak (robust to a
+            # stray sub-threshold point in the noise tail — use the LAST, not the first).
+            above = np.where(g2 > 0.01 * g0)[0]
+            end = float(tau[above[-1]]) if above.size else float(tau[-1])
+            decay_end = max(decay_end, end)
+        if decay_end <= 0 or data_max <= 0:
+            return None
+        upper = min(data_max, 3.0 * decay_end)
+        # Only clamp when it meaningfully shrinks the view (data runs well past the decay).
+        if upper >= 0.95 * data_max:
+            return None
+        return upper * tfac
 
     def _redraw(self) -> None:
         for ax in (self.main_ax, self.resid_ax, *self.side_axes):
             ax.clear()
         if not self._raw:
+            # Nothing ticked: show ONE centred placeholder on the main axis and hide the
+            # empty satellite + residual boxes, which otherwise render as blank 0–1 boxes
+            # that read as broken (findings 4.1/4.3). Restored below once a curve exists.
+            for ax in (self.resid_ax, *self.side_axes):
+                ax.set_visible(False)
             self.main_ax.set_title('Tick a measurement to plot')
             self.canvas.draw_idle()
             return
+        for ax in (self.resid_ax, *self.side_axes):
+            ax.set_visible(True)
         ws = self.controller.workspace.measurements
         xs, ys = _SCALE_XY[self._scales[0]]
-        # main view: overlay every ticked measurement (data + its fit, same colour)
+        x_clamp = self._linear_x_clamp_display()   # None unless a pathological long lag
+        # main view: overlay every ticked measurement (data + its fit, same color)
         for iid, (tau, g2) in self._raw.items():
-            col = self.selection.colour_for(iid)
+            col = self.selection.color_for(iid)
             res = self._fit_for(iid)
             ft, fg = ((np.asarray(res.fit_tau_s, dtype=float),
                        np.asarray(res.fitted_g2m1, dtype=float)) if res else (None, None))
             plot_correlogram_scaled(self.main_ax, tau, g2, ft, fg, xscale=xs,
-                                    yscale=ys, colour=col, label=_meas_label(ws[iid]))
-        self.main_ax.set_title(f'Correlogram — {self._scales[0]}'
-                               '   (double-click a side view to promote)')
+                                    yscale=ys, color=col, label=_meas_label(ws[iid]),
+                                    marker=self.selection.marker_for(iid))
+        self.main_ax.set_title(f'Correlogram — {self._scales[0]}')
         self._draw_markers()                     # window + baseline handles
+        if xs == 'linear':
+            # Pin a linear delay axis to 0 (negative τ is meaningless) and, on a very
+            # long lag range, clamp the right to the decay region so it isn't crushed at
+            # the origin (finding 5.5). Done before the residual copies the x-lim below.
+            right = x_clamp if x_clamp is not None else self.main_ax.get_xlim()[1]
+            self.main_ax.set_xlim(0.0, right)
         handles, labels = self.main_ax.get_legend_handles_labels()
         if labels:
             self.main_ax.legend(frameon=False, fontsize=7, loc='best')
-        # residual panel: one residual per fit (matching colour). Plot in the same
+        # residual panel: one residual per fit (matching color). Plot in the same
         # DISPLAY units as the main axis (× display factor) so it lines up under the
         # fit — previously it drew raw seconds on a µs axis and squished to the left.
         tfac = _disp_factor('time')
@@ -962,7 +1008,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
             if res is not None:
                 self.resid_ax.plot(np.asarray(res.fit_tau_s, dtype=float) * tfac,
                                    np.asarray(res.residuals, dtype=float), '-',
-                                   color=self.selection.colour_for(iid), lw=1.0)
+                                   color=self.selection.color_for(iid), lw=1.0)
         self.resid_ax.axhline(0.0, color='#444', lw=0.6, ls=':')
         self.resid_ax.set_xscale(xs)
         self.resid_ax.set_xlim(self.main_ax.get_xlim())
@@ -973,13 +1019,17 @@ class _CorrelogramTab(QtWidgets.QWidget):
             name = self._scales[k + 1]
             sxs, sys = _SCALE_XY[name]
             for iid, (tau, g2) in self._raw.items():
-                col = self.selection.colour_for(iid)
+                col = self.selection.color_for(iid)
                 res = self._fit_for(iid)
                 ft, fg = ((np.asarray(res.fit_tau_s, dtype=float),
                            np.asarray(res.fitted_g2m1, dtype=float)) if res
                           else (None, None))
                 plot_correlogram_scaled(sax, tau, g2, ft, fg, xscale=sxs, yscale=sys,
-                                        compact=True, colour=col)
+                                        compact=True, color=col,
+                                        marker=self.selection.marker_for(iid))
+            if sxs == 'linear':                   # pin to 0; clamp the crush (finding 5.5)
+                right = x_clamp if x_clamp is not None else sax.get_xlim()[1]
+                sax.set_xlim(0.0, right)
             sax.set_title(name, fontsize=8)
         self.canvas.draw_idle()
 
@@ -1005,7 +1055,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         for col, iid in enumerate(ids, start=1):
             hi = table.horizontalHeaderItem(col)
             if hi is not None:
-                hi.setForeground(QtGui.QColor(self.selection.colour_for(iid)))
+                hi.setForeground(QtGui.QColor(self.selection.color_for(iid)))
         table.horizontalHeader().setSectionResizeMode(
             0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         for col in range(1, 1 + len(ids)):
@@ -1025,28 +1075,42 @@ class _CorrelogramTab(QtWidgets.QWidget):
             res = self._fit_for(iid)
             if res is None:
                 continue
-            self._fill_col(self.result_table, col, self._result_values(key, res))
+            self._fill_col(self.result_table, col,
+                           self._result_values(key, res, self._no_unc_sig()))
+
+    def _no_unc_sig(self) -> int:
+        """Sig figs for the ±-less result values (Settings → no-uncertainty precision).
+
+        A single-correlogram fit has no honest ± (invariant 8), so ALL of its reported
+        numbers — Rh, Γ, μ₂, β, τ, stretch, amplitude fractions — use this one fixed
+        precision. Standing policy: a value with a ± is set by its ± and never comes
+        here; a value without one is set by this knob (default 3)."""
+        return self.controller.settings.no_uncertainty_sig_figs
 
     @staticmethod
-    def _result_values(key: str, res) -> List[str]:
-        """The result-table column values, in `_RESULT_ROWS[key]` order."""
+    def _result_values(key: str, res, sig: int = 3) -> List[str]:
+        """The result-table column values, in `_RESULT_ROWS[key]` order. Every reported
+        number here is from a single correlogram (no honest ±, invariant 8), so all use
+        the `sig` no-uncertainty precision; `order`/method/convergence are labels."""
+        def q(v):
+            return format_fixed_sig(v, sig)
         if key == 'cumulant':
             # A failed nonlinear fit now reports NaN outputs (D2), not a linear-fit
             # substitute — label it '(failed)', and the Rh/Gamma cells read 'n/a'.
             method_lbl = res.method + ('' if res.success else ' (failed)')
-            baseline_lbl = _fmt(res.baseline, 4) if res.method == 'nonlinear' else '—'
-            return [_fmt(res.gamma_s_inv, 4), _fmt(res.rh_nm),
-                    f'{_fmt(res.pdi)} {"✓" if res.pdi_valid else "⚠>0.3"}',
-                    _fmt(res.mu2_s_inv2, 3), str(res.order), method_lbl, baseline_lbl]
+            baseline_lbl = q(res.baseline) if res.method == 'nonlinear' else '—'
+            return [q(res.gamma_s_inv), q(res.rh_nm),
+                    f'{q(res.pdi)} {"✓" if res.pdi_valid else "⚠>0.3"}',
+                    q(res.mu2_s_inv2), str(res.order), method_lbl, baseline_lbl]
         if key == 'single':
-            return [_fmt(res.mode.gamma_s_inv, 4), _fmt(res.mode.rh_nm),
-                    _fmt(res.beta), 'yes' if res.success else 'no']
+            return [q(res.mode.gamma_s_inv), q(res.mode.rh_nm),
+                    q(res.beta), 'yes' if res.success else 'no']
         if key == 'double':
-            return [_fmt(res.mode1.rh_nm), _fmt(res.mode1.amplitude_fraction, 2),
-                    _fmt(res.mode2.rh_nm), _fmt(res.mode2.amplitude_fraction, 2),
+            return [q(res.mode1.rh_nm), q(res.mode1.amplitude_fraction),
+                    q(res.mode2.rh_nm), q(res.mode2.amplitude_fraction),
                     'yes' if res.success else 'no']
-        return [_fmt(res.stretch), _fmt(res.tau_c_s, 3), _fmt(res.mean_tau_s, 3),
-                _fmt(res.rh_from_tau_c_nm), _fmt(res.rh_from_mean_tau_nm),
+        return [q(res.stretch), q(res.tau_c_s), q(res.mean_tau_s),
+                q(res.rh_from_tau_c_nm), q(res.rh_from_mean_tau_nm),
                 'yes' if res.success else 'no']
 
     @staticmethod
@@ -1085,19 +1149,22 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self.flag_label.setText('\n'.join(flags))
 
     def _summary(self, key: str, r) -> Tuple[str, str]:
+        # Status-line echoes of the same ±-less numbers the table shows — keep them on
+        # the one no-uncertainty knob so a value never reads at two precisions in one view.
+        q = lambda v: format_fixed_sig(v, self._no_unc_sig())
         if key == 'cumulant':
             flag = ('' if r.pdi_valid else
-                    f'⚠ PDI = {_fmt(r.pdi, 2)} > 0.3: cumulant size unreliable for this '
+                    f'⚠ PDI = {q(r.pdi)} > 0.3: cumulant size unreliable for this '
                     'polydispersity — prefer a distribution method.')
             return 'Cumulant fit (see table).', flag
         if key == 'single':
-            return (f'Single exp: Γ = {_fmt(r.mode.gamma_s_inv, 4)} s⁻¹   '
-                    f'Rh = {_fmt(r.mode.rh_nm)} nm'), _conv(r.success)
+            return (f'Single exp: Γ = {q(r.mode.gamma_s_inv)} s⁻¹   '
+                    f'Rh = {q(r.mode.rh_nm)} nm'), _conv(r.success)
         if key == 'double':
-            return (f'Double exp: fast Rh = {_fmt(r.mode1.rh_nm)} nm '
-                    f'(f = {_fmt(r.mode1.amplitude_fraction, 2)}),   '
-                    f'slow Rh = {_fmt(r.mode2.rh_nm)} nm '
-                    f'(f = {_fmt(r.mode2.amplitude_fraction, 2)})'), _conv(r.success)
+            return (f'Double exp: fast Rh = {q(r.mode1.rh_nm)} nm '
+                    f'(f = {q(r.mode1.amplitude_fraction)}),   '
+                    f'slow Rh = {q(r.mode2.rh_nm)} nm '
+                    f'(f = {q(r.mode2.amplitude_fraction)})'), _conv(r.success)
         return 'KWW fit (see table).', _conv(r.success)
 
 
@@ -1148,7 +1215,7 @@ class _DistributionTab(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox('Distribution')
         add_help_to_groupbox(box, 'Recover a full size distribution (not just one '
                              'average) from the correlogram.', bullets=[
-                                 '<b>CONTIN</b> (default): smooth, regularised — the '
+                                 '<b>CONTIN</b> (default): smooth, regularized — the '
                                  'robust general choice.',
                                  '<b>NNLS</b>: sharper but noisier; can split modes.',
                                  '<b>Lognormal</b>: assumes a single skewed peak — '
@@ -1156,7 +1223,8 @@ class _DistributionTab(QtWidgets.QWidget):
                                  'These are distribution-weighted, not z-average — '
                                  'compare against the cumulant Rh.',
                                  '<b>CONTIN α selection</b>: L-curve corner (default, '
-                                 'robust) or Provencher’s F-test for legacy comparison. '
+                                 'robust) or the F-test option (see the Advanced Guide) '
+                                 'for legacy comparison. '
                                  'For the F-test, a higher “probability to reject” gives '
                                  'a smoother fit, lower gives more detail.',
                              ])
@@ -1191,17 +1259,17 @@ class _DistributionTab(QtWidgets.QWidget):
         form.addRow('Rh grid (min / max / pts):', gholder)
         # CONTIN α selection: L-curve corner (default) or Provencher's F-test. The two
         # methods need different controls, so only the selected method's control is
-        # shown (owner: show/hide, not grey-out — no confusing inert fields).
+        # shown (owner: show/hide, not gray-out — no confusing inert fields).
         self.alpha_method = QtWidgets.QComboBox()
         self.alpha_method.addItem('L-curve corner', 'lcurve')
         self.alpha_method.addItem('F-test (probability to reject)', 'ftest')
         self.alpha_method.setToolTip(
-            'How CONTIN chooses its regularisation α automatically.\n'
+            'How CONTIN chooses its regularization α automatically.\n'
             '• L-curve corner (default): the elbow of the fit-vs-smoothness trade-off '
-            '(Salazar et al. 2023) — modern and robust.\n'
-            '• F-test: Provencher’s original criterion — the smoothest solution '
-            'whose fit is not significantly worse than the best (Provencher 1982). Use '
-            'to compare against legacy CONTIN output. See the Advanced Guide (CONTIN).')
+            '— modern and robust.\n'
+            '• F-test: the smoothest solution whose fit is not significantly worse than '
+            'the best — for comparison against legacy CONTIN output. '
+            'See the Advanced Guide (CONTIN).')
         form.addRow('CONTIN α selection:', self.alpha_method)
         self.alpha_min = QtWidgets.QLineEdit()
         self.alpha_max = QtWidgets.QLineEdit()
@@ -1218,7 +1286,7 @@ class _DistributionTab(QtWidgets.QWidget):
         self.ftest_prob.setSingleStep(0.05)
         self.ftest_prob.setDecimals(2)
         self.ftest_prob.setToolTip(
-            'F-test significance level (Provencher default 0.50). A HIGHER value '
+            'F-test significance level (default 0.50). A HIGHER value '
             'accepts more fit degradation and so selects a SMOOTHER, more parsimonious '
             'distribution; a LOWER value keeps a rougher, more-detailed one.')
         form.addRow('F-test probability to reject:', self.ftest_prob)
@@ -1241,7 +1309,7 @@ class _DistributionTab(QtWidgets.QWidget):
         self.export_button.clicked.connect(self._on_export)
         form.addRow(self.export_button)
         # Per-measurement peak results for the ticked curves (feedback #10), mirroring
-        # the Correlogram tab's results panel: one coloured column per (measurement ·
+        # the Correlogram tab's results panel: one colored column per (measurement ·
         # method), positional-peak rows. Populated in _draw, cleared on selection change.
         results_section = QtWidgets.QWidget()
         rlay = QtWidgets.QVBoxLayout(results_section)
@@ -1262,6 +1330,12 @@ class _DistributionTab(QtWidgets.QWidget):
         self.status = QtWidgets.QLabel('')
         self.status.setWordWrap(True)
         left.addWidget(self.status)
+        # A red flag label for run-skips, mirroring the Correlogram tab so a skipped
+        # measurement uses the same channel everywhere (style guide §5 R5.5) rather than
+        # hiding on the muted status line. Set via the shared tiered renderer.
+        self.flag_label = ThemedLabel('', role='error', bold=True)
+        self.flag_label.setWordWrap(True)
+        left.addWidget(self.flag_label)
 
         self.figure = Figure(figsize=(5.3, 4.4), constrained_layout=True)
         # The distribution + residual do NOT share x (both carry their own x-label), so a
@@ -1278,7 +1352,7 @@ class _DistributionTab(QtWidgets.QWidget):
         self._gs = self.figure.add_gridspec(4, 1, height_ratios=[a, a, a, self._resid_ratio])
         self.ax = self.figure.add_subplot(self._gs[0:3, 0])
         self.resid_ax = self.figure.add_subplot(self._gs[3, 0])
-        right.addWidget(NavigationToolbar(self.canvas, self))
+        right.addWidget(themed_navtoolbar(self.canvas, self))
         right.addWidget(self.canvas, 1)
         self._resid_resizer = attach_residual_resizer(
             self.canvas, self.figure, self.ax, self.resid_ax, self._apply_resid_ratio)
@@ -1295,7 +1369,7 @@ class _DistributionTab(QtWidgets.QWidget):
 
     def _update_alpha_controls_visibility(self) -> None:
         """Show only the selected α-selection method's control (L-curve α range vs the
-        F-test level) — the owner asked for show/hide, not greyed-out inert fields."""
+        F-test level) — the owner asked for show/hide, not grayed-out inert fields."""
         is_ftest = self.alpha_method.currentData() == 'ftest'
         self._alpha_range_holder.setVisible(not is_ftest)
         if self._alpha_range_label is not None:
@@ -1306,7 +1380,7 @@ class _DistributionTab(QtWidgets.QWidget):
 
     def reseed_from_settings(self) -> None:
         """(Re)seed the Rh grid + α fields from the global Settings defaults. The
-        per-run values the user types here always win (run_distribution honours
+        per-run values the user types here always win (run_distribution honors
         explicit kwargs over its settings setdefault)."""
         s = self.controller.settings
         self.rh_min.setValue(s.rh_grid_min_nm)
@@ -1468,22 +1542,24 @@ class _DistributionTab(QtWidgets.QWidget):
     def _draw(self) -> None:
         self.ax.clear()
         self.resid_ax.clear()
+        self.resid_ax.set_visible(True)      # restore after an empty _clear() hid it
         axis = self.axis_combo.currentData()
         ws = self.controller.workspace.measurements
         single = len(self._results) == 1
-        peak_items = []          # (x, y, text, colour) collected across all curves
+        peak_items = []          # (x, y, text, color) collected across all curves
         for iid, _key, res in self._results:
             d = self._as_distribution(res)
-            colour = self.selection.colour_for(iid)
+            color = self.selection.color_for(iid)
             label = f'{_meas_short(ws[iid])} · {d.method.upper()}'
             plot_distribution(d, ax=self.ax, axis=axis, label=label,
-                              colour=colour, fill=single)
-            peak_items.extend(self._collect_peak_labels(d, res, axis, colour))
+                              color=color, fill=single,
+                              linestyle=self.selection.linestyle_for(iid) or '-')
+            peak_items.extend(self._collect_peak_labels(d, res, axis, color))
             # Residuals (data - reconstructed g2-1) vs delay time, per curve. Plot in
             # display units (× factor) so the τ axis matches the rest of the app.
             tau = np.asarray(d.fit_tau_s, dtype=float) * _disp_factor('time')
             self.resid_ax.plot(tau, np.asarray(d.residuals, dtype=float),
-                               '-', color=colour, lw=1.0)
+                               '-', color=color, lw=1.0)
         # One de-collided pass so peaks that coincide across curves stagger (capped at
         # 6 + "+N more") instead of piling into an unreadable blob (feedback #8).
         annotate_decollided(self.ax, peak_items)
@@ -1511,18 +1587,23 @@ class _DistributionTab(QtWidgets.QWidget):
                          else 'CONTIN α by F-test')
         elif sel == 'lcurve':
             notes.append('CONTIN α by L-curve corner')
-        if getattr(self, '_failures', None):
-            notes.append('⚠ skipped: ' + '; '.join(self._failures))
         if self.controller.is_dirty() and self._results:
             notes.append('(ran on last committed values)')
         if _is_stale(self.controller, self._results_sig):
             notes.append(_STALE_HINT)
         notes.append('Peak values are also in the Summary tab.')
         self.status.setText('   '.join(notes))
+        # A skipped run is a data/operational problem, not a muted status note: render it
+        # on the red flag label via the shared renderer, matching the Correlogram tab
+        # (style guide §5 R5.5). Empty text clears it when nothing was skipped.
+        failures = getattr(self, '_failures', None)
+        set_flag(self.flag_label,
+                 ('skipped: ' + '; '.join(failures)) if failures else '',
+                 problem=True)
         self._refresh_results()
 
     def _refresh_results(self) -> None:
-        """Fill the peak-results panel from the ticked results — one coloured column per
+        """Fill the peak-results panel from the ticked results — one colored column per
         (measurement · method), positional-peak rows (feedback #10). Mirrors the
         Correlogram results panel; reuses the same peak source as the plot labels."""
         ws = self.controller.workspace.measurements
@@ -1540,18 +1621,22 @@ class _DistributionTab(QtWidgets.QWidget):
         for col, (iid, _k, _r) in enumerate(cols, start=1):
             hi = table.horizontalHeaderItem(col)
             if hi is not None:
-                hi.setForeground(QtGui.QColor(self.selection.colour_for(iid)))
+                hi.setForeground(QtGui.QColor(self.selection.color_for(iid)))
         table.horizontalHeader().setSectionResizeMode(
             0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         for col in range(1, 1 + len(cols)):
             table.horizontalHeader().setSectionResizeMode(
                 col, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        # Distribution peaks are from an ill-posed inversion — no honest ± (invariant 8)
+        # — so the Rh uses the documented fixed-sig fallback, never a fabricated ±.
+        sig = self.controller.settings.no_uncertainty_sig_figs
         for r in range(n_rows):
             table.setItem(r, 0, QtWidgets.QTableWidgetItem(_ordinal_peak(r)))
             for col, peaks in enumerate(peaks_per, start=1):
                 if r < len(peaks):
                     rh_nm, _gamma, weight = peaks[r]
-                    txt = f'{_fmt(rh_nm)} nm · {weight * 100:.0f}%'
+                    txt = (f'{format_fixed_sig(rh_nm, sig)} nm · '
+                           f'{format_fixed_sig(weight * 100, sig)}%')
                 else:
                     txt = '—'
                 table.setItem(r, col, QtWidgets.QTableWidgetItem(txt))
@@ -1566,31 +1651,40 @@ class _DistributionTab(QtWidgets.QWidget):
         self.result_table.setRowCount(0)
         self.result_table.setColumnCount(0)
 
-    def _collect_peak_labels(self, dist, res, axis: str, colour: str) -> list:
-        """Collect this curve's peak labels as (x, y, text, colour) tuples for the
+    def _collect_peak_labels(self, dist, res, axis: str, color: str) -> list:
+        """Collect this curve's peak labels as (x, y, text, color) tuples for the
         shared de-collision pass (GUI overlay; kept on saved images too, like the
         Correlogram τ markers). Uses the controller's peak finder so the analysis layer
         is not imported here. y is the curve's height at the peak, from the grid."""
         grid = np.asarray(dist.rh_grid_nm if axis == 'rh'
                           else dist.gamma_grid_s_inv, dtype=float)
         w = np.asarray(dist.weights, dtype=float)
+        sig = self.controller.settings.no_uncertainty_sig_figs   # distribution peaks: ±-less
         items = []
         for rh_nm, gamma_s_inv, _weight in self.controller.distribution_peaks(res):
             x = rh_nm if axis == 'rh' else gamma_s_inv
             if x is None or not math.isfinite(x) or grid.size == 0:
                 continue
             y = float(w[int(np.argmin(np.abs(grid - x)))])
-            txt = f'{_fmt(rh_nm)} nm' if axis == 'rh' else f'{_fmt(gamma_s_inv)} s⁻¹'
-            items.append((x, y, txt, colour))
+            txt = (f'{format_fixed_sig(rh_nm, sig)} nm' if axis == 'rh'
+                   else f'{format_fixed_sig(gamma_s_inv, sig)} s⁻¹')
+            items.append((x, y, txt, color))
         return items
 
     def _clear(self, message: str) -> None:
         self.ax.clear()
         self.resid_ax.clear()
+        # Hide the empty residual box while there is no distribution — a blank 0–1 axis
+        # reads as broken (findings 4.1/4.3). _draw re-shows it once a curve exists.
+        self.resid_ax.set_visible(False)
         self.ax.set_title(message)
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)
         self._clear_results()
+        # Drop any stale skipped-run flag: this is the reset choke point (selection
+        # change etc.), and _draw — the only place the flag is set — does not run on a
+        # cleared/empty-results state, so the red alarm would otherwise linger.
+        self.flag_label.clear()
 
 
 # ===========================================================================
@@ -1666,11 +1760,11 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
                 'Only this sample\'s DLS measurements appear — it is a single-sample fit.',
                 'The fit needs ≥ 2 distinct '
                 + ('angles.' if self.kind == 'gamma_q2' else 'concentrations.'),
-                'Greyed rows can\'t be ticked — hover a row to see why '
+                'Grayed rows can\'t be ticked — hover a row to see why '
                 '(unconfirmed parameters, or a different Mw fraction).',
                 'Γ and D fill in only after you Run; ticking never refits on its own.',
                 'Ticked rows read blue and light the matching sidebar leaves.',
-                'Unticked points still plot as a grey × (labelled "excluded" in the '
+                'Unticked points still plot as a gray × (labeled "excluded" in the '
                 'legend) so you can see what the fit left out.']))
         # Empty/ineligible-state hint + NaN-temperature sibling note (feedback 2026-07-06).
         self.table_note = ThemedLabel('', role='hint', size=10)
@@ -1724,7 +1818,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self.figure = Figure(figsize=(5.2, 4.3), constrained_layout=True)
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
         self.ax = self.figure.add_subplot(111)
-        self._nav = NavigationToolbar(self.canvas, self)
+        self._nav = themed_navtoolbar(self.canvas, self)
         right.addWidget(self._nav)
         right.addWidget(self.canvas, 1)
         self.axis_bar = AxisControlBar(self.canvas)
@@ -1740,7 +1834,8 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             return [
                 (f'D ({du})', lambda r: pm(r.d_m2_s, r.d_se)),
                 ('Rh (nm)', lambda r: format_pm(r.rh_nm, r.rh_se)),
-                ('R²', lambda r: _fmt(r.r_squared)),
+                ('R²', lambda r: format_fixed_sig(
+                    r.r_squared, self.controller.settings.no_uncertainty_sig_figs)),
                 ('Diffusive?', lambda r: '✓' if r.is_diffusive else '⚠ no'),
                 ('angles fitted', lambda r: str(r.q2_m2.size)),
             ]
@@ -1748,7 +1843,8 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             (f'D₀ ({du})', lambda r: pm(r.d0_m2_s, r.d0_se)),
             ('Rh₀ (nm)', lambda r: format_pm(r.rh0_nm, r.rh0_se)),
             ('k_D (mL/g)', lambda r: format_pm(r.kd_mL_per_g, r.kd_se)),
-            ('R²', lambda r: _fmt(r.r_squared)),
+            ('R²', lambda r: format_fixed_sig(
+                r.r_squared, self.controller.settings.no_uncertainty_sig_figs)),
             ('concs fitted', lambda r: str(r.n_concentrations)),
         ]
 
@@ -1801,7 +1897,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         # Auto-tick all eligible rows on first focus (ticking now only selects — it
         # computes nothing), so the common "use every point" case is one Run away.
         self._included[sid] = (prev & fresh) if prev is not None else set(fresh)
-        # Restore this sample's last-run per-point values (for the table Γ/D + greying).
+        # Restore this sample's last-run per-point values (for the table Γ/D + graying).
         cached = self._cache.get(sid)
         self._run_points[sid] = list(getattr(cached, 'all_points', None) or [])
         self._refresh_table(sid)
@@ -1875,8 +1971,9 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
                         else f"{row['concentration_g_per_mL'] * dfc:g}")
                 pt = run_by_id.get(row['item_id'])
                 has_val = pt is not None and pt['quality'] in ('ok', 'high_pdi')
-                gtxt = _fmt(pt['gamma_s_inv'] * dfg) if has_val else '—'
-                dtxt = _fmt(pt['d_app_m2_s'] * dfd) if has_val else '—'
+                sig = self.controller.settings.no_uncertainty_sig_figs   # per-angle Γ/D: ±-less
+                gtxt = format_fixed_sig(pt['gamma_s_inv'] * dfg, sig) if has_val else '—'
+                dtxt = format_fixed_sig(pt['d_app_m2_s'] * dfd, sig) if has_val else '—'
                 vals = ([ang, conc, gtxt, dtxt] if self.kind == 'gamma_q2'
                         else [conc, ang, dtxt])
                 for c, v in enumerate(vals, start=1):
@@ -1889,7 +1986,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             self._suppress_table = False
 
     def _row_tooltip(self, row: dict, pt: Optional[dict]) -> str:
-        """Explain a row's eligibility / quality so the user knows why it is greyed or
+        """Explain a row's eligibility / quality so the user knows why it is grayed or
         excluded (feedback 2026-07-06)."""
         reason = row.get('reason')
         if reason == 'unbuilt':
@@ -1913,7 +2010,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         return 'Eligible — ticked rows enter the fit when you press Run.'
 
     def _tint_row(self, r: int, on: bool) -> None:
-        """Colour a table row to match the shared idiom: ticked rows read
+        """Color a table row to match the shared idiom: ticked rows read
         `marker_selected` blue, like the sidebar mirror and the DLS picker."""
         col = theme_color(self.table, 'marker_selected') if on else QtGui.QBrush()
         for c in range(self.table.columnCount()):
@@ -2075,7 +2172,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
                 return                      # sample/tick set changed — stale
             self._cache[sid] = res
             self._cache_sig[sid] = self.controller.committed_signature(include_ids)
-            # Fold the run's per-point values into the table + greying (feedback
+            # Fold the run's per-point values into the table + graying (feedback
             # 2026-07-06): Γ/D now appear, and quality flags become hoverable.
             self._run_points[sid] = list(getattr(res, 'all_points', None) or [])
             self._refresh_table(sid)
@@ -2141,36 +2238,42 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
     def _draw(self, res) -> None:
         self.ax.clear()
         sid = self._sample_id()
+        # Glyph-less flag text + a `problem` tier; set_flag prepends ⚠/ⓘ to match the
+        # color (style guide §5, R5.1). The non-diffusive note is the genuine problem;
+        # the ± caveat is a neutral qualifier. A single label carries one tier, so — as
+        # on the SLS tab — a real problem tints the whole (possibly multi-line) label red.
         if self.kind == 'gamma_q2':
             plot_gamma_q2(res, ax=self.ax)
             self.ax.set_title('Γ vs q² (multi-angle)')
+            problem = not res.is_diffusive
             flag = ('' if res.is_diffusive else
-                    '⚠ not purely diffusive: Γ is not linear through the origin in q² '
+                    'not purely diffusive: Γ is not linear through the origin in q² '
                     '— Rh is apparent; check for a slow mode or internal motion (qRg>1).')
             if res.d_se is not None:
                 flag = (flag + '\n' if flag else '') + '(± statistical only)'
         else:
             plot_concentration_extrapolation(res, ax=self.ax)
             self.ax.set_title('D vs c → infinite dilution')
+            problem = False
             flag = ('(± statistical only)'
                     if (res.d0_se is not None or res.kd_se is not None) else '')
         drew_excluded = False
         if sid is not None:
-            drew_excluded = self._grey_points(sid)   # grey the unticked (excluded) ok points
+            drew_excluded = self._gray_points(sid)   # gray the unticked (excluded) ok points
         if drew_excluded:
-            # The grey ×'s are added AFTER the analysis layer built the legend, so
+            # The gray ×'s are added AFTER the analysis layer built the legend, so
             # re-issue it (preserving any title, e.g. the D-vs-c k_D title) to give the
             # 'excluded' marker an entry.
             reissue_legend_preserving_title(self.ax, fontsize=9)
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)
-        self.flag_label.setText(flag)
+        set_flag(self.flag_label, flag, problem=problem)
 
-    def _grey_points(self, sid: str) -> bool:
-        """Grey × the computed points that are NOT ticked, from the run's per-point
+    def _gray_points(self, sid: str) -> bool:
+        """Gray × the computed points that are NOT ticked, from the run's per-point
         values (by item_id, so replicates are disambiguated). Returns True if any
         excluded point was drawn (so the caller can add a legend entry). Only the
-        first marker is labelled so the legend shows one 'excluded' entry, not one
+        first marker is labeled so the legend shows one 'excluded' entry, not one
         per point."""
         inc = self._included.get(sid, set())
         if self.kind == 'gamma_q2':
@@ -2196,7 +2299,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
 class _DDLSTab(QtWidgets.QWidget):
     """Depolarized DLS (DDLS): rotational diffusion D_r from a sample's VV/VH
     correlogram pairs. Sample-scoped, like the Γ vs q² tab. Tag each correlogram's
-    polarisation (VV/VH) in the Data tab; this pairs them by angle and extracts
+    polarization (VV/VH) in the Data tab; this pairs them by angle and extracts
     D_r = (Γ_VH − Γ_VV)/6, with D_t from the VV channel."""
 
     _RESULT_ROWS = ['D_r (rad²/s)', 'τ_rot (µs)', 'D_t (m²/s)', 'R_h,t (nm)',
@@ -2233,14 +2336,14 @@ class _DDLSTab(QtWidgets.QWidget):
         left.addWidget(note)
 
         # Paired angles with an include checkbox (tick to include in the D_r/D_t fit —
-        # the same idiom as Γ vs q²), plus each correlogram's polarisation + pairing.
+        # the same idiom as Γ vs q²), plus each correlogram's polarization + pairing.
         left.addWidget(section_header(
-            'Paired angles (tick to include in the fit)',
+            'Paired Angles (tick to include in the fit)',
             'Tick which paired angles enter the D_r/D_t fit.',
             bullets=['Only angles with BOTH a VV and a VH correlogram can be paired.',
                      'Untick an angle to drop it (e.g. an outlier); the fit re-runs on '
                      'the ticked angles.',
-                     'Dropped angles still plot as a grey × (labelled "excluded" in the '
+                     'Dropped angles still plot as a gray × (labeled "excluded" in the '
                      'legend) so you can see what was left out.',
                      'Ticked angles read blue and light the matching sidebar leaves.']))
         self.table = QtWidgets.QTableWidget(0, 4)
@@ -2263,7 +2366,7 @@ class _DDLSTab(QtWidgets.QWidget):
         rod_w = QtWidgets.QWidget(); rod_w.setLayout(rod_row)
         left.addWidget(rod_w)
 
-        self.run_button = QtWidgets.QPushButton('Run DDLS')
+        self.run_button = QtWidgets.QPushButton('Run')
         self.run_button.setToolTip(BACKGROUND_RUN_TOOLTIP)
         self.run_button.clicked.connect(self._on_run)
         left.addWidget(self.run_button)
@@ -2272,7 +2375,7 @@ class _DDLSTab(QtWidgets.QWidget):
         self.export_button.clicked.connect(self._on_export)
         left.addWidget(self.export_button)
         # Outlier removal (#9): untick an angle above to drop it; unticked angles are
-        # greyed on the plot. "Include all" re-ticks every paired angle.
+        # grayed on the plot. "Include all" re-ticks every paired angle.
         self.reset_excl_button = QtWidgets.QPushButton('Include all angles')
         self.reset_excl_button.clicked.connect(self._on_include_all)
         left.addWidget(self.reset_excl_button)
@@ -2290,7 +2393,7 @@ class _DDLSTab(QtWidgets.QWidget):
         # Shape models (model-dependent dimensions). Framed + captioned so the
         # "assumed shape, not measured" caveat reads clearly vs the D_r/D_t observables.
         self.shape_box = QtWidgets.QGroupBox(
-            'Shape models (assumed geometry — not measured)')
+            'Shape Models (assumed geometry — not measured)')
         shape_layout = QtWidgets.QVBoxLayout(self.shape_box)
         self.shape_table = _readonly_table(
             ['Model', 'Dimensions', 'Aspect / ratio', 'OK?'], [])
@@ -2305,7 +2408,7 @@ class _DDLSTab(QtWidgets.QWidget):
         self.figure = Figure(figsize=(5.2, 4.3), constrained_layout=True)
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
         self.ax = self.figure.add_subplot(111)
-        self._nav = NavigationToolbar(self.canvas, self)
+        self._nav = themed_navtoolbar(self.canvas, self)
         right.addWidget(self._nav)
         right.addWidget(self.canvas, 1)
         self.axis_bar = AxisControlBar(self.canvas)
@@ -2364,7 +2467,7 @@ class _DDLSTab(QtWidgets.QWidget):
         """Angles to exclude from the fit = paired − included (engine takes excludes)."""
         inc = self._included.get(sid)
         if inc is None:
-            return set()                          # not initialised yet → nothing excluded
+            return set()                          # not initialized yet → nothing excluded
         return self._paired_angles(sid) - inc
 
     def _refresh_table(self, sid: str) -> None:
@@ -2583,13 +2686,14 @@ class _DDLSTab(QtWidgets.QWidget):
                   if any(np.isclose(a, e) for e in excl)]
             drew_excluded = draw_excluded_markers(self.ax, xy, zorder=5)
         if drew_excluded:
-            # Re-issue the legend so the grey ×'s (added after plot_ddls built it) show.
+            # Re-issue the legend so the gray ×'s (added after plot_ddls built it) show.
             # plot_ddls sets a titleless, framed legend at fontsize 8; match that.
             reissue_legend_preserving_title(self.ax, fontsize=8, frameon=True)
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)
 
-        rh = (_fmt(res.rh_t_nm) if math.isfinite(res.rh_t_nm)
+        sig = self.controller.settings.no_uncertainty_sig_figs
+        rh = (format_fixed_sig(res.rh_t_nm, sig) if math.isfinite(res.rh_t_nm)
               else 'n/a (needs viscosity)')
         paired = f'{len(info["paired_angles"])} · {res.method}'
         if info.get('n_replicate_angles'):
@@ -2602,7 +2706,7 @@ class _DDLSTab(QtWidgets.QWidget):
             ql = '—'
         _fill_vtable(self.results, [
             format_pm(res.d_r_rad2_s, res.d_r_se),
-            _fmt(res.rotational_time_s * 1e6),
+            format_fixed_sig(res.rotational_time_s * 1e6, sig),
             format_pm(res.d_t_m2_s, res.d_t_se),
             rh, paired, ql])
         self.status.clear()
@@ -2622,7 +2726,16 @@ class _DDLSTab(QtWidgets.QWidget):
         if res.d_r_se is not None or res.d_t_se is not None:
             bits.append('(± statistical: D_t from the multi-angle VV fit, '
                         'D_r from the per-angle spread; excludes calibration.)')
-        self.flag_label.setText('  '.join(bits))
+        # Tier the flag structurally (style guide §5): the only genuine problem here is an
+        # unphysical D_r ≤ 0 (Γ_VH ≤ Γ_VV) — its note ships red ⚠. Key `problem` off the
+        # SAME per-angle condition that emits that note (analysis/depolarization.py:
+        # `np.any(d_r_per_angle <= 0)`), NOT the aggregate mean d_r_rad2_s — a noisy set
+        # can have one negative angle (note fires) yet a positive mean, which would else
+        # demote a real problem to the calm tier. The qL caveat, the single-angle "no ±"
+        # note, the Skipped angle-pairing inventory, and the ± caveat are neutral → calm ⓘ
+        # (R5.5: the inventory is informational, a different event class from a fit skip).
+        problem = bool(np.any(np.asarray(res.d_r_per_angle, dtype=float) <= 0))
+        set_flag(self.flag_label, '  '.join(bits), problem=problem)
 
         self._draw_shape()
 
@@ -2639,20 +2752,31 @@ class _DDLSTab(QtWidgets.QWidget):
             return
         rod, sph = shapes['rod'], shapes['sphere']
 
+        sig = self.controller.settings.no_uncertainty_sig_figs
+
+        def pm_or_knob(v, se):
+            # L/d/p/R(D_r) carry a Monte-Carlo/delta-method SE — WHEN it exists (both
+            # D_t and D_r have one), show σ-driven so the ± sets the precision. When it
+            # is None (a single-correlogram D_t, or <2 replicate angles), fall back to
+            # the one no-uncertainty knob, uniformly with the ±-less cells below — not
+            # format_pm's hard-coded no-SE default.
+            return format_pm(v, se) if se is not None else format_fixed_sig(v, sig)
+
         if not rod.converged:
             rod_cells = ['Rod', 'no rigid rod reproduces both D_t and D_r', '', '✗']
         else:
             ok = '✓ in range' if rod.in_valid_range else '⚠ p outside 2–30'
             rod_cells = [
                 'Rod',
-                f'L = {format_pm(rod.length_nm, rod.length_se)} nm,  '
-                f'd = {format_pm(rod.diameter_nm, rod.diameter_se)} nm',
-                f'p = {rod.aspect_ratio_p:.2f}', ok]
+                f'L = {pm_or_knob(rod.length_nm, rod.length_se)} nm,  '
+                f'd = {pm_or_knob(rod.diameter_nm, rod.diameter_se)} nm',
+                f'p = {pm_or_knob(rod.aspect_ratio_p, rod.aspect_ratio_se)}', ok]
+        # radius_trans (= Rh from D_t) and the sphericity ratio carry no SE here → the knob.
         sph_cells = [
             'Sphere',
-            f'R(D_r) = {format_pm(sph.radius_rot_nm, sph.radius_rot_se)} nm  '
-            f'vs  R(D_t)=Rh = {_fmt(sph.radius_trans_nm)} nm',
-            f'ratio {sph.sphericity_ratio:.2f}',
+            f'R(D_r) = {pm_or_knob(sph.radius_rot_nm, sph.radius_rot_se)} nm  '
+            f'vs  R(D_t)=Rh = {format_fixed_sig(sph.radius_trans_nm, sig)} nm',
+            f'ratio {format_fixed_sig(sph.sphericity_ratio, sig)}',
             '✓' if sph.is_consistent else '✗']
         t = self.shape_table
         t.setRowCount(2)
@@ -2688,7 +2812,7 @@ class _DDLSTab(QtWidgets.QWidget):
 # Summary sub-tab (durable results table over the snapshot store)
 # ===========================================================================
 
-# How each sample-level source_kind is labelled in the table's "Source" column.
+# How each sample-level source_kind is labeled in the table's "Source" column.
 _SOURCE_LABELS = {
     'replicate_avg': 'Replicate avg',
     'gamma_q2': 'Γ vs q²',
@@ -2696,12 +2820,17 @@ _SOURCE_LABELS = {
 }
 
 
-def _peak_cell(peaks: List[Tuple[float, float]]) -> str:
-    """Render a distribution method's peaks as 'Rh (Int %); Rh (Int %)'."""
+def _peak_cell(peaks: List[Tuple[float, float]], sig: int = 3) -> str:
+    """Render a distribution method's peaks as 'Rh (Int %); Rh (Int %)'.
+
+    NNLS/CONTIN/lognormal peaks are from an ill-posed inversion — no honest ±
+    (invariant 8) — so BOTH the Rh and its intensity weight use the one
+    no-uncertainty knob (`sig`), never a separate fixed convention."""
     if not peaks:
         return '—'
     return '; '.join(
-        f'{_fmt(rh)} ({frac * 100:.0f}%)' if frac is not None else _fmt(rh)
+        f'{format_fixed_sig(rh, sig)} ({format_fixed_sig(frac * 100, sig)}%)'
+        if frac is not None else format_fixed_sig(rh, sig)
         for rh, frac in peaks)
 
 
@@ -2803,34 +2932,49 @@ class _SummaryTab(QtWidgets.QWidget):
             headers.append('Lognormal (Rh / Int %)')
         if show_dbl:
             headers.append('Double-exp (Rh fast / slow)')
+        # Every number here is from a single correlogram or an ill-posed inversion — no
+        # honest ± (invariant 8) — so all use the one no-uncertainty knob, never a
+        # fabricated uncertainty.
+        sig = self.controller.settings.no_uncertainty_sig_figs
         rows = []
         for r in recs:
             cells = [
                 r['sample_label'], r['measurement_label'],
-                _fmt(r['cumulant_rh']), _fmt(r['pdi']), _fmt(r['single_rh']),
-                _fmt(r['kww_rh']),
-                _peak_cell(r['peaks'].get('nnls', [])),
-                _peak_cell(r['peaks'].get('contin', [])),
+                format_fixed_sig(r['cumulant_rh'], sig), format_fixed_sig(r['pdi'], sig),
+                format_fixed_sig(r['single_rh'], sig),
+                format_fixed_sig(r['kww_rh'], sig),
+                _peak_cell(r['peaks'].get('nnls', []), sig),
+                _peak_cell(r['peaks'].get('contin', []), sig),
             ]
             if show_logn:
-                cells.append(_peak_cell(r['peaks'].get('lognormal', [])))
+                cells.append(_peak_cell(r['peaks'].get('lognormal', []), sig))
             if show_dbl:
                 cells.append(
-                    f"{_fmt(r['double_fast'])} / {_fmt(r['double_slow'])}"
+                    f"{format_fixed_sig(r['double_fast'], sig)} / "
+                    f"{format_fixed_sig(r['double_slow'], sig)}"
                     if r['double_fast'] is not None else '—')
             rows.append(cells)
         self._replace_table(self.per_meas_table, headers, rows)
 
     def _fill_sample(self, recs: List[Dict]) -> None:
         headers = ['Sample', 'Source', 'Rh (nm)', '±SE', 'Rh Type', 'From']
+        sig = self.controller.settings.no_uncertainty_sig_figs
         rows = []
         for r in recs:
             se = r['rh_se']
+            # With an honest SE, round Rh to the place its σ supports (invariant 8) and
+            # show the SE at that same place, so value and ± agree (45 ± 1, not 45.2 ± 1.03).
+            # Without one, fall back to the documented fixed-sig precision — never a ±.
+            if se is not None and math.isfinite(se) and se > 0:
+                rh_cell = format_value_at_uncertainty(r['rh_nm'], se)
+                se_cell = format_value_at_uncertainty(se, se)
+            else:
+                rh_cell = format_fixed_sig(r['rh_nm'], sig)
+                se_cell = '—'
             rows.append([
                 r['sample_label'],
                 _SOURCE_LABELS.get(r['source_kind'], r['source_kind']),
-                _fmt(r['rh_nm']),
-                _fmt(se) if se is not None else '—',
+                rh_cell, se_cell,
                 r['rh_type_label'], r['from_label'],
             ])
         self._replace_table(self.sample_table, headers, rows)
@@ -2886,8 +3030,12 @@ class DLSModule(QtWidgets.QWidget):
         # Distribution tabs so the two stay consistent.
         self.region = _AnalysisRegion()
         # One shared selection model for the co-plotting tabs (Correlogram / Distribution
-        # / Summary). The colour cycle keeps each measurement a stable overlay colour.
-        self.selection = SelectionModel(colour_cycle=_CYCLE)
+        # / Summary). The color cycle keeps each measurement a stable overlay color.
+        # Pass the live `cycle` FUNCTION (not a snapshot) so a plot-palette switch
+        # reaches the DLS overlay colours; markers/linestyles are palette-independent.
+        self.selection = SelectionModel(color_cycle=_plot_cycle,
+                                        marker_cycle=_MARKER_CYCLE,
+                                        linestyle_cycle=_LINESTYLE_CYCLE)
         self.correlogram_tab = _CorrelogramTab(controller, self.region, self.selection)
         self.distribution_tab = _DistributionTab(controller, self.region, self.selection)
         self.gamma_q2_tab = _SampleAnalysisTab(controller, 'gamma_q2')
@@ -2934,7 +3082,7 @@ class DLSModule(QtWidgets.QWidget):
         self.item_id = item_id
         if item_id is None:
             self.header.setText('Pick a measurement in the Workspace list; '
-                                'tick measurements in the sub-tabs to analyse.')
+                                'tick measurements in the sub-tabs to analyze.')
             runnable = False
         else:
             kind = self.controller.workspace.measurements[item_id].kind

@@ -5,7 +5,7 @@ analysis/dls/distributions.py
 Distribution methods: recover a full decay-rate / size distribution rather than a
 few parameters.
 
-The field ACF is discretised on a grid of decay rates Gamma_n (equivalently
+The field ACF is discretized on a grid of decay rates Gamma_n (equivalently
 hydrodynamic radii Rh_n):
 
     |g1(tau_m)|^2  ~  sum_n  x_n exp(-2 Gamma_n tau_m)        (A x)_m
@@ -25,9 +25,9 @@ use SLSQP with a sum(x)=1 equality constraint. Instead we use the standard
 augmented-NNLS formulation -- stack [A; alpha L] over [y; 0] and call
 scipy.optimize.nnls -- which is faster, more robust, and avoids forcing the
 distribution to integrate to exactly 1 when the data do not support it. The
-reported distribution is normalised to sum 1 afterwards, for display only.
+reported distribution is normalized to sum 1 afterwards, for display only.
 
-The data y fed to the solver is the baseline-subtracted, beta-normalised
+The data y fed to the solver is the baseline-subtracted, beta-normalized
 correlogram, y = (g2 - 1 - baseline) / beta, so that y(0) ~ 1 and the recovered
 weights are an intensity-weighted distribution. beta and baseline are estimated by
 default (see _estimate_beta / _estimate_baseline in _common) but may be overridden.
@@ -63,11 +63,11 @@ from analysis.dls.cumulants import fit_cumulants
 class DistributionResult:
     """A decay-rate / size distribution from NNLS or CONTIN."""
     method: str                       # 'nnls' or 'contin'
-    alpha: Optional[float]            # regularisation parameter (None for NNLS)
+    alpha: Optional[float]            # regularization parameter (None for NNLS)
     # the grid (paired: rh_grid_nm[i] corresponds to gamma_grid_s_inv[i])
     rh_grid_nm: np.ndarray
     gamma_grid_s_inv: np.ndarray
-    weights: np.ndarray               # normalised intensity weights (sum = 1)
+    weights: np.ndarray               # normalized intensity weights (sum = 1)
     # summary statistics of the distribution
     mean_rh_nm: float                 # intensity-weighted mean Rh
     mean_gamma_s_inv: float           # intensity-weighted mean decay rate
@@ -82,14 +82,14 @@ class DistributionResult:
     fitted_g2m1: np.ndarray           # beta * (A x) reconstructed on fit_tau_s
     residuals: np.ndarray             # (g2-1) data - fitted, on fit_tau_s
     rms_error: float
-    residual_norm: float              # ||A x - y||^2 (normalised-space residual)
+    residual_norm: float              # ||A x - y||^2 (normalized-space residual)
     solution_norm: float              # ||x||^2
     n_skipped: int = 0                # leading channels dropped (skip_initial_channels)
 
 
 @dataclass
 class LCurveResult:
-    """The alpha sweep used to choose CONTIN's regularisation parameter.
+    """The alpha sweep used to choose CONTIN's regularization parameter.
 
     Despite the name (kept for backward compatibility), this holds the sweep for
     EITHER alpha-selection method — the L-curve corner or the Provencher F-test.
@@ -110,7 +110,7 @@ class ContinResult:
 
     `alpha_selection_method` records how the automatic alpha was chosen
     ('lcurve' | 'ftest'), and `ftest_prob_reject` the F-test level when applicable,
-    so a distribution is never ambiguous about how its regularisation was picked.
+    so a distribution is never ambiguous about how its regularization was picked.
     When alpha was user-supplied, the method is reported as 'user'.
     """
     distribution: DistributionResult
@@ -140,9 +140,9 @@ def _solve_distribution(
     alpha: float,
     L: Optional[np.ndarray],
 ) -> np.ndarray:
-    """Solve a non-negative (optionally regularised) least-squares problem.
+    """Solve a non-negative (optionally regularized) least-squares problem.
 
-    Minimises ||A x - y||^2 + alpha^2 ||L x||^2 subject to x >= 0 by stacking
+    Minimizes ||A x - y||^2 + alpha^2 ||L x||^2 subject to x >= 0 by stacking
     [A; alpha L] over [y; 0] and calling scipy.optimize.nnls. For NNLS, pass
     alpha = 0 (or L = None); the augmentation then vanishes.
     """
@@ -247,7 +247,7 @@ def fit_nnls(
     """Recover a decay-rate distribution by non-negative least squares.
 
     Solves min ||A x - y||^2 subject to x >= 0, with no smoothing. NNLS is the
-    unregularised special case (alpha = 0) of CONTIN. It can resolve clearly
+    unregularized special case (alpha = 0) of CONTIN. It can resolve clearly
     separated modes but, lacking a smoothness constraint, tends to produce spiky
     distributions that are sensitive to noise; CONTIN is usually preferable for
     real data.
@@ -260,7 +260,7 @@ def fit_nnls(
     n_grid : int
         Number of grid points (default 100).
     beta : float, optional
-        Coherence factor for normalisation. Estimated from the data if omitted.
+        Coherence factor for normalization. Estimated from the data if omitted.
     baseline : float, optional
         Residual baseline offset to subtract. Estimated from the long-delay tail
         if omitted.
@@ -396,7 +396,7 @@ def _tikhonov_effective_dof(A: np.ndarray, L: np.ndarray, alpha: float,
                             AtA: Optional[np.ndarray] = None) -> float:
     """Effective degrees of freedom of the Tikhonov solution at this alpha.
 
-    The regularised least-squares solution has the linear "hat" (influence) matrix
+    The regularized least-squares solution has the linear "hat" (influence) matrix
     H = A (A^T A + alpha^2 L^T L)^-1 A^T; its trace is the effective number of free
     parameters -- the honest degrees of freedom, NOT the raw grid size (Hansen 1998;
     the number of grid points is "to a large extent arbitrary", Provencher 1982). It
@@ -429,7 +429,7 @@ def _ftest_corner(residual_norms, dof_eff, n_data: int,
         F(alpha) = [ (V(alpha) - V0) / V0 ] * (Ny - NDF0) / NDF0             (Eq. 3.24)
 
     with V(alpha) = ||A x - y||^2, and V0 the MINIMUM residual over the sweep, at the
-    reference alpha_0 (the least-regularised / least-squares end). Ny is the number of
+    reference alpha_0 (the least-regularized / least-squares end). Ny is the number of
     data points and NDF0 = NDF(alpha_0) the effective degrees of freedom AT that
     reference -- Provencher's NDF = sum_j s_j^2/(s_j^2 + alpha^2) (Eqs. 3.15-3.16),
     which is exactly the trace of the Tikhonov hat matrix (`_tikhonov_effective_dof`),
@@ -439,7 +439,7 @@ def _ftest_corner(residual_norms, dof_eff, n_data: int,
 
         fc(alpha) = P[F(alpha); NDF0, Ny - NDF0]                             (Eq. 3.23)
 
-    is Provencher's PROB1, the "probability to reject": ~0 where the regulariser barely
+    is Provencher's PROB1, the "probability to reject": ~0 where the regularizer barely
     changes the fit (rough, under-smoothed) and ~1 where it changes it a lot (Provencher:
     "only when PROB1 > ~0.9 are there significant grounds to suspect alpha may be too
     large"). The chosen solution is the one whose fc is closest to `prob_reject`
@@ -488,10 +488,10 @@ def fit_contin(
     alpha_method: str = 'lcurve',
     ftest_prob_reject: float = 0.5,
 ) -> ContinResult:
-    """Recover a smoothed decay-rate distribution by regularised inversion.
+    """Recover a smoothed decay-rate distribution by regularized inversion.
 
     Solves min ||A x - y||^2 + alpha^2 ||L x||^2 subject to x >= 0, with L the
-    second-difference operator (Provencher 1982). The regularisation parameter
+    second-difference operator (Provencher 1982). The regularization parameter
     alpha trades fit quality against distribution smoothness.
 
     If alpha is None (default), a sweep over [alpha_min, alpha_max] is run and alpha
@@ -503,7 +503,7 @@ def fit_contin(
       * 'lcurve' (default): the L-curve corner (Salazar et al. 2023).
       * 'ftest': Provencher's original F-test / "probability to reject" criterion
         (Provencher 1982; Scotti et al. 2015), picking the solution whose residual
-        increase over the least-regularised fit sits at the `ftest_prob_reject`
+        increase over the least-regularized fit sits at the `ftest_prob_reject`
         significance level (default 0.5). Higher -> smoother, lower -> rougher.
 
     Parameters
@@ -511,7 +511,7 @@ def fit_contin(
     measurement : DLSMeasurement
     rh_min_nm, rh_max_nm, n_grid : grid specification (default 1-1000 nm, 100 pts)
     alpha : float, optional
-        Fixed regularisation parameter. If omitted, chosen by `alpha_method`.
+        Fixed regularization parameter. If omitted, chosen by `alpha_method`.
     alpha_min, alpha_max, n_alpha :
         Log-spaced alpha sweep (default 1e-6 to 1e2, 20 points).
     beta, baseline : float, optional
@@ -597,13 +597,13 @@ def fit_contin(
 
 
 # ---------------------------------------------------------------------------
-# Rh <-> Gamma axis helper (for the visualisation toggle and general use)
+# Rh <-> Gamma axis helper (for the visualization toggle and general use)
 # ---------------------------------------------------------------------------
 
 def distribution_axis(distribution: DistributionResult, axis: str = 'rh'):
     """Return (x_values, weights, x_label) for plotting a DistributionResult.
 
-    Supports the Rh <-> Gamma visualisation toggle. The same weights are plotted
+    Supports the Rh <-> Gamma visualization toggle. The same weights are plotted
     against either the hydrodynamic-radius grid or the decay-rate grid; only the
     x-axis changes. Values are returned sorted ascending in the chosen axis.
 
@@ -677,10 +677,10 @@ def find_distribution_peaks(
         return []
 
     n = w.size
-    # Local maxima, including the endpoints if they rise above their neighbour. A
+    # Local maxima, including the endpoints if they rise above their neighbor. A
     # flat-topped peak (a run of consecutive EQUAL heights, e.g. [...,1,1,...]) is
     # ONE population, not two: scan by runs of equal weight and report the run's
-    # centre, so an exact plateau isn't split into two spurious peaks.
+    # center, so an exact plateau isn't split into two spurious peaks.
     maxima: List[int] = []
     i = 0
     while i < n:
@@ -694,7 +694,7 @@ def find_distribution_peaks(
         right_ok = (j == n - 1) or (w[j] >= w[j + 1])
         strictly = ((i > 0 and w[i] > w[i - 1]) or (j < n - 1 and w[j] > w[j + 1]))
         if left_ok and right_ok and strictly:
-            maxima.append((i + j) // 2)         # centre of the plateau (grid index)
+            maxima.append((i + j) // 2)         # center of the plateau (grid index)
         i = j + 1
     if not maxima:
         maxima = [int(np.argmax(w))]

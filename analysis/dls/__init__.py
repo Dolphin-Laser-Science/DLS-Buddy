@@ -15,7 +15,7 @@ function g2(tau) - 1. It provides six analysis methods in two families:
 
   Distribution methods (recover a full decay-rate distribution):
     - fit_nnls                 non-negative least squares (no smoothing)
-    - fit_contin               regularised (smoothed) inversion, L-curve alpha
+    - fit_contin               regularized (smoothed) inversion, L-curve alpha
     - fit_lognormal            single-mode lognormal (parametric distribution)
 
 Shared front-end: multi-angle Gamma/q^2, concentration extrapolation, replicate
@@ -43,9 +43,9 @@ the Siegert relation:
     g2(tau) - 1 = beta |g1(tau)|^2
 
 where beta is the coherence factor (intercept). We fit g2(tau) - 1 directly
-(beta floating), rather than linearising to g1 by taking a square root, because
+(beta floating), rather than linearizing to g1 by taking a square root, because
 the noise lives on g2 - 1 and the square-root transform both distorts that noise
-and fails where g2 - 1 dips negative in the baseline. (A linearised-g1 option may
+and fails where g2 - 1 dips negative in the baseline. (A linearized-g1 option may
 be added later.)
 
 A consequence of the Siegert relation is a FACTOR OF 2 in every decay exponent:

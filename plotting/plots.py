@@ -4,7 +4,7 @@ plotting/plots.py
 
 Matplotlib plotting for the DLS and SLS result objects.
 
-This is the visualisation layer. It is built before, and independently of, any
+This is the visualization layer. It is built before, and independently of, any
 GUI, and is designed to drop straight into one later. Every function follows the
 same contract:
 
@@ -21,7 +21,7 @@ Interactivity (re-fitting on a slider move, etc.) is NOT here: the GUI reads its
 controls, re-calls the analysis function with new arguments, and calls the
 matching plot function again. Plotting stays static and stateless.
 
-Styling uses the Okabe-Ito colourblind-safe palette, applied consistently across
+Styling uses the Okabe-Ito colorblind-safe palette, applied consistently across
 every plot so overlays remain distinguishable.
 
 Change history
@@ -47,8 +47,8 @@ from analysis.dls import distribution_axis
 # Shared style and helpers
 # ===========================================================================
 
-# Okabe-Ito colourblind-safe palette (the default). Plots reference colours by
-# SEMANTIC ROLE ('blue', 'vermilion', ...), not literal colour, so a palette swap
+# Okabe-Ito colorblind-safe palette (the default). Plots reference colors by
+# SEMANTIC ROLE ('blue', 'vermilion', ...), not literal color, so a palette swap
 # remaps every plot consistently. The role keys are shared across all palettes.
 OKABE_ITO = {
     'black': '#000000', 'orange': '#E69F00', 'sky': '#56B4E9',
@@ -79,13 +79,126 @@ _CYCLE = [PALETTE[k] for k in _CYCLE_KEYS]
 def set_palette(name: str) -> None:
     """Switch the active plot palette ('okabe_ito' / 'tab10' / 'grayscale').
 
-    Applies to plots drawn afterwards; figures already on screen keep their colours
+    Applies to plots drawn afterwards; figures already on screen keep their colors
     until redrawn. Unknown names fall back to the Okabe-Ito default."""
     global _CYCLE
     chosen = _PALETTES.get(name, _PALETTES['okabe_ito'])
     PALETTE.clear()
     PALETTE.update(chosen)
     _CYCLE = [PALETTE[k] for k in _CYCLE_KEYS]
+
+
+def cycle() -> list:
+    """The CURRENT overlay color cycle (reflects the active `set_palette`). Pass this
+    function itself to a live consumer (e.g. `SelectionModel(color_cycle=cycle)`) so a
+    palette switch reaches it — `_CYCLE` is rebound on each swap, so a captured copy or
+    a stale `import _CYCLE` binding would freeze on the startup palette."""
+    return list(_CYCLE)
+
+
+# ---------------------------------------------------------------------------
+# Per-series marker + linestyle cycles (colour-independence — UI Batch 5, WCAG 1.4.1)
+# ---------------------------------------------------------------------------
+# Overlaid series (co-plotted correlograms, Zimm concentrations, scaling series) must be
+# distinguishable WITHOUT colour — for a colour-vision-deficient reader and in greyscale.
+# These run in lock-step with `_CYCLE` (same length, index-keyed), so series N gets a
+# stable (colour, marker, linestyle) triple. The GUI's SelectionModel exposes matching
+# marker_for/linestyle_for keyed the same way.
+_MARKER_CYCLE = ['o', 's', '^', 'D', 'v', 'P', 'X']          # circle, square, triangle...
+_LINESTYLE_CYCLE = ['-', '--', ':', '-.', (0, (3, 1, 1, 1)), (0, (5, 1)), (0, (1, 1))]
+
+
+def marker_for(i: int) -> str:
+    """Stable marker for series index `i` (cycles)."""
+    return _MARKER_CYCLE[i % len(_MARKER_CYCLE)]
+
+
+def linestyle_for(i: int):
+    """Stable linestyle for series index `i` (cycles)."""
+    return _LINESTYLE_CYCLE[i % len(_LINESTYLE_CYCLE)]
+
+
+# ---------------------------------------------------------------------------
+# On-screen figure theming (UI Batch 5, finding 7.1) — white default + opt-in dark
+# ---------------------------------------------------------------------------
+# The on-screen matplotlib figure defaults to WHITE (clean exports/print). The GUI may
+# opt in to theming the *on-screen* figure to a dark palette when the app theme is dark
+# (Settings "Match plot to app theme"). EXPORT ALWAYS STAYS WHITE (locked, style guide
+# R10.3): `save_figure_white` recolours to white, saves, and restores. Only the figure
+# CHROME (facecolor, spines, ticks, labels, title, grid, legend frame) is themed — the
+# data SERIES keep their PALETTE colours so they stay legible in both.
+import matplotlib as _mpl
+
+_LIGHT_FIG = {'fig': 'white', 'ax': 'white', 'chrome': 'black', 'grid': '#b0b0b0'}
+_DARK_FIG = {'fig': '#2b2b2b', 'ax': '#2b2b2b', 'chrome': '#d8d8d8', 'grid': '#555555'}
+_ONSCREEN_DARK = False                    # current on-screen theme (module state)
+
+
+def onscreen_plot_dark() -> bool:
+    """Whether the on-screen plot theme is currently dark."""
+    return _ONSCREEN_DARK
+
+
+def set_onscreen_plot_theme(dark: bool) -> None:
+    """Set the on-screen plot chrome theme via rcParams, so figures drawn/redrawn
+    afterwards inherit it with NO change to the plot functions (they clear + recreate
+    axes, which pick up the rcParams). Export stays white regardless (savefig.facecolor).
+    Call `apply_figure_theme` on already-drawn canvases for an immediate refresh."""
+    global _ONSCREEN_DARK
+    _ONSCREEN_DARK = bool(dark)
+    p = _DARK_FIG if dark else _LIGHT_FIG
+    _mpl.rcParams.update({
+        'figure.facecolor': p['fig'], 'axes.facecolor': p['ax'],
+        'axes.edgecolor': p['chrome'], 'axes.labelcolor': p['chrome'],
+        'axes.titlecolor': p['chrome'], 'xtick.color': p['chrome'],
+        'ytick.color': p['chrome'], 'xtick.labelcolor': p['chrome'],
+        'ytick.labelcolor': p['chrome'], 'text.color': p['chrome'],
+        'grid.color': p['grid'], 'legend.facecolor': p['fig'],
+        'legend.edgecolor': p['chrome'],
+        'savefig.facecolor': 'white', 'savefig.edgecolor': 'white',
+    })
+
+
+def apply_figure_theme(fig, dark: bool) -> None:
+    """Force the chrome colours of an ALREADY-DRAWN figure to the light/dark theme
+    (rcParams only affect NEW artists). Used for an immediate on-screen refresh and,
+    with dark=False, by `save_figure_white`. Recolours facecolor, spines, ticks, axis
+    labels, titles, grid lines and any legend frame/text; leaves data series alone."""
+    p = _DARK_FIG if dark else _LIGHT_FIG
+    fig.set_facecolor(p['fig'])
+    fig.set_edgecolor(p['fig'])
+    for ax in fig.axes:
+        ax.set_facecolor(p['ax'])
+        for spine in ax.spines.values():
+            spine.set_edgecolor(p['chrome'])
+        ax.tick_params(colors=p['chrome'], which='both')
+        ax.xaxis.label.set_color(p['chrome'])
+        ax.yaxis.label.set_color(p['chrome'])
+        ax.title.set_color(p['chrome'])
+        for lbl in (*ax.get_xticklabels(), *ax.get_yticklabels()):
+            lbl.set_color(p['chrome'])
+        for gl in (*ax.get_xgridlines(), *ax.get_ygridlines()):
+            gl.set_color(p['grid'])
+        leg = ax.get_legend()
+        if leg is not None:
+            leg.get_frame().set_facecolor(p['fig'])
+            leg.get_frame().set_edgecolor(p['chrome'])
+            for t in leg.get_texts():
+                t.set_color(p['chrome'])
+
+
+def save_figure_white(fig, path: str) -> str:
+    """Save `fig` to `path` on a WHITE background regardless of the on-screen theme
+    (locked policy — exports must be clean/print-parity). Recolours to white, saves,
+    then restores the current on-screen theme."""
+    apply_figure_theme(fig, dark=False)
+    try:
+        fig.savefig(path, facecolor='white', edgecolor='white')
+    finally:
+        apply_figure_theme(fig, dark=_ONSCREEN_DARK)
+        if fig.canvas is not None:
+            fig.canvas.draw_idle()
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +303,7 @@ def annotate_decollided(ax, items, *, max_stack: int = 6, fontsize: int = 8,
 
     texts = []
     for members in clusters:
-        # Stack from the cluster's highest point (largest display y) upward; centre the
+        # Stack from the cluster's highest point (largest display y) upward; center the
         # column on the members' mean x so it reads as one tidy stack.
         order = sorted(members, key=lambda j: disp[j][1], reverse=True)
         anchor_x = float(np.mean([pts_data[j][0] for j in members]))
@@ -238,8 +351,8 @@ def _get_ax(ax: Optional[Any], figsize=(6.0, 4.5)):
     return ax.figure, ax, False
 
 
-def _next_colour(ax) -> str:
-    """Pick a palette colour not obviously already in use on this axes."""
+def _next_color(ax) -> str:
+    """Pick a palette color not obviously already in use on this axes."""
     used = len(ax.lines) + len(ax.collections)
     return _CYCLE[used % len(_CYCLE)]
 
@@ -252,7 +365,7 @@ def plot_correlogram_fit(
     result,
     ax: Optional[Any] = None,
     residual_ax: Optional[Any] = None,
-    colour: Optional[str] = None,
+    color: Optional[str] = None,
     label: Optional[str] = None,
     show_residuals: bool = True,
 ) -> PlotHandles:
@@ -269,8 +382,8 @@ def plot_correlogram_fit(
     ----------
     result : a parametric DLS result object
     ax, residual_ax : matplotlib Axes, optional
-    colour : str, optional
-        Overrides the automatic palette colour (useful when overlaying).
+    color : str, optional
+        Overrides the automatic palette color (useful when overlaying).
     label : str, optional
         Legend label for the fit line.
     show_residuals : bool
@@ -294,7 +407,7 @@ def plot_correlogram_fit(
     else:
         fig, ax, created = _get_ax(ax)
 
-    c = colour or _next_colour(ax)
+    c = color or _next_color(ax)
     tau_d, t_unit = _disp('time', tau)
     artists = {}
     artists['data'] = ax.scatter(tau_d, data, s=18, facecolors='none',
@@ -324,7 +437,7 @@ def plot_correlogram_fit(
 # sub-normal positives spanning ~300 decades; on a log axis that sends autoscale
 # and the tick formatter (round(inf)) haywire under constrained_layout. This floor
 # trims such a tail. It sits far below any physically meaningful plotted quantity
-# (a normalised g2-1 has ~1e-3-1e-4 precision), so it never clips real data.
+# (a normalized g2-1 has ~1e-3-1e-4 precision), so it never clips real data.
 _LOG_FLOOR = 1e-12
 
 
@@ -333,7 +446,7 @@ def mask_log_axes(x, y, *, xlog: bool, ylog: bool, floor: float = _LOG_FLOOR):
 
     Removes any non-finite point, and on a log axis any value below `floor` --
     which discards both non-positive values and an underflowing computed-curve
-    tail (see `_LOG_FLOOR`). Shared sanitiser for log-scale plots; use it wherever
+    tail (see `_LOG_FLOOR`). Shared sanitizer for log-scale plots; use it wherever
     a *computed* curve is drawn on a log axis and could underflow. NOTE it filters
     x and y together, so it is not suitable where a separate index must stay
     aligned to the unfiltered arrays (e.g. the L-curve's optimal-point marker),
@@ -359,39 +472,42 @@ def plot_correlogram_scaled(
     *,
     xscale: str = 'log',
     yscale: str = 'linear',
-    colour: Optional[str] = None,
+    color: Optional[str] = None,
     label: Optional[str] = None,
     compact: bool = False,
+    marker: str = 'o',
 ) -> PlotHandles:
     """Draw a correlogram (+ optional fit overlay) on one axes at given scales.
 
     `xscale` / `yscale` are 'linear' or 'log'. On a log axis, non-positive values
     are masked (g2-1 dips just below 0 in the noise tail). `compact` shrinks the
     ticks and drops axis labels for the small side views of the multi-scale panel.
-    `colour`/`label` let several correlograms be overlaid on one axes with a legend.
+    `color`/`label` let several correlograms be overlaid on one axes with a legend;
+    `marker` varies the point SHAPE per overlaid series so they stay distinct without
+    colour (WCAG 1.4.1 / greyscale — UI Batch 5).
     Used by the DLS tab's 4-view correlogram and the multi-measurement overlay.
     """
     fig, ax, _ = _get_ax(ax)
     tfac = display_factor('time')
     tau = np.asarray(tau, dtype=float) * tfac
     g2 = np.asarray(g2m1, dtype=float)
-    c = colour or PALETTE['blue']
+    c = color or PALETTE['blue']
 
     xlog, ylog = xscale == 'log', yscale == 'log'
 
     artists = {}
     dx, dy = mask_log_axes(tau, g2, xlog=xlog, ylog=ylog)
-    artists['data'] = ax.scatter(dx, dy, s=(7 if compact else 18),
+    artists['data'] = ax.scatter(dx, dy, s=(7 if compact else 18), marker=marker,
                                  facecolors='none', edgecolors=c, alpha=0.7,
                                  label=(label or 'data'))
     if fit_tau is not None and fit_g2m1 is not None:
         fx, fy = mask_log_axes(np.asarray(fit_tau, dtype=float) * tfac,
                                np.asarray(fit_g2m1, dtype=float),
                                xlog=xlog, ylog=ylog)
-        # When an explicit colour is given (multi-measurement overlay) the fit line
-        # matches its data colour so each measurement reads as one colour; with no
-        # colour (single-measurement view) the fit keeps the vermilion default.
-        fit_c = colour or PALETTE['vermilion']
+        # When an explicit color is given (multi-measurement overlay) the fit line
+        # matches its data color so each measurement reads as one color; with no
+        # color (single-measurement view) the fit keeps the vermilion default.
+        fit_c = color or PALETTE['vermilion']
         artists['fit'] = ax.plot(fx, fy, '-', color=fit_c,
                                  lw=(1.2 if compact else 1.8), label='fit')[0]
     ax.set_xscale(xscale)
@@ -408,14 +524,15 @@ def plot_distribution(
     result,
     ax: Optional[Any] = None,
     axis: str = 'rh',
-    colour: Optional[str] = None,
+    color: Optional[str] = None,
     label: Optional[str] = None,
     fill: bool = True,
+    linestyle: str = '-',
 ) -> PlotHandles:
     """Plot an NNLS or CONTIN size/rate distribution.
 
     Overlay-capable: call twice on the same `ax` (e.g. NNLS and CONTIN) and each
-    gets its own palette colour and label.
+    gets its own palette color and label.
 
     Parameters
     ----------
@@ -423,7 +540,7 @@ def plot_distribution(
     ax : matplotlib Axes, optional
     axis : str
         'rh' (hydrodynamic radius, nm) or 'gamma' (decay rate, 1/s).
-    colour, label : optional styling.
+    color, label : optional styling.
     fill : bool
         Lightly fill under the curve.
 
@@ -442,11 +559,11 @@ def plot_distribution(
         x = x * display_factor('radius')
         xlabel = rf'$R_h$ ({display_unit("radius")})'
     fig, ax, created = _get_ax(ax)
-    c = colour or _next_colour(ax)
+    c = color or _next_color(ax)
     lbl = label or (result.method.upper() if hasattr(result, 'method') else None)
 
     artists = {}
-    artists['line'] = ax.plot(x, weights, '-', color=c, lw=1.8, label=lbl)[0]
+    artists['line'] = ax.plot(x, weights, color=c, ls=linestyle, lw=1.8, label=lbl)[0]
     if fill:
         artists['fill'] = ax.fill_between(x, weights, color=c, alpha=0.15)
     ax.set_xscale('log')
@@ -481,7 +598,7 @@ def plot_gamma_q2(result, ax: Optional[Any] = None) -> PlotHandles:
     """Plot Gamma vs q^2 with the through-origin diffusion fit.
 
     The data points, the through-origin line (slope = D), and the unconstrained
-    intercept are shown. A non-zero intercept flags non-diffusive behaviour.
+    intercept are shown. A non-zero intercept flags non-diffusive behavior.
     """
     fig, ax, created = _get_ax(ax)
     qfac, q_unit = display_factor('scattering_q2'), display_unit('scattering_q2')
@@ -534,11 +651,11 @@ def plot_concentration_extrapolation(result, ax: Optional[Any] = None) -> PlotHa
 # ===========================================================================
 
 def plot_rayleigh_ratio(result, ax: Optional[Any] = None,
-                        colour: Optional[str] = None,
+                        color: Optional[str] = None,
                         label: Optional[str] = None) -> PlotHandles:
     """Plot the excess Rayleigh ratio dR vs q^2 for one concentration."""
     fig, ax, created = _get_ax(ax)
-    c = colour or _next_colour(ax)
+    c = color or _next_color(ax)
     q2 = np.asarray(result.q2_nm2, dtype=float)
     dR = np.asarray(result.excess_rayleigh_cm_inv, dtype=float)
     lbl = label or f'c = {result.concentration_g_per_mL*1000:.3g} mg/mL'
@@ -637,7 +754,9 @@ def plot_zimm(
         q2 = np.asarray(r.q2_nm2, dtype=float)
         y = ordinate(np.asarray(r.kc_over_dR_mol_per_g, dtype=float))
         x = q2 + k * r.concentration_g_per_mL
-        pts = ax.plot(x, y, 'o', color=col, ms=4,
+        # Vary the marker SHAPE per concentration so the series stay distinct without
+        # colour (WCAG 1.4.1 / greyscale — UI Batch 5), not hue alone.
+        pts = ax.plot(x, y, marker=marker_for(i), ls='none', color=col, ms=5,
                       label=f'{r.concentration_g_per_mL*1000:.3g} mg/mL')[0]
         artists['concentrations'].append(pts)
 
@@ -721,12 +840,12 @@ def plot_i_sin_theta(result, ax: Optional[Any] = None) -> PlotHandles:
     fig, ax, created = _get_ax(ax)
     artists = {}
     for curve in result.curves:
-        colour = _next_colour(ax)
+        color = _next_color(ax)
         artists[curve.label] = ax.plot(
-            curve.angles_deg, curve.i_sin_theta, 'o-', color=colour,
+            curve.angles_deg, curve.i_sin_theta, 'o-', color=color,
             ms=4, lw=1.2, label=curve.label)[0]
-    ax.set_xlabel(r'Scattering angle $\theta$ (deg)')
-    ax.set_ylabel(r'$I\,\sin\theta$ (normalised)' if result.mode == 'normalized'
+    ax.set_xlabel(r'Scattering angle $\theta$ (°)')
+    ax.set_ylabel(r'$I\,\sin\theta$ (normalized)' if result.mode == 'normalized'
                   else r'$I\,\sin\theta$ (a.u.)')
     if result.curves:
         ax.legend(frameon=False, fontsize=8)
@@ -846,7 +965,7 @@ def plot_synthetic_multi_dls(dls, ax: Optional[Any] = None) -> PlotHandles:
     artists = {}
     delay, t_unit = _disp('time', dls.delay_times_s)
     for a in dls.angles_deg:
-        col = _next_colour(ax)
+        col = _next_color(ax)
         artists[a] = ax.plot(delay, np.asarray(dls.signals[a], dtype=float), '-',
                              color=col, lw=1.0, label=f'{a:g}°')[0]
     ax.set_xscale('log')
@@ -868,12 +987,12 @@ def plot_synthetic_sls_set(sls, ax: Optional[Any] = None) -> PlotHandles:
     artists = {}
     angles = np.asarray(sls.angles_deg, dtype=float)
     for c in sls.concentrations_g_per_mL:
-        col = _next_colour(ax)
+        col = _next_color(ax)
         label = 'solvent (c = 0)' if c == 0 else f'{c * 1e3:g} mg/mL'
         marker = 'o-' if angles.size > 1 else 'o'
         artists[c] = ax.plot(angles, np.asarray(sls.intensities[c], dtype=float),
                              marker, color=col, ms=4, lw=1.0, label=label)[0]
-    ax.set_xlabel(r'Scattering angle $\theta$ (deg)')
+    ax.set_xlabel(r'Scattering angle $\theta$ (°)')
     ax.set_ylabel('Intensity (a.u.)')
     cal = 'calibrated' if sls.calibrated else 'uncalibrated'
     ax.legend(frameon=False, fontsize=7,

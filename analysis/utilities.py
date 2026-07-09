@@ -52,7 +52,7 @@ Change history
             Uses physics.constants for q and Stokes-Einstein so the generated
             data uses the same conventions as the analysis code.
 2026-06-26  Promoted the intensity-trace signal-analysis cluster to
-            analysis/trace_analysis.py (no behaviour change). Pruned the now
+            analysis/trace_analysis.py (no behavior change). Pruned the now
             unused imports (scipy optimize/stats, IntensityTrace). (v3)
 """
 
@@ -91,7 +91,7 @@ class ISinThetaCurve:
     """One I*sin(theta) curve for a single SLS measurement."""
     label: str
     angles_deg: np.ndarray
-    i_sin_theta: np.ndarray        # absolute or normalised, per `mode`
+    i_sin_theta: np.ndarray        # absolute or normalized, per `mode`
 
 
 @dataclass
@@ -146,7 +146,7 @@ def i_sin_theta(
     Raises
     ------
     ValueError
-        If mode is unrecognised or the sequence is empty.
+        If mode is unrecognized or the sequence is empty.
     """
     if mode not in ('absolute', 'normalized'):
         raise ValueError(
@@ -163,7 +163,7 @@ def i_sin_theta(
             mean_val = values.mean()
             if mean_val == 0:
                 raise ValueError(
-                    f"Cannot normalise: mean I*sin(theta) is zero for a "
+                    f"Cannot normalize: mean I*sin(theta) is zero for a "
                     f"measurement (label={m.sample_label!r})."
                 )
             values = values / mean_val
@@ -395,7 +395,7 @@ def interpret_scaling_exponent(exponent: float, quantity: str) -> str:
                     "homologous series — check for mixed systems or scatter.")
         if exponent > -0.05:
             return (f"slope ~ 0 ({exponent:+.2f}): A2 nearly Mw-independent — "
-                    "near-theta behaviour (A2 -> 0 at the theta point).")
+                    "near-theta behavior (A2 -> 0 at the theta point).")
         if exponent >= -0.40:
             return (f"slope = {exponent:.2f}: A2 ~ Mw^{exponent:.2f}, the mild "
                     "negative scaling typical of flexible coils in a good solvent "
@@ -431,7 +431,7 @@ def interpret_scaling_exponent(exponent: float, quantity: str) -> str:
 # sensible choice, and let the user override (a hand-entered value always wins).
 #
 # Design principles enforced here:
-#   * NEVER a silent choice. The default is a *labelled* default; the GUI shows
+#   * NEVER a silent choice. The default is a *labeled* default; the GUI shows
 #     `label` verbatim next to the value it used.
 #   * Apparent vs thermodynamic is tracked per candidate (`is_apparent`) and is
 #     never conflated -- a derived quantity (e.g. rho) is apparent if ANY of its
@@ -520,7 +520,7 @@ class SyntheticPopulation:
         intensity contribution you want to see in the correlogram.
     spread_cv : float
         Coefficient of variation (sigma/median) of the size distribution within
-        this population, modelled as log-normal. 0.0 (default) means a perfectly
+        this population, modeled as log-normal. 0.0 (default) means a perfectly
         monodisperse population (a single exponential). 0.1 means a 10% spread.
     """
     rh_nm: float
@@ -591,7 +591,7 @@ def generate_synthetic_correlogram(
 
     Each population is spread into a log-normal distribution of sizes (unless
     spread_cv is 0, giving a single exponential). Amplitudes A_i are the
-    scattering-weighted contributions and are normalised so g1(0) = 1.
+    scattering-weighted contributions and are normalized so g1(0) = 1.
 
     Parameters
     ----------
@@ -694,7 +694,7 @@ def generate_synthetic_correlogram(
             radii = np.geomspace(lo, hi, n_grid_per_population)
             pdf = (1.0 / (radii * sigma_ln * math.sqrt(2.0 * math.pi))) * \
                   np.exp(-(np.log(radii) - mu_ln) ** 2 / (2.0 * sigma_ln ** 2))
-            a = pdf / pdf.sum() * p.weight   # normalise to the population weight
+            a = pdf / pdf.sum() * p.weight   # normalize to the population weight
         for r, amp in zip(radii, a, strict=True):
             d = stokes_einstein_diffusion_coefficient(r * 1e-9, temperature_K, viscosity_Pa_s)
             gammas.append(d * q ** 2)
@@ -702,7 +702,7 @@ def generate_synthetic_correlogram(
 
     gammas = np.array(gammas, dtype=float)
     amps = np.array(amps, dtype=float)
-    amps = amps / amps.sum()           # normalise so g1(0) = 1
+    amps = amps / amps.sum()           # normalize so g1(0) = 1
 
     # Field autocorrelation and Siegert relation.
     # exp_matrix[i, j] = exp(-gamma_j * tau_i)
@@ -791,7 +791,7 @@ def export_synthetic_correlogram_csv(
     Raises
     ------
     ValueError
-        If delay_unit is unrecognised.
+        If delay_unit is unrecognized.
     """
     if delay_unit not in _DELAY_OUTPUT_FACTORS:
         raise ValueError(

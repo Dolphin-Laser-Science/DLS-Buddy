@@ -4,7 +4,7 @@ analysis/trace_analysis.py
 
 Intensity-trace signal-analysis diagnostics. Given a count-rate trace
 (IntensityTrace), these assess data quality: summary statistics, robust baseline
-estimation, shot-noise outlier flagging, baseline normalisation, sliding-window
+estimation, shot-noise outlier flagging, baseline normalization, sliding-window
 running averages, blocking (standard-error-vs-block-size) analysis, count-rate
 histograms with Gaussian/Poisson fits and the Fano factor, and a formal Augmented
 Dickey-Fuller stationarity test.
@@ -88,7 +88,7 @@ class OutlierFlags:
 
 @dataclass
 class NormalizedTraceResult:
-    """A trace normalised by its baseline (fluctuates around 1.0)."""
+    """A trace normalized by its baseline (fluctuates around 1.0)."""
     times_s: np.ndarray
     normalized: np.ndarray         # count_rates / baseline
     baseline_cps: float
@@ -207,7 +207,7 @@ def compute_trace_statistics(
     Parameters
     ----------
     trace : IntensityTrace
-        The count-rate trace to analyse.
+        The count-rate trace to analyze.
     baseline_method : str
         'percentile' (default) or 'sigma_clip'. See identify_baseline.
     baseline_parameter : float
@@ -272,7 +272,7 @@ def identify_baseline(
     Raises
     ------
     ValueError
-        If method is unrecognised, or a percentile is outside [0, 100].
+        If method is unrecognized, or a percentile is outside [0, 100].
     """
     y = trace.count_rates_cps
     if method == 'percentile':
@@ -355,7 +355,7 @@ def normalize_trace(
     baseline_method: str = 'percentile',
     baseline_parameter: float = 25.0,
 ) -> NormalizedTraceResult:
-    """Normalise a trace by its baseline so it fluctuates around 1.0.
+    """Normalize a trace by its baseline so it fluctuates around 1.0.
 
     Useful for comparing traces from different samples or concentrations on the
     same axes, where absolute count-rate differences would otherwise dominate.
@@ -373,13 +373,13 @@ def normalize_trace(
     Raises
     ------
     ValueError
-        If the estimated baseline is zero (cannot normalise).
+        If the estimated baseline is zero (cannot normalize).
     """
     baseline = identify_baseline(trace, method=baseline_method,
                                  parameter=baseline_parameter).baseline_cps
     if baseline == 0:
         raise ValueError(
-            "Estimated baseline is zero; cannot normalise the trace."
+            "Estimated baseline is zero; cannot normalize the trace."
         )
     return NormalizedTraceResult(
         times_s=trace.times_s.copy(),
@@ -407,9 +407,9 @@ def running_average(
     ----------
     trace : IntensityTrace
     window_s : float, optional
-        Full width of the centred time window, in seconds.
+        Full width of the centered time window, in seconds.
     window_points : int, optional
-        Full width of the centred window, in number of points.
+        Full width of the centered window, in number of points.
 
     Returns
     -------
@@ -644,7 +644,7 @@ def fit_count_rate_histogram(
     Raises
     ------
     ValueError
-        If distribution or bin_method is unrecognised.
+        If distribution or bin_method is unrecognized.
     """
     if distribution not in ('gaussian', 'poisson', 'both'):
         raise ValueError(
@@ -758,7 +758,7 @@ def fit_count_rate_histogram(
         try:
             total = counts.sum()
             # Each rate bin maps to an inclusive integer-count range [c_lo, c_hi]; the
-            # Poisson mass over it is cdf(c_hi) - cdf(c_lo - 1). Vectorised over all
+            # Poisson mass over it is cdf(c_hi) - cdf(c_lo - 1). Vectorized over all
             # bins — one pair of cdf() calls instead of a per-bin arange + pmf sum,
             # which looped over every integer count in the bin (a big win for bright
             # samples spanning 10^5-10^6 counts). Bins narrower than one count
@@ -788,7 +788,7 @@ def test_stationarity_adf(
     The null hypothesis of the ADF test is that the series has a unit root
     (i.e. is non-stationary). A p-value below `significance` lets you reject
     that null and conclude the trace is stationary. A non-stationary trace
-    indicates drift or slow-mode behaviour that violates the assumptions of
+    indicates drift or slow-mode behavior that violates the assumptions of
     standard DLS analysis.
 
     Parameters
