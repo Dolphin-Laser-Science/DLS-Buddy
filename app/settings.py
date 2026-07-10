@@ -62,7 +62,7 @@ class SettingsState:
     se_estimator: str = 'hc3'               # 'hc3' (robust, default; never under-reports)
     #                                         or 'ols' (classical s^2(X'X)^-1, opt-in for
     #                                         comparability; can under-report). See the
-    #                                         Theory-and-Equations-Guide 15.1.
+    #                                         Theory-and-Equations-Guide 6.1.
 
     # NOTE: the synthetic-generator (β/noise/points) and intensity-trace (outlier k,
     # baseline, block-variance, ADF) defaults used to live here. They were moved into

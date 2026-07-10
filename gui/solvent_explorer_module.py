@@ -87,7 +87,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
                 'the shaded band is a conservative bound at each condition '
                 '(narrowest where the sources are strongest).',
                 'The band is <b>shown, never propagated</b> into any reported ± '
-                '(see Theory-and-Equations-Guide §12).',
+                '(see Theory-and-Equations-Guide §5).',
             ]))
 
         # ---- top: form (left) + numeric readout (right) ----
@@ -165,7 +165,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
 
         self.band_note = ThemedLabel(
             'Shaded band = conservative bound at each condition '
-            '(Theory-and-Equations-Guide §12) — shown, never propagated into an analysis SE. '
+            '(Theory-and-Equations-Guide §5) — shown, never propagated into an analysis SE. '
             'Curves stop where the library’s validity ends.',
             role='hint', size=11)
         self.band_note.setWordWrap(True)

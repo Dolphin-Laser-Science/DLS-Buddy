@@ -1,0 +1,55 @@
+Date/Time,1/1/2026 12:00:00 PM
+Sample ID,Stress SLS
+Operator ID,Synthetic
+Sample Liquid,water
+Refractive Index of Sample Liquid,1.33
+Refractive Index Inc. (dn/dc) (mL/g),0.135
+Calibration Constant,3.1496E-10
+Calibration Liquid,Toluene
+Refractive Index of Calibration Liquid,1.496
+Rayleigh Ratio of Calibration Liquid,3.1496E-05
+Wavelength (nm),532
+'A' Dark Count Rate,0
+Number of Angles Measured,6
+Angle 1 (degrees),35
+Angle 2 (degrees),55
+Angle 3 (degrees),75
+Angle 4 (degrees),95
+Angle 5 (degrees),115
+Angle 6 (degrees),135
+Number of Concentrations Measured,5
+Concentration 1 (mg/mL),0
+Concentration 2 (mg/mL),0.2
+Concentration 3 (mg/mL),0.6
+Concentration 4 (mg/mL),1
+Concentration 5 (mg/mL),1.4
+Intensity - Concentration 1 - Angle 1,10461
+Intensity - Concentration 1 - Angle 2,7325
+Intensity - Concentration 1 - Angle 3,6212
+Intensity - Concentration 1 - Angle 4,6023
+Intensity - Concentration 1 - Angle 5,6620
+Intensity - Concentration 1 - Angle 6,8485
+Intensity - Concentration 2 - Angle 1,10091
+Intensity - Concentration 2 - Angle 2,7065
+Intensity - Concentration 2 - Angle 3,5991
+Intensity - Concentration 2 - Angle 4,5809
+Intensity - Concentration 2 - Angle 5,6385
+Intensity - Concentration 2 - Angle 6,8183
+Intensity - Concentration 3 - Angle 1,9351
+Intensity - Concentration 3 - Angle 2,6547
+Intensity - Concentration 3 - Angle 3,5551
+Intensity - Concentration 3 - Angle 4,5381
+Intensity - Concentration 3 - Angle 5,5914
+Intensity - Concentration 3 - Angle 6,7578
+Intensity - Concentration 4 - Angle 1,8612
+Intensity - Concentration 4 - Angle 2,6028
+Intensity - Concentration 4 - Angle 3,5111
+Intensity - Concentration 4 - Angle 4,4954
+Intensity - Concentration 4 - Angle 5,5443
+Intensity - Concentration 4 - Angle 6,6974
+Intensity - Concentration 5 - Angle 1,7872
+Intensity - Concentration 5 - Angle 2,5510
+Intensity - Concentration 5 - Angle 3,4670
+Intensity - Concentration 5 - Angle 4,4526
+Intensity - Concentration 5 - Angle 5,4972
+Intensity - Concentration 5 - Angle 6,6370

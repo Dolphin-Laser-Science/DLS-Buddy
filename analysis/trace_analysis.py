@@ -223,7 +223,9 @@ def compute_trace_statistics(
     y = trace.count_rates_cps
     mean = float(y.mean())
     std = float(y.std(ddof=1)) if y.size > 1 else 0.0
-    cv = std / mean if mean != 0 else float('nan')
+    # A degenerate all-zero (or zero-mean) trace has no meaningful relative spread;
+    # report cv = 0 rather than leak a bare nan from 0/0 into the statistics.
+    cv = std / mean if mean != 0 else 0.0
     baseline = identify_baseline(trace, method=baseline_method,
                                  parameter=baseline_parameter).baseline_cps
     sc_mean, _ = _sigma_clipped_mean(y)
@@ -694,7 +696,10 @@ def fit_count_rate_histogram(
     fano = var_counts / mean_counts if mean_counts != 0 else float('nan')
     mean_rate = float(y.mean())
     std_rate = float(y.std(ddof=1)) if y.size > 1 else 0.0
-    cv = std_rate / mean_rate if mean_rate != 0 else float('nan')
+    # Degenerate zero-mean trace: report cv = 0 rather than a bare nan from 0/0,
+    # consistent with compute_trace_statistics. (Fano/shot-noise stay nan: a Poisson
+    # statistic is genuinely undefined with no counts, unlike a relative spread.)
+    cv = std_rate / mean_rate if mean_rate != 0 else 0.0
     shot_noise_cv = 1.0 / math.sqrt(mean_counts) if mean_counts > 0 else float('nan')
 
     result = HistogramFitResult(

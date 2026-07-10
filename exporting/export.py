@@ -461,8 +461,32 @@ def export_concentration_extrapolation(result, file_path: str,
 def _se_note(result) -> str:
     """Comments-cell label for a ± column: names the estimator only when it is the
     non-default classical OLS (silent for HC3, matching the 'calibrated is the silent
-    default' convention). See the Theory-and-Equations-Guide §15.1."""
+    default' convention). See the Theory-and-Equations-Guide §6.1."""
     return 'SE: classical OLS' if getattr(result, 'se_estimator', 'hc3') == 'ols' else ''
+
+
+def _reliability_comment(result, reliable: bool = True) -> str:
+    """Comments-cell note for a reliability-gated column (Mw / A2).
+
+    `mw_reliable`/`a2_reliable` fold in SEVERAL independent gates — calibration, a sign
+    guard (intercept/a/y > 0), numerical conditioning, and finiteness — so keying only on
+    `calibrated`/`reliability_note` would let a value that is unreliable for one of the
+    *other* reasons (a non-physical intercept, or a non-finite overflow) fall through and
+    get the caller's healthy default note next to a NaN/inf. Pass the column's own flag
+    (`result.mw_reliable` / `.a2_reliable`) so every False produces some explanatory text.
+
+    Precedence: uncalibrated -> "arbitrary scale" (unchanged wording); else a specific
+    `reliability_note` (ill-conditioned / subnormal / non-positive divisor); else, if the
+    flag is False for another reason, a generic unreliable marker; else '' (the caller's
+    default APPARENT/thermodynamic note fills in)."""
+    if not getattr(result, 'calibrated', True):
+        return 'uncalibrated, arbitrary scale'
+    note = getattr(result, 'reliability_note', '') or ''
+    if note:
+        return note
+    if not reliable:
+        return 'unreliable (non-physical or non-finite fit)'
+    return ''
 
 
 def export_rayleigh_ratio(result, file_path: str, delimiter: str = ',') -> str:
@@ -493,8 +517,11 @@ def export_rayleigh_ratio(result, file_path: str, delimiter: str = ',') -> str:
 
 
 def export_debye(result, file_path: str, delimiter: str = ',') -> str:
-    """Export a single-concentration Debye analysis (DebyeResult, apparent)."""
-    mw_comment = '' if result.mw_reliable else 'uncalibrated, arbitrary scale'
+    """Export a single-concentration Debye analysis (DebyeResult, apparent).
+
+    The Mw column's Comments cell distinguishes uncalibrated (arbitrary scale) from an
+    ill-conditioned design (numerically unreliable) — see `_reliability_comment`."""
+    mw_comment = _reliability_comment(result, result.mw_reliable)
     columns = [
         OriginColumn('q^2', 'nm^-2', '', np.asarray(result.q2_nm2, dtype=float)),
         OriginColumn('Kc/dR', 'mol/g', 'Debye ordinate',
@@ -519,9 +546,10 @@ def export_guinier(result, file_path: str, delimiter: str = ',') -> str:
     """Export a single-concentration Guinier analysis (GuinierResult, apparent).
 
     The Mw column carries the uncalibrated marker in its Comments cell when the
-    run was uncalibrated; Rg comes from the slope and stays reliable regardless.
+    run was uncalibrated, or the ill-conditioned marker when the design is degenerate
+    (`_reliability_comment`); Rg comes from the slope and stays reliable regardless.
     """
-    mw_comment = '' if result.mw_reliable else 'uncalibrated, arbitrary scale'
+    mw_comment = _reliability_comment(result, result.mw_reliable)
     columns = [
         OriginColumn('q^2', 'nm^-2', '', np.asarray(result.q2_nm2, dtype=float)),
         OriginColumn('ln(dR)', '', 'log excess Rayleigh ratio',
@@ -548,10 +576,12 @@ def export_single_angle(result, file_path: str, delimiter: str = ',') -> str:
     """Export a single-angle, single-concentration apparent Mw (SingleAngleResult).
 
     The Mw column carries the uncalibrated marker in its Comments cell when the run
-    was uncalibrated (the value is then on an arbitrary scale), mirroring Debye/Guinier.
+    was uncalibrated (the value is then on an arbitrary scale), the ill-conditioned
+    marker when the divisor is subnormal, else the APPARENT default — mirroring
+    Debye/Guinier via `_reliability_comment`.
     """
-    mw_comment = ('uncalibrated, arbitrary scale' if not result.mw_reliable else
-                  'APPARENT, single angle + single concentration')
+    mw_comment = (_reliability_comment(result, result.mw_reliable)
+                  or 'APPARENT, single angle + single concentration')
     columns = [
         _scalar_column('Angle', 'deg', result.angle_deg),
         _scalar_column('q^2', 'nm^-2', result.q2_nm2),
@@ -658,10 +688,13 @@ def export_zimm(rayleigh_results, zimm_result, file_path: str,
         'q^2 (grid)', 'nm^-2', 'for the c->0 line',
         np.asarray(zimm_result.q2_nm2, dtype=float)))
 
-    # Thermodynamic results. Mw and A2 carry the uncalibrated marker in their
-    # Comments cell when the run was uncalibrated; calibrated is the silent default.
-    mw_note = '' if zimm_result.mw_reliable else 'uncalibrated, arbitrary scale'
-    a2_note = '' if zimm_result.a2_reliable else 'uncalibrated, arbitrary scale'
+    # Thermodynamic results. Mw and A2 carry the uncalibrated marker (arbitrary scale),
+    # the ill-conditioned marker (degenerate design), or a generic unreliable marker
+    # (non-physical / non-finite) in their Comments cell; a healthy calibrated run is the
+    # silent default. Pass each column's own flag so a value unreliable for a non-
+    # conditioning reason is not mislabelled healthy (`_reliability_comment`).
+    mw_note = _reliability_comment(zimm_result, zimm_result.mw_reliable)
+    a2_note = _reliability_comment(zimm_result, zimm_result.a2_reliable)
     columns += [
         _scalar_column('Method', '', zimm_result.method),
         _scalar_column('Mw', 'g/mol', zimm_result.mw_g_per_mol,
@@ -721,18 +754,24 @@ def export_scaling(quantity: str, labels, mw, y, fit, file_path: str,
 
 
 def export_calibration_free_a2(result, file_path: str, delimiter: str = ',') -> str:
-    """Export a calibration-free A2 analysis (CalibrationFreeA2Result)."""
+    """Export a calibration-free A2 analysis (CalibrationFreeA2Result).
+
+    The 2 A2 Mw / A2 columns carry the ill-conditioned marker in their Comments cell when
+    the Y-vs-c design is near-degenerate (near-equal concentrations); there is no
+    uncalibrated case here (the estimator is calibration-free). See `_reliability_comment`.
+    """
+    note = _reliability_comment(result, getattr(result, 'two_a2_mw_reliable', True))
     columns = [
         OriginColumn('Concentration', 'g/mL', '',
                      np.asarray(result.concentrations_g_per_mL, dtype=float)),
         OriginColumn('Y', '', '[I(c_ref)/c_ref] / [I(c)/c]',
                      np.asarray(result.Y, dtype=float)),
         _scalar_column('Angle', 'deg', result.angle_deg),
-        _scalar_column('2 A2 Mw', '', result.two_a2_mw, 'slope / intercept'),
+        _scalar_column('2 A2 Mw', '', result.two_a2_mw, note or 'slope / intercept'),
         _scalar_column('2 A2 Mw SE', '', result.two_a2_mw_se,
                        comments=_se_note(result) or 'statistical (calibration/dn-dc-free)'),
         _scalar_column('A2', 'mol mL/g^2', result.a2_mol_mL_per_g2,
-                       'only if Mw supplied'),
+                       note or 'only if Mw supplied'),
         _scalar_column('A2 SE', 'mol mL/g^2', result.a2_se,
                        comments=_se_note(result) or 'statistical (Mw treated as exact)'),
         _scalar_column('Slope', '', result.slope),

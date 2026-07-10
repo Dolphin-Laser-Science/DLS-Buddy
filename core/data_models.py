@@ -359,6 +359,94 @@ def _require_non_empty_string(value, field_name: str) -> None:
         )
 
 
+def _require_finite_array(arr: np.ndarray, field_name: str) -> None:
+    """Reject an array holding any nan/inf value.
+
+    Tokens like nan/inf/1e400 parse through float() into non-finite values; a
+    correlogram or delay axis containing them is meaningless and must never reach
+    the analysis engine (mirrors the SLSMeasurement dn/dc math.isfinite guard).
+    """
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(
+            f"{field_name} must contain only finite numbers; found nan/inf value(s)."
+        )
+
+
+def _require_increasing_lag_axis(arr: np.ndarray, field_name: str) -> None:
+    """Reject a delay/lag axis that is not strictly increasing from a non-negative start.
+
+    A correlator's lag axis is strictly increasing by construction; non-monotonic,
+    duplicate, or negative lags are physically impossible and would corrupt every
+    downstream fit (which assumes an ordered axis). A leading zero-lag channel is
+    allowed -- some correlators report tau = 0 as the first channel -- so only a
+    NEGATIVE first value is rejected, not a zero one.
+    """
+    if arr[0] < 0 or not np.all(np.diff(arr) > 0):
+        raise ValueError(
+            f"{field_name} must be strictly increasing from a non-negative start "
+            f"(a correlator lag axis); got non-monotonic, duplicate, or "
+            f"negative values."
+        )
+
+
+def _require_non_negative_array(arr: np.ndarray, field_name: str) -> None:
+    """Reject an array holding any negative value (e.g. a count rate)."""
+    if np.any(arr < 0):
+        raise ValueError(
+            f"{field_name} must be zero or positive; found negative value(s)."
+        )
+
+
+# Plausibility bands for auto-filled header metadata. These are DELIBERATELY wide,
+# general sanity bounds (not solvent- or instrument-specific tuning, cf. invariants
+# 3 & 4): a value outside them is almost certainly a unit slip or typo in the source
+# file (e.g. T = 2980 K for 298.0, n = 13.3 for 1.33). The check only WARNS -- the
+# value is user-owned and freely overridable -- it never rejects.
+_PLAUSIBLE_TEMPERATURE_K = (250.0, 370.0)      # solution light scattering
+_PLAUSIBLE_REFRACTIVE_INDEX = (1.2, 1.8)       # common liquids
+
+
+def implausible_metadata_reasons(temperature_K, refractive_index) -> list:
+    """Short, human-readable reasons the given auto-fill metadata looks physically
+    implausible (a likely unit slip), or ``[]`` if both are within their bands.
+
+    Pure and side-effect-free: the SINGLE source of truth for the plausibility bands,
+    shared by the load-time warning (:func:`_warn_if_implausible_metadata`) and the
+    Data-tab's passive note, so the two never drift. Each reason is glyph-less and
+    self-contained, so a caller can lead it with its own framing (a UserWarning
+    preamble, or a GUI ``ⓘ`` note).
+    """
+    reasons = []
+    lo, hi = _PLAUSIBLE_TEMPERATURE_K
+    if temperature_K is not None and not (lo <= temperature_K <= hi):
+        reasons.append(
+            f"temperature {temperature_K:g} K is outside the usual {lo:g}-{hi:g} K "
+            f"for solution light scattering")
+    lo, hi = _PLAUSIBLE_REFRACTIVE_INDEX
+    if refractive_index is not None and not (lo <= refractive_index <= hi):
+        reasons.append(
+            f"refractive index {refractive_index:g} is outside the usual "
+            f"{lo:g}-{hi:g} for common liquids")
+    return reasons
+
+
+def _warn_if_implausible_metadata(temperature_K, refractive_index) -> None:
+    """Emit a non-fatal UserWarning if T or n is physically implausible.
+
+    Called from the measurement __post_init__ so it fires when a measurement is built
+    from parsed/auto-filled header metadata. A warning, not a guard: the user owns
+    these values and may legitimately override them (invariant 3). The GUI surfaces
+    the same check as a passive note via :func:`implausible_metadata_reasons`.
+    """
+    reasons = implausible_metadata_reasons(temperature_K, refractive_index)
+    if reasons:
+        warnings.warn(
+            "Implausible metadata (likely a unit slip): " + "; ".join(reasons)
+            + ". The value is used exactly as entered.",
+            UserWarning, stacklevel=3,
+        )
+
+
 # Polarization/analyzer geometry of a measurement, as (incident, analyzer):
 #   VV  vertical incident, vertical analyzer     -- ordinary polarized intensity
 #   VH  vertical incident, horizontal analyzer   -- depolarized intensity (DPLS)
@@ -435,6 +523,10 @@ class IntensityTrace:
         _require_same_length(
             self.times_s, self.count_rates_cps, "times_s", "count_rates_cps"
         )
+        # Raw photon count rates are physically non-negative; a negative value is a
+        # corrupt/over-subtracted trace, not real data. Reject it here rather than
+        # let it bias downstream statistics (mean, baseline, blocking).
+        _require_non_negative_array(self.count_rates_cps, "count_rates_cps")
 
     def __repr__(self) -> str:
         # A compact repr keeps the console and debugger readable
@@ -535,6 +627,9 @@ class DLSMeasurement:
         _require_same_length(
             self.delay_times_s, self.correlogram, "delay_times_s", "correlogram"
         )
+        _require_finite_array(self.delay_times_s, "delay_times_s")
+        _require_finite_array(self.correlogram, "correlogram")
+        _require_increasing_lag_axis(self.delay_times_s, "delay_times_s")
         _require_non_empty_string(self.polymer_name, "polymer_name")
         _require_non_empty_string(self.solvent_name, "solvent_name")
         _require_positive(self.temperature_K, "temperature_K")
@@ -549,6 +644,8 @@ class DLSMeasurement:
         self.analyzer_geometry = _normalize_analyzer_geometry(
             self.analyzer_geometry, "analyzer_geometry")
         _warn_if_unrecognized_solvent(self.solvent_name)
+        _warn_if_implausible_metadata(
+            self.temperature_K, self.solvent_refractive_index)
 
     @property
     def sample_key(self) -> SampleKey:
@@ -681,6 +778,8 @@ class SLSMeasurement:
             self.analyzer_geometry, "analyzer_geometry"
         )
         _warn_if_unrecognized_solvent(self.solvent_name)
+        _warn_if_implausible_metadata(
+            self.temperature_K, self.solvent_refractive_index)
 
     @property
     def sample_key(self) -> SampleKey:

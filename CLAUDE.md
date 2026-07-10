@@ -28,7 +28,7 @@ This project is **correctness-first**, and the domain is physical:
 - **Correctness over cleverness or brevity.** Track units explicitly. Validate
   numerically against a known answer; don't claim something works without it.
 - Ground physical claims in **primary literature** and cite it (authors + year). Never
-  invent a citation. The user-facing citation index is `docs/5. Code-References.md`.
+  invent a citation. The user-facing citation index is `docs/5. Citation-Index.md`.
 - When a result is corrected, acknowledge the specific error and re-derive from scratch;
   don't defend a wrong result for consistency.
 - **Flag hard-to-reverse choices before acting on them** and give the reasoning.
@@ -136,7 +136,7 @@ Top-level packages (each with an `__init__.py`) using top-level package imports
 ├── requirements.txt          # pinned deps (Python 3.13 venv)
 ├── docs/                     # user-facing docs: 1. Quickstart-Guide.pdf, 2. User-Manual.pdf,
 │                             #   3. Theory-and-Equations-Guide.pdf, 4. Code-Map.md,
-│                             #   5. Code-References.md (generated citation index)
+│                             #   5. Citation-Index.md (generated citation index)
 ├── test-data/                # datasets used by validation
 ├── core/
 │   ├── data_models.py        # SampleKey, DLSMeasurement, SLSMeasurement, solvent vocab

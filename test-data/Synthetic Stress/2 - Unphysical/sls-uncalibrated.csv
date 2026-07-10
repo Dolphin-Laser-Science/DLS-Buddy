@@ -1,0 +1,51 @@
+Date/Time,1/1/2026 12:00:00 PM
+Sample ID,Stress SLS
+Operator ID,Synthetic
+Sample Liquid,water
+Refractive Index of Sample Liquid,1.33
+Refractive Index Inc. (dn/dc) (mL/g),0.135
+Wavelength (nm),532
+'A' Dark Count Rate,0
+Number of Angles Measured,6
+Angle 1 (degrees),35
+Angle 2 (degrees),55
+Angle 3 (degrees),75
+Angle 4 (degrees),95
+Angle 5 (degrees),115
+Angle 6 (degrees),135
+Number of Concentrations Measured,5
+Concentration 1 (mg/mL),0
+Concentration 2 (mg/mL),0.2
+Concentration 3 (mg/mL),0.6
+Concentration 4 (mg/mL),1
+Concentration 5 (mg/mL),1.4
+Intensity - Concentration 1 - Angle 1,10461
+Intensity - Concentration 1 - Angle 2,7325
+Intensity - Concentration 1 - Angle 3,6212
+Intensity - Concentration 1 - Angle 4,6023
+Intensity - Concentration 1 - Angle 5,6620
+Intensity - Concentration 1 - Angle 6,8485
+Intensity - Concentration 2 - Angle 1,338077
+Intensity - Concentration 2 - Angle 2,214302
+Intensity - Concentration 2 - Angle 3,162197
+Intensity - Concentration 2 - Angle 4,140778
+Intensity - Concentration 2 - Angle 5,140579
+Intensity - Concentration 2 - Angle 6,167305
+Intensity - Concentration 3 - Angle 1,931270
+Intensity - Concentration 3 - Angle 2,592673
+Intensity - Concentration 3 - Angle 3,450183
+Intensity - Concentration 3 - Angle 4,391725
+Intensity - Concentration 3 - Angle 5,391732
+Intensity - Concentration 3 - Angle 6,466501
+Intensity - Concentration 4 - Angle 1,1454020
+Intensity - Concentration 4 - Angle 2,930028
+Intensity - Concentration 4 - Angle 3,710088
+Intensity - Concentration 4 - Angle 4,620634
+Intensity - Concentration 4 - Angle 5,622771
+Intensity - Concentration 4 - Angle 6,743397
+Intensity - Concentration 5 - Angle 1,1918173
+Intensity - Concentration 5 - Angle 2,1232693
+Intensity - Concentration 5 - Angle 3,945827
+Intensity - Concentration 5 - Angle 4,830289
+Intensity - Concentration 5 - Angle 5,836018
+Intensity - Concentration 5 - Angle 6,1000399

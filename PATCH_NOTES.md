@@ -9,6 +9,77 @@ window title.
 
 ---
 
+## 0.22.0 — Documentation refresh + Theory-Guide renumbering (2026-07-10)
+
+*Documentation only — no change to any calculation. This release also brings the public
+build up to date with the **0.21.0** ill-conditioned-fit reliability flag and the **0.20.3**
+synthetic-stress-corpus hardening (both detailed in their own sections below).*
+
+- **Theory-and-Equations-Guide renumbered to be sequential.** Chapters now run **1–6** (were
+  7, 9, 10, 11, 12, 15, with gaps) and equations **1–55** in reading order (were scrambled
+  1–53 with 7a/7b/30a suffixes). Every cross-reference — inside the guide, in the User-Manual,
+  and in the generated Citation-Index — was updated to match. A pre-existing mis-reference (the
+  replicate-average standard error pointed at the wrong equation) was corrected in passing.
+- **Quickstart + User-Manual prose pass.** Trimmed and clarified text, American spelling, an
+  expanded Data-tab parameter table, and a decoupled PDF version marker ("Applies to vX.Y.Z and
+  later") so a patch bump no longer forces a doc rebuild.
+- **Numbering integrity is now checked automatically** when the documentation PDFs are
+  built, so the guide's chapters, equations, and index can't silently drift out of order again.
+
+---
+
+## 0.21.0 — Ill-conditioned-fit reliability flag (2026-07-10)
+
+A new numerical-health flag for static light scattering, plus two latent-crash fixes it
+uncovered. No change to any correct calculation — a well-posed fit behaves exactly as
+before; this only adds a warning (and closes two edge-case crashes) for degenerate fits.
+
+- **A numerically degenerate SLS fit is now flagged unreliable.** When the extrapolation
+  design is near-collinear — clustered angles, or two nearly-equal concentrations, so the
+  fit cannot honestly resolve *M*<sub>w</sub> — the Zimm/Berry, Debye and Guinier
+  *M*<sub>w</sub> (and absolute *A*₂), and the calibration-free 2·*A*₂·*M*<sub>w</sub>
+  product, are marked unreliable, with a red note in the SLS tab and in the export Comments
+  cell advising to add concentrations/angles or widen their spread. The value is still
+  shown; *R*<sub>g</sub> (from the slope) is unaffected. The
+  test is the design's condition number — a scale-invariant numerical criterion, **not** an
+  "*M*<sub>w</sub> too large" cutoff, so a legitimate ultra-high-*M*<sub>w</sub> sample is
+  never flagged for its size alone.
+- **A single-angle *M*<sub>w</sub> from a vanishing scattering signal is flagged.** When
+  *Kc*/Δ*R* is so small that its reciprocal loses all precision, the apparent
+  *M*<sub>w</sub> is marked unreliable instead of reported as a confident number.
+- **Two edge-case crashes fixed.** A Guinier plot with a very large intercept (an
+  overflowing dR(0)) and a near-singular linear fit (a tiny negative variance) previously
+  raised an error; both now degrade to a flagged/uncertainty-free result.
+- **A degenerate fit never reports a ± of exactly zero.** Where error propagation cancels
+  to a non-positive variance, the uncertainty is now omitted rather than shown as 0.
+
+## 0.20.3 — Robustness hardening (2026-07-10)
+
+Guards and reliability flags for physically impossible input and fits, driven by an
+adversarial "stress" test corpus. No change to any correct calculation; these only
+change how the program responds to bad or extreme data.
+
+- **Impossible files are now refused at load.** A correlogram containing `nan`/`inf`,
+  a delay (lag) axis that is not strictly increasing, or an intensity trace with a
+  negative count rate is rejected with a clear message instead of being silently
+  analyzed.
+- **A physically implausible temperature or refractive index is flagged.** A likely
+  unit slip — for example 2980 K for 298 K, or *n* = 13.3 for 1.33 — now shows a calm
+  note under the Data-tab parameter table (and raises a warning), but the value is
+  still used exactly as entered (these are yours to set and override).
+- **Impossible cumulant fits are no longer marked reliable.** A fit that returns a
+  negative polydispersity index (from an over-subtracted baseline) or a negative decay
+  rate (from a correlogram that rises instead of decays) is now flagged unreliable,
+  where before it could slip through as a plausible-looking size.
+- **A non-physical Zimm/Berry molecular weight is caught.** When the extrapolated
+  intercept is non-positive — which would imply a negative or infinite *M*<sub>w</sub>
+  — the result is reported as not-a-number and flagged unreliable, matching the
+  existing Debye behaviour.
+- **Extreme intensities no longer crash the SLS math.** Values near the floating-point
+  ceiling degrade to a finite result instead of raising an error.
+- **A constant (all-zero) intensity trace** now reports a coefficient of variation of
+  0 rather than a bare not-a-number.
+
 ## 0.20.2 — Documentation overhaul (2026-07-09)
 
 A top-to-bottom review of the guides, with the science and citations checked first. No

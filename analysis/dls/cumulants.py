@@ -184,6 +184,11 @@ def _fit_cumulants_linear(
     gamma = -c[1] / 2.0
     mu2 = c[2] if order >= 2 else 0.0
     mu3 = (-3.0 * c[3]) if order >= 3 else None
+    # PDI = mu2 / gamma^2. pdi_valid (below) additionally requires pdi >= 0 and
+    # gamma > 0: a negative mu2 (over-subtracted baseline) or a negative decay rate
+    # (an increasing/anti-correlated g2-1) is physically impossible, so a fit that
+    # produces one must not be marked reliable even if |pdi| happens to fall under
+    # the 0.3 limit.
     pdi = mu2 / gamma ** 2 if gamma != 0 else float('nan')
 
     q = _measurement_q_m(measurement)
@@ -209,7 +214,8 @@ def _fit_cumulants_linear(
         mu2_s_inv2=mu2,
         mu3_s_inv3=mu3,
         pdi=pdi,
-        pdi_valid=bool(pdi <= CUMULANT_PDI_VALIDITY_LIMIT) if math.isfinite(pdi) else False,
+        pdi_valid=bool(math.isfinite(pdi) and 0.0 <= pdi <= CUMULANT_PDI_VALIDITY_LIMIT
+                       and gamma > 0),
         d_m2_s=d,
         rh_nm=rh,
         q_m_inv=q,
@@ -344,6 +350,11 @@ def _fit_cumulants_nonlinear(
             n_skipped=int(skip_initial_channels or 0),
             method='nonlinear', baseline=nan, success=False)
 
+    # PDI = mu2 / gamma^2. pdi_valid (below) additionally requires pdi >= 0 and
+    # gamma > 0: a negative mu2 (over-subtracted baseline) or a negative decay rate
+    # (an increasing/anti-correlated g2-1) is physically impossible, so a fit that
+    # produces one must not be marked reliable even if |pdi| happens to fall under
+    # the 0.3 limit.
     pdi = mu2 / gamma ** 2 if gamma != 0 else float('nan')
     fitted = f(tau, *popt)
     residuals = g2m1 - fitted
@@ -370,7 +381,8 @@ def _fit_cumulants_nonlinear(
         mu2_s_inv2=mu2,
         mu3_s_inv3=mu3,
         pdi=pdi,
-        pdi_valid=bool(pdi <= CUMULANT_PDI_VALIDITY_LIMIT) if math.isfinite(pdi) else False,
+        pdi_valid=bool(math.isfinite(pdi) and 0.0 <= pdi <= CUMULANT_PDI_VALIDITY_LIMIT
+                       and gamma > 0),
         d_m2_s=d,
         rh_nm=rh,
         q_m_inv=q,

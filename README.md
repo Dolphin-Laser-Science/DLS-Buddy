@@ -54,18 +54,20 @@ python -m gui.main
 
 ## Documentation
 
-- **Quickstart-Guide** — the common path (load → confirm parameters → run a DLS or SLS
-  analysis → export): [`docs/1. Quickstart-Guide.pdf`](docs/1.%20Quickstart-Guide.pdf).
-- **User-Manual** — the comprehensive reference: every module, file format, and parameter,
-  with worked figures: [`docs/2. User-Manual.pdf`](docs/2.%20User-Manual.pdf).
-- **Theory-and-Equations-Guide** — the physics, numbered equations, and literature behind
-  each method: [`docs/3. Theory-and-Equations-Guide.pdf`](docs/3.%20Theory-and-Equations-Guide.pdf).
-- [`Code-Map.md`](docs/4.%20Code-Map.md) — directory and per-file tour, for reading/forking the code.
-- [`Code-References.md`](docs/5.%20Code-References.md) — every literature source mapped to where it is used.
-- [`Acknowledgements.md`](docs/6.%20Acknowledgements.md) — beta testers and test-data contributors.
-- [`AI-Use-Statement.txt`](docs/7.%20AI-Use-Statement.txt) — how this project was built, in the author's words.
+- [`1. Quickstart-Guide.pdf`](docs/1.%20Quickstart-Guide.pdf) — the common path: load → confirm
+  parameters → run a DLS or SLS analysis → export.
+- [`2. User-Manual.pdf`](docs/2.%20User-Manual.pdf) — the comprehensive reference: every module,
+  file format, and parameter, with worked figures.
+- [`3. Theory-and-Equations-Guide.pdf`](docs/3.%20Theory-and-Equations-Guide.pdf) — the physics,
+  numbered equations, and literature behind each method.
+- [`4. Code-Map.md`](docs/4.%20Code-Map.md) — directory and per-file tour, for reading/forking the code.
+- [`5. Citation-Index.md`](docs/5.%20Citation-Index.md) — every literature source mapped to where it is used.
+- [`6. Acknowledgements.md`](docs/6.%20Acknowledgements.md) — beta testers and test-data contributors.
+- [`7. AI-Use-Statement.txt`](docs/7.%20AI-Use-Statement.txt) — how this project was built, in the author's words.
 - [`PATCH_NOTES.md`](PATCH_NOTES.md) — what changed per release, plus known issues.
 - [`CLAUDE.md`](CLAUDE.md) — architecture invariants for contributors.
+- [`Synthetic Stress corpus`](test-data/Synthetic%20Stress/expected-outcomes.md) — adversarial
+  edge-case test files and how the program is expected to handle each.
 
 ## License
 

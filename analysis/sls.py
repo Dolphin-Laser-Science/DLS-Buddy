@@ -97,6 +97,23 @@ from physics.constants import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Numerical-health note (shared wording for the ill-conditioned-fit reliability flag)
+# ---------------------------------------------------------------------------
+
+def _ill_conditioned_note(cond: float) -> str:
+    """Reliability note for a degenerate extrapolation design (see uncertainty.COND_LIMIT).
+
+    A calibrated fit whose design X is near-singular (clustered angles, two near-equal
+    concentrations, or an extreme intensity scale) yields a numerically unreliable
+    1/coefficient Mw/A2 even though the value is finite. This note rides on the result
+    (and into the export Comments cell + a GUI qualifier) so the "why" travels with the
+    suppressed reliability flag — distinct from the uncalibrated arbitrary-scale note.
+    """
+    return (f"ill-conditioned fit design (cond={cond:.1e}); Mw/A2 numerically "
+            "unreliable — add concentrations/angles or widen their spread")
+
+
 # ===========================================================================
 # Result objects
 # ===========================================================================
@@ -394,6 +411,11 @@ class DebyeResult:
     mw_apparent_se: Optional[float] = None   # statistical (regression) SEs --
     rg_apparent_se: Optional[float] = None   # exclude calibration/dn-dc systematics
     se_estimator: str = 'hc3'                 # covariance estimator behind the SEs
+    # numerical-health of the linear design (Kc/dR vs q^2). well_conditioned=False ->
+    # near-degenerate angles -> mw_reliable is suppressed (value still shown).
+    well_conditioned: bool = True
+    cond: float = float('nan')                # condition number of the design
+    reliability_note: str = ''                # ill-conditioned reason, if any
 
 
 @dataclass
@@ -412,6 +434,11 @@ class SingleAngleResult:
     is_apparent: bool                 # always True here
     calibrated: bool = True           # was the Rayleigh ratio calibrated?
     mw_reliable: bool = True          # False if uncalibrated (Mw_app on an arbitrary scale)
+    # numerical-health of the 1/y reciprocal (no design matrix here): a subnormal
+    # divisor y = Kc/dR loses catastrophic precision in 1/y -> mw_reliable suppressed.
+    well_conditioned: bool = True
+    cond: float = float('nan')                # NaN: no design matrix for a single datum
+    reliability_note: str = ''                # ill-conditioned reason, if any
 
 
 @dataclass
@@ -445,10 +472,16 @@ class GuinierResult:
     rg_se: Optional[float] = None            # statistical (regression) SEs --
     mw_apparent_se: Optional[float] = None   # exclude calibration/dn-dc systematics
     se_estimator: str = 'hc3'                 # covariance estimator behind the SEs
+    # numerical-health of the linear design (ln(dR) vs q^2). well_conditioned=False ->
+    # near-degenerate angles -> mw_reliable is suppressed (value still shown).
+    well_conditioned: bool = True
+    cond: float = float('nan')                # condition number of the design
+    reliability_note: str = ''                # ill-conditioned reason, if any
 
 
 def debye_analysis(rayleigh_result: RayleighRatioResult,
-                   estimator: str = 'hc3') -> DebyeResult:
+                   estimator: str = 'hc3',
+                   cond_limit: float = unc.COND_LIMIT) -> DebyeResult:
     """Single-concentration Debye plot: linear fit of Kc/dR vs q^2.
 
     Gives the apparent molecular weight (from the intercept) and apparent radius
@@ -478,7 +511,7 @@ def debye_analysis(rayleigh_result: RayleighRatioResult,
             "Debye analysis needs at least two angles with finite Kc/dR."
         )
 
-    fit = unc.linear_fit(q2, y, estimator)  # cov order [intercept, slope]
+    fit = unc.linear_fit(q2, y, estimator, cond_limit)  # cov order [intercept, slope]
     slope, intercept = fit.slope, fit.intercept
     r2 = fit.r_squared
 
@@ -504,6 +537,11 @@ def debye_analysis(rayleigh_result: RayleighRatioResult,
             jac = [-rg_app / (2.0 * intercept), rg_app / (2.0 * slope)]
             rg_se = unc.se_or_none(unc.propagate(jac, fit.cov))
 
+    # Numerical health of the Kc/dR-vs-q^2 design: a near-degenerate angle set makes
+    # 1/intercept fragile even when calibrated and intercept>0 -> suppress mw_reliable
+    # and carry the reason (value still shown; Rg from the slope-ratio stays reported).
+    note = '' if fit.well_conditioned else _ill_conditioned_note(fit.cond)
+
     return DebyeResult(
         concentration_g_per_mL=rayleigh_result.concentration_g_per_mL,
         q2_nm2=q2, kc_over_dR=y,
@@ -511,9 +549,16 @@ def debye_analysis(rayleigh_result: RayleighRatioResult,
         mw_apparent_g_per_mol=float(mw_app), rg_apparent_nm=float(rg_app),
         r_squared=float(r2), is_apparent=True, n_angles=int(q2.size),
         calibrated=rayleigh_result.calibrated,
-        mw_reliable=rayleigh_result.calibrated,
+        # intercept > 0 as well as calibrated: mw_app was already NaN'd for a
+        # non-positive intercept above, so it must not read reliable either (keeps
+        # the sign guard and the reliability flag consistent). well_conditioned adds
+        # the numerical-degeneracy gate (invariant 4: scale-invariant, not a magnitude);
+        # math.isfinite closes the float-overflow edge (consistent with Guinier/Zimm).
+        mw_reliable=(rayleigh_result.calibrated and bool(intercept > 0)
+                     and fit.well_conditioned and math.isfinite(mw_app)),
         mw_apparent_se=mw_se, rg_apparent_se=rg_se,
         se_estimator=estimator,
+        well_conditioned=fit.well_conditioned, cond=fit.cond, reliability_note=note,
     )
 
 
@@ -549,19 +594,45 @@ def single_angle_mw(rayleigh_result: RayleighRatioResult, angle_deg: float) -> S
     if c == 0:
         raise ValueError("Cannot compute Mw at zero concentration.")
     y = rayleigh_result.kc_over_dR_mol_per_g[i]   # = K c / dR
-    mw_app = 1.0 / y if y != 0 else float('nan')
+    # Mw = 1/y requires a POSITIVE y (Kc/dR): a non-positive value (over-subtracted
+    # solvent -> dR < 0) would give a negative/infinite Mw. Guard the sign, not just
+    # y != 0, and don't mark such a result reliable (the 1/coefficient sign rule,
+    # matching the Zimm/Debye intercept>0 guards).
+    y_ok = bool(y > 0)          # Python bool (y is a numpy scalar; keep the flag native)
+    mw_app = 1.0 / y if y_ok else float('nan')
+    # Numerical-health of the reciprocal (no design matrix for a single datum): a
+    # SUBNORMAL divisor y (below the smallest normal float, ~2.2e-308 -- e.g. from an
+    # extreme intensity scale) loses catastrophic precision in 1/y and yields a
+    # huge-but-finite garbage Mw. This is a float-representation criterion, scale-
+    # invariant, NOT a magnitude ceiling on Mw (invariant 4). Flag it and suppress
+    # reliability while still showing the number.
+    tiny = float(np.finfo(float).tiny)
+    well_cond = bool(y_ok and y >= tiny and math.isfinite(mw_app))
+    # Every not-well_cond branch carries a note (the "well_conditioned=False => note
+    # present" contract the export/GUI surfacing relies on): a non-positive divisor
+    # (over-subtracted solvent -> Mw undefined) vs. a subnormal divisor (finite but
+    # numerically unreliable). A healthy result has no note.
+    if well_cond:
+        note = ''
+    elif not y_ok:
+        note = 'non-positive Kc/dR; Mw = 1/(Kc/dR) is undefined (over-subtracted solvent)'
+    else:
+        note = ('subnormal divisor Kc/dR; Mw = 1/(Kc/dR) is numerically unreliable '
+                '(catastrophic precision loss at an extreme intensity scale)')
     return SingleAngleResult(
         concentration_g_per_mL=c, angle_deg=float(rayleigh_result.angles_deg[i]),
         q2_nm2=float(rayleigh_result.q2_nm2[i]),
         mw_apparent_g_per_mol=float(mw_app), is_apparent=True,
         calibrated=rayleigh_result.calibrated,
-        mw_reliable=rayleigh_result.calibrated,
+        mw_reliable=rayleigh_result.calibrated and well_cond,
+        well_conditioned=well_cond, reliability_note=note,
     )
 
 
 def guinier_analysis(rayleigh_result: RayleighRatioResult,
                      qrg_max_valid: float = 1.3,
-                     estimator: str = 'hc3') -> GuinierResult:
+                     estimator: str = 'hc3',
+                     cond_limit: float = unc.COND_LIMIT) -> GuinierResult:
     """Single-concentration Guinier plot: linear fit of ln(dR) vs q^2.
 
     Fits ln(dR) = ln(dR(0)) - (Rg^2/3) q^2. Rg comes from the slope
@@ -603,17 +674,21 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
         )
 
     y = np.log(dRg)
-    fit = unc.linear_fit(q2g, y, estimator)  # cov order [intercept, slope]
+    fit = unc.linear_fit(q2g, y, estimator, cond_limit)  # cov order [intercept, slope]
     slope, intercept = fit.slope, fit.intercept
     r2 = fit.r_squared
 
     # Rg from the slope: slope = -Rg^2/3  (q^2 in nm^-2 -> Rg in nm).
     rg = math.sqrt(-3.0 * slope) if slope < 0 else float('nan')
 
-    # Apparent Mw from the intercept: dR(0) = exp(intercept) = K c Mw.
+    # Apparent Mw from the intercept: dR(0) = exp(intercept) = K c Mw. Use np.exp, which
+    # SATURATES to +inf for a large intercept (>~709.78), where math.exp would raise a
+    # bare OverflowError and crash the analysis. An infinite dR0 -> infinite Mw is then
+    # caught by the math.isfinite gate on mw_reliable below (adjacent fix #2).
     K = rayleigh_result.optical_constant_K
     c = rayleigh_result.concentration_g_per_mL
-    dR0 = math.exp(intercept)
+    with np.errstate(over='ignore'):       # a large intercept saturates dR0 to +inf on purpose
+        dR0 = float(np.exp(intercept))
     mw_app = dR0 / (K * c) if (K > 0 and c > 0) else float('nan')
 
     # Statistical SEs: Rg from the slope alone; Mw from the intercept (dMw/dint = Mw).
@@ -627,15 +702,23 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
     qrg_max = float(qg.max() * rg) if math.isfinite(rg) else float('nan')
     valid = math.isfinite(qrg_max) and qrg_max <= qrg_max_valid
 
+    # Numerical health of the ln(dR)-vs-q^2 design + a finiteness guard on Mw. Mw here
+    # is exp(intercept)/(Kc): a large intercept (>~709) overflows to inf, so the flag
+    # must require a finite Mw (previously mw_reliable was unconditional on `calibrated`,
+    # weaker than Debye/Zimm -- adjacent fix #2). well_conditioned adds the design gate.
+    note = '' if fit.well_conditioned else _ill_conditioned_note(fit.cond)
+
     return GuinierResult(
         concentration_g_per_mL=c, q2_nm2=q2g, ln_excess_rayleigh=y,
         slope=float(slope), intercept=float(intercept), rg_nm=float(rg),
         mw_apparent_g_per_mol=float(mw_app), qrg_max=qrg_max,
         guinier_valid=bool(valid), r_squared=float(r2), n_angles=int(q2g.size),
         is_apparent=True, calibrated=rayleigh_result.calibrated,
-        mw_reliable=rayleigh_result.calibrated,
+        mw_reliable=(rayleigh_result.calibrated and math.isfinite(mw_app)
+                     and fit.well_conditioned),
         rg_se=rg_se, mw_apparent_se=mw_se,
         se_estimator=estimator,
+        well_conditioned=fit.well_conditioned, cond=fit.cond, reliability_note=note,
     )
 
 
@@ -697,6 +780,12 @@ class ZimmBerryResult:
     mw_from_q0_g_per_mol: Optional[float] = None
     extrapolation_agreement_rel: Optional[float] = None
     se_estimator: str = 'hc3'                 # covariance estimator behind the SEs
+    # numerical-health of the global design X = [1, q^2, c]. well_conditioned=False ->
+    # near-degenerate (clustered angles / near-equal concentrations / extreme scale) ->
+    # mw_reliable and a2_reliable are suppressed even when calibrated (value still shown).
+    well_conditioned: bool = True
+    cond: float = float('nan')                # condition number of the design
+    reliability_note: str = ''                # ill-conditioned reason, if any
 
 
 @dataclass
@@ -723,6 +812,13 @@ class CalibrationFreeA2Result:
     two_a2_mw_se: Optional[float] = None   # statistical SE (slope/intercept covariance)
     a2_se: Optional[float] = None          # if mw provided (mw treated as exact)
     se_estimator: str = 'hc3'              # covariance estimator behind the SEs
+    # numerical-health of the Y-vs-c design [1, c]: near-equal concentrations make it
+    # near-collinear -> slope/intercept fragile. two_a2_mw_reliable is suppressed (value
+    # still shown). There is no `calibrated` gate -- this estimator is calibration-free.
+    well_conditioned: bool = True
+    cond: float = float('nan')             # condition number of the design
+    reliability_note: str = ''             # ill-conditioned reason, if any
+    two_a2_mw_reliable: bool = True        # False if the design is ill-conditioned
 
 
 def _collect_zimm_points(rayleigh_results: Sequence[RayleighRatioResult]):
@@ -744,6 +840,7 @@ def zimm_analysis(
     rayleigh_results: Sequence[RayleighRatioResult],
     method: str = 'zimm',
     estimator: str = 'hc3',
+    cond_limit: float = unc.COND_LIMIT,
 ) -> ZimmBerryResult:
     """Full Zimm or Berry double extrapolation for Mw, Rg, and A2.
 
@@ -759,6 +856,10 @@ def zimm_analysis(
     method : str
         'zimm' (ordinate = Kc/dR; default) or 'berry' (ordinate = sqrt(Kc/dR),
         preferred for Mw above ~1 MDa or qRg approaching 1).
+    cond_limit : float
+        Numerical-health ceiling for the design's (column-normalized) condition
+        number; above it the fit is flagged near-degenerate and mw_reliable/a2_reliable
+        are suppressed (see uncertainty.COND_LIMIT). Overridable; default COND_LIMIT.
 
     Returns
     -------
@@ -815,30 +916,47 @@ def zimm_analysis(
 
     # Global multilinear fit: ordinate = a + b q^2 + d c, with its 3x3 covariance.
     A = np.column_stack([np.ones_like(q2), q2, c])
-    mf = unc.multilinear_fit(A, ordinate, estimator)
+    mf = unc.multilinear_fit(A, ordinate, estimator, cond_limit)
     a, b, d = float(mf.coeffs[0]), float(mf.coeffs[1]), float(mf.coeffs[2])
     cov = mf.cov                          # order (a, b, d)
     r2 = mf.r_squared
 
+    # The ordinate intercept a (Kc/dR extrapolated to q->0, c->0) is physically
+    # POSITIVE: a = 1/Mw (Zimm) or 1/sqrt(Mw) (Berry). A noisy NON-POSITIVE intercept
+    # would give a negative or infinite Mw, which is impossible -- guard it to NaN
+    # (mirroring the Debye path's intercept>0 guard) rather than present an unphysical
+    # negative Mw. Rg shares the guard: with a<=0 the whole fit is unphysical, so an
+    # Rg extracted from its slope/intercept ratio is not meaningful either.
     if method == 'zimm':
-        mw = 1.0 / a if a != 0 else float('nan')
-        rg = math.sqrt(3.0 * b / a) if (a != 0 and b / a > 0) else float('nan')
-        a2 = d / 2.0
+        mw = 1.0 / a if a > 0 else float('nan')
+        rg = math.sqrt(3.0 * b / a) if (a > 0 and b / a > 0) else float('nan')
+        a2 = d / 2.0                      # independent of a (no sign guard needed)
     else:  # berry
-        mw = 1.0 / a ** 2 if a != 0 else float('nan')
-        rg = math.sqrt(6.0 * b / a) if (a != 0 and b / a > 0) else float('nan')
-        a2 = d * a   # A2 = d' / sqrt(Mw) = d' * a'
+        # Mw = 1/a^2: require a>0 AND a**2 not underflowed to 0.0 (an extreme scale can
+        # drive a to a denormal that passes a>0 yet squares to 0.0 -> 1/0.0 would raise
+        # ZeroDivisionError). A2 = d'*a' is sign-dependent on a, so it must be NaN'd on a
+        # non-physical intercept too (else a garbage A2 rides out with a2_reliable set).
+        mw = 1.0 / a ** 2 if (a > 0 and a ** 2 > 0) else float('nan')
+        rg = math.sqrt(6.0 * b / a) if (a > 0 and b / a > 0) else float('nan')
+        a2 = d * a if a > 0 else float('nan')   # A2 = d' / sqrt(Mw) = d' * a'
 
     # Statistical SEs by first-order propagation through Cov(a,b,d). Rg uses the
     # same Jacobian form for Zimm (Rg^2=3b/a) and Berry (Rg^2=6b/a): dRg/da=-Rg/2a,
-    # dRg/db=+Rg/2b. Mw and A2 differ between the two constructions.
+    # dRg/db=+Rg/2b. Mw and A2 differ between the two constructions. Gated on a>0 (so
+    # no SE travels with a non-physical Mw) AND on the Mw Jacobian's denominator being
+    # a positive finite number: at an extreme intensity scale a**2 / a**3 can UNDERFLOW
+    # to 0.0 even though a != 0, which would make -1/a**2 raise a bare ZeroDivisionError.
     mw_se = rg_se = a2_se = None
-    if np.all(np.isfinite(cov)) and a != 0:
+    if np.all(np.isfinite(cov)) and a > 0:
         if method == 'zimm':
-            mw_se = unc.se_or_none(unc.propagate([-1.0 / a ** 2, 0.0, 0.0], cov))
+            denom = a ** 2
+            if denom > 0:
+                mw_se = unc.se_or_none(unc.propagate([-1.0 / denom, 0.0, 0.0], cov))
             a2_se = unc.se_or_none(unc.propagate([0.0, 0.0, 0.5], cov))
         else:  # berry: Mw=1/a^2, A2=d*a
-            mw_se = unc.se_or_none(unc.propagate([-2.0 / a ** 3, 0.0, 0.0], cov))
+            denom = a ** 3
+            if denom > 0:
+                mw_se = unc.se_or_none(unc.propagate([-2.0 / denom, 0.0, 0.0], cov))
             a2_se = unc.se_or_none(unc.propagate([d, 0.0, a], cov))
         if math.isfinite(rg) and rg > 0 and b != 0:
             rg_se = unc.se_or_none(
@@ -868,9 +986,14 @@ def zimm_analysis(
     # intercept to (q->0, c->0) should agree. Route 1: q->0 intercepts (per c)
     # extrapolated to c->0. Route 2: c->0 intercepts (per angle) extrapolated to q->0.
     def _mw_from_intercept(a0: float) -> Optional[float]:
-        if not math.isfinite(a0) or a0 == 0:
+        # a0 <= 0 (not just == 0): a non-positive intercept gives a non-physical Mw, so
+        # the agreement diagnostic must not be built on it. a0**2 (Berry) also guards
+        # underflow-to-zero at an extreme scale, mirroring the main Mw computation.
+        if not math.isfinite(a0) or a0 <= 0:
             return None
-        return 1.0 / a0 if method == 'zimm' else 1.0 / a0 ** 2
+        if method == 'zimm':
+            return 1.0 / a0
+        return 1.0 / a0 ** 2 if a0 ** 2 > 0 else None
 
     mw_q0 = mw_c0 = agree = None
     if conc_levels.size >= 2:
@@ -882,6 +1005,13 @@ def zimm_analysis(
     if mw_q0 and mw_c0 and (mw_q0 + mw_c0) != 0:
         agree = abs(mw_q0 - mw_c0) / (0.5 * abs(mw_q0 + mw_c0))
 
+    # Numerical health of the global design X = [1, q^2, c]: clustered angles or two
+    # near-equal concentrations (or an extreme intensity scale) make it near-singular,
+    # so 1/a (Mw) and d*a/d/2 (A2) are fragile even when calibrated and a>0. Suppress
+    # both reliability flags and carry the reason (values still shown; Rg from the
+    # slope-ratio stays reported). cond(X) is scale-invariant (invariant 4).
+    note = '' if mf.well_conditioned else _ill_conditioned_note(mf.cond)
+
     return ZimmBerryResult(
         method=method, mw_g_per_mol=float(mw), rg_nm=float(rg),
         a2_mol_mL_per_g2=float(a2),
@@ -889,8 +1019,17 @@ def zimm_analysis(
         n_points=int(q2.size), n_concentrations=int(n_conc), n_angles=int(n_ang),
         is_apparent=False,
         calibrated=all_calibrated,
-        mw_reliable=all_calibrated,
-        a2_reliable=all_calibrated,
+        # a > 0 as well as calibrated: a non-positive ordinate intercept makes the whole
+        # extrapolation non-physical (negative/infinite Mw; and for Berry a sign-flipped
+        # A2 = d'*a'), so neither Mw nor A2 may be marked reliable -- both are NaN'd above.
+        # well_conditioned adds the numerical-degeneracy (thin-design) gate; math.isfinite
+        # closes the float-overflow edge honestly (a underflowing to 0 / a**2 -> 0 NaNs Mw
+        # -- the corpus precision_overflow case -- which must not read reliable). Neither is
+        # a magnitude threshold on Mw itself (invariant 4): a finite-but-huge Mw from
+        # physically-inconsistent input, e.g. a sample far brighter than the calibrant, is
+        # a GIGO/implausible-input concern handled elsewhere, not a conditioning defect.
+        mw_reliable=all_calibrated and a > 0 and mf.well_conditioned and math.isfinite(mw),
+        a2_reliable=all_calibrated and a > 0 and mf.well_conditioned and math.isfinite(a2),
         concentrations_g_per_mL=conc_levels,
         intercept_per_concentration=np.array(inter_per_c),
         q2_nm2=q2_levels, intercept_per_angle=np.array(inter_per_q),
@@ -898,6 +1037,7 @@ def zimm_analysis(
         mw_from_c0_g_per_mol=mw_c0, mw_from_q0_g_per_mol=mw_q0,
         extrapolation_agreement_rel=agree,
         se_estimator=estimator,
+        well_conditioned=mf.well_conditioned, cond=mf.cond, reliability_note=note,
     )
 
 
@@ -908,6 +1048,7 @@ def calibration_free_a2(
     mw_g_per_mol: Optional[float] = None,
     use_excess_intensity=None,
     estimator: str = 'hc3',
+    cond_limit: float = unc.COND_LIMIT,
 ) -> CalibrationFreeA2Result:
     """A2 from intensity ratios at a fixed angle, without absolute calibration.
 
@@ -1017,7 +1158,7 @@ def calibration_free_a2(
 
     # Y(c) = (e_ref / c_ref) / (excess / c)
     Y = (e_ref / c_ref) / (excess / conc)
-    fit = unc.linear_fit(conc, Y, estimator)  # cov order [intercept, slope]
+    fit = unc.linear_fit(conc, Y, estimator, cond_limit)  # cov order [intercept, slope]
     slope, intercept = fit.slope, fit.intercept
     r2 = fit.r_squared
 
@@ -1037,10 +1178,18 @@ def calibration_free_a2(
         if two_a2_mw_se is not None and mw_g_per_mol:
             a2_se = two_a2_mw_se / (2.0 * mw_g_per_mol)     # Mw treated as exact
 
+    # Numerical health of the Y-vs-c design [1, c]: near-equal concentrations make it
+    # near-collinear, so slope/intercept (= 2 A2 Mw) is fragile even though the intercept
+    # is ~1 by construction (Y(c_ref)=1, not the a->0 failure mode of the other methods).
+    # Suppress two_a2_mw_reliable and carry the reason; the value is still returned.
+    note = '' if fit.well_conditioned else _ill_conditioned_note(fit.cond)
+
     return CalibrationFreeA2Result(
         angle_deg=float(angle_deg), concentrations_g_per_mL=conc, Y=Y,
         slope=float(slope), intercept=float(intercept), two_a2_mw=two_a2_mw,
         a2_mol_mL_per_g2=a2, r_squared=float(r2),
         two_a2_mw_se=two_a2_mw_se, a2_se=a2_se,
         se_estimator=estimator,
+        well_conditioned=fit.well_conditioned, cond=fit.cond, reliability_note=note,
+        two_a2_mw_reliable=fit.well_conditioned,
     )

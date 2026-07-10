@@ -90,7 +90,7 @@ class SolventProps:
 
     # ---- per-condition uncertainty descriptor (display-only) ----
     # Components of sigma_n(lambda, T) and sigma_eta_rel(T) -- see the Advanced
-    # Guide sec. 12 for the model. u_src = the source's stated accuracy floor;
+    # Guide sec. 5 for the model. u_src = the source's stated accuracy floor;
     # the node tuples are piecewise-linear UPPER envelopes ((x, r), ...) of the
     # unified-fit residual (clamped flat beyond the end nodes); u_slope = the
     # documented dn/dT-slope allowance. None -> that component is absent (a
@@ -737,7 +737,7 @@ def solvent_uncertainty_n(
 ) -> float:
     """Per-condition ABSOLUTE display uncertainty sigma_n(lambda, T).
 
-    The quadrature of the record's descriptor components (Theory-and-Equations-Guide sec. 12):
+    The quadrature of the record's descriptor components (Theory-and-Equations-Guide sec. 5):
     the source's stated accuracy floor, the unified-fit residual envelopes in
     lambda and T, and the propagated dn/dT-slope allowance. Same range guards as
     ``refractive_index_solvent`` (raises outside the box, never extrapolates).

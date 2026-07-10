@@ -58,6 +58,24 @@ OLS = 'ols'
 _ESTIMATORS = (HC3, OLS)
 
 
+# Condition-number ceiling for a healthy linear design X (a NUMERICAL-health criterion,
+# not a physics threshold and not a magnitude of any fitted quantity). We measure the
+# condition number of the COLUMN-NORMALIZED design (see `_design_cond`), so it is
+# invariant to the units the abscissas are in and reflects genuine collinearity only. On
+# that normalized measure a well-posed Zimm design X = [1, q^2, c] conditions at O(1-100),
+# and float64 loses roughly one significant digit per decade of cond, with total precision
+# loss near cond ~ 1e15-1e16. A default of 1e12 (only ~4 of ~16 digits left) sits in the
+# "numerically near-singular" zone yet far above any healthy design, so it flags a
+# genuinely degenerate extrapolation (a rank-deficient / near-collinear design: q^2
+# proportional to c, or duplicate/near-duplicate concentrations) WITHOUT tripping on a
+# legitimate high-Mw sample -- the flag targets NUMERICAL singularity, not statistical
+# thinness (two well-separated but sparse concentrations condition fine; their honest
+# uncertainty is carried by the inflated HC3 SE, not this flag). Being computed on the
+# normalized design, it is NOT an "Mw too large" magnitude magic number (invariant 4).
+# Overridable per-fit via the `cond_limit` argument.
+COND_LIMIT = 1e12
+
+
 def _hc3_cov(X: np.ndarray, y: np.ndarray, beta: np.ndarray) -> np.ndarray:
     """HC3 heteroscedasticity-consistent covariance of the OLS coefficients.
 
@@ -115,6 +133,48 @@ def _cov(X: np.ndarray, y: np.ndarray, beta: np.ndarray, estimator: str = HC3) -
         return _hc3_cov(X, y, beta)
     raise ValueError(f"unknown estimator {estimator!r}; expected one of {_ESTIMATORS}")
 
+def _diag_se(var: float) -> float:
+    """Square-root of a covariance-diagonal variance, guarding sign as well as finiteness.
+
+    A near-singular design can make an HC3/OLS covariance diagonal come out as a tiny
+    NEGATIVE number in float arithmetic (it should be >= 0). math.sqrt would then raise a
+    bare ValueError('math domain error'); we return NaN instead (-> se_or_none -> None),
+    so a degenerate fit yields "no defensible SE" rather than crashing the analysis."""
+    return math.sqrt(var) if (np.isfinite(var) and var >= 0) else float('nan')
+
+
+def _design_cond(X: np.ndarray) -> float:
+    """2-norm condition number of a design matrix X after COLUMN-NORMALIZING it, robust
+    to a singular design.
+
+    We scale each column to unit 2-norm before taking the condition number. This is
+    deliberate: the raw cond([1, q^2, c]) is dominated by the arbitrary UNIT scales of
+    the columns (q^2 in nm^-2 ~ 1e-4, c in g/mL ~ 1e-3, intercept = 1), so it would
+    change if concentration were expressed in mg/mL instead of g/mL -- making a "raw
+    cond" flag depend on the unit choice, not the physics. Column-normalizing removes
+    that per-column scaling and leaves the genuine collinearity (near-equal
+    concentrations, clustered angles), so the criterion is invariant to the units the
+    abscissas happen to be in -- the scale-invariance invariant 4 asks for. A healthy
+    design then conditions at O(1-100); a degenerate one explodes.
+
+    np.linalg.cond returns +inf for an exactly singular design; we also map a NaN (from
+    a non-finite entry, e.g. an infinite intensity already propagated into X, or a
+    zero-norm column) to +inf, so `cond <= cond_limit` cleanly reads False for any
+    degenerate design rather than letting a NaN slip through the comparison.
+    """
+    X = np.asarray(X, dtype=float)
+    norms = np.sqrt(np.sum(X ** 2, axis=0))
+    # A zero-norm column (an all-zero regressor) is itself degenerate; leaving it
+    # unscaled makes the matrix singular -> cond = inf, the correct verdict.
+    safe = np.where(norms > 0, norms, 1.0)
+    Xn = X / safe
+    try:
+        c = float(np.linalg.cond(Xn))
+    except np.linalg.LinAlgError:
+        return float('inf')
+    return c if math.isfinite(c) else float('inf')
+
+
 @dataclass
 class LinearFit:
     """OLS y = intercept + slope*x with standard errors and covariance.
@@ -123,6 +183,12 @@ class LinearFit:
     when there are too few points to estimate the residual variance: HC3 (p = 2)
     needs n - p >= 2 residual dof (n >= 4), classical OLS needs n - p >= 1 (n >= 3).
     `estimator` records which covariance estimator produced `cov`/the SEs ('hc3' | 'ols').
+
+    `cond` is the condition number of the design X = [1, x] and `well_conditioned` is
+    `cond <= cond_limit` (the numerical-health flag, default ceiling `COND_LIMIT`). A
+    False here means the design is near-degenerate and any 1/coefficient extrapolation
+    (Mw = 1/intercept, etc.) is numerically unreliable regardless of magnitude; callers
+    that build such a quantity gate their reliability flag on it.
     """
     slope: float
     intercept: float
@@ -132,10 +198,18 @@ class LinearFit:
     r_squared: float
     n: int
     estimator: str = HC3
+    cond: float = float('nan')
+    well_conditioned: bool = True
+    cond_limit: float = COND_LIMIT
 
 
-def linear_fit(x: Sequence[float], y: Sequence[float], estimator: str = HC3) -> LinearFit:
-    """OLS y = a + b x with robust HC3 (default) or classical OLS standard errors.  (Eq. 30, 30a, 32)"""
+def linear_fit(x: Sequence[float], y: Sequence[float], estimator: str = HC3,
+               cond_limit: float = COND_LIMIT) -> LinearFit:
+    """OLS y = a + b x with robust HC3 (default) or classical OLS standard errors.  (Eq. 47, 50, 49)
+
+    Also reports the design condition number `cond = cond([1, x])` and the numerical-health
+    flag `well_conditioned = cond <= cond_limit` (see `COND_LIMIT`).
+    """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     n = int(x.size)
@@ -146,13 +220,15 @@ def linear_fit(x: Sequence[float], y: Sequence[float], estimator: str = HC3) -> 
     ss_tot = float(np.sum((y - y.mean()) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
     cov = _cov(X, y, beta, estimator)                # order [intercept, slope]
-    a_se = math.sqrt(cov[0, 0]) if np.isfinite(cov[0, 0]) else float('nan')
-    b_se = math.sqrt(cov[1, 1]) if np.isfinite(cov[1, 1]) else float('nan')
-    return LinearFit(b, a, b_se, a_se, cov, r2, n, estimator)
+    a_se = _diag_se(cov[0, 0])
+    b_se = _diag_se(cov[1, 1])
+    cond = _design_cond(X)
+    return LinearFit(b, a, b_se, a_se, cov, r2, n, estimator,
+                     cond=cond, well_conditioned=cond <= cond_limit, cond_limit=cond_limit)
 
 
 def linear_fit_through_origin(x: Sequence[float], y: Sequence[float], estimator: str = HC3):
-    """OLS slope of y = b x (no intercept) with robust HC3 (default) or classical OLS SE.  (Eq. 31)
+    """OLS slope of y = b x (no intercept) with robust HC3 (default) or classical OLS SE.  (Eq. 48)
 
     b = sum(xy)/sum(x^2). Returns (slope, slope_se); with p = 1 fitted parameter,
     slope_se is NaN for n < 3 under HC3 (needs n - p >= 2) and n < 2 under classical
@@ -165,7 +241,7 @@ def linear_fit_through_origin(x: Sequence[float], y: Sequence[float], estimator:
     b = float(x @ y) / sxx if sxx > 0 else float('nan')
     if n > 1 and sxx > 0:
         cov = _cov(x.reshape(-1, 1), y, np.array([b]), estimator)
-        b_se = math.sqrt(cov[0, 0]) if np.isfinite(cov[0, 0]) else float('nan')
+        b_se = _diag_se(cov[0, 0])
     else:
         b_se = float('nan')
     return b, b_se
@@ -175,15 +251,23 @@ def linear_fit_through_origin(x: Sequence[float], y: Sequence[float], estimator:
 class MultiFit:
     """Multilinear OLS y = X b (caller supplies the full design X, incl. intercept).
 
-    `estimator` records which covariance estimator produced `cov` ('hc3' | 'ols')."""
+    `estimator` records which covariance estimator produced `cov` ('hc3' | 'ols').
+    `cond` is the condition number of the supplied design X and `well_conditioned` is
+    `cond <= cond_limit` (numerical-health flag, default ceiling `COND_LIMIT`) — a False
+    means the Zimm/Berry extrapolation design is near-degenerate (clustered angles or
+    near-equal concentrations) and the 1/intercept Mw is numerically unreliable."""
     coeffs: np.ndarray
     cov: np.ndarray             # p x p covariance of coeffs
     r_squared: float
     n: int
     estimator: str = HC3
+    cond: float = float('nan')
+    well_conditioned: bool = True
+    cond_limit: float = COND_LIMIT
 
 
-def multilinear_fit(X: np.ndarray, y: Sequence[float], estimator: str = HC3) -> MultiFit:
+def multilinear_fit(X: np.ndarray, y: Sequence[float], estimator: str = HC3,
+                    cond_limit: float = COND_LIMIT) -> MultiFit:
     """OLS point estimate for a supplied design matrix X (n x p) with the selected covariance.
 
     The coefficients are ordinary least squares; the parameter covariance is, by default,
@@ -191,7 +275,8 @@ def multilinear_fit(X: np.ndarray, y: Sequence[float], estimator: str = HC3) -> 
     Cov(b) = s^2 (X^T X)^-1 -- so it does not under-report under non-uniform precision. Passing
     estimator='ols' selects the classical form for comparability (invariant 8 clause A).
     Used for the Zimm/Berry global fit ordinate = a + b q^2 + d c (X = [1, q^2, c]).
-    (Eq. 32)
+    Also reports `cond = cond(X)` and `well_conditioned = cond <= cond_limit` (see `COND_LIMIT`).
+    (Eq. 49)
     """
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -201,7 +286,9 @@ def multilinear_fit(X: np.ndarray, y: Sequence[float], estimator: str = HC3) -> 
     ss_tot = float(np.sum((y - y.mean()) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
     cov = _cov(X, y, beta, estimator)
-    return MultiFit(beta, cov, r2, n, estimator)
+    cond = _design_cond(X)
+    return MultiFit(beta, cov, r2, n, estimator,
+                    cond=cond, well_conditioned=cond <= cond_limit, cond_limit=cond_limit)
 
 
 # ---------------------------------------------------------------------------
@@ -218,22 +305,27 @@ def se_or_none(x: Optional[float]) -> Optional[float]:
 
 
 def propagate(jac: Sequence[float], cov: np.ndarray) -> float:
-    """Standard error of a scalar f(b): sqrt(J^T Cov J).  (Eq. 33)
+    """Standard error of a scalar f(b): sqrt(J^T Cov J).  (Eq. 51)
 
     `jac` is the gradient of f w.r.t. the parameters; `cov` their covariance.
-    Returns NaN if the covariance is not finite.
+    Returns NaN if the covariance is not finite, or if the propagated variance is not
+    strictly positive: a near-singular covariance can make J^T Cov J cancel to a tiny
+    negative or exactly-zero value in float arithmetic, and reporting that as SE = 0.0
+    would be a spuriously tight, UNDER-reported uncertainty (the cardinal invariant-8
+    failure). We return NaN instead, which `se_or_none` maps to None ("no defensible
+    uncertainty") — a case every caller already handles.
     """
     jac = np.asarray(jac, dtype=float)
     cov = np.asarray(cov, dtype=float)
     if not np.all(np.isfinite(cov)):
         return float('nan')
     var = float(jac @ cov @ jac)
-    return math.sqrt(var) if var > 0 else 0.0
+    return math.sqrt(var) if var > 0 else float('nan')
 
 
 def ratio_se(a: float, a_se: Optional[float],
              b: float, b_se: Optional[float]) -> Optional[float]:
-    """SE of r = a/b for INDEPENDENT a, b: |a/b| sqrt((a_se/a)^2 + (b_se/b)^2).  (Eq. 34)
+    """SE of r = a/b for INDEPENDENT a, b: |a/b| sqrt((a_se/a)^2 + (b_se/b)^2).  (Eq. 52)
 
     Returns None unless both SEs are available and a, b are non-zero (so the
     fractional terms are defined). Used for rho = Rg/Rh (Rg from SLS, Rh from DLS —
@@ -247,7 +339,7 @@ def ratio_se(a: float, a_se: Optional[float],
 
 def power_law_se(f_value: float, x_value: float, x_se: Optional[float],
                  exponent: float) -> Optional[float]:
-    """SE of f = k * x^exponent from x's SE: |exponent| |f| (x_se/|x|).  (Eq. 35)
+    """SE of f = k * x^exponent from x's SE: |exponent| |f| (x_se/|x|).  (Eq. 53)
 
     For Rh = kT/(6 pi eta D) ~ D^-1, exponent = -1 gives sigma_Rh/Rh = sigma_D/D.
     Returns None if x_se is None/non-finite or x is zero."""
@@ -278,7 +370,7 @@ class ReplicateStats:
 
 
 def replicate_mean_se(values: Sequence[float]) -> ReplicateStats:
-    """Mean +/- standard error of a parameter across replicate measurements.  (Eq. 36)
+    """Mean +/- standard error of a parameter across replicate measurements.  (Eq. 55)
 
     For n independent repeats x_1..x_n of one quantity (e.g. Rh fitted from each
     of an ALV 10-run replicate set):
@@ -420,7 +512,7 @@ def format_fixed_sig(value: Optional[float], sig: int = 3) -> str:
     number's honesty is carried by its apparent/±-omitted qualifier (invariant #7),
     the digit count by this rule.
 
-    Standing policy (see the Theory-and-Equations-Guide §15.6): a value that HAS an uncertainty is
+    Standing policy (see the Theory-and-Equations-Guide §6.6): a value that HAS an uncertainty is
     set by that uncertainty and never comes here; a value WITHOUT one is set by ``sig``,
     which is user-configurable (Settings → the no-uncertainty precision knob, default 3).
     Because any sig-fig choice for an unquantified number is inherently arbitrary, that is

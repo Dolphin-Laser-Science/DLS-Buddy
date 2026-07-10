@@ -25,12 +25,13 @@ from typing import Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from core.data_models import implausible_metadata_reasons
 from core.workspace import _DLS_PARAM_KEYS, _SLS_PARAM_KEYS
 from app.controller import _SHARED_PARAM_KEYS
 from app import units as U
 from analysis.uncertainty import format_value_at_uncertainty
 from gui.help import section_header
-from gui.theme import ThemedLabel, color as theme_color, token as theme_token
+from gui.theme import ThemedLabel, set_flag, color as theme_color, token as theme_token
 from gui.worker import busy_notice, runner
 
 
@@ -158,6 +159,10 @@ class DataModule(QtWidgets.QWidget):
                 'a value you type by hand is never overwritten.',
                 'A teal dot marks a library value; no dot means your own value. '
                 'dn/dc is never proposed — always enter it yourself.',
+                'Values are used exactly as entered. If a temperature or refractive '
+                'index looks like a unit slip (e.g. 2980 K for 298 K, or n = 13.3 for '
+                '1.33) a note below the table flags it as implausible — double-check '
+                'it, then keep or correct it as you see fit.',
                 'Tip: press <b>Enter</b> in a value to jump to the next field.',
             ]))
         self.table = QtWidgets.QTableWidget(0, 3)
@@ -207,6 +212,13 @@ class DataModule(QtWidgets.QWidget):
         self.autofill_note = ThemedLabel('', role='hint', size=11)
         self.autofill_note.setWordWrap(True)
         layout.addWidget(self.autofill_note)
+        # Passive plausibility note (a likely unit slip in the committed T / n): a
+        # neutral steel ⓘ qualifier, not an alarm — the value is user-owned and used
+        # as entered (invariant 3). Shares its band with the load-time warning via
+        # core.data_models.implausible_metadata_reasons so the two never drift.
+        self.plausibility_note = ThemedLabel('', size=11)
+        self.plausibility_note.setWordWrap(True)
+        layout.addWidget(self.plausibility_note)
 
         row = QtWidgets.QHBoxLayout()
         self.update_button = QtWidgets.QPushButton('Update')
@@ -251,6 +263,7 @@ class DataModule(QtWidgets.QWidget):
             self._set_enabled(False)
             self.pending.setText('')
             self.autofill_note.setText('')
+            self.plausibility_note.setText('')
             # The provenance legend is data-dependent chrome (R8.2): hide it on an empty
             # table so an unpopulated tab doesn't explain a dot that isn't there.
             self.legend.hide()
@@ -826,6 +839,25 @@ class DataModule(QtWidgets.QWidget):
         # state to step back to; otherwise there is nothing to undo.
         self.undo_button.setEnabled(
             self.item_id is not None and self.controller.can_undo())
+        # Every mutation path (edit, commit, undo, reset, autofill) and selection change
+        # routes through here, so refresh the plausibility note from the same hook.
+        self._refresh_plausibility()
+
+    def _refresh_plausibility(self) -> None:
+        """Show a passive ⓘ note when the working temperature / refractive index is
+        outside its physical plausibility band (a likely unit slip). Non-blocking —
+        the value is used exactly as entered (invariant 3). The band is defined once,
+        in core.data_models.implausible_metadata_reasons, shared with the load-time
+        warning so the GUI note and the warning can never disagree."""
+        if self.item_id is None:
+            set_flag(self.plausibility_note, '', problem=False)
+            return
+        working = self.controller.workspace.measurements[self.item_id].working_params
+        reasons = implausible_metadata_reasons(
+            working.get('temperature_K'), working.get('solvent_refractive_index'))
+        msg = ('Check for a unit slip — ' + '; '.join(reasons)
+               + '. Used exactly as entered.') if reasons else ''
+        set_flag(self.plausibility_note, msg, problem=False)
 
     def _set_enabled(self, on: bool) -> None:
         self.table.setEnabled(on)

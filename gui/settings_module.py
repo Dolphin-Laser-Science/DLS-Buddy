@@ -124,7 +124,7 @@ class SettingsModule(QtWidgets.QWidget):
             'Covariance estimator behind every reported regression ± (SLS Zimm/Berry, '
             'Debye, Guinier, calibration-free A₂; DLS Γ vs q² and kD; the Rg/A₂–Mw '
             'scaling exponent). Switching clears existing ±-bearing results (you will '
-            'be asked to confirm). See Theory-and-Equations-Guide §15.1.')
+            'be asked to confirm). See Theory-and-Equations-Guide §6.1.')
         est_help = HelpBadge(
             'Which standard error the app reports for its straight-line and '
             'multilinear fits.',
@@ -139,7 +139,7 @@ class SettingsModule(QtWidgets.QWidget):
                 'The choice is global, persists across restart, and is recorded on '
                 'each result and written into the export (an OLS ± is labeled '
                 '“SE: classical OLS”). Point estimates (Mw, Rg, D, Rh) are unaffected.',
-                'Detail and formulas: Theory-and-Equations-Guide §15.1.',
+                'Detail and formulas: Theory-and-Equations-Guide §6.1.',
             ])
         est_row = QtWidgets.QWidget()
         est_lay = QtWidgets.QHBoxLayout(est_row)

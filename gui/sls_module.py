@@ -53,6 +53,38 @@ _STAT_CAVEAT = ' (± statistical; excludes calibration & dn/dc)'
 # it. Rg and the calibration-free 2·A₂·Mw product survive and stay shown.
 _UNCAL_MW = '— (uncalibrated)'
 
+
+# Calculation-nuance hover for the ill-conditioned flag (the always-visible flag says
+# WHAT and the remedy; this tooltip carries the WHY/threshold, pointing to the guide —
+# the how-to-use vs calculation-nuance tier split, CLAUDE.md rule 8).
+_ILL_COND_TOOLTIP = (
+    'Numerical-health flag: the extrapolation design (1, q², c) is near-singular, so the '
+    '1/coefficient Mw/A₂ loses precision independent of magnitude. Threshold: condition '
+    'number > 1×10¹² (a healthy design is ~10²–10⁴; float64 loses all precision near '
+    '~10¹⁶). This is scale-invariant, not an “Mw too large” cutoff. See the '
+    'Theory-and-Equations-Guide, numerical-conditioning note.')
+
+
+def _mw_unreliable_caution(res) -> str:
+    """Below-fold caution when a CALIBRATED SLS fit's Mw is unreliable for a NUMERICAL
+    reason — an ill-conditioned design, a non-finite overflow, or a non-physical
+    (sign-guarded) intercept/divisor.
+
+    Empty when Mw is reliable, or when the fit is uncalibrated (that case has its own
+    louder wording and dashes the value out). Unlike the uncalibrated case the NUMBER is
+    still shown — finite, or rendered 'n/a' when non-finite — so the reason rides in the
+    flag. This is a data-conditional problem, so it is the red ⚠ `error` tier, matching
+    "uncalibrated" (ui_style_guide §5 R5.2), not a neutral ⓘ qualifier. It keys on
+    `mw_reliable` (a conjunction of calibration, sign, conditioning and finiteness gates),
+    not on `well_conditioned` alone, so a value unreliable for a non-conditioning reason
+    is never left with a neutral "apparent" flag next to an 'n/a'. Prefers the result's
+    specific `reliability_note`; the condition-number tooltip is attached separately, only
+    for the genuine ill-conditioning case (`not well_conditioned`)."""
+    if getattr(res, 'calibrated', True) and not getattr(res, 'mw_reliable', True):
+        return (getattr(res, 'reliability_note', '')
+                or 'Mw is unreliable (non-physical or degenerate fit).')
+    return ''
+
 # Shown when a redisplayed (cached) SLS fit no longer matches its committed params /
 # mask / calibration / estimator — the same explicit-Run + staleness-hint contract the
 # DLS tabs use. Matches gui.dls_module._STALE_HINT wording.
@@ -302,8 +334,10 @@ class SLSModule(QtWidgets.QWidget):
             'or higher-Mw particles where Zimm curves.',
             'Flags under the plot come in two tiers: a calm <b>ⓘ</b> note is a neutral, '
             'expected qualifier (e.g. “apparent”, “± statistical only”) — not a problem; '
-            'a bold red <b>⚠</b> is a genuine data-quality issue (uncalibrated, or the '
-            'two extrapolation routes disagree by &gt;10%).',
+            'a bold red <b>⚠</b> is a genuine data-quality issue (uncalibrated; an '
+            '<b>ill-conditioned design</b> — clustered angles or near-equal '
+            'concentrations make Mw/A₂ numerically unreliable; or the two extrapolation '
+            'routes disagree by &gt;10%).',
             '<b>Run</b> is the only thing that computes a fit. Switching sample '
             'or fraction, or committing a parameter, redisplays the last fit and — if the '
             'inputs changed — flags it “press Run to refresh” rather than silently '
@@ -1121,8 +1155,13 @@ class SLSModule(QtWidgets.QWidget):
                                           getattr(res, 'rg_apparent_se', None))),
                 ('R²', format_fixed_sig(res.r_squared, sig)),
             ])
-            self._set_flag(self._apparent_flag(res.calibrated) + _STAT_CAVEAT,
-                           problem=not res.calibrated)
+            caution = _mw_unreliable_caution(res)
+            flag = self._apparent_flag(res.calibrated) + _STAT_CAVEAT
+            if caution:
+                flag += '  ' + caution
+            self._set_flag(flag, problem=(not res.calibrated) or bool(caution))
+            if not getattr(res, 'well_conditioned', True):
+                self.flag_label.setToolTip(_ILL_COND_TOOLTIP)
         elif method == 'guinier':
             res = payload['res']
             self._export = (f'{sid}_guinier.csv', lambda p: c.export_guinier(res, p))
@@ -1135,40 +1174,52 @@ class SLSModule(QtWidgets.QWidget):
                 ('R²', format_fixed_sig(res.r_squared, sig)),
             ])
             # Tier tracks severity: the plain "apparent" note is a neutral qualifier;
-            # an out-of-regime qRg(max) is a genuine caution (red). _set_flag adds the glyph.
-            problem = not res.guinier_valid
+            # an out-of-regime qRg(max) or an ill-conditioned design is a genuine caution
+            # (red). _set_flag adds the glyph.
+            caution = _mw_unreliable_caution(res)
             flag = ('apparent (single concentration): Rg still contains '
                     'concentration effects — extrapolate over c for the '
                     'thermodynamic Rg.')
-            if problem:
+            if not res.guinier_valid:
                 flag += (f'  qRg(max) = {format_fixed_sig(res.qrg_max, sig)} > 1.3 is '
                          'outside the Guinier regime — treat Rg with caution (Berry/Zimm '
                          'linearize the high-qRg regime better).')
-            self._set_flag(flag, problem=problem)
+            if caution:
+                flag += '  Mw (from the intercept): ' + caution
+            self._set_flag(flag, problem=(not res.guinier_valid) or bool(caution))
+            if not getattr(res, 'well_conditioned', True):
+                self.flag_label.setToolTip(_ILL_COND_TOOLTIP)
         elif method == 'single':
             res = payload['res']
             self._export = (f'{sid}_single_angle.csv',
                             lambda p: c.export_single_angle(res, p))
             self._clear_plot()
             # Single angle + single concentration = one datum, so Mw_app has no honest ±
-            # — the documented fixed-sig fallback, never a fabricated ±.
+            # — the documented fixed-sig fallback, never a fabricated ±. Dash the value
+            # only when uncalibrated (arbitrary scale); an ill-conditioned (subnormal
+            # divisor) Mw is finite, so it is still shown, with a red caution below.
             mw_app = (format_fixed_sig(res.mw_apparent_g_per_mol,
                                        self.controller.settings.no_uncertainty_sig_figs)
-                      if res.mw_reliable else _UNCAL_MW)
+                      if res.calibrated else _UNCAL_MW)
             self._fill_result_table([
                 ('Mw_app (g/mol)', mw_app),
                 ('Angle', f'{res.angle_deg:.0f}°'),
                 ('c (mg/mL)', f'{res.concentration_g_per_mL * 1000:.3g}'),
             ])
-            if res.calibrated:
-                self._set_flag(
-                    'apparent: single angle + single concentration (contains the '
-                    'form factor and the 2A₂c term).', problem=False)
-            else:
+            caution = _mw_unreliable_caution(res)
+            if not res.calibrated:
                 self._set_flag(
                     'apparent + uncalibrated: single angle + single concentration '
                     '(contains the form factor and the 2A₂c term), and Mw_app is on an '
                     'arbitrary scale.', problem=True)
+            elif caution:
+                self._set_flag(
+                    'apparent: single angle + single concentration (contains the '
+                    'form factor and the 2A₂c term).  ' + caution, problem=True)
+            else:
+                self._set_flag(
+                    'apparent: single angle + single concentration (contains the '
+                    'form factor and the 2A₂c term).', problem=False)
         elif method == 'calfree':
             res = payload['res']
             self._export = (f'{sid}_calibration_free_a2.csv',
@@ -1183,12 +1234,22 @@ class SLSModule(QtWidgets.QWidget):
                  format_pm(res.two_a2_mw, getattr(res, 'two_a2_mw_se', None))),
                 ('A₂ (mol·mL/g²)', a2),
             ])
-            if getattr(res, 'two_a2_mw_se', None) is not None:
+            # An ill-conditioned Y-vs-c design (near-equal concentrations) makes
+            # 2·A₂·Mw = slope/intercept numerically unreliable — red tier, value still
+            # shown. The neutral ± caveat is secondary and yields to it.
+            ill_cond = '' if getattr(res, 'well_conditioned', True) else (
+                getattr(res, 'reliability_note', '')
+                or 'ill-conditioned design (near-equal concentrations); '
+                   '2·A₂·Mw numerically unreliable.')
+            if ill_cond:
+                self._set_flag(ill_cond, problem=True)
+                self.flag_label.setToolTip(_ILL_COND_TOOLTIP)
+            elif getattr(res, 'two_a2_mw_se', None) is not None:
                 self._set_flag('± statistical only', problem=False)
                 self.flag_label.setToolTip(
                     'No calibration or dn/dc enters 2·A₂·Mw (they cancel in the intensity '
                     'ratio); the ± is a conservative statistical SE that never under-reports '
-                    'and tightens with more concentration points. See the Theory-and-Equations-Guide §15.1.')
+                    'and tightens with more concentration points. See the Theory-and-Equations-Guide §6.1.')
             else:
                 self._set_flag('', problem=False)
                 self.flag_label.setToolTip('')   # no SE → drop the §15.1 hover
@@ -1343,11 +1404,13 @@ class SLSModule(QtWidgets.QWidget):
         a2_se = getattr(res, 'a2_se', None)
         # Uncalibrated Mw AND absolute A₂ are both on an arbitrary scale (Mw_app = Mw/f,
         # A₂_app = f·A₂) — dash BOTH at the value rather than show a meaningless number.
-        # Only Rg (scale-free) survives here; the calibration-free
-        # 2·A₂·Mw product is a separate method/table. Matches the below-fold flag, which
-        # calls Mw AND absolute A₂ unreliable.
-        mw_value = (format_pm(res.mw_g_per_mol, mw_se) if res.mw_reliable else _UNCAL_MW)
-        a2_value = (format_pm(res.a2_mol_mL_per_g2, a2_se) if res.a2_reliable else _UNCAL_MW)
+        # Only Rg (scale-free) survives here; the calibration-free 2·A₂·Mw product is a
+        # separate method/table. An ill-conditioned (but calibrated) fit is NOT dashed —
+        # the value is finite, so we keep it (format_pm renders a non-physical NaN as
+        # 'n/a') and warn below the fold; so key the dash on `calibrated`, not on the
+        # reliability flag (which now also folds in conditioning).
+        mw_value = (format_pm(res.mw_g_per_mol, mw_se) if res.calibrated else _UNCAL_MW)
+        a2_value = (format_pm(res.a2_mol_mL_per_g2, a2_se) if res.calibrated else _UNCAL_MW)
         self._fill_result_table([
             ('Method', res.method.capitalize()),
             ('Mw (g/mol)', mw_value),
@@ -1359,6 +1422,12 @@ class SLSModule(QtWidgets.QWidget):
             '' if res.calibrated else
             'uncalibrated: Mw and absolute A₂ are unreliable; Rg and the '
             'calibration-free 2·A₂·Mw remain valid (the scale cancels).')
+        # Calibrated but Mw/A₂ unreliable for a numerical reason (ill-conditioned design,
+        # non-finite overflow, or a non-physical intercept): value shown, red tier
+        # (see _mw_unreliable_caution).
+        cond_caution = _mw_unreliable_caution(res)
+        if cond_caution:
+            flag = (flag + '\n' + cond_caution) if flag else cond_caution
         # Two-route consistency: Mw can be read off the c→0 line OR the q→0 line, and
         # the two should match; a large gap warns of curvature/extrapolation error
         # (no ± involved). `agree` is the RELATIVE DIFFERENCE between the two, so we
@@ -1376,11 +1445,13 @@ class SLSModule(QtWidgets.QWidget):
             flag = (flag + '\n' + note) if flag else note
         if mw_se is not None or a2_se is not None:
             flag = (flag + '\n' if flag else '') + _STAT_CAVEAT.strip()
-        # Red alarm only for a genuine problem (uncalibrated, or the two Mw routes
-        # disagree by >10 %); the plain two-route note and the ± caveat are neutral
-        # qualifiers. _set_flag adds the ⚠/ⓘ glyph to match the tier.
-        problem = (not res.calibrated) or route_disagrees
+        # Red alarm only for a genuine problem (uncalibrated, ill-conditioned design, or
+        # the two Mw routes disagree by >10 %); the plain two-route note and the ± caveat
+        # are neutral qualifiers. _set_flag adds the ⚠/ⓘ glyph to match the tier.
+        problem = (not res.calibrated) or route_disagrees or bool(cond_caution)
         self._set_flag(flag, problem=problem)
+        if not getattr(res, 'well_conditioned', True):
+            self.flag_label.setToolTip(_ILL_COND_TOOLTIP)
 
     def _set_flag(self, text: str, *, problem: bool = True) -> None:
         """Set this tab's flag label via the shared two-tier renderer.

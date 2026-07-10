@@ -1,0 +1,9 @@
+# The Synthetic Stress corpus is byte-exact by design: line endings, text
+# encodings (UTF-16 + BOM), and decimal separators are part of what each file
+# probes. Disable git's eol/encoding normalization so the exact bytes round-trip
+# on every platform -- otherwise, e.g., the CRLF case would be normalized to LF
+# and quietly stop testing CRLF handling.
+*.csv  -text
+*.txt  -text
+*.ASC  -text
+# expected-outcomes.md is normal prose -- leave it diffable (not listed here).
