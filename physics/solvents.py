@@ -88,7 +88,7 @@ class SolventProps:
     #   'bulk'      -- a handbook/bulk compilation (CRC, Riddick).
     eta_source_grade: Optional[str] = None
 
-    # ---- per-condition uncertainty descriptor (display-only; Spec 3) ----
+    # ---- per-condition uncertainty descriptor (display-only) ----
     # Components of sigma_n(lambda, T) and sigma_eta_rel(T) -- see the Advanced
     # Guide sec. 12 for the model. u_src = the source's stated accuracy floor;
     # the node tuples are piecewise-linear UPPER envelopes ((x, r), ...) of the
@@ -709,7 +709,7 @@ def viscosity_solvent(name: str, temperature_C: float) -> float:
 
 
 # ===========================================================================
-# Per-condition display uncertainty (Spec 3) -- shown, NEVER propagated
+# Per-condition display uncertainty -- shown, NEVER propagated
 # ===========================================================================
 
 def _envelope_value(nodes: Optional[tuple], x: float) -> float:
@@ -737,7 +737,7 @@ def solvent_uncertainty_n(
 ) -> float:
     """Per-condition ABSOLUTE display uncertainty sigma_n(lambda, T).
 
-    The quadrature of the record's descriptor components (Advanced Guide sec. 12):
+    The quadrature of the record's descriptor components (Theory-and-Equations-Guide sec. 12):
     the source's stated accuracy floor, the unified-fit residual envelopes in
     lambda and T, and the propagated dn/dT-slope allowance. Same range guards as
     ``refractive_index_solvent`` (raises outside the box, never extrapolates).

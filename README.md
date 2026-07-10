@@ -54,9 +54,16 @@ python -m gui.main
 
 ## Documentation
 
-- **Quickstart** and **Advanced Guide** (theory + equations) — PDFs in [`docs/`](docs/).
-- [`code_map.md`](docs/code_map.md) — directory and per-file tour, for reading/forking the code.
-- [`code_references.md`](docs/code_references.md) — every literature source mapped to where it is used.
+- **Quickstart-Guide** — the common path (load → confirm parameters → run a DLS or SLS
+  analysis → export): [`docs/1. Quickstart-Guide.pdf`](docs/1.%20Quickstart-Guide.pdf).
+- **User-Manual** — the comprehensive reference: every module, file format, and parameter,
+  with worked figures: [`docs/2. User-Manual.pdf`](docs/2.%20User-Manual.pdf).
+- **Theory-and-Equations-Guide** — the physics, numbered equations, and literature behind
+  each method: [`docs/3. Theory-and-Equations-Guide.pdf`](docs/3.%20Theory-and-Equations-Guide.pdf).
+- [`Code-Map.md`](docs/4.%20Code-Map.md) — directory and per-file tour, for reading/forking the code.
+- [`Code-References.md`](docs/5.%20Code-References.md) — every literature source mapped to where it is used.
+- [`Acknowledgements.md`](docs/6.%20Acknowledgements.md) — beta testers and test-data contributors.
+- [`AI-Use-Statement.txt`](docs/7.%20AI-Use-Statement.txt) — how this project was built, in the author's words.
 - [`PATCH_NOTES.md`](PATCH_NOTES.md) — what changed per release, plus known issues.
 - [`CLAUDE.md`](CLAUDE.md) — architecture invariants for contributors.
 

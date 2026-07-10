@@ -61,40 +61,40 @@ class SettingsState:
     # --- uncertainty (applies to every regression SE: SLS + DLS Gamma-q^2/kD) ---
     se_estimator: str = 'hc3'               # 'hc3' (robust, default; never under-reports)
     #                                         or 'ols' (classical s^2(X'X)^-1, opt-in for
-    #                                         comparability; can under-report). See invariant 8
-    #                                         clause A + Advanced Guide 15.1.
+    #                                         comparability; can under-report). See the
+    #                                         Theory-and-Equations-Guide 15.1.
 
     # NOTE: the synthetic-generator (β/noise/points) and intensity-trace (outlier k,
-    # baseline, block-variance, ADF) defaults used to live here. Per feedback
-    # 2026-06-26 #6 they were moved into their own tabs as plain session-only fields
-    # (Synthetic generator / Traces), seeded each launch from in-module code
-    # constants, and the controller's trace methods fall back to the constants in
-    # app/controller.py. They are intentionally no longer persisted settings.
+    # baseline, block-variance, ADF) defaults used to live here. They were moved into
+    # their own tabs as plain session-only fields (Synthetic generator / Traces),
+    # seeded each launch from in-module code constants, and the controller's trace
+    # methods fall back to the constants in app/controller.py. They are intentionally
+    # no longer persisted settings.
 
     # --- result display (GUI-global; applies directly, not a seed) ---
     no_uncertainty_sig_figs: int = 3        # significant figures for a result that has
     #                                         NO honest ± (single correlogram, NNLS/CONTIN,
     #                                         single-angle Mw). NEVER governs a value that
-    #                                         HAS a ± — that place is σ-driven (invariant 8).
+    #                                         HAS a ± — that place is σ-driven.
 
     # --- appearance (GUI-global; may apply directly, not seed) ---
     theme: str = 'system'                   # 'system' / 'light' / 'dark'
     ui_density: str = 'comfortable'         # app-wide font size: 'compact' / 'comfortable'
     #                                         / 'large' (accessibility + screen real-estate)
-    show_tooltips: bool = True              # passive hover tooltips on/off (Section B)
+    show_tooltips: bool = True              # passive hover tooltips on/off
     plot_palette: str = 'okabe_ito'         # 'okabe_ito' / 'tab10' / 'grayscale'
     plot_match_theme: bool = False          # theme the ON-SCREEN plot to the dark app
     #                                         theme (opt-in). Export ALWAYS stays white
     #                                         regardless (locked; style guide R10.3).
-    # Plot-axis display units (feedback 2026-06-26 #8): {quantity: unit}. Empty =
-    # the human-scale defaults from plotting.plots. Applied globally to the plots.
+    # Plot-axis display units: {quantity: unit}. Empty = the human-scale defaults
+    # from plotting.plots. Applied globally to the plots.
     plot_units: Dict[str, str] = field(default_factory=dict)
 
     # --- session (interface) ---
     reopen_last_session: bool = False       # auto-save the workspace on exit and reopen
     #                                         it on the next launch (off by default)
     last_session_path: str = ''             # app-managed autosave file (set by the GUI;
-    #                                         resolved beside settings.json — invariant 9)
+    #                                         resolved beside settings.json, never CWD)
 
     # ---- serialization ----
     def to_dict(self) -> Dict[str, Any]:

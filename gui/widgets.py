@@ -4,15 +4,14 @@ gui/widgets.py
 
 Small cross-module Qt widget helpers that don't belong to any one tab:
 
-* the tab-bar room fix (`RoomyTabBar` / `roomy_tabs`) — usability feedback
-  2026-06-30 item 3;
+* the tab-bar room fix (`RoomyTabBar` / `roomy_tabs`) — a usability fix;
 * the visible-grip splitter (`GripSplitter`);
 * the **shared selection layer** (`SelectionModel` + `MeasurementPicker`) — the one
   measurement-picker idiom every analysis tab uses (real checkboxes, include-semantics,
   select-all/none, grouped by sample). Promoted from the DLS-only checklist so all tabs
   share one look and one model, and the sidebar can mirror "what's selected";
 * the **bulk group-tick row** (`GroupTickBar`) — a "tick all at concentration / angle"
-  helper shared by the Γ-q²/D-c tabs and the Distribution picker (feedback 2026-07-07).
+  helper shared by the Γ-q²/D-c tabs and the Distribution picker.
 
 The tab-bar fix widens each tab's **size hint** rather than applying a `QTabBar::tab`
 stylesheet — a stylesheet would override Fusion's native tab painting (flat, unstyled
@@ -102,7 +101,7 @@ def roomy_tabs(tab_widget: QtWidgets.QTabWidget) -> QtWidgets.QTabWidget:
 
 
 # ---------------------------------------------------------------------------
-# Splitter with a visible "grip" handle (usability feedback 2026-06-30 #5/#9)
+# Splitter with a visible "grip" handle (usability)
 # ---------------------------------------------------------------------------
 # Qt's default splitter handle is a near-invisible thin line, so users can't tell a
 # divider is draggable. GripSplitter paints a small centered grip (three dots) on every
@@ -157,8 +156,8 @@ class GripSplitter(QtWidgets.QSplitter):
 # ---------------------------------------------------------------------------
 # One idiom for "which measurements is this tab analyzing?", used by every analysis
 # tab: real checkboxes, INCLUDE-semantics (tick = use it), select-all/none, grouped by
-# sample. The model is GUI-side only (not persisted — architecture invariant #5: the
-# controller stays Qt-free/stateless about selection; analysis calls take the ticked
+# sample. The model is GUI-side only (not persisted — the controller stays
+# Qt-free/stateless about selection; analysis calls take the ticked
 # ids inline via `include_ids`). The picker is a thin view over a model; two pickers can
 # share one model (e.g. the DLS Correlogram + Distribution overlay) and stay in lock-step
 # because both react to the model's `changed` signal.
@@ -186,7 +185,7 @@ class SelectionModel(QtCore.QObject):
         self._cycle = color_cycle
         # Parallel marker / linestyle cycles (injected so this module imports no
         # plotting) so an overlaid series is distinguishable by SHAPE, not colour alone
-        # (WCAG 1.4.1 / greyscale — UI Batch 5). Keyed by the same insertion index as
+        # (WCAG 1.4.1 / greyscale). Keyed by the same insertion index as
         # color_for, so each measurement keeps a stable (colour, marker, linestyle).
         self._markers = marker_cycle
         self._linestyles = linestyle_cycle
@@ -295,8 +294,8 @@ class GroupTickBar(QtWidgets.QWidget):
         self._buttons: dict = {}         # key -> QPushButton
         self._formatters: dict = {key: fmt for key, _noun, fmt in fields}
         # One (label, combo, Tick) row PER field, stacked vertically — a single HBox
-        # would overflow the narrow control column once there are two fields (feedback
-        # 2026-07-07). A single-field bar is just one row.
+        # would overflow the narrow control column once there are two fields.
+        # A single-field bar is just one row.
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         for key, noun, _fmt in fields:
@@ -307,7 +306,7 @@ class GroupTickBar(QtWidgets.QWidget):
             combo.setToolTip(
                 f'Tick every eligible measurement sharing the chosen {noun}.')
             # Grow to its content but don't hog the row — keep the Tick button visible
-            # in the narrow control column (feedback 2026-07-07).
+            # in the narrow control column.
             combo.setSizeAdjustPolicy(
                 QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
             self._combos[key] = combo
@@ -385,7 +384,7 @@ class MeasurementPicker(QtWidgets.QWidget):
 
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
-        # Title + "?" badge (doc-rule #8: how-to-use help is the visible badge).
+        # Title + "?" badge (how-to-use help is the visible badge).
         v.addWidget(section_header(title, help_text, bullets=help_bullets))
         self._list = QtWidgets.QListWidget()
         # Min (not max) height so the list grows to fill its resizable splitter pane.
@@ -405,7 +404,7 @@ class MeasurementPicker(QtWidgets.QWidget):
         btn_row.addStretch(1)
         v.addLayout(btn_row)
 
-        # Optional bulk group-tick row (feedback 2026-07-07): "tick all at concentration
+        # Optional bulk group-tick row: "tick all at concentration
         # / angle" over the currently-listed measurements. Emits a (key, value); we
         # resolve the matching leaves and tick them on the shared model.
         self._group_bar = GroupTickBar(self._group_fields) if self._group_fields else None
@@ -542,7 +541,7 @@ class SampleSelector(QtWidgets.QWidget):
     ``predicate`` (e.g. "has SLS data"); emits ``sampleChanged(sample_id)`` (``''`` when
     none) on a user pick.
 
-    Since UI Batch 7 the combo is a **mirror/override of the shell's single active sample**,
+    The combo is a **mirror/override of the shell's single active sample**,
     not an independent model: a user pick drives the active sample (the shell fans it out to
     every tab + the sidebar); a sidebar focus is pushed back here via
     :meth:`set_current_sample_id` (no emit). When the active sample is one this tab can't
@@ -550,7 +549,7 @@ class SampleSelector(QtWidgets.QWidget):
     shows a named empty-state.
 
     ``predicate(sample) -> bool`` filters eligibility; ``label_fn(sample) -> str`` labels
-    each row. A "?" help badge satisfies doc-rule #8."""
+    each row. A "?" help badge carries the how-to-use help."""
 
     sampleChanged = QtCore.Signal(str)          # sample_id, or '' when none
 
@@ -607,7 +606,7 @@ class SampleSelector(QtWidgets.QWidget):
     def show_incompatible(self, text: str) -> None:
         """Show a neutral, non-selectable placeholder (`text`) for an active sample this
         tab can't display — so the dropdown mirrors "the active sample has no data here"
-        instead of a stale, still-eligible pick (UI Batch 7). Selected WITHOUT emitting;
+        instead of a stale, still-eligible pick. Selected WITHOUT emitting;
         cleared by the next :meth:`refresh`. No-op when there are no eligible samples at
         all (the combo already reads "(no eligible samples)"). The combo stays enabled so
         the user can still open it and pick an eligible sample to leave the empty-state."""

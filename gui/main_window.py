@@ -8,8 +8,8 @@ with the six agreed modules:
 
     Data | DLS | SLS | Cross-Sample | Utilities | Settings
 
-Design (settled with the user, Session 19)
-------------------------------------------
+Design (settled with the user)
+------------------------------
 * Sidebar = the live workspace: samples (auto-grouped by polymer/solvent/rounded
   temperature) with their measurements beneath. Loading and selection are global;
   picking a measurement points every module at it.
@@ -97,7 +97,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.controller = Controller()
         self.current_item: Optional[str] = None
-        # The single ACTIVE SAMPLE (UI Batch 7): sample_of(current_item), the sample every
+        # The single ACTIVE SAMPLE: sample_of(current_item), the sample every
         # sample-scoped tab follows. Driveable from the tree or any tab's dropdown.
         self.active_sample_id: Optional[str] = None
         self._syncing_sample = False        # re-entrancy guard for _focus_sample
@@ -175,7 +175,7 @@ class MainWindow(QtWidgets.QMainWindow):
         side.addWidget(self.sidebar_note)
 
         # ---- module tabs ---------------------------------------------------
-        self.tabs = roomy_tabs(QtWidgets.QTabWidget())   # roomier tabs so labels don't clip (#3)
+        self.tabs = roomy_tabs(QtWidgets.QTabWidget())   # roomier tabs so labels don't clip
 
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         self.splitter.addWidget(side_widget)
@@ -205,7 +205,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Cross-Sample selects in-tab (its own Sample combo, not the tree), but it
         # read-only MIRRORS the focused sample onto the tree so the two stay coherent.
         self.cross_module.selectionChanged.connect(self._on_selection_changed)
-        # Unified active sample (UI Batch 7): a user pick in ANY tab's sample dropdown
+        # Unified active sample: a user pick in ANY tab's sample dropdown
         # sets the single active sample, which the shell fans out to every tab + the
         # sidebar. One source of truth, driveable from the tree or any combo.
         self.sls_module.sampleFocusRequested.connect(self._focus_sample)
@@ -221,7 +221,7 @@ class MainWindow(QtWidgets.QMainWindow):
         titles = ['Data', 'DLS', 'SLS', 'Cross-Sample', 'Utilities', 'Settings']
         # Map each tab's scroll-area wrapper back to its module, so the active
         # module is resolved by WIDGET, not tab index — tabs are user-reorderable
-        # (feedback A4), so index order is no longer fixed.
+        # so index order is no longer fixed.
         self._module_by_wrapper: Dict[QtWidgets.QWidget, QtWidgets.QWidget] = {}
         # The data-scoped tabs show a shared empty-state CTA over their content when the
         # workspace has no measurements (style guide §8; owner-confirmed scope). Utilities
@@ -236,11 +236,11 @@ class MainWindow(QtWidgets.QMainWindow):
             wrapper = self._wrap_tab(module)
             self._module_by_wrapper[wrapper] = module
             self.tabs.addTab(wrapper, title)
-        self.tabs.setMovable(True)               # drag to reorder main tabs (A4)
+        self.tabs.setMovable(True)               # drag to reorder main tabs
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self._apply_theme(self.controller.settings.theme)   # honor saved theme
         set_palette(self.controller.settings.plot_palette)  # and saved plot palette
-        set_plot_units(self.controller.settings.plot_units)  # and saved plot units (#8)
+        set_plot_units(self.controller.settings.plot_units)  # and saved plot units
         app = QtWidgets.QApplication.instance()
         if app is not None:
             install_tooltip_gate(app)                       # global tooltip on/off
@@ -249,7 +249,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage('Load data to begin.')
         # Global busy affordance: while a background analysis runs, show a busy
         # cursor (BusyCursor, not WaitCursor — the window stays interactive) and
-        # a status-bar message. One analysis in flight app-wide (invariant 4).
+        # a status-bar message. One analysis in flight app-wide.
         runner().busy_changed.connect(self._on_busy_changed)
 
     @QtCore.Slot(bool, str)
@@ -529,7 +529,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tree.addTopLevelItem(parent)
             parent.setExpanded(True)
             # Group the two measurement kinds under labeled, non-selectable headers
-            # so DLS and SLS are visually delineated within a sample (feedback A6).
+            # so DLS and SLS are visually delineated within a sample.
             if s.dls_item_ids:
                 dls_group = self._group_header(parent, 'DLS',
                                                ('group', 'dls', s.sample_id))
@@ -600,7 +600,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _group_header(self, parent, text: str,
                       role) -> QtWidgets.QTreeWidgetItem:
         """A bold, non-selectable header row that groups a sample's measurements by
-        kind (DLS / SLS) in the navigator (feedback A6). `role` is a tuple marker
+        kind (DLS / SLS) in the navigator. `role` is a tuple marker
         used by the context menu and click-to-select-children handling."""
         node = QtWidgets.QTreeWidgetItem([text])
         node.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)   # header, not selectable
@@ -641,7 +641,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if angle:
             parts.append(f'{angle:g}°')
         if frac:
-            parts.append(f'[{frac}]')           # delineate Mw fractions (feedback A6)
+            parts.append(f'[{frac}]')           # delineate Mw fractions
         prefix = (' '.join(parts) + ' — ') if parts else ''
         text = f'{prefix}{base}'
         item = QtWidgets.QTreeWidgetItem([text])
@@ -654,7 +654,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _add_trace_nodes(self) -> None:
         """Add a flat top-level 'Traces' node listing the workspace's count-rate
-        traces (feedback 2026-06-26 #4). Traces have no sample identity yet, so they
+        traces. Traces have no sample identity yet, so they
         live in one group rather than under a sample."""
         traces = self.controller.traces()
         if not traces:
@@ -713,15 +713,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._set_current(role)
         # Tell the Data tab the full highlighted set so an edit + commit can be
-        # applied to every highlighted measurement at once (feedback A2).
+        # applied to every highlighted measurement at once.
         self.data_module.set_selected_ids(
             self._measurement_ids(self.tree.selectedItems()))
 
     @QtCore.Slot('QTreeWidgetItem*', int)
     def _on_tree_clicked(self, item, _col) -> None:
         """Left-click on a structural header (sample / DLS / SLS) selects all the
-        measurements beneath it (feedback 2026-06-26 #2); a Traces node / trace leaf
-        opens the Traces tab (#4). Headers are not selectable themselves, so this
+        measurements beneath it; a Traces node / trace leaf
+        opens the Traces tab. Headers are not selectable themselves, so this
         rides the itemClicked signal rather than the selection-changed one."""
         role = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
         if not isinstance(role, tuple):
@@ -730,7 +730,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if kind in ('sample', 'group'):
             self._select_descendants(item)
             # Clicking a sample / DLS / SLS header makes that sample the active sample
-            # (UI Batch 7) — the tree is now a real sample navigator for every tab. The
+            # — the tree is now a real sample navigator for every tab. The
             # sample id is role[1] for 'sample', role[2] for a ('group', kind, sid) node.
             # select_leaf=False: _select_descendants already highlighted the whole sample
             # for a bulk Data edit; don't collapse that to the single representative leaf.
@@ -785,7 +785,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if clicked is None:
             return
         # A structural node (sample / DLS / SLS / Traces header) gets its own
-        # remove-all / load menu (feedback 2026-06-26 #1, #4); measurement leaves
+        # remove-all / load menu; measurement leaves
         # keep the existing grouping/averaging/remove menu.
         role = clicked.data(0, QtCore.Qt.ItemDataRole.UserRole)
         if isinstance(role, tuple):
@@ -860,7 +860,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _header_context_menu(self, item, role, pos: QtCore.QPoint) -> None:
         """Right-click menu for a structural node. The sample header removes the
         whole sample; a DLS/SLS header removes only that kind; the Traces node loads
-        or clears traces (feedback 2026-06-26 #1, #4)."""
+        or clears traces."""
         menu = QtWidgets.QMenu(self)
         kind = role[0]
         if kind == 'traces':
@@ -1040,7 +1040,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_current(self, item_id: Optional[str]) -> None:
         """Focus a measurement (from the sidebar). Every sample-scoped tab follows the
-        resulting active sample (UI Batch 7): Data/DLS to the measurement, SLS/Utilities/
+        resulting active sample: Data/DLS to the measurement, SLS/Utilities/
         Cross to its sample — with a named empty-state where the sample has no data for
         that tab."""
         self.current_item = item_id
@@ -1133,7 +1133,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_cross(self) -> None:
         """Rebuild Cross-Sample, then point its focused sample at the active sample so it
-        follows the sidebar/tabs (UI Batch 7)."""
+        follows the sidebar/tabs."""
         self.cross_module.refresh()
         self.cross_module.set_focused_sample(self.active_sample_id)
 
@@ -1143,7 +1143,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_sidebar()
         # Re-fan-out the current focus so the analysis tabs repopulate against the
         # freshly committed parameters — without this the Γ-q²/D-c measurement tables
-        # stay empty until a sidebar re-click (feedback 2026-07-06).
+        # stay empty until a sidebar re-click.
         self._set_current(self.current_item)
         self.cross_module.refresh()      # the pairable-sample set may have changed
 
@@ -1183,7 +1183,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Deferred while a run is in flight: refresh() auto-selects labeled
             # Rg/Rh/Mw/A2 picks, which WRITES SampleResult fields the worker may
             # be reading — run it now, or once the current job completes. Then point
-            # its focused sample at the active sample (UI Batch 7).
+            # its focused sample at the active sample.
             run_when_idle(self._refresh_cross)
         if w is self.settings_module:
             self.sidebar_note.setText('Settings are global — no sample needed.')
@@ -1264,14 +1264,14 @@ class MainWindow(QtWidgets.QMainWindow):
         """Theme the ON-SCREEN plots to match the app theme when the user opted in and
         the theme is dark; otherwise keep them white (the default). Export always stays
         white (handled in the plot save path). rcParams drive future redraws; the
-        one-shot walk re-themes canvases already on screen (UI Batch 5, finding 7.1)."""
+        one-shot walk re-themes canvases already on screen."""
         plot_dark = self.controller.settings.plot_match_theme and is_dark(self)
         set_onscreen_plot_theme(plot_dark)
         for canvas in self.findChildren(FigureCanvasQTAgg):
             apply_figure_theme(canvas.figure, plot_dark)
             canvas.draw_idle()
 
-    # UI density -> point-size delta from the platform default (UI Batch 5, 5.5).
+    # UI density -> point-size delta from the platform default.
     _DENSITY_DELTA = {'compact': -1, 'comfortable': 0, 'large': 2}
     # The platform-default base font size, captured ONCE per process (class-level, not
     # per-instance) before any density adjustment — so 'comfortable' == the untouched
@@ -1294,11 +1294,11 @@ class MainWindow(QtWidgets.QMainWindow):
         font.setPointSize(max(6, MainWindow._base_font_pt + delta))
         app.setFont(font)
 
-    # ---- last-session autosave / reopen (UI Batch 5, 5.6) ----
+    # ---- last-session autosave / reopen ----
     @staticmethod
     def _managed_session_path() -> str:
         """The app-managed autosave file, beside settings.json (moves with the settings
-        location — never a hard-coded/assumed drive path; invariant 9)."""
+        location — never a hard-coded/assumed drive path)."""
         from app.settings import SettingsState
         return str(SettingsState.default_path().parent / 'last_session.lsjson')
 
@@ -1324,7 +1324,7 @@ class MainWindow(QtWidgets.QMainWindow):
         an autosave problem must never block closing."""
         try:
             s = self.controller.settings
-            # Skip the autosave while a background fit is in flight (invariant 4): the
+            # Skip the autosave while a background fit is in flight: the
             # worker may still be writing SampleResult fields, so serializing now could
             # capture a torn snapshot. Fail-soft — the prior saved session simply stands.
             if (s.reopen_last_session and self.controller.workspace.measurements
@@ -1345,7 +1345,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_theme(self.controller.settings.theme)
         self._apply_ui_density()                                # font size (5.5)
         set_palette(self.controller.settings.plot_palette)
-        set_plot_units(self.controller.settings.plot_units)     # plot-axis units (#8)
+        set_plot_units(self.controller.settings.plot_units)     # plot-axis units
         set_tooltips_enabled(self.controller.settings.show_tooltips)
         self._refresh_sidebar()      # re-pick tree marker colors for the new theme
         self.dls_module.reseed_from_settings()

@@ -570,8 +570,9 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
     calibration. Only angles with a finite, POSITIVE excess Rayleigh ratio are
     used (ln requires dR > 0).
 
-    The Guinier approximation is due to Guinier (1939); see Chu (1991) and
-    Russo et al. (2021, Ch. 13) for accessible derivations of the plot.
+    The Guinier approximation is due to Guinier & Fournet (1955; originally
+    Guinier 1939); see Chu (1991) and Russo et al. (2021, Ch. 13) for accessible
+    derivations of the plot.
 
     Parameters
     ----------
@@ -1028,7 +1029,7 @@ def calibration_free_a2(
     # concentration ladder this HC3 SE is CONSERVATIVE (meets-or-exceeds the sampling
     # spread, ~1.3x at n=5; never under-reports) because HC3 up-weights the high-leverage
     # endpoints; it tightens toward exact as the ladder lengthens. See advanced_guide
-    # 15.1/11.4 and tests/test_sls.test_calibration_free_a2_se_conservative (Session 97).
+    # 15.1/11.4 and tests/test_sls.test_calibration_free_a2_se_conservative.
     two_a2_mw_se = a2_se = None
     if intercept != 0 and math.isfinite(fit.intercept_se):
         jac = [-slope / intercept ** 2, 1.0 / intercept]   # order [intercept, slope]

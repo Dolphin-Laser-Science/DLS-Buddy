@@ -2,10 +2,9 @@
 gui/worker.py
 =============
 
-Background dispatch for the heavy controller calls (threading enablement,
-spec 2026-07-01).
+Background dispatch for the heavy controller calls (threading enablement).
 
-The controller stays Qt-free (architecture invariant 5): widgets build a
+The controller stays Qt-free: widgets build a
 zero-argument *thunk* on the main thread that binds a controller method to its
 already-read arguments, then hand it to :func:`runner`'s ``try_submit``. The
 thunk runs on a single pooled worker thread; ``on_done(result)`` /
@@ -15,7 +14,7 @@ delivery, so widget code never touches Qt objects from the worker.
 Deliberate non-features (spec boundaries):
 
 - **One job in flight, app-wide.** ``try_submit`` refuses while busy — this is
-  the global re-entry guard (invariant 4): controller ``run_*`` methods mutate
+  the global re-entry guard: controller ``run_*`` methods mutate
   shared state, so two concurrent runs are never allowed, whichever tabs they
   come from. No queue, no priorities.
 - **No cancellation.** A running scipy call cannot be safely interrupted; a

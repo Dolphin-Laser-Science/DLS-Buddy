@@ -98,8 +98,8 @@ def _fmt_num(x: float) -> str:
 
 class _EnterAdvanceDelegate(QtWidgets.QStyledItemDelegate):
     """Value-cell editor delegate that fires `enter_pressed` when the user commits a
-    cell with Return/Enter, so the table can advance focus to the next field
-    (feedback 2026-06-30 #6). The open editor is a child QLineEdit that consumes the
+    cell with Return/Enter, so the table can advance focus to the next field.
+    The open editor is a child QLineEdit that consumes the
     key, so a table-level keyPressEvent wouldn't see it — hooking the editor's
     `returnPressed` is the reliable signal."""
 
@@ -164,7 +164,7 @@ class DataModule(QtWidgets.QWidget):
         self.table.setHorizontalHeaderLabels(['Parameter', 'Value', 'Unit'])
         self.table.verticalHeader().setVisible(False)
         hdr = self.table.horizontalHeader()
-        # All three columns are user-draggable (feedback A1/B3). The Value column is
+        # All three columns are user-draggable. The Value column is
         # no longer forced to Stretch — Stretch made it fill the whole window (the
         # "huge empty space"), and a stretched column cannot be dragged. Interactive
         # with a sensible default lets the user size it; trailing space is harmless.
@@ -175,11 +175,11 @@ class DataModule(QtWidgets.QWidget):
         self.table.setColumnWidth(0, 200)
         self.table.setColumnWidth(1, 260)
         self.table.setColumnWidth(2, 90)
-        # Single click into a Value cell starts editing (feedback B2) — only the
+        # Single click into a Value cell starts editing — only the
         # Value column is editable, so navigating Parameter/Unit cells is harmless.
         self.table.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.AllEditTriggers)
-        # Enter in a Value cell commits and jumps to the next field (feedback #6). The
+        # Enter in a Value cell commits and jumps to the next field. The
         # delegate (on the Value column only) reports the Return; we advance deferred so
         # the editor finishes committing through _on_cell_changed first.
         self._enter_delegate = _EnterAdvanceDelegate(self.table)
@@ -189,7 +189,7 @@ class DataModule(QtWidgets.QWidget):
         self.table.itemChanged.connect(self._on_cell_changed)
         layout.addWidget(self.table, 1)
         # (The shared-vs-per-measurement note now lives in the section's "?" help,
-        # so it is no longer repeated as an always-visible line — feedback B4.)
+        # so it is no longer repeated as an always-visible line.)
 
         # Provenance legend (the ONE place the dot's meaning + the never-overwrite
         # rule live as always-visible text; the per-cell tooltips carry only cell
@@ -231,7 +231,7 @@ class DataModule(QtWidgets.QWidget):
 
     # ---------------------------------------------------------- selection ---
     def set_selected_ids(self, item_ids) -> None:
-        """Record which measurements are highlighted in the sidebar (feedback A2).
+        """Record which measurements are highlighted in the sidebar.
         The shell calls this on every selection change; the focused measurement is
         still set via set_measurement."""
         self._selected_ids = tuple(item_ids)
@@ -245,7 +245,7 @@ class DataModule(QtWidgets.QWidget):
             self.table.setRowCount(0)
             self._suppress = False
             # Don't repeat "load data" here (the load buttons + status bar already
-            # say it, feedback B4) — just point at the next step.
+            # say it) — just point at the next step.
             self.header.setText(
                 'No measurement selected — pick one in the Workspace list.')
             self._set_enabled(False)
@@ -411,7 +411,8 @@ class DataModule(QtWidgets.QWidget):
         evaluated. Uses the SAME controller accessors the autofill rounded with
         (``solvent_value_n``/``solvent_value_eta`` — which turn the relative η σ into an
         absolute Pa·s ±), so the displayed precision matches the stored rounding exactly
-        (Spec 3). The σ chooses the decimal place and travels no further (invariant #8)."""
+        (this is the solvent library's per-condition display uncertainty). The σ chooses
+        the decimal place and travels no further — it never enters the analysis."""
         name = working.get(_SOLVENT_KEY)
         # A cleared solvent name can linger with a stale 'library:primary' tag (the
         # autofill early-returns without clearing it), so guard the falsy/non-string
@@ -509,14 +510,14 @@ class DataModule(QtWidgets.QWidget):
             # The Mw fraction is a per-measurement axis like angle/concentration:
             # set it only on the edited row (and any other highlighted rows), with
             # no propagate-and-commit popup — applying it is now consistent with
-            # every other per-measurement parameter (feedback 2026-06-26 #13).
+            # every other per-measurement parameter.
             self.controller.set_param(self.item_id, key, value)
         self._refresh_dirty()
         self._refresh_provenance()
         self._refresh_pending()
 
     def _advance_to_next_field(self) -> None:
-        """Move focus to the next editable Value cell after Enter (feedback #6). Skips to
+        """Move focus to the next editable Value cell after Enter. Skips to
         the next row whose Value is an editable item and opens its editor so the user can
         keep typing; if that row's Value is a widget (the geometry dropdown) it is focused
         instead. Stops at the last field (no wrap)."""
@@ -578,7 +579,7 @@ class DataModule(QtWidgets.QWidget):
     # ---------------------------------------------------------- commit/undo ---
     def _apply_edits_to_selection(self) -> None:
         """Copy the focused measurement's pending edits to the other highlighted
-        measurements before committing (feedback A2). No-op unless several are
+        measurements before committing. No-op unless several are
         highlighted."""
         if self.item_id is None:
             return
@@ -591,7 +592,7 @@ class DataModule(QtWidgets.QWidget):
 
     def _on_update(self) -> None:
         # A background run reads COMMITTED params mid-flight — committing under
-        # it would change the numbers it is computing from (invariant 4).
+        # it would change the numbers it is computing from.
         if runner().is_busy:
             busy_notice(self.update_button)
             return
@@ -684,8 +685,8 @@ class DataModule(QtWidgets.QWidget):
         on the Data tab — teal (``library:primary``) or no dot (user / absent); the
         estimate-tier violet lives on the Solvent Explorer, not here. Every dot is
         backed by the cell tooltip (§2d) so color is never the only signal
-        (colorblind-safe). Bulk-grade dn/dT is deliberately NOT flagged here (Spec 1
-        decision #5 — it is a docs-only caveat)."""
+        (colorblind-safe). Bulk-grade dn/dT is deliberately NOT flagged here (it is a
+        docs-only caveat)."""
         if self.item_id is None:
             return
         working = self.controller.workspace.measurements[self.item_id].working_params
@@ -723,12 +724,12 @@ class DataModule(QtWidgets.QWidget):
 
     def _lib_tooltip(self, key: str, working: dict) -> str:
         """Cell-specific facts for a library value: tier + this property's validity box
-        + the PER-CONDITION uncertainty at this sample's committed T/λ (Spec 3 — the
+        + the PER-CONDITION uncertainty at this sample's committed T/λ (the
         same σ the auto-fill rounding used, so the tooltip's ± always matches the
         cell's precision; falls back to the box-wide figure if the condition can't be
         evaluated). The shared behavior (auto-fill / re-derive / never-overwrite) is
-        stated once in the section ? help + the legend, not here. No citations
-        (doc-rule #8) — 'sources: Advanced Guide'."""
+        stated once in the section ? help + the legend, not here. No citations in the
+        tooltip — it points to the Theory-and-Equations-Guide instead."""
         name = working.get(_SOLVENT_KEY)
         # A cleared solvent name can linger with a stale 'library:primary' tag, so a
         # falsy/non-string name would reach solvent_property_info -> normalize_solvent_name
@@ -765,7 +766,7 @@ class DataModule(QtWidgets.QWidget):
                 pass
         return (f"Library value ({info['tier']}) · {box} · {unc} · "
                 f"rounded at this ± (the uncertainty itself is never used in any "
-                f"analysis) · sources: Advanced Guide.")
+                f"analysis) · sources: Theory-and-Equations-Guide.")
 
     def _render_legend(self) -> None:
         """(Re)render the provenance legend with the current theme's teal so the dot

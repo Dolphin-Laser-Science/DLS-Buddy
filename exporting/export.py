@@ -461,7 +461,7 @@ def export_concentration_extrapolation(result, file_path: str,
 def _se_note(result) -> str:
     """Comments-cell label for a ± column: names the estimator only when it is the
     non-default classical OLS (silent for HC3, matching the 'calibrated is the silent
-    default' convention). See invariant 8 clause A / Advanced Guide §15.1."""
+    default' convention). See the Theory-and-Equations-Guide §15.1."""
     return 'SE: classical OLS' if getattr(result, 'se_estimator', 'hc3') == 'ols' else ''
 
 

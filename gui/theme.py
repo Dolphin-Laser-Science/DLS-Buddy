@@ -2,7 +2,7 @@
 gui/theme.py
 ============
 
-A tiny, theme-aware **UI color-token** layer (owner feedback 2026-06-30, items 1–2).
+A tiny, theme-aware **UI color-token** layer.
 
 Why this exists
 ---------------
@@ -52,7 +52,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 #   qualifier     — a neutral, expected result-type qualifier (e.g. "apparent (single
 #                   concentration)", "± statistical only"): a calm steel/slate accent,
 #                   distinct from the alarm-red `error`, so a fact-of-life caveat does not
-#                   read as a failure. Kept visible (invariant 7), just off the red channel.
+#                   read as a failure. Kept visible, just off the red channel.
 #   edited_bg     — CHANGED-but-uncommitted cell background: a calm, theme-aware tint
 #                   (derived from the `pending` amber family), NOT a full-saturation fill
 #                   (which reads as alarm and fails contrast in dark mode — style guide
@@ -221,7 +221,7 @@ def set_flag(label: ThemedLabel, text: str, *, problem: bool = True) -> None:
     a run skipped, an unphysical value …): bold red ``error``, message led with ⚠.
     ``problem=False`` → a neutral, expected qualifier (apparent / ± statistical / an
     informational inventory): a calm non-bold ``qualifier`` accent, message led with ⓘ.
-    Both stay visible (invariant 7 — apparent is never hidden); only the alarm level
+    Both stay visible (apparent is never hidden); only the alarm level
     differs. Empty text falls back to the default (red/bold) so no stale qualifier
     color lingers behind a later message.
 

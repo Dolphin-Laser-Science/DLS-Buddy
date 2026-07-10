@@ -2,14 +2,14 @@
 gui/help.py
 ===========
 
-A small, consistent in-program help system (owner feedback 2026-06-29, Section B).
+A small, consistent in-program help system.
 
 Two tiers, by design:
 
 1. **How-to-use help is VISIBLE** — a circular "?" badge (`HelpBadge`) placed next to
    a section header. The badge is an obvious, clickable affordance; clicking it shows a
    concise popup. Use it for "what is this panel / how do I use it" guidance, and keep
-   the text short (a sentence or a short bulleted list), pointing to the Advanced Guide
+   the text short (a sentence or a short bulleted list), pointing to the Theory-and-Equations-Guide
    for the underlying maths rather than re-deriving it inline.
 
 2. **Calculation-nuance help is a passive tooltip** — an ordinary `setToolTip`. These
@@ -72,7 +72,7 @@ def tooltips_enabled() -> bool:
 # The "?" help badge
 # ---------------------------------------------------------------------------
 def _bullets(lines: Sequence[str]) -> str:
-    """Render a short list as compact HTML bullets (lists beat paragraphs, Section B)."""
+    """Render a short list as compact HTML bullets (lists beat paragraphs)."""
     items = ''.join(f'<li>{ln}</li>' for ln in lines)
     return f'<ul style="margin:2px 0 0 0; -qt-list-indent:1;">{items}</ul>'
 

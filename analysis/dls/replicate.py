@@ -107,7 +107,7 @@ def average_replicate_correlograms(
         # A tiny grid-scaled atol (not 0): a pure-relative compare demands an EXACT
         # match on a leading tau=0 channel (rtol*0 == 0), so sub-ns float drift there
         # would wrongly reject genuine replicates. atol stays far below the first real
-        # lag channel, so distinct grids still differ (B9).
+        # lag channel, so distinct grids still differ.
         grid_atol = 1e-9 * float(np.max(np.abs(grid))) if grid.size else 0.0
         if not np.allclose(m.delay_times_s, grid, rtol=rtol, atol=grid_atol):
             raise ValueError(

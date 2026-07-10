@@ -124,7 +124,7 @@ _SHARED_PARAM_KEYS = (
     'solvent_refractive_index', 'viscosity_Pa_s', 'dn_dc_mL_per_g',
 )
 
-# Parameter keys the Reset button preserves (feedback 2026-06-29 #6): the scattering
+# Parameter keys the Reset button preserves: the scattering
 # angle is a structural fact read from the instrument file, not a typed parameter, so
 # wiping it would lose which angle a correlogram belongs to. Everything else the user
 # entered is cleared.
@@ -225,7 +225,7 @@ class CalibrationState:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'CalibrationState':
         # Forward-compatible: drop unknown keys so a session written by a newer build
-        # (extra calibration field) still loads in an older one (D1).
+        # (extra calibration field) still loads in an older one.
         if not d:
             return cls()
         known = {f.name for f in fields(cls)}
@@ -338,7 +338,7 @@ class ScalingData:
 def _json_sanitize(obj):
     """Recursively replace non-finite floats (NaN / ±Inf) with ``None`` so a session
     serializes to strict, portable JSON (``allow_nan=False``) rather than the
-    non-standard ``NaN``/``Infinity`` tokens strict/external readers reject (D8).
+    non-standard ``NaN``/``Infinity`` tokens strict/external readers reject.
 
     ``None`` is a safe stand-in: every serialized field that can hold a non-finite
     float is Optional, and its readers already treat a missing value the same as a
@@ -386,7 +386,7 @@ class Controller:
         # last analysis results, keyed for the GUI to fetch and plot
         self.results: Dict[str, Any] = {}
         # Memoized SLS candidate/A2 computations for the Cross-Sample tab, keyed by the
-        # full sls_run_signature (feedback 2026-07-07): refresh() re-runs the same
+        # full sls_run_signature: refresh() re-runs the same
         # Zimm/Debye/Guinier fits 3-5x per fraction (auto-select + source panel), so this
         # collapses them to one until an input changes. See _sls_cached.
         self._sls_candidate_cache: Dict[tuple, Any] = {}
@@ -406,7 +406,7 @@ class Controller:
         self._distribution_stamps: Dict[tuple, int] = {}
         # Undo history: a stack of committed-state snapshots, one pushed before each
         # Update that actually changes something. `undo` steps back through these
-        # previously-applied parameter sets (feedback 2026-06-29 #5).
+        # previously-applied parameter sets.
         self._commit_history: List[Dict[str, Any]] = []
 
     # ----------------------------------------------------------------------
@@ -465,7 +465,7 @@ class Controller:
                 lm.working_params[key] = value
 
     def apply_value_to_items(self, item_ids, key: str, value: Any) -> None:
-        """Set one working parameter on several measurements at once (feedback A2).
+        """Set one working parameter on several measurements at once.
 
         Used when the Data tab commits with multiple measurements highlighted: the
         value the user typed on the focused measurement is copied to every other
@@ -632,7 +632,7 @@ class Controller:
 
     # -- Solvent Explorer wrappers (display-only calculator; GUI holds no physics) --
     # All forward to physics.solvents and let ValueError surface for the tab to show.
-    # The engine's display-only PER-CONDITION uncertainty (Spec 3: σ_n(λ,T) /
+    # The engine's display-only PER-CONDITION uncertainty (σ_n(λ,T) /
     # σ_η,rel(T)) is returned for the readout / confidence band; per invariant #8 it
     # is NEVER propagated into any analysis SE (these values never reach a
     # measurement — the Explorer is a standalone calculator).
@@ -640,8 +640,8 @@ class Controller:
 
     def solvent_value_n(self, name: str, wavelength_nm: float,
                         temperature_C: float):
-        """(n, absolute PER-CONDITION display uncertainty) at one condition (Spec 3:
-        σ_n(λ,T), so the readout's ± matches the band at the selected dot). Raises
+        """(n, absolute PER-CONDITION display uncertainty) at one condition (σ_n(λ,T),
+        so the readout's ± matches the band at the selected dot). Raises
         ``ValueError`` (unknown solvent / out-of-range λ or T) for the tab to display."""
         n = solvents_lib.refractive_index_solvent(name, wavelength_nm, temperature_C)
         return n, solvents_lib.solvent_uncertainty_n(name, wavelength_nm, temperature_C)
@@ -657,13 +657,13 @@ class Controller:
         """Library metadata record for ``name`` (validity boxes, tier, box-wide
         uncertainties, has_viscosity). A thin pass-through so the GUI reads solvent
         descriptors through the controller boundary rather than importing
-        physics.solvents directly (invariant 5). Raises ``ValueError``/``TypeError``
+        physics.solvents directly. Raises ``ValueError``/``TypeError``
         for an unknown or invalid name."""
         return solvents_lib.solvent_property_info(name)
 
     def available_solvents(self, tier: str = 'primary') -> list:
         """The library's solvent names at ``tier`` (for the Data-tab dropdown). Thin
-        pass-through keeping physics.solvents behind the controller (invariant 5)."""
+        pass-through keeping physics.solvents behind the controller boundary."""
         return solvents_lib.available_solvents(tier)
 
     def _solvent_sample_box(self, lo: float, hi: float, compute):
@@ -683,7 +683,7 @@ class Controller:
     def solvent_curve_n_vs_T(self, name: str, wavelength_nm: float):
         """(T_C[], n[], band_half[]) across the record's refractive-index temperature
         box at the selected wavelength. ``band_half`` is the PER-CONDITION absolute
-        σ_n(λ, T[i]) (Spec 3) — tightest near the reference temperature, growing
+        σ_n(λ, T[i]) — tightest near the reference temperature, growing
         toward the box edges, never exceeding the box-wide ``n_uncertainty``. Raises
         ``ValueError`` if the wavelength is outside the box (so the tab hides the RI
         curve but can still draw η)."""
@@ -700,7 +700,7 @@ class Controller:
     def solvent_curve_n_vs_lambda(self, name: str, temperature_C: float):
         """(lambda_nm[], n[], band_half[]) across the refractive-index wavelength box
         at the selected temperature. ``band_half`` is the PER-CONDITION absolute
-        σ_n(λ[i], T) (Spec 3). Raises ``ValueError`` if the temperature is outside
+        σ_n(λ[i], T). Raises ``ValueError`` if the temperature is outside
         the box."""
         info = solvents_lib.solvent_property_info(name)
         l0, l1 = info['n_lambda_min_nm'], info['n_lambda_max_nm']
@@ -713,7 +713,7 @@ class Controller:
 
     def solvent_curve_eta_vs_T(self, name: str):
         """(T_C[], eta[], band_half[]) across the viscosity temperature box (η in
-        Pa·s). ``band_half`` is the PER-CONDITION σ_η,rel(T[i]) · η[i] (Spec 3):
+        Pa·s). ``band_half`` is the PER-CONDITION σ_η,rel(T[i]) · η[i]:
         relative, so it widens with η, and the relative width itself varies where
         the source supports a shape (flat for bulk-grade sources). Raises
         ``ValueError`` if the solvent carries no viscosity block."""
@@ -966,7 +966,7 @@ class Controller:
 
     def reset_working_params(self, item_ids) -> None:
         """Blank the entered parameters of the given measurements — a clean slate to
-        re-enter (feedback 2026-06-29 #6). Identity/optics/concentration/temperature/
+        re-enter. Identity/optics/concentration/temperature/
         viscosity/dn-dc/label/geometry are cleared; the per-measurement scattering
         ANGLE is preserved (it is a structural fact from the instrument file, not a
         typed parameter), as is the raw data. Edits are left in the WORKING set only
@@ -1241,8 +1241,8 @@ class Controller:
 
     def dls_sample_rows(self, sample_id: str, kind: str,
                         fraction: Optional[str] = None):
-        """Metadata-only enumeration for the Γ vs q² / D vs c tables — **no fitting**
-        (feedback 2026-07-06): one dict per DLS measurement of the sample, so the tabs
+        """Metadata-only enumeration for the Γ vs q² / D vs c tables — **no fitting**.
+        One dict per DLS measurement of the sample, so the tabs
         can populate cheaply on load/commit without silently computing an analysis. The
         Γ/D values themselves are produced only by an explicit Run (see `run_gamma_q2` /
         `run_concentration_extrapolation`, whose results carry per-point values).
@@ -1294,7 +1294,7 @@ class Controller:
         temperature is **not yet confirmed** — they group into a separate NaN-temperature
         sample (see `sample_group_key`) and so are invisible from this sample's tabs.
         The GUI surfaces this as a one-line note so the user knows why some siblings are
-        missing (feedback 2026-07-06). Returns 0 if the sample is unknown."""
+        missing. Returns 0 if the sample is unknown."""
         s = self.workspace.samples.get(sample_id)
         if s is None:
             return 0
@@ -1371,7 +1371,7 @@ class Controller:
         measurements were dropped for a fit-quality reason (failed cumulant / q ≤ 0) —
         the run-enable gate counts buildable rows, but the run drops unfittable ones, so
         without this the engine would raise a bare "needs at least two" that looks wrong
-        to a user who ticked enough (feedback 2026-07-06). Returns None when nothing was
+        to a user who ticked enough. Returns None when nothing was
         dropped, so the engine's own message applies (genuinely too few ticked)."""
         considered = [pt for pt in points
                       if include_ids is None or pt['item_id'] in include_ids]
@@ -1389,11 +1389,11 @@ class Controller:
         """Gamma vs q^2 across the DLS angles of a sample (optionally one fraction).
 
         `include_ids` (a set of measurement item_ids) restricts the fit to the ticked
-        measurements, so the user can choose a subset / drop outliers and recompute
-        (feedback 2026-06-30 #11/#12). `None` = every eligible measurement.
+        measurements, so the user can choose a subset / drop outliers and recompute.
+        `None` = every eligible measurement.
 
         The result also carries `all_points` — every eligible measurement's per-point
-        Γ/q²/D_app + quality (feedback 2026-07-06), so the tab can fill its table and gray
+        Γ/q²/D_app + quality, so the tab can fill its table and gray
         the excluded points from the run itself rather than a separate on-focus fit. Only
         fit-usable ticked points (quality 'ok'/'high_pdi', finite) enter the line fit."""
         points = self._dls_run_points(sample_id, fraction)
@@ -1429,11 +1429,11 @@ class Controller:
         measurement is angle-independent, so a multi-angle set still extrapolates).
 
         `include_ids` (a set of measurement item_ids) restricts the fit to the ticked
-        measurements, so the user can choose a subset / drop outliers and recompute
-        (feedback 2026-06-30 #11/#12). `None` = every eligible measurement.
+        measurements, so the user can choose a subset / drop outliers and recompute.
+        `None` = every eligible measurement.
 
         As with `run_gamma_q2`, the result carries `all_points` (every eligible
-        measurement's per-point D_app + quality, feedback 2026-07-06); only fit-usable
+        measurement's per-point D_app + quality); only fit-usable
         ticked points enter the extrapolation."""
         points = self._dls_run_points(sample_id, fraction)
         usable = {pt['item_id'] for pt in points
@@ -2067,7 +2067,7 @@ class Controller:
             raise ValueError(
                 "No angle has both a VV and a VH correlogram. Tag each correlogram's "
                 "polarization (VV/VH) in the Data tab; DDLS pairs them by angle.")
-        # Drop user-excluded outlier angles (feedback 2026-06-26 #9).
+        # Drop user-excluded outlier angles.
         if exclude_angles:
             paired_angles = [a for a in paired_angles
                              if not _value_in(a, exclude_angles)]
@@ -2462,10 +2462,17 @@ class Controller:
         # tier 2 -- Gamma vs q^2 -> q->0, PER CONCENTRATION (apparent). Done one
         # concentration at a time: mixing concentrations would fold the
         # concentration dependence into the q^2 fit. Needs >= 2 angles at that c.
-        by_conc: Dict[float, List[Any]] = {}
+        # Concentration is OPTIONAL for DLS: measurements with none group under the
+        # `None` key -- a multi-angle set at an unknown concentration is still a valid
+        # q->0 Rh (analyze_gamma_q2 is q-based, never reads concentration; the label
+        # reads 'c = ?'). The sort key keeps that group last without comparing None
+        # to a float.
+        by_conc: Dict[Optional[float], List[Any]] = {}
         for m in meas:
-            by_conc.setdefault(round(float(m.concentration_g_per_mL), 12), []).append(m)
-        for c, ms in sorted(by_conc.items()):
+            c = m.concentration_g_per_mL
+            by_conc.setdefault(round(float(c), 12) if c is not None else None,
+                               []).append(m)
+        for c, ms in sorted(by_conc.items(), key=lambda kv: (kv[0] is None, kv[0])):
             if len({round(float(m.angle_deg), 6) for m in ms}) < 2:
                 continue
             try:
@@ -2492,10 +2499,13 @@ class Controller:
         for m in meas:
             by_angle.setdefault(round(float(m.angle_deg), 6), []).append(m)
         for a, ms in sorted(by_angle.items()):
-            if len({round(float(m.concentration_g_per_mL), 12) for m in ms}) < 2:
+            # Concentration is the x-axis here, so a measurement without one can't be a
+            # point on the series -- drop it before counting/fitting (unlike tier 2).
+            ms_c = [m for m in ms if m.concentration_g_per_mL is not None]
+            if len({round(float(m.concentration_g_per_mL), 12) for m in ms_c}) < 2:
                 continue
             try:
-                ce = dls_engine.extrapolate_diffusion_vs_concentration(ms)
+                ce = dls_engine.extrapolate_diffusion_vs_concentration(ms_c)
             except Exception:
                 continue
             if not np.isfinite(ce.rh0_nm):

@@ -21,7 +21,7 @@ function g2(tau) - 1. It provides six analysis methods in two families:
 Shared front-end: multi-angle Gamma/q^2, concentration extrapolation, replicate
 averaging.
 
-Package layout (Session 59 split of the former single dls.py module; the public
+Package layout (a split of the former single dls.py module; the public
 API and import surface are unchanged -- everything below is re-exported here, so
 `from analysis.dls import fit_cumulants` keeps working):
 

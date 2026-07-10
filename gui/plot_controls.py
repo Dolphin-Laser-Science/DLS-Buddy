@@ -4,7 +4,7 @@ gui/plot_controls.py
 
 A small reusable widget that puts axis controls *next to a plot* — per-axis
 linear/log scale, an explicit min/max for each axis, and an autoscale button —
-so the user can adjust a plot's axes directly (feedback B7) without digging into
+so the user can adjust a plot's axes directly without digging into
 matplotlib's hidden "figure options" dialog.
 
 Usage: build one under a figure canvas, then call `attach(ax)` after each
@@ -64,10 +64,10 @@ def make_canvas_expanding(canvas, min_height: int = 170,
                           max_height: Optional[int] = None):
     """Let a matplotlib FigureCanvas grow/shrink vertically with its container so
     the plot fills the available height (and resizes when the window or a splitter
-    is dragged) instead of being pinned to its figsize (feedback 2026-06-26 #10).
+    is dragged) instead of being pinned to its figsize.
     A small minimum keeps it usable; the figsize now only sets the default aspect.
     `max_height` optionally caps it so a plot does not balloon on a tall pane
-    (feedback 2026-06-29 #9)."""
+    on a tall pane."""
     canvas.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
                          QtWidgets.QSizePolicy.Policy.Expanding)
     canvas.setMinimumHeight(min_height)
@@ -81,13 +81,13 @@ def make_split_panels(parent, left_min_width: Optional[int] = None,
     """Build a horizontal control-panel / plot splitter as `parent`'s sole child.
 
     Replaces the old fixed QHBoxLayout(control | plot) so the user can drag the
-    divider to resize the control panel against the plot (feedback A3/B3). Returns
+    divider to resize the control panel against the plot. Returns
     (splitter, left_layout, right_layout); callers add their controls to
     `left_layout` and the figure/canvas to `right_layout` exactly as before.
     """
     outer = QtWidgets.QHBoxLayout(parent)
     outer.setContentsMargins(0, 0, 0, 0)
-    splitter = GripSplitter(QtCore.Qt.Orientation.Horizontal)   # visible drag grip (#5/#9)
+    splitter = GripSplitter(QtCore.Qt.Orientation.Horizontal)   # visible drag grip
     outer.addWidget(splitter)
 
     left_widget = QtWidgets.QWidget()
@@ -95,14 +95,14 @@ def make_split_panels(parent, left_min_width: Optional[int] = None,
     left.setContentsMargins(0, 0, 0, 0)
     # Give the control column its OWN vertical scroll area so a tall set of controls
     # scrolls internally instead of forcing the whole tab past the viewport — that
-    # overflow is what made the plot pane balloon and the page scroll (feedback
-    # 2026-06-29 #9). Horizontal scrolling is off (forms wrap instead, #8).
+    # overflow is what made the plot pane balloon and the page scroll.
+    # Horizontal scrolling is off (forms wrap instead).
     left_scroll = QtWidgets.QScrollArea()
     left_scroll.setWidgetResizable(True)
     left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
     # Horizontal bar only when a panel is genuinely wider than its column, so an
     # over-wide control (e.g. a long checkbox label) is still reachable rather than
-    # clipped. The #9 fix was about the VERTICAL page scroll, not this.
+    # clipped. That vertical-scroll fix was about the VERTICAL page scroll, not this.
     left_scroll.setHorizontalScrollBarPolicy(
         QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     left_scroll.setWidget(left_widget)
@@ -123,7 +123,7 @@ def make_split_panels(parent, left_min_width: Optional[int] = None,
 
 def make_vertical_plot_stack(widgets, sizes=None, min_heights=None):
     """Stack several widgets in a draggable vertical QSplitter (with a visible grip
-    handle) so each can be resized independently (feedback 2026-06-29 #9, 2026-06-30 #5/#9).
+    handle) so each can be resized independently.
 
     Two uses: (1) genuinely INDEPENDENT plots with different x-axes (e.g. the Utilities
     trace vs its histogram diagnostic) — NOT a fit + its residual, which stay on one
@@ -131,14 +131,14 @@ def make_vertical_plot_stack(widgets, sizes=None, min_heights=None):
     the stacked sections of a control column, so the user can resize the checklist /
     results table / etc. against each other. `min_heights` keeps each pane usable.
     Returns the splitter."""
-    splitter = GripSplitter(QtCore.Qt.Orientation.Vertical)     # visible drag grip (#5/#9)
+    splitter = GripSplitter(QtCore.Qt.Orientation.Vertical)     # visible drag grip
     for i, w in enumerate(widgets):
         splitter.addWidget(w)
         if min_heights is not None and i < len(min_heights):
             # Floor the requested minimum at the widget's own content minimum so a caller
             # can never specify a value that lets the splitter squeeze a pane UNDER its
             # children (which made the Distribution picker's bulk-select rows overlap the
-            # checklist — finding 5.1, style guide R3.2).
+            # checklist — style guide R3.2).
             w.setMinimumHeight(max(min_heights[i], w.minimumSizeHint().height()))
     if sizes is not None:
         splitter.setSizes(list(sizes))
@@ -150,7 +150,7 @@ def attach_residual_resizer(canvas, fig, main_ax, resid_ax, apply_ratio,
     """Make the boundary between a fit axes (`main_ax`) and its residual axes
     (`resid_ax`) — both on the SAME figure, sharing one x-axis — draggable, so the
     residual can be resized vertically while staying perfectly aligned under the fit
-    (feedback 2026-06-29 #9, owner's request).
+    (owner's request).
 
     The fit + residual keep their guaranteed `sharex` alignment because they live on
     one canvas; only their height split changes. `apply_ratio(resid_fraction)` is a
@@ -180,7 +180,7 @@ class _ResidualResizer:
         self.mt = margin_top
         self._drag = False
         # A visible grip line drawn in the gap so users can tell the boundary is
-        # draggable (feedback 2026-06-30 #5). It is `animated` (excluded from the normal
+        # draggable. It is `animated` (excluded from the normal
         # draw) and painted on top in the draw_event via blitting, so it always tracks
         # the current gap position without triggering a redraw.
         self._grip = Line2D([0.45, 0.55], [0.5, 0.5], transform=fig.transFigure,
@@ -218,7 +218,7 @@ class _ResidualResizer:
         When the fit axes carries its OWN x-axis label — the Distribution tab, where
         fit and residual do not share x — that label (ticks + title) hangs down into
         the gap, so centering the grip on the geometric gap midpoint drops it onto the
-        label (feedback 2026-07-07). When we can measure the fit's x-axis extent at draw
+        label. When we can measure the fit's x-axis extent at draw
         time we put the grip just below it; otherwise (no renderer yet, or nothing on
         the fit's x-axis reaches into the gap) we fall back to the geometric midpoint."""
         try:

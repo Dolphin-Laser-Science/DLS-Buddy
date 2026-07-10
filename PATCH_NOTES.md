@@ -9,6 +9,40 @@ window title.
 
 ---
 
+## 0.20.2 — Documentation overhaul (2026-07-09)
+
+A top-to-bottom review of the guides, with the science and citations checked first. No
+change to the analysis; this is documentation and in-source comments only.
+
+- **The Quickstart is now two documents.** *Quickstart-Guide* is short again — the load →
+  confirm parameters → run → export path through the most-used modules, with annotated
+  screenshots. Everything it used to carry moved into a new comprehensive **User-Manual**
+  (every module, file format, and parameter), which also gains a **solvent table** of the
+  Solvent Explorer's built-in solvents and the temperature/wavelength ranges over which each
+  one predicts refractive index and viscosity.
+- **The Advanced Guide is now the *Theory-and-Equations-Guide*** — a name that says what it
+  holds (the physics, numbered equations, and the literature behind each method).
+- **The `docs/` folder is numbered** so it reads in order: 1. Quickstart-Guide, 2. User-Manual,
+  3. Theory-and-Equations-Guide, 4. Code-Map, 5. Code-References, plus two new files —
+  **6. Acknowledgements** (beta testers and test-data contributors) and **7. AI-Use-Statement**
+  (how the project was built, in the author's words).
+- **Citations audited.** Every scientific claim was cross-checked against its primary source,
+  and each citation confirmed to exist in the reference library and to support the statement it
+  is attached to.
+- **In-source comments cleaned up** for anyone reading or forking the code: internal shorthand
+  that pointed at private notes was rewritten to stand on its own, while every literature
+  citation was kept.
+
+## 0.20.1 — Cross-Sample crash fix (2026-07-09)
+
+- **Fixed a crash when opening the Cross-Sample tab for a sample whose DLS measurements
+  have no concentration.** Concentration is optional for DLS (only the D-vs-c extrapolation
+  needs it), but leaving it blank made the ρ table's *R*<sub>h</sub> picker fail and took down
+  the whole tab. The picker now handles a missing concentration: a multi-angle set still yields
+  its Γ-vs-q² (*q*→0) *R*<sub>h</sub>, labelled *"at c = ?"* since the concentration is unknown,
+  while the D-vs-c (*c*→0) extrapolation is offered only for the measurements that do have a
+  concentration. No numbers change when a concentration is present.
+
 ## 0.20.0 — Uncertainty-driven result precision (2026-07-09)
 
 Results are now shown to the precision their uncertainty actually supports — no more digits

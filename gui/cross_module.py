@@ -7,7 +7,7 @@ tabs (Data/DLS/SLS) operate on the one measurement picked in the shell sidebar,
 this tab reads results ACROSS samples: the ρ = Rg/Rh pairing and the log–log
 scaling plots (Rg–Mw, A₂–Mw) are both built here.
 
-Selection model (two distinct things — Item 10; focus unified in UI Batch 7)
+Selection model (two distinct things; focus unified across tabs)
 ---------------------------------------------------------------------------
 This is the only AGGREGATE tab, so it needs two selections a sample-scoped tab
 collapses into one:
@@ -16,8 +16,8 @@ collapses into one:
   and scaling regressions. All SLS samples start included; untick to exclude. This is
   in-tab only (never driven by the sidebar).
 * **Focus** — which one sample/fraction the source rows edit. The **Fraction** combo
-  is in-tab; the **Sample** focus is now the shell's single **active sample** (UI Batch
-  7): it is driven by the in-tab Sample combo **or** by clicking a sample in the
+  is in-tab; the **Sample** focus is now the shell's single **active sample**:
+  it is driven by the in-tab Sample combo **or** by clicking a sample in the
   Workspace tree (`set_focused_sample`, called from the shell's `_focus_sample`) — the
   two are mirrors of one choice. (For a non-SLS active sample, which isn't in the Cross
   universe, the focus keeps its last value — Cross is aggregate over SLS-bearing
@@ -115,7 +115,7 @@ class CrossSampleModule(QtWidgets.QWidget):
     # the Workspace tree.
     selectionChanged = QtCore.Signal()
     # Emitted when the USER picks a sample in the in-tab dropdown, so the shell makes it
-    # the single active sample and fans it out to every tab + the sidebar (UI Batch 7).
+    # the single active sample and fans it out to every tab + the sidebar.
     sampleFocusRequested = QtCore.Signal(str)
 
     def __init__(self, controller, parent=None) -> None:
@@ -160,7 +160,7 @@ class CrossSampleModule(QtWidgets.QWidget):
             QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         # The left list is MEMBERSHIP only (tick = included in the aggregate views).
         # Which sample the source panel edits ("focus") is the shell's active sample —
-        # driven by the in-tab Sample combo below OR a Workspace tree click (UI Batch 7),
+        # driven by the in-tab Sample combo below OR a Workspace tree click,
         # never by clicking a row in THIS membership list or a ρ-table row.
         self.sample_list.itemSelectionChanged.connect(self._on_selection_changed)
         left.addWidget(self.sample_list, 1)
@@ -181,8 +181,8 @@ class CrossSampleModule(QtWidgets.QWidget):
         right = QtWidgets.QVBoxLayout()
         outer.addLayout(right, 1)
 
-        self.inner = roomy_tabs(QtWidgets.QTabWidget())   # roomier tabs so labels don't clip (#3)
-        self.inner.setMovable(True)              # drag to reorder sub-tabs (A4)
+        self.inner = roomy_tabs(QtWidgets.QTabWidget())   # roomier tabs so labels don't clip
+        self.inner.setMovable(True)              # drag to reorder sub-tabs
         right.addWidget(self.inner, 1)
 
         # rho tab: the rho table + interpretation
@@ -328,7 +328,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.a2_combo.setToolTip(
             'A₂ from the Zimm/Berry double extrapolation (thermodynamic). '
             'Calibration-dependent — an uncalibrated A₂ is on an arbitrary scale '
-            '(see the Advanced Guide, SLS section). No manual entry: A₂ is a '
+            '(see the Theory-and-Equations-Guide, SLS section). No manual entry: A₂ is a '
             'solvent/temperature-specific interaction coefficient with no external '
             'standard, and it is the y-axis the A₂–Mw plot fits.')
         self.a2_combo.activated.connect(lambda i: self._on_source_chosen('a2', i))
@@ -381,7 +381,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         or after a commit (the sample set or its results may have changed)."""
         # refresh() runs the labeled Rg/Rh/Mw/A2 auto-picks, which WRITE
         # SampleResult fields — so it must not run while a background fit is
-        # writing them too (invariant 4). Defer until the worker frees.
+        # writing them too. Defer until the worker frees.
         if runner().is_busy:
             run_when_idle(self.refresh)
             return
@@ -460,7 +460,7 @@ class CrossSampleModule(QtWidgets.QWidget):
 
         Honour the display unit FIRST, then round at the (converted) σ place — a radius
         unit change is a pure linear scale, so the σ converts with the value and the
-        place stays correct (invariant 8). With no honest σ, fall back to the documented
+        place stays correct. With no honest σ, fall back to the documented
         fixed-sig precision (Settings → no-uncertainty precision); we never fabricate a ±.
         """
         if x is None or not (isinstance(x, (int, float)) and math.isfinite(x)):
@@ -547,7 +547,7 @@ class CrossSampleModule(QtWidgets.QWidget):
                 msg = f'{name}: {sym} = {exp_text}, {len(sd.mw)} points'
                 if sd.n_excluded:
                     msg += f' ({sd.n_excluded} lacked Mw or a positive value)'
-                # Interpretation hint, mirroring the ρ table (feedback B8).
+                # Interpretation hint, mirroring the ρ table.
                 msg += '\n    → ' + interpret_scaling_exponent(sd.fit.exponent, q)
             else:
                 msg = (f'{name}: need ≥2 points with Mw + {self._SCALE_NEEDS[q]} '
@@ -593,7 +593,7 @@ class CrossSampleModule(QtWidgets.QWidget):
             return
         # Ticking a sample runs _auto_select_all, which WRITES SampleResult fields
         # (the labeled Rg/Rh/Mw/A2 auto-picks) -- it must not race a background fit
-        # writing them too (invariant 4), exactly as refresh() guards. Defer the whole
+        # writing them too, exactly as refresh() guards. Defer the whole
         # handler until the worker frees; the tick persists in the live widget, so
         # re-reading the selection at idle applies it correctly (deferred, not dropped).
         if runner().is_busy:
@@ -686,7 +686,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         sid = self.sample_combo.currentData(QtCore.Qt.ItemDataRole.UserRole)
         if sid is None:
             return
-        # A user pick here drives the shell's single active sample (UI Batch 7); the shell
+        # A user pick here drives the shell's single active sample; the shell
         # fans it out to every tab + the sidebar and calls back set_focused_sample.
         self.sampleFocusRequested.emit(sid)
 
@@ -864,7 +864,7 @@ class CrossSampleModule(QtWidgets.QWidget):
             combo.addItem(_MANUAL_LABEL)
             combo.setItemData(combo.count() - 1, None, QtCore.Qt.ItemDataRole.UserRole)
         elif not groups and current_source != 'user':
-            # no fit-derived candidates and no manual path (A2): a disabled hint
+            # no fit-derived candidates and no manual path: a disabled hint
             combo.addItem('— no fit available (needs ≥2 concentrations) —')
             combo.setItemData(combo.count() - 1, _HEADER_SENTINEL,
                               QtCore.Qt.ItemDataRole.UserRole)

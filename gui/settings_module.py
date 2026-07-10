@@ -26,7 +26,7 @@ from gui.help import HelpBadge
 from gui.theme import ThemedLabel
 from gui.worker import busy_notice, runner
 
-# Plot-axis display-unit choices surfaced in Settings (feedback 2026-06-26 #8):
+# Plot-axis display-unit choices surfaced in Settings:
 # (quantity, label). The combo for each offers U.unit_options(quantity).
 _PLOT_UNIT_ROWS = [
     ('time', 'Delay time τ'),
@@ -89,7 +89,7 @@ class SettingsModule(QtWidgets.QWidget):
         self.skip_channels.setToolTip(
             'Drop this many leading correlator channels (shortest lags) from every DLS '
             'fit to remove afterpulsing / dead-time artifacts; keep it small so a real '
-            'small-particle mode is not erased. See the Advanced Guide.')
+            'small-particle mode is not erased. See the Theory-and-Equations-Guide.')
         form.addRow('Skip initial lag channels:', self.skip_channels)
 
         form.addRow(self._header('SLS Defaults'))
@@ -98,14 +98,14 @@ class SettingsModule(QtWidgets.QWidget):
         self.geometry.setToolTip(
             'Scattering geometry of the calibration standard: VV = polarized, '
             'VH = depolarized, VU = no analyzer (e.g. the BI-200SM). '
-            'See the Advanced Guide.')
+            'See the Theory-and-Equations-Guide.')
         form.addRow('Standard geometry:', self.geometry)
         self.qrg_max = QtWidgets.QDoubleSpinBox()
         self.qrg_max.setRange(0.5, 3.0)
         self.qrg_max.setSingleStep(0.1)
         self.qrg_max.setToolTip(
             'Maximum qRg for a valid Guinier fit; above it the Guinier expansion '
-            'breaks down. See the Advanced Guide (Guinier).')
+            'breaks down. See the Theory-and-Equations-Guide (Guinier).')
         form.addRow('Guinier qRg validity limit:', self.qrg_max)
 
         form.addRow(self._header('Solvent Library'))
@@ -124,7 +124,7 @@ class SettingsModule(QtWidgets.QWidget):
             'Covariance estimator behind every reported regression ± (SLS Zimm/Berry, '
             'Debye, Guinier, calibration-free A₂; DLS Γ vs q² and kD; the Rg/A₂–Mw '
             'scaling exponent). Switching clears existing ±-bearing results (you will '
-            'be asked to confirm). See Advanced Guide §15.1.')
+            'be asked to confirm). See Theory-and-Equations-Guide §15.1.')
         est_help = HelpBadge(
             'Which standard error the app reports for its straight-line and '
             'multilinear fits.',
@@ -139,7 +139,7 @@ class SettingsModule(QtWidgets.QWidget):
                 'The choice is global, persists across restart, and is recorded on '
                 'each result and written into the export (an OLS ± is labeled '
                 '“SE: classical OLS”). Point estimates (Mw, Rg, D, Rh) are unaffected.',
-                'Detail and formulas: Advanced Guide §15.1.',
+                'Detail and formulas: Theory-and-Equations-Guide §15.1.',
             ])
         est_row = QtWidgets.QWidget()
         est_lay = QtWidgets.QHBoxLayout(est_row)
@@ -150,8 +150,8 @@ class SettingsModule(QtWidgets.QWidget):
         form.addRow('Regression SE estimator:', est_row)
 
         # NB: the synthetic-generator (β/noise/points) and intensity-trace (outlier
-        # k, running-average window) defaults used to live here. Per feedback
-        # 2026-06-26 #6 they were moved into their own tabs (Utilities → Synthetic
+        # k, running-average window) defaults used to live here. They were
+        # moved into their own tabs (Utilities → Synthetic
         # generator / Traces) as plain session fields, so they no longer clutter
         # this global tab.
 
@@ -258,8 +258,7 @@ class SettingsModule(QtWidgets.QWidget):
     def _header(text: str) -> QtWidgets.QLabel:
         # ThemedLabel so the header follows the theme (a plain stylesheet without a
         # `color` froze to the build-time palette → unreadable light-gray on the light
-        # theme). Title Case + bold; no all-caps (feedback 2026-06-30 #2; casing per
-        # style guide §9).
+        # theme). Title Case + bold; no all-caps (casing per style guide §9).
         return ThemedLabel(text, role='header', bold=True, extra='margin-top:8px;')
 
     # ----------------------------------------------------------- transfer ---
@@ -325,7 +324,7 @@ class SettingsModule(QtWidgets.QWidget):
         aborted (busy, or a stale-guard prompt canceled) — `_restore` uses this to
         fully revert the widgets on cancel."""
         # Settings values seed the analysis defaults a background run reads
-        # mid-flight — applying under it could change its numbers (invariant 4).
+        # mid-flight — applying under it could change its numbers.
         if runner().is_busy:
             busy_notice(self)
             return False

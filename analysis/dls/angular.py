@@ -68,7 +68,7 @@ class GammaQ2Result:
     rh_se: Optional[float] = None
     se_estimator: str = 'hc3'             # covariance estimator behind the SEs
     # every eligible measurement's per-point Γ/q²/D_app + quality tag, attached by the
-    # controller run so the GUI table/graying come from the run (feedback 2026-07-06).
+    # controller run so the GUI table/graying come from the run.
     all_points: Optional[list] = None
 
 
@@ -94,7 +94,7 @@ class ConcentrationExtrapolationResult:
     kd_se: Optional[float] = None
     se_estimator: str = 'hc3'             # covariance estimator behind the SEs
     # every eligible measurement's per-point D_app + quality tag, attached by the
-    # controller run so the GUI table/graying come from the run (feedback 2026-07-06).
+    # controller run so the GUI table/graying come from the run.
     all_points: Optional[list] = None
 
 
@@ -146,7 +146,7 @@ def gamma_per_measurement(measurements, gamma_source='cumulant', tau_min_s=None,
                           cumulant_method='linear'):
     """Per-measurement decay rate Γ (s⁻¹) and scattering vector q (m⁻¹), in INPUT
     order (no sorting, no ≥2 validation), for populating the GUI's per-measurement
-    table (feedback 2026-06-30 #11/#13). It reuses the exact per-measurement path the
+    table. It reuses the exact per-measurement path the
     multi-angle/-concentration fits use (`_gamma_for_measurement`), so the tabulated Γ
     match the fitted points. Failure-tolerant: a measurement whose fit or q can't be
     computed yields NaN for that entry rather than raising.

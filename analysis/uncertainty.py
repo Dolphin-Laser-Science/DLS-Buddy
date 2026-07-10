@@ -4,7 +4,7 @@ analysis/uncertainty.py
 
 Statistical-uncertainty toolkit for the analysis layer.
 
-Scope and philosophy (see the Advanced Guide, "Uncertainty estimates"):
+Scope and philosophy (see the Theory-and-Equations-Guide, "Uncertainty estimates"):
 we report the **statistical** (regression) uncertainty of a fit, and only where the
 fitted points are genuinely independent measurements (SLS angle/concentration series,
 Gamma-vs-q^2 over angles, D-vs-c over concentrations, the cross-sample scaling fit).
@@ -82,7 +82,7 @@ def _ols_cov(X: np.ndarray, y: np.ndarray, beta: np.ndarray) -> np.ndarray:
     The textbook estimator: assumes every point shares one error variance. Offered as
     an opt-in for comparability with classical software / literature tables (invariant 8
     clause A) — it under-reports on short, high-leverage designs where precision varies
-    (Session 97: ~10% low on the 5-point calibration-free A2 ladder), which is why HC3,
+    (~10% low on the 5-point calibration-free A2 ladder), which is why HC3,
     not this, is the default. Returns NaN when there are too few residual dof to estimate
     the spread (n - p < 1)."""
     n, p = X.shape
@@ -420,7 +420,7 @@ def format_fixed_sig(value: Optional[float], sig: int = 3) -> str:
     number's honesty is carried by its apparent/±-omitted qualifier (invariant #7),
     the digit count by this rule.
 
-    Standing policy (see the Advanced Guide §15.6): a value that HAS an uncertainty is
+    Standing policy (see the Theory-and-Equations-Guide §15.6): a value that HAS an uncertainty is
     set by that uncertainty and never comes here; a value WITHOUT one is set by ``sig``,
     which is user-configurable (Settings → the no-uncertainty precision knob, default 3).
     Because any sig-fig choice for an unquantified number is inherently arbitrary, that is

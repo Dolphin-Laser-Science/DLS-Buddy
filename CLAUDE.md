@@ -2,8 +2,9 @@
 
 Orientation for working on this project. This is the high-signal subset needed to be
 productive without re-deriving things or breaking an invariant. For a human/forker map
-of the code see `docs/code_map.md`; for the science and the numbered equations see
-`docs/Advanced-Guide.pdf`, and for usage see `docs/Quickstart.pdf`.
+of the code see `docs/4. Code-Map.md`; for the science and the numbered equations see
+`docs/3. Theory-and-Equations-Guide.pdf`, and for usage see `docs/1. Quickstart-Guide.pdf`
+and `docs/2. User-Manual.pdf`.
 
 ---
 
@@ -27,7 +28,7 @@ This project is **correctness-first**, and the domain is physical:
 - **Correctness over cleverness or brevity.** Track units explicitly. Validate
   numerically against a known answer; don't claim something works without it.
 - Ground physical claims in **primary literature** and cite it (authors + year). Never
-  invent a citation. The user-facing citation index is `docs/code_references.md`.
+  invent a citation. The user-facing citation index is `docs/5. Code-References.md`.
 - When a result is corrected, acknowledge the specific error and re-derive from scratch;
   don't defend a wrong result for consistency.
 - **Flag hard-to-reverse choices before acting on them** and give the reasoning.
@@ -44,7 +45,7 @@ alters the behaviour of a user-facing control, update its help in the same chang
 section's `?` `HelpBadge` (`gui/help.py`: `section_header` / `add_help_to_groupbox`)
 and/or its passive `setToolTip`. *How-to-use* help is the visible `?` badge (concise,
 lists over paragraphs, no citations); *calculation nuance* is a brief tooltip that points
-to the Advanced Guide. Tooltips honour the global Settings "Show tooltips" gate; `?`
+to the Theory-and-Equations-Guide. Tooltips honour the global Settings "Show tooltips" gate; `?`
 badges always work on click.
 
 ---
@@ -82,7 +83,7 @@ badges always work on click.
    NNLS/CONTIN (ill-posed) or single-angle Mw (one datum). Every new SE must be
    **Monte-Carlo-validated** against the sampling SD before it ships. When adding or
    modifying ANY analysis, state how it treats uncertainty and document the formula in the
-   Advanced Guide (numbered LaTeX), exactly as the analysis itself is documented.
+   Theory-and-Equations-Guide (numbered LaTeX), exactly as the analysis itself is documented.
 9. **No owner-machine specifics in the product or docs.** The program (code, config,
    defaults) must never hard-code or assume a particular computer setup — file paths,
    usernames, drive layout, or sync mechanism; anything machine-specific stays
@@ -133,8 +134,9 @@ Top-level packages (each with an `__init__.py`) using top-level package imports
 ├── PATCH_NOTES.md            # per-release changes + known issues
 ├── LICENSE                   # GPLv3
 ├── requirements.txt          # pinned deps (Python 3.13 venv)
-├── docs/                     # user-facing docs: Quickstart.pdf, Advanced-Guide.pdf,
-│                             #   code_map.md, code_references.md (generated citation index)
+├── docs/                     # user-facing docs: 1. Quickstart-Guide.pdf, 2. User-Manual.pdf,
+│                             #   3. Theory-and-Equations-Guide.pdf, 4. Code-Map.md,
+│                             #   5. Code-References.md (generated citation index)
 ├── test-data/                # datasets used by validation
 ├── core/
 │   ├── data_models.py        # SampleKey, DLSMeasurement, SLSMeasurement, solvent vocab

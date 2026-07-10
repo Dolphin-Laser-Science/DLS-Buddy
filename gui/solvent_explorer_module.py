@@ -22,12 +22,12 @@ One shared figure, two side-by-side plots (core, not deferrable):
   * **Right — vs wavelength.** RI against wavelength at the selected temperature,
      across the RI λ box, with its band + a selection dot. (η has no λ dependence.)
 
-The confidence band is the engine's **per-condition conservative bound** (Spec 3):
+The confidence band is the engine's **per-condition conservative bound**:
 σ_n(λ,T) absolute for n, σ_η,rel(T)·η for η — tightest near each source's reference
 conditions, growing toward the validity-box edges, honestly FLAT where a source
 supplies no shape (bulk-grade viscosities). Every part of it derives from real
 quantities (stated source accuracy, fit-residual envelopes, dn/dT-slope
-propagation) — never a fabricated model (invariant #8). It is **shown, never
+propagation) — never a fabricated model. It is **shown, never
 propagated** into any analysis SE. All physics lives in the controller/engine; this
 widget only drives the controller and draws the bare arrays it returns.
 
@@ -87,7 +87,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
                 'the shaded band is a conservative bound at each condition '
                 '(narrowest where the sources are strongest).',
                 'The band is <b>shown, never propagated</b> into any reported ± '
-                '(see Advanced Guide §12).',
+                '(see Theory-and-Equations-Guide §12).',
             ]))
 
         # ---- top: form (left) + numeric readout (right) ----
@@ -165,7 +165,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
 
         self.band_note = ThemedLabel(
             'Shaded band = conservative bound at each condition '
-            '(Advanced Guide §12) — shown, never propagated into an analysis SE. '
+            '(Theory-and-Equations-Guide §12) — shown, never propagated into an analysis SE. '
             'Curves stop where the library’s validity ends.',
             role='hint', size=11)
         self.band_note.setWordWrap(True)

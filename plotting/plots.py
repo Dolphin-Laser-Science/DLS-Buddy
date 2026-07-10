@@ -97,7 +97,7 @@ def cycle() -> list:
 
 
 # ---------------------------------------------------------------------------
-# Per-series marker + linestyle cycles (colour-independence — UI Batch 5, WCAG 1.4.1)
+# Per-series marker + linestyle cycles (colour-independence — WCAG 1.4.1)
 # ---------------------------------------------------------------------------
 # Overlaid series (co-plotted correlograms, Zimm concentrations, scaling series) must be
 # distinguishable WITHOUT colour — for a colour-vision-deficient reader and in greyscale.
@@ -119,7 +119,7 @@ def linestyle_for(i: int):
 
 
 # ---------------------------------------------------------------------------
-# On-screen figure theming (UI Batch 5, finding 7.1) — white default + opt-in dark
+# On-screen figure theming — white default + opt-in dark
 # ---------------------------------------------------------------------------
 # The on-screen matplotlib figure defaults to WHITE (clean exports/print). The GUI may
 # opt in to theming the *on-screen* figure to a dark palette when the app theme is dark
@@ -202,7 +202,7 @@ def save_figure_white(fig, path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Plot-axis display units (feedback 2026-06-26 #8)
+# Plot-axis display units
 # ---------------------------------------------------------------------------
 # Plots store/compute in canonical units but DISPLAY in human-scale units (µs, kcps,
 # nm⁻², µm²/s, mg/mL, ...). The active choice is a module-level dict mutated by
@@ -484,7 +484,7 @@ def plot_correlogram_scaled(
     ticks and drops axis labels for the small side views of the multi-scale panel.
     `color`/`label` let several correlograms be overlaid on one axes with a legend;
     `marker` varies the point SHAPE per overlaid series so they stay distinct without
-    colour (WCAG 1.4.1 / greyscale — UI Batch 5).
+    colour (WCAG 1.4.1 / greyscale).
     Used by the DLS tab's 4-view correlogram and the multi-measurement overlay.
     """
     fig, ax, _ = _get_ax(ax)
@@ -550,7 +550,7 @@ def plot_distribution(
     """
     x, weights, xlabel = distribution_axis(result, axis)
     x = np.asarray(x, dtype=float)
-    # Display-unit scaling (feedback #8): Rh in the active radius unit (default nm),
+    # Display-unit scaling: Rh in the active radius unit (default nm),
     # Γ in the active decay-rate unit (default s⁻¹).
     if axis == 'gamma':
         x = x * display_factor('decay_rate')
@@ -755,7 +755,7 @@ def plot_zimm(
         y = ordinate(np.asarray(r.kc_over_dR_mol_per_g, dtype=float))
         x = q2 + k * r.concentration_g_per_mL
         # Vary the marker SHAPE per concentration so the series stay distinct without
-        # colour (WCAG 1.4.1 / greyscale — UI Batch 5), not hue alone.
+        # colour (WCAG 1.4.1 / greyscale), not hue alone.
         pts = ax.plot(x, y, marker=marker_for(i), ls='none', color=col, ms=5,
                       label=f'{r.concentration_g_per_mL*1000:.3g} mg/mL')[0]
         artists['concentrations'].append(pts)
@@ -763,8 +763,8 @@ def plot_zimm(
     # Both extrapolations come from the global plane fit  ord = a + b q^2 + d c, so
     # the c->0 line (vs q^2) and the q->0 line (vs k*c) are straight and meet at the
     # common intercept a (= 1/Mw, or its root for Berry) at x = 0. Continue each line
-    # all the way to x = 0 so the extrapolation visibly reaches the axis (feedback
-    # A7); the route-specific intercepts stay as markers on the real data range.
+    # all the way to x = 0 so the extrapolation visibly reaches the axis;
+    # the route-specific intercepts stay as markers on the real data range.
     a = float(zimm_result.coef_intercept)
     b = float(zimm_result.coef_q2)
     d = float(zimm_result.coef_c)
@@ -1045,7 +1045,7 @@ def plot_scaling(result, quantity: str = 'rg', labels: Optional[Sequence[str]] =
     ax.set_ylabel({'rg': rf'$R_g$ ({r_unit})', 'rh': rf'$R_h$ ({r_unit})'}.get(
         quantity, r'$A_2$ (mol·mL/g$^2$)'))
     if labels is not None:
-        # Stagger sample-name labels so close points don't collide (feedback #8); a
+        # Stagger sample-name labels so close points don't collide; a
         # crowded corner caps at "+N more" rather than piling up. Done LAST, after the
         # log scales + limits are set, so the de-collision sees the final transData.
         annotate_decollided(

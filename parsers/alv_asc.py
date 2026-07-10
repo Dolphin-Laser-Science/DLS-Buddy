@@ -248,7 +248,7 @@ def _parse_alv_file(file_path: str) -> _ALVData:
     # `is not None` (not `if visc`): a header viscosity of 0.0 is PRESENT-but-invalid,
     # not absent, so it must reach convert_viscosity to be rejected — and its
     # ValueError (0/negative, or a bad unit) surfaces as a ParseError, this layer's
-    # contract, rather than a bare ValueError leaking to the caller (B9).
+    # contract, rather than a bare ValueError leaking to the caller.
     try:
         viscosity_Pa_s = convert_viscosity(visc, 'cp') if visc is not None else None
     except ValueError as exc:

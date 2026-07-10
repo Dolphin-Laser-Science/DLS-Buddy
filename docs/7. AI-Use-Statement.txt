@@ -1,0 +1,16 @@
+TL;DR at bottom
+
+This project started because I was doing a lot of light scattering experiments as a PhD student at UMass PSE, and I needed a better tool to analyze my data. I found existing software options lacking; they were either bad, proprietary, or bad and proprietary. I thought to myself, "screw it, I'm just going to make my own program" before I remembered that I didn't know how to code. As it turns out, that was less of a hindrance than I thought and we live in a world where that isn't a roadblock to software development anymore, hence the need for this disclaimer.
+
+The vast, vast majority of this project was made using Claude Code by Anthropic. Everything from the analysis engine, to the GUI, and even the user guides were all created by agentic AI agents--Mostly Opus 4.8, with some Sonnet 5 and Fable 5 sprinkled in. This txt file might be the only thing that Claude didn't have any part of making. I put forward my best effort to ground the AI with programming invariants focused on making sure the science stayed as truthful as possible. DLS Buddy was not built by just one prompt, it's been 100+ back-and-forth development sessions with peer reviewed literature anchoring every part of the program that does a calculation, wherever a primary source exists.
+
+A public release, of course, invites scrutiny of my development choices, and I welcome such constructive criticism. This started as a personal project, and I intend to keep using it myself, so I want it to be as good as it can be. I've left in a sanitized version of CLAUDE.md in the project so you can examine the kind of instructions I left for the AI agents. The included Patch Notes are a condensed version of the developer log, which I will send to you if you want. If you find any bugs while using DLS Buddy, I'd love to know about them so I can (ask Claude to) fix it ASAP.
+
+I've probably betrayed my internal concerns when it comes to such heavy reliance on AI and I'll admit this statement is to assuage my uncertainties as much as yours. I've already made this much longer than it needed to be, so I'll end now with a parting thought: The purpose of this project was to produce a tool to help human beings do science. If it manages to do that, then I consider it a success.
+
+TL;DR
+Claude made everything here, I tried my best to keep it honest.
+
+Esam Alfalah
+Polymer Science and Engineering
+University of Massachusetts Amherst

@@ -47,7 +47,7 @@ _TEMPERATURE_GROUP_DECIMALS = 2   # round Kelvin to 0.01 K for grouping
 
 def _known_only(cls, d: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Keep only keys that are fields of dataclass `cls`. Makes a `from_dict` forward-
-    compatible (D1): a session written by a NEWER build (with an extra field) loads in
+    compatible: a session written by a NEWER build (with an extra field) loads in
     an older one — the unknown key is ignored rather than raising `TypeError`. Mirrors
     `SettingsState.from_dict` / `Workspace.from_dict`."""
     known = {f.name for f in fields(cls)}
@@ -592,8 +592,8 @@ class Workspace:
                 conc = p.get('concentration_g_per_mL', None)
                 if conc is not None and conc == 0:
                     # First-loaded blank wins the single reference slot; any further
-                    # c = 0 series is parked as an extra so it can't silently vanish
-                    # (A5). Measurements iterate in load order, so "first" is stable.
+                    # c = 0 series is parked as an extra so it can't silently vanish.
+                    # Measurements iterate in load order, so "first" is stable.
                     if samp.solvent_reference_item_id is None:
                         samp.solvent_reference_item_id = item_id
                     else:
@@ -642,7 +642,7 @@ class Workspace:
         Empty when no sample has a collision (the common case). The GUI reads this
         to warn the user that a second blank isn't the active reference -- the model
         keeps the first-loaded one, and the extras stay here so they are never
-        silently dropped (A5)."""
+        silently dropped."""
         return {sid: list(s.extra_solvent_reference_item_ids)
                 for sid, s in self.samples.items()
                 if s.extra_solvent_reference_item_ids}

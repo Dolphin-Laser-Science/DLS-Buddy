@@ -77,7 +77,7 @@ _TRACE_CYCLE = ['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#E69F00',
 _TRACE_PARSERS = [ALVTraceParser, BrookhavenTraceParser]
 
 # Default seeds for the intensity-trace controls. These used to live in Settings;
-# per feedback 2026-06-26 #6 they are now plain in-tab fields seeded each launch
+# they are now plain in-tab fields seeded each launch
 # from these fixed code constants (not persisted).
 _DEFAULT_OUTLIER_K = 3.0
 _DEFAULT_RUNAVG_WINDOW = 0     # 0 → auto (≈ n/20 points)
@@ -92,8 +92,8 @@ _HEAVY_TRACE_POINTS = 20_000
 # Synthetic-data generator field groups: (key, label, default).
 # Conditions are shared by DLS + SLS; the size populations drive DLS Rh, while the
 # SLS sample block carries Mw/Rg/A2 (a different set of physical parameters).
-# Temperature + viscosity are entered with selectable units (feedback 2026-06-26
-# #14, defaults °C and mPa·s) and handled apart; only the unitless conditions go
+# Temperature + viscosity are entered with selectable units (defaults °C and
+# mPa·s) and handled apart; only the unitless conditions go
 # through this simple list.
 _SYNTH_CONDITIONS = [
     ('wavelength_nm', 'Wavelength (nm)', '532'),
@@ -142,7 +142,7 @@ class UtilitiesModule(QtWidgets.QWidget):
     workspaceChanged = QtCore.Signal()
     selectionChanged = QtCore.Signal()   # emitted when the I·sinθ sample changes (mirror)
     # Emitted when the USER picks a sample in the I·sinθ dropdown, so the shell makes it
-    # the single active sample and fans it out to every tab + the sidebar (UI Batch 7).
+    # the single active sample and fans it out to every tab + the sidebar.
     sampleFocusRequested = QtCore.Signal(str)
 
     def __init__(self, controller, parent=None) -> None:
@@ -167,8 +167,8 @@ class UtilitiesModule(QtWidgets.QWidget):
     # ------------------------------------------------------------------ UI ---
     def _build_ui(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
-        self.inner = roomy_tabs(QtWidgets.QTabWidget())   # roomier tabs so labels don't clip (#3)
-        self.inner.setMovable(True)              # drag to reorder sub-tabs (A4)
+        self.inner = roomy_tabs(QtWidgets.QTabWidget())   # roomier tabs so labels don't clip
+        self.inner.setMovable(True)              # drag to reorder sub-tabs
         outer.addWidget(self.inner)
         self.inner.addTab(self._build_traces_tab(), 'Traces')
         self.inner.addTab(self._build_isin_tab(), 'I·sin θ')
@@ -184,7 +184,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(w)
 
         # The I·sin θ dropdown is a mirror/override of the shell's single active sample
-        # (UI Batch 7): picking here sets the active sample everywhere; the sidebar drives
+        # picking here sets the active sample everywhere; the sidebar drives
         # it too. Only SLS-bearing samples can produce an I·sin θ plot (it needs the c = 0
         # angular intensities); an incompatible active sample shows a named empty-state.
         self.isin_selector = SampleSelector(
@@ -242,7 +242,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             'Fano check, or block-variance).',
         ]))
         # A multi-select checklist (Select all/none), matching the DLS correlogram
-        # tab's measurement selector (feedback 2026-06-26 #4): tick several traces to
+        # tab's measurement selector: tick several traces to
         # overlay them. The focused trace drives the stats line + secondary diagnostic.
         self.trace_list = QtWidgets.QListWidget()
         self.trace_list.setSelectionMode(
@@ -288,7 +288,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         right.addLayout(trow)
 
         # overlay toggles (GUI-owned flags, never baked into the figure data)
-        # 'k' tooltip (feedback 2026-06-26 #11): k is the shot-noise band multiplier.
+        # 'k' tooltip: k is the shot-noise band multiplier.
         _k_help = ('k — the shot-noise band multiplier. A point is flagged when its '
                    'count rate lies outside mean ± k·√mean (√mean is the Poisson '
                    'standard deviation for raw photon counts).')
@@ -309,7 +309,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.ov_running = QtWidgets.QCheckBox('Running average')
         self.ov_running.toggled.connect(self._update_trace)
         orow.addWidget(self.ov_running)
-        # User-adjustable running-average window (feedback 2026-06-26 #12). The
+        # User-adjustable running-average window. The
         # sliding window spans this many points; 0 = auto (≈ n/20).
         win_lbl = QtWidgets.QLabel('window (pts):')
         win_lbl.setToolTip('Number of points in the sliding window; 0 = auto (≈ n/20).')
@@ -327,8 +327,8 @@ class UtilitiesModule(QtWidgets.QWidget):
 
         # The main trace plot and the secondary diagnostic are independent plots
         # (count rate vs time; histogram / block variance) with different x-axes, so
-        # they go in a draggable vertical splitter — each resizable on its own
-        # (feedback 2026-06-29 #9). (A fit + its residual, which must stay aligned,
+        # they go in a draggable vertical splitter — each resizable on its own.
+        # (A fit + its residual, which must stay aligned,
         # share one canvas instead — see the DLS tabs.)
         top = QtWidgets.QWidget()
         tlay = QtWidgets.QVBoxLayout(top); tlay.setContentsMargins(0, 0, 0, 0)
@@ -352,7 +352,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.diag_combo.setToolTip(
             'Secondary diagnostic plotted below the trace: the count-rate histogram '
             '(with a Poisson/Fano check) or the block-variance vs block-size curve. '
-            'See the Advanced Guide.')
+            'See the Theory-and-Equations-Guide.')
         # Switching the sub-plot type reuses the cached diagnostics (or backgrounds
         # them for a long trace) rather than recomputing on the UI thread.
         self.diag_combo.currentIndexChanged.connect(self._on_diag_view_changed)
@@ -688,8 +688,8 @@ class UtilitiesModule(QtWidgets.QWidget):
     def load_traces_dialog(self) -> None:
         """Load one or more count-rate traces. Instrument-agnostic: each file is
         auto-detected (ALV, Brookhaven), falling back to the plain two-column generic
-        parser with a units prompt (feedback 2026-06-26 #3). Public so the sidebar's
-        Traces node can trigger it too (#4)."""
+        parser with a units prompt. Public so the sidebar's
+        Traces node can trigger it too."""
         if runner().is_busy:                 # add mutates the workspace store
             busy_notice(self)
             return
@@ -844,8 +844,8 @@ class UtilitiesModule(QtWidgets.QWidget):
             e = QtWidgets.QLineEdit(default)
             self.syn_cond[key] = e
             cform.addRow(f'{label}:', e)
-        # Temperature + viscosity with selectable units (feedback #14: default °C,
-        # mPa·s). Stored in human units; converted to canonical (K, Pa·s) on read.
+        # Temperature + viscosity with selectable units (default °C, mPa·s).
+        # Stored in human units; converted to canonical (K, Pa·s) on read.
         self.syn_temp = QtWidgets.QLineEdit('25')
         self.syn_temp_unit = QtWidgets.QComboBox()
         self.syn_temp_unit.addItems(U.unit_options('temperature'))   # °C default
@@ -976,8 +976,8 @@ class UtilitiesModule(QtWidgets.QWidget):
         ov.addLayout(srow)
         left.addWidget(out_box)
         left.addStretch(1)
-        # β / noise / points keep their in-tab default text (feedback 2026-06-26 #6:
-        # the synthetic-generator defaults are session fields here, not Settings).
+        # β / noise / points keep their in-tab default text (the synthetic-generator
+        # defaults are session fields here, not Settings).
 
         # ---- right: preview ----
         right = QtWidgets.QVBoxLayout()
@@ -1046,12 +1046,12 @@ class UtilitiesModule(QtWidgets.QWidget):
             self.syn_folder.setText(d)
 
     def _synth_temperature_K(self) -> float:
-        """The generator's temperature, read in the chosen unit → canonical K (#14)."""
+        """The generator's temperature, read in the chosen unit → canonical K."""
         return U.to_canonical('temperature', float(self.syn_temp.text()),
                               self.syn_temp_unit.currentText())
 
     def _synth_viscosity_Pa_s(self) -> float:
-        """The generator's viscosity, read in the chosen unit → canonical Pa·s (#14)."""
+        """The generator's viscosity, read in the chosen unit → canonical Pa·s."""
         return U.to_canonical('viscosity', float(self.syn_visc.text()),
                               self.syn_visc_unit.currentText())
 
@@ -1330,7 +1330,7 @@ class UtilitiesModule(QtWidgets.QWidget):
     # ------------------------------------------------------------- updates ---
     def reseed_from_settings(self) -> None:
         """Re-render after a Settings change (e.g. plot palette). The trace + synthetic
-        defaults are session-only in-tab fields now (feedback 2026-06-26 #6), so there
+        defaults are session-only in-tab fields now, so there
         is nothing to re-seed from SettingsState here.
 
         NB: this must NOT cascade into the nested Solvent Explorer — default_solvent
@@ -1340,7 +1340,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         self._update_trace()
 
     def set_measurement(self, item_id: Optional[str]) -> None:
-        """Follow the shell's active sample (UI Batch 7): always adopt the focused
+        """Follow the shell's active sample: always adopt the focused
         measurement's sample; an incompatible one shows a named empty-state, not the old
         keep-last."""
         sid = self.controller.sample_id_of(item_id) if item_id is not None else None
@@ -1382,7 +1382,7 @@ class UtilitiesModule(QtWidgets.QWidget):
 
     def _update_isin(self) -> None:
         # run_i_sin_theta writes the shared controller.results dict, so it must
-        # not run while a background fit is writing it too (invariant 4). Defer
+        # not run while a background fit is writing it too. Defer
         # the whole refresh until the worker frees rather than race it — and dedup
         # (a single pending flag) so a burst of abs/rel toggles doesn't queue N
         # identical redraws that all fire on drain.
@@ -1399,7 +1399,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             self.isin_canvas.draw_idle()
             return
         # An active sample that can't produce I·sin θ (no SLS / solvent reference): named
-        # empty-state, not a caught run error (UI Batch 7). `has_sample` is False for it
+        # empty-state, not a caught run error. `has_sample` is False for it
         # (only the neutral placeholder is selected in the dropdown).
         if not self.isin_selector.has_sample(self.sample_id):
             s = self.controller.workspace.samples.get(self.sample_id)

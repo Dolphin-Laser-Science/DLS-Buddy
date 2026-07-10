@@ -8,8 +8,7 @@ or SLS modules. Three broad categories live here:
   1. Data-quality diagnostics  -- the SLS I*sin(theta) optical-quality check.
      (The intensity-trace signal-analysis diagnostics -- statistics, baseline,
      outlier flagging, running average, block variance, count-rate histogram,
-     ADF stationarity -- were promoted to analysis/trace_analysis.py in
-     Session 59.)
+     ADF stationarity -- were promoted to analysis/trace_analysis.py.)
 
   2. Cross-analysis            -- quantities that link the DLS and SLS pipelines,
      specifically the shape parameter rho = Rg / Rh, and the Rg/Mw/A2 scaling
@@ -233,7 +232,7 @@ def rho_shape_label(rho: float) -> str:
     return 'rod / extended / aggregated'
 
 
-# Temperature match tolerance for rho's sample-key check (B6): guards float round-off
+# Temperature match tolerance for rho's sample-key check: guards float round-off
 # between the DLS and SLS paths without merging distinct set points (>= 0.01 K apart
 # under the grouping key).
 _RHO_TEMPERATURE_TOL_K = 1.0e-6
@@ -291,7 +290,7 @@ def compute_rho(
         keys_matched = (
             rg_sample_key.polymer_name == rh_sample_key.polymer_name
             and rg_sample_key.solvent_name == rh_sample_key.solvent_name
-            # Tolerance, not exact ==, on temperature (B6): the DLS and SLS paths can
+            # Tolerance, not exact ==, on temperature: the DLS and SLS paths can
             # carry the same set-point with sub-µK float drift, and an exact compare
             # would spuriously refuse a genuine match. Well below any real set-point
             # separation, so 35 vs 50 C still differ.
@@ -376,7 +375,7 @@ def fit_power_law(x: Sequence[float], y: Sequence[float],
 
 def interpret_scaling_exponent(exponent: float, quantity: str) -> str:
     """A short textual interpretation of a power-law scaling exponent, mirroring the
-    rho interpretation on the cross-sample tab (feedback B8).
+    rho interpretation on the cross-sample tab.
 
     For a SIZE exponent nu (Rg ~ Mw^nu or Rh ~ Mw^nu) the Flory values are the
     references: nu ~ 1/3 compact sphere / collapsed globule (poor solvent),

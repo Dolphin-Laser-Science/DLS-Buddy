@@ -9,7 +9,7 @@ running averages, blocking (standard-error-vs-block-size) analysis, count-rate
 histograms with Gaussian/Poisson fits and the Fano factor, and a formal Augmented
 Dickey-Fuller stationarity test.
 
-(Promoted out of analysis/utilities.py in Session 59: this cluster has no code
+(Promoted out of analysis/utilities.py into its own module: this cluster has no code
 coupling to the rest of utilities -- the SLS I*sin(theta) diagnostic, rho = Rg/Rh,
 the scaling power-law, the result-candidate picker, and the synthetic generator
 all stay in utilities.py.)

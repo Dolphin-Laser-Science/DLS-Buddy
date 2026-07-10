@@ -29,15 +29,15 @@ from typing import Dict, List
 _LINEAR: Dict[str, Dict[str, float]] = {
     # canonical g/mL
     'concentration': {'mg/mL': 1e-3, 'g/L': 1e-3, 'µg/mL': 1e-6, 'g/mL': 1.0},
-    # canonical Pa·s   (cP was dropped per feedback 2026-06-26 #15 — it is identical
-    # to mPa·s, so offering both only invited confusion)
+    # canonical Pa·s   (cP was dropped — it is identical to mPa·s, so offering
+    # both only invited confusion)
     'viscosity': {'mPa·s': 1e-3, 'Pa·s': 1.0},
     # canonical s
     'time': {'µs': 1e-6, 'ns': 1e-9, 'ms': 1e-3, 's': 1.0},
     # canonical cps (counts per second)
     'intensity': {'kcps': 1e3, 'cps': 1.0, 'Mcps': 1e6},
-    # --- plot-axis display quantities (feedback 2026-06-26 #8). The first entry of
-    # each is the human-scale default the plots start on. ---
+    # --- plot-axis display quantities. The first entry of each is the
+    # human-scale default the plots start on. ---
     'scattering_q2': {'nm⁻²': 1e18, 'm⁻²': 1.0},          # canonical m^-2
     'diffusion': {'µm²/s': 1e-12, 'cm²/s': 1e-4, 'm²/s': 1.0},   # canonical m^2/s
     'decay_rate': {'s⁻¹': 1.0, 'ms⁻¹': 1e3},              # canonical s^-1

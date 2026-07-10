@@ -196,8 +196,8 @@ def _fit_cumulants_linear(
 
     # Model evaluated over the fitted region, for plotting and residuals. The fitted
     # region IS the cutoff-masked (high-amplitude, short-lag) subset — so rms_error
-    # below is over that support, matching the nonlinear path's rms (D3: comparable
-    # goodness-of-fit across methods).
+    # below is over that support, matching the nonlinear path's rms (so goodness-of-fit
+    # is comparable across methods).
     model_log = np.polyval(coeffs_high_first, t)
     fitted = np.exp(model_log)
     residuals = y - fitted
