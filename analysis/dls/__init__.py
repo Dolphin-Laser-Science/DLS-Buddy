@@ -120,7 +120,6 @@ from analysis.dls.angular import (
     GammaQ2Result,
     analyze_gamma_q2,
     extrapolate_diffusion_vs_concentration,
-    gamma_per_measurement,
     gamma_to_rh_nm,
     rh_nm_to_gamma,
 )
@@ -161,7 +160,6 @@ __all__ = [
     'rh_nm_to_gamma',
     'analyze_gamma_q2',
     'extrapolate_diffusion_vs_concentration',
-    'gamma_per_measurement',
     # replicate averaging
     'AveragedCorrelogramResult',
     'average_replicate_correlograms',

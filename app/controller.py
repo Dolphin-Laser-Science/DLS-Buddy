@@ -1193,6 +1193,7 @@ class Controller:
                         and self._is_cumulant_replicate_label(r.rh_label)):
                     r.rh_nm = None
                     r.rh_se = None
+                    r.rh_se_estimator = None
                     r.rh_label = ''
                     r.rh_apparent = None
                     r.rh_source = 'computed'
@@ -1915,6 +1916,7 @@ class Controller:
         r.rh_apparent = True
         r.rh_label = label
         r.rh_se = unc.se_or_none(rh_stats.sem)
+        r.rh_se_estimator = None          # a replicate SEM is not a regression SE -> estimator-independent
         # Also snapshot it as a durable Summary Table-2 row (alongside the
         # SampleResult write above), so it persists and reads back in the table.
         self.workspace.upsert_sample_rh_row(SampleRhRow(
@@ -1994,6 +1996,9 @@ class Controller:
             s.a2_mol_mL_per_g2 = res.a2_mol_mL_per_g2
             s.a2_source = 'computed'
             s.a2_se = unc.se_or_none(getattr(res, 'a2_se', None))
+            # Copy the estimator only alongside a real SE -- a source fit sets se_estimator
+            # unconditionally, so guard the orphan case (Clause A; see ResultCandidate.__post_init__).
+            s.a2_se_estimator = getattr(res, 'se_estimator', None) if s.a2_se is not None else None
             s.a2_calibrated = res.calibrated
             a2_cal_note = '' if res.calibrated else '; UNCALIBRATED — arbitrary scale'
             s.a2_label = (
@@ -2016,6 +2021,7 @@ class Controller:
         r.calibrated = True               # trusted value; also clears any stale flag from a prior run
         r.mw_label = 'user-entered'
         r.mw_se = None                    # a hand-entered value carries no statistical SE
+        r.mw_se_estimator = None          # ... and no estimator provenance; clear any stale tag
 
     # --- depolarized light scattering (static, Phase 1) ---
     def compute_depolarization(self, *, i_vv: Optional[float] = None,
@@ -2541,7 +2547,8 @@ class Controller:
                 kind='dls_gamma_q2', is_apparent=True, tier=2,
                 quality=(r2 if np.isfinite(r2) else None), quality_kind='r_squared',
                 source_id=f'gamma_q2@{c}',
-                value_se=unc.se_or_none(getattr(gq, 'rh_se', None))))
+                value_se=unc.se_or_none(getattr(gq, 'rh_se', None)),
+                value_se_estimator=getattr(gq, 'se_estimator', None)))
 
         # tier 3 -- D vs c -> c->0, PER ANGLE (thermodynamic). Done one angle at a
         # time so any q-dependence is not folded into the concentration fit. Needs
@@ -2570,7 +2577,8 @@ class Controller:
                 kind='dls_conc_extrap', is_apparent=False, tier=3,
                 quality=(r2 if np.isfinite(r2) else None), quality_kind='r_squared',
                 source_id=f'conc_extrap@{a}',
-                value_se=unc.se_or_none(getattr(ce, 'rh0_se', None))))
+                value_se=unc.se_or_none(getattr(ce, 'rh0_se', None)),
+                value_se_estimator=getattr(ce, 'se_estimator', None)))
 
         return cands
 
@@ -2591,6 +2599,7 @@ class Controller:
         r.rh_apparent = bool(candidate.is_apparent)
         r.rh_label = candidate.label
         r.rh_se = candidate.value_se
+        r.rh_se_estimator = candidate.value_se_estimator  # copied provenance (invariant-8 Clause A)
 
     def auto_select_rh(self, sample_id: str,
                        fraction: Optional[str] = None) -> Optional[ResultCandidate]:
@@ -2627,6 +2636,7 @@ class Controller:
         r.rh_apparent = bool(is_apparent)
         r.rh_label = 'user-entered'
         r.rh_se = None                    # a hand-entered value carries no statistical SE
+        r.rh_se_estimator = None          # ... and no estimator provenance; clear any stale tag
 
     def _sls_cached(self, kind: str, sample_id: str, fraction: Optional[str], compute):
         """Memoize an SLS candidate/A2 computation for (sample, fraction) under the full
@@ -2722,7 +2732,8 @@ class Controller:
                     kind=f'sls_{method}', is_apparent=False, tier=3,
                     quality=(r2 if np.isfinite(r2) else None),
                     quality_kind='r_squared', source_id=method,
-                    value_se=unc.se_or_none(getattr(res, 'rg_se', None))))
+                    value_se=unc.se_or_none(getattr(res, 'rg_se', None)),
+                    value_se_estimator=getattr(res, 'se_estimator', None)))
 
         # tier 2 -- apparent Debye / Guinier, one per concentration
         for r in nonzero:
@@ -2738,7 +2749,8 @@ class Controller:
                         kind='sls_debye', is_apparent=True, tier=2,
                         quality=(r2 if np.isfinite(r2) else None),
                         quality_kind='r_squared', source_id=f'debye@{c}',
-                        value_se=unc.se_or_none(getattr(d, 'rg_apparent_se', None))))
+                        value_se=unc.se_or_none(getattr(d, 'rg_apparent_se', None)),
+                        value_se_estimator=getattr(d, 'se_estimator', None)))
             except Exception:
                 pass
             try:
@@ -2752,7 +2764,8 @@ class Controller:
                         kind='sls_guinier', is_apparent=True, tier=2,
                         quality=(r2 if np.isfinite(r2) else None),
                         quality_kind='r_squared', source_id=f'guinier@{c}',
-                        value_se=unc.se_or_none(getattr(g, 'rg_se', None))))
+                        value_se=unc.se_or_none(getattr(g, 'rg_se', None)),
+                        value_se_estimator=getattr(g, 'se_estimator', None)))
             except Exception:
                 pass
 
@@ -2773,6 +2786,7 @@ class Controller:
         r.rg_apparent = bool(candidate.is_apparent)
         r.rg_label = candidate.label
         r.rg_se = candidate.value_se
+        r.rg_se_estimator = candidate.value_se_estimator  # copied provenance (invariant-8 Clause A)
 
     def auto_select_rg(self, sample_id: str,
                        fraction: Optional[str] = None) -> Optional[ResultCandidate]:
@@ -2807,6 +2821,7 @@ class Controller:
         r.rg_apparent = bool(is_apparent)
         r.rg_label = 'user-entered'
         r.rg_se = None                    # a hand-entered value carries no statistical SE
+        r.rg_se_estimator = None          # ... and no estimator provenance; clear any stale tag
 
     def sls_mw_candidates(self, sample_id: str,
                           fraction: Optional[str] = None) -> List[ResultCandidate]:
@@ -2858,6 +2873,7 @@ class Controller:
                     quality=(r2 if np.isfinite(r2) else None),
                     quality_kind='r_squared', source_id=method,
                     value_se=unc.se_or_none(getattr(res, 'mw_se', None)),
+                    value_se_estimator=getattr(res, 'se_estimator', None),
                     calibrated=bool(res.calibrated)))
 
         for r in nonzero:
@@ -2881,6 +2897,7 @@ class Controller:
                     quality=(r2 if np.isfinite(r2) else None),
                     quality_kind='r_squared', source_id=f'{kind}@{c}',
                     value_se=unc.se_or_none(getattr(res, 'mw_apparent_se', None)),
+                    value_se_estimator=getattr(res, 'se_estimator', None),
                     calibrated=bool(res.calibrated)))
         return cands
 
@@ -2896,6 +2913,7 @@ class Controller:
         r.mw_apparent = bool(candidate.is_apparent)
         r.mw_label = candidate.label
         r.mw_se = candidate.value_se
+        r.mw_se_estimator = candidate.value_se_estimator  # copied provenance (invariant-8 Clause A)
         # Carry the calibration flag as a real field off the candidate -- never
         # parse it back out of the human-readable label string.
         r.calibrated = candidate.calibrated
@@ -2962,6 +2980,7 @@ class Controller:
                 quality=(r2 if np.isfinite(r2) else None),
                 quality_kind='r_squared', source_id=method,
                 value_se=unc.se_or_none(getattr(res, 'a2_se', None)),
+                value_se_estimator=getattr(res, 'se_estimator', None),
                 calibrated=cal))
         return cands
 
@@ -2980,6 +2999,7 @@ class Controller:
         r.a2_source = 'picked' if explicit else 'computed'
         r.a2_label = candidate.label
         r.a2_se = candidate.value_se
+        r.a2_se_estimator = candidate.value_se_estimator  # copied provenance (invariant-8 Clause A)
         r.a2_calibrated = candidate.calibrated
 
     def auto_select_a2(self, sample_id: str,
@@ -3017,11 +3037,19 @@ class Controller:
         rr = compute_rho(rg_nm=float(r.rg_nm), rh_nm=float(r.rh_nm),
                          rg_se=r.rg_se, rh_se=r.rh_se)
         is_apparent = bool(r.rg_apparent) or bool(r.rh_apparent)
-        # rho_se is a ratio of the Rg and Rh REGRESSION SEs, so it inherits the
-        # selected covariance estimator (a single global setting). Carry that
-        # provenance so an OLS-derived rho ± is never shown unlabeled (invariant 8
-        # clause A). Only meaningful when rho_se exists.
-        rho_estimator = self.settings.se_estimator if rr.rho_se is not None else None
+        # rho_se is a ratio of the Rg and Rh REGRESSION SEs, so it inherits their
+        # covariance estimator. Read that provenance from the STORED per-SE tags on
+        # the SampleResult -- NOT from the current global setting, which may have been
+        # switched since these SEs were computed (the durable bundle is not recomputed
+        # on a switch). Disclose the potentially-under-reporting one: 'ols' if either
+        # input SE is OLS, else 'hc3'; None when rho_se is absent or neither input SE is
+        # a regression SE. Invariant 8 clause A: an OLS-derived rho ± is never shown
+        # unlabeled (see also gui/cross_module.py, which renders this tag).
+        if rr.rho_se is None:
+            rho_estimator = None
+        else:
+            ests = {e for e in (r.rg_se_estimator, r.rh_se_estimator) if e}
+            rho_estimator = 'ols' if 'ols' in ests else ('hc3' if ests else None)
         return SampleRho(
             sample_id=sample_id, rho=rr.rho,
             rg_nm=float(r.rg_nm), rh_nm=float(r.rh_nm),
@@ -3031,11 +3059,6 @@ class Controller:
             shape=rr.shape, rho_se=rr.rho_se, se_estimator=rho_estimator,
             rg_se=unc.se_or_none(r.rg_se), rh_se=unc.se_or_none(r.rh_se),
             notes=rr.notes)
-
-    def samples_pairable_rho(self) -> List[str]:
-        """Sample ids that have both DLS and SLS (rho = Rg/Rh is possible)."""
-        return [sid for sid, s in self.workspace.samples.items()
-                if s.can_pair_rho]
 
     def samples_with_sls(self) -> List[str]:
         """Sample ids with SLS data -- the Cross-Sample universe.
@@ -3167,21 +3190,6 @@ class Controller:
                 "sample has none. Load or assign a c = 0 SLS measurement.")
         res = util.i_sin_theta(meas, mode=mode)
         self.results[('i_sin_theta', sample_id, mode)] = res
-        return res
-
-    def generate_synthetic(self, population_specs: List[Dict[str, float]], **kwargs):
-        """Generate a synthetic correlogram from a list of population specs
-        ({'rh_nm', 'weight', 'spread_cv'}) plus generate_synthetic_correlogram
-        keyword args (angle_deg, wavelength_nm, ... beta, noise_level, n_points,
-        output_form, seed). Returns a SyntheticCorrelogramResult."""
-        pops = [
-            util.SyntheticPopulation(
-                rh_nm=float(p['rh_nm']), weight=float(p['weight']),
-                spread_cv=float(p.get('spread_cv', 0.0)))
-            for p in population_specs
-        ]
-        res = util.generate_synthetic_correlogram(pops, **kwargs)
-        self.results[('synthetic',)] = res
         return res
 
     def export_synthetic(self, result, file_path: str, delay_unit: str = 's') -> str:
@@ -3593,7 +3601,14 @@ class Controller:
         with open(file_path, 'w') as fh:
             # Sanitize non-finite floats to null and forbid the NaN/Infinity tokens
             # (allow_nan=False), so the file is strict, externally-portable JSON.
-            json.dump(_json_sanitize(payload), fh, indent=2, allow_nan=False)
+            # Write compact (no indent): the payload embeds raw correlogram/trace
+            # arrays of thousands of floats, and indent=2 puts each on its own line,
+            # inflating the file ~1.5x. A session is a self-contained data artifact,
+            # not meant for hand-editing; pretty-print on demand with
+            # `python -m json.tool <session>.lsjson`. load_session reads via json.load,
+            # so compact and indented files parse identically.
+            json.dump(_json_sanitize(payload), fh, separators=(',', ':'),
+                      allow_nan=False)
         return file_path
 
     def load_session(self, file_path: str) -> None:
@@ -3638,5 +3653,11 @@ class Controller:
         self._commit_history.clear()
 
     def source_paths(self) -> Dict[str, Optional[str]]:
-        """item_id -> original file path, for an optional reload-from-source."""
+        """item_id -> original file path, for an optional reload-from-source.
+
+        Intentional scaffolding for the Planned reload-from-source feature (see
+        CLAUDE.md "Planned"): the per-measurement ``source_path`` field is already
+        populated and serialized, and this aggregator is the accessor that feature
+        will consume. Kept deliberately though currently uncalled -- not dead code.
+        """
         return {i: m.source_path for i, m in self.workspace.measurements.items()}

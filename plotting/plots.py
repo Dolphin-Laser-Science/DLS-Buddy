@@ -890,7 +890,8 @@ def plot_count_rate_histogram(result, ax: Optional[Any] = None) -> PlotHandles:
     """Count-rate histogram with optional Gaussian/Poisson overlays (a
     trace_analysis.HistogramFitResult). The legend title reports the Fano factor
     (variance/mean in count space): ~1 for ideal shot noise, >1 for excess
-    fluctuations (slow modes, dust)."""
+    fluctuations (slow modes, dust). Each overlay's legend entry carries its
+    reduced chi-square (chi^2_r ~ 1 = a good fit) when the fit was computed."""
     fig, ax, created = _get_ax(ax)
     ifac, i_unit = display_factor('intensity'), display_unit('intensity')
     centers = np.asarray(result.bin_centers, dtype=float) * ifac
@@ -900,13 +901,19 @@ def plot_count_rate_histogram(result, ax: Optional[Any] = None) -> PlotHandles:
     artists = {'hist': ax.bar(centers, counts, width=width, align='center',
                               color=PALETTE['sky'], alpha=0.7)}
     if result.gaussian_curve is not None:
+        g_chi2 = result.gaussian_chi2_reduced
+        g_label = ('Gaussian' if g_chi2 is None
+                   else f'Gaussian ($\\chi^2_r$ = {g_chi2:.2f})')
         artists['gaussian'] = ax.plot(centers, result.gaussian_curve, '-',
                                       color=PALETTE['vermilion'], lw=1.4,
-                                      label='Gaussian')[0]
+                                      label=g_label)[0]
     if result.poisson_curve is not None:
+        p_chi2 = result.poisson_chi2_reduced
+        p_label = ('Poisson' if p_chi2 is None
+                   else f'Poisson ($\\chi^2_r$ = {p_chi2:.2f})')
         artists['poisson'] = ax.plot(centers, result.poisson_curve, '--',
                                      color=PALETTE['green'], lw=1.4,
-                                     label='Poisson')[0]
+                                     label=p_label)[0]
     ax.set_xlabel(f'Count rate ({i_unit})')
     ax.set_ylabel('Frequency')
     ax.legend(frameon=False, fontsize=8,

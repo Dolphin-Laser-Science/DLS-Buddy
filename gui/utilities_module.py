@@ -351,8 +351,9 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.diag_combo.addItems(['Count-rate histogram', 'Block variance'])
         self.diag_combo.setToolTip(
             'Secondary diagnostic plotted below the trace: the count-rate histogram '
-            '(with a Poisson/Fano check) or the block-variance vs block-size curve. '
-            'See the Theory-and-Equations-Guide.')
+            '(with a Poisson/Fano check; the Gaussian/Poisson overlays report their '
+            'reduced chi-square in the legend) or the block-variance vs block-size '
+            'curve. See the Theory-and-Equations-Guide.')
         # Switching the sub-plot type reuses the cached diagnostics (or backgrounds
         # them for a long trace) rather than recomputing on the UI thread.
         self.diag_combo.currentIndexChanged.connect(self._on_diag_view_changed)

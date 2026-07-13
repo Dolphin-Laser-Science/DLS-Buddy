@@ -463,7 +463,20 @@ class ResultCandidate:
     quality_kind: str = ''           # what `quality` means, for display ('r_squared', ...)
     source_id: str = ''              # optional identity for re-selecting (item id / conc)
     value_se: Optional[float] = None # statistical SE of `value` (None if undefined)
+    value_se_estimator: Optional[str] = None  # covariance estimator behind value_se, copied from the
+    #                                  source fit's se_estimator ('hc3'/'ols'); None for a non-regression
+    #                                  SE or no SE. Named value_se_estimator (not se_estimator) so it pairs
+    #                                  with value_se and stays a passthrough, not a primary-fit tag (F-28).
     calibrated: Optional[bool] = None  # None = calibration N/A (Rg/Rh); real flag for scale-dependent SLS Mw/A2
+
+    def __post_init__(self):
+        # An estimator label is meaningless without an SE for it to govern. A source fit sets
+        # se_estimator UNCONDITIONALLY but None-guards its *_se when the point estimate is
+        # non-physical (e.g. a Debye fit with a non-positive q->0 intercept), so a caller may
+        # copy value_se=None beside value_se_estimator='ols'. Drop the orphan tag here so the
+        # "None if no SE" contract holds for every consumer (invariant-8 Clause A).
+        if self.value_se is None:
+            self.value_se_estimator = None
 
 
 def select_default_candidate(

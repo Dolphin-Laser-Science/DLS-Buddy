@@ -9,6 +9,41 @@ window title.
 
 ---
 
+## 1.0.3 — Smaller saved sessions (2026-07-13)
+
+- **Polish:** saved session files (`.lsjson`) are now written compactly instead of
+  pretty-printed. Because a session embeds the raw correlogram and trace data (thousands
+  of numbers), the old one-number-per-line layout inflated the file roughly 1.5×; the new
+  format is about that much smaller and loads a touch faster. Sessions saved by older
+  versions still open unchanged, and the file is still standard JSON — to read one by eye,
+  run `python -m json.tool your-session.lsjson`.
+
+---
+
+## 1.0.2 — Correct uncertainty-estimator label after a mid-session switch (2026-07-13)
+
+- **Fix:** the Cross-Sample ρ = Rg/Rh table's uncertainty-estimator note (`[SE: classical
+  OLS]`) now reflects the estimator that actually produced the stored Rg/Rh ±, not whichever
+  estimator happens to be selected when the table is drawn. Previously, switching the
+  regression-SE estimator (Settings → *Regression SE estimator*) after a value was computed
+  could label an existing ± with the wrong estimator until the analysis was re-run. The point
+  estimates and ± values themselves were always correct; only the estimator *label* could be
+  stale. (The trustworthy fix is still to re-run the analysis under the chosen estimator, which
+  refreshes the ± itself.)
+
+---
+
+## 1.0.1 — Backlog polish (2026-07-13)
+
+- The count-rate histogram diagnostic (Utilities → Traces) now reports each fitted
+  overlay's **reduced chi-square** in its legend (χ²ᵣ ≈ 1 is a good fit), alongside the
+  Gaussian and Poisson curves it already draws — a quick goodness-of-fit read for the
+  shot-noise check.
+- Internal cleanup: removed several built-but-unused functions from the shipped source
+  (no behaviour change).
+
+---
+
 ## 1.0.0 — First stable release (2026-07-13)
 
 The first stable release of DLS Buddy — a general-purpose, instrument-agnostic platform for

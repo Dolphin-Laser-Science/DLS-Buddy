@@ -157,35 +157,6 @@ def _gamma_for_measurement(measurement, gamma_source, tau_min_s, tau_max_s,
         )
 
 
-def gamma_per_measurement(measurements, gamma_source='cumulant', tau_min_s=None,
-                          tau_max_s=None, skip_initial_channels=0,
-                          cumulant_method='linear'):
-    """Per-measurement decay rate Γ (s⁻¹) and scattering vector q (m⁻¹), in INPUT
-    order (no sorting, no ≥2 validation), for populating the GUI's per-measurement
-    table. It reuses the exact per-measurement path the
-    multi-angle/-concentration fits use (`_gamma_for_measurement`), so the tabulated Γ
-    match the fitted points. Failure-tolerant: a measurement whose fit or q can't be
-    computed yields NaN for that entry rather than raising.
-
-    Returns (gamma, q) as float ndarrays aligned with `measurements`.
-    """
-    gammas, qs = [], []
-    for m in measurements:
-        try:
-            g = float(_gamma_for_measurement(
-                m, gamma_source, tau_min_s, tau_max_s,
-                skip_initial_channels, cumulant_method))
-        except Exception:
-            g = float('nan')
-        try:
-            q = float(_measurement_q_m(m))
-        except Exception:
-            q = float('nan')
-        gammas.append(g)
-        qs.append(q)
-    return np.asarray(gammas, dtype=float), np.asarray(qs, dtype=float)
-
-
 def analyze_gamma_q2(
     measurements: List[DLSMeasurement],
     gamma_source: str = 'cumulant',

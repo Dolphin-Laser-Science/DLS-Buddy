@@ -21,8 +21,7 @@ Design (settled with the user)
   parameters and never edit them. Committing can change a sample's identity, so
   the Data module signals the shell to re-group and refresh the sidebar.
 
-All six modules are built and wired here (the old StubModule placeholders in
-gui/stub_module.py are no longer used). The navigation and the
+All six modules are built and wired here. The navigation and the
 load -> confirm -> analyze loop run end to end through the controller.
 """
 

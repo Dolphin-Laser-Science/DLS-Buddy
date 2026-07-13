@@ -275,21 +275,28 @@ class SampleResult:
     mw_apparent: Optional[bool] = None  # True = single-condition (Debye/Guinier/single-angle); False = Zimm/Berry
     mw_label: str = ''                  # plain-language provenance of mw_g_per_mol
     mw_se: Optional[float] = None       # statistical SE (None for user/no-SE sources)
+    mw_se_estimator: Optional[str] = None  # covariance estimator behind mw_se (copied from the
+    #                                        source SLS fit: 'hc3'/'ols'; None for a user/no-SE Mw)
     rg_nm: Optional[float] = None
     rg_source: str = 'computed'
     rg_apparent: Optional[bool] = None  # True = single-conc (Debye/Guinier); False = Zimm/Berry (thermodynamic)
     rg_label: str = ''                  # plain-language provenance of rg_nm (shown in Cross-Sample)
     rg_se: Optional[float] = None
+    rg_se_estimator: Optional[str] = None  # covariance estimator behind rg_se (copied from source; None if no SE)
     a2_mol_mL_per_g2: Optional[float] = None
     a2_source: str = 'computed'
     a2_label: str = ''                  # plain-language provenance of a2_mol_mL_per_g2 (shown in Cross-Sample)
     a2_se: Optional[float] = None
+    a2_se_estimator: Optional[str] = None  # covariance estimator behind a2_se (copied from source; None if no SE)
     a2_calibrated: Optional[bool] = None  # whether the SLS run that filled A2 was calibrated (A2 is scale-dependent)
     rh_nm: Optional[float] = None       # from DLS (infinite-dilution if available)
     rh_source: str = 'computed'
     rh_apparent: Optional[bool] = None  # True = apparent (single q or single c); False = thermodynamic (c->0)
     rh_label: str = ''                  # plain-language provenance of rh_nm (shown in Cross-Sample)
     rh_se: Optional[float] = None
+    rh_se_estimator: Optional[str] = None  # covariance estimator behind rh_se for a REGRESSION source
+    #                                        (gamma_q2/conc_extrap); None for the replicate-average SEM
+    #                                        (not a regression SE) or a hand-entered Rh
     calibrated: Optional[bool] = None   # whether the SLS run that filled Mw was calibrated
     notes: str = ''
 

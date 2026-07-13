@@ -564,33 +564,6 @@ def _reliability_comment(result, reliable: bool = True) -> str:
     return ''
 
 
-def export_rayleigh_ratio(result, file_path: str, delimiter: str = ',') -> str:
-    """Export an excess Rayleigh ratio (RayleighRatioResult).
-
-    If the result is uncalibrated, the dR and Kc/dR columns carry an
-    "uncalibrated, arbitrary scale" note in their Comments header row (no extra
-    rows, so the Origin import is unaffected). A calibrated result is the default
-    and is left unmarked.
-    """
-    scale_note = _scale_note(result.calibrated)
-    columns = [
-        OriginColumn('Angle', 'deg', '', np.asarray(result.angles_deg, dtype=float)),
-        OriginColumn('q', 'nm^-1', 'scattering vector', np.asarray(result.q_nm_inv, dtype=float)),
-        OriginColumn('q^2', 'nm^-2', '', np.asarray(result.q2_nm2, dtype=float)),
-        OriginColumn('Excess Rayleigh ratio', 'cm^-1', scale_note or 'dR(theta)',
-                     np.asarray(result.excess_rayleigh_cm_inv, dtype=float)),
-        OriginColumn('Kc/dR', 'mol/g', scale_note or 'Zimm ordinate',
-                     np.asarray(result.kc_over_dR_mol_per_g, dtype=float)),
-        _scalar_column('Concentration', 'g/mL', result.concentration_g_per_mL),
-        _scalar_column('Optical constant K', 'mol cm^2/g^2', result.optical_constant_K),
-        _scalar_column('k_c used', 'cm^-1/intensity', result.k_c_used),
-        _scalar_column('RI correction', '', result.ri_correction),
-        _scalar_column('dn/dc', 'mL/g', result.dn_dc_mL_per_g),
-        _scalar_column('Temperature', 'K', result.temperature_K),
-    ]
-    return write_origin_csv(file_path, columns, delimiter)
-
-
 def export_debye(result, file_path: str, delimiter: str = ',') -> str:
     """Export a single-concentration Debye analysis (DebyeResult, apparent).
 
@@ -715,7 +688,7 @@ def export_zimm(rayleigh_results, zimm_result, file_path: str,
 
     If the run is uncalibrated, the Kc/dR ordinate columns and both intercept
     columns (Kc/dR-scale) carry the "uncalibrated, arbitrary scale" note in their
-    Comments header, exactly as the sibling Rayleigh exporters do -- no extra rows,
+    Comments header, exactly as the sibling Rayleigh exporter does -- no extra rows,
     so the Origin import is unaffected. Rg still survives (slope-derived).
 
     Parameters
@@ -742,7 +715,7 @@ def export_zimm(rayleigh_results, zimm_result, file_path: str,
 
     # The Kc/dR ordinate and both extrapolated intercepts are on the excess-Rayleigh
     # scale, so an uncalibrated run makes them arbitrary-scale -- stamp the same note
-    # the sibling Rayleigh exporters use (export_rayleigh_ratio/_series), no extra rows.
+    # the sibling Rayleigh exporter uses (export_rayleigh_series), no extra rows.
     # Rg survives an uncalibrated Zimm (slope-derived), so the export is still useful;
     # the marker just prevents a re-import to Origin being mistaken for absolute scale.
     scale_note = _scale_note(all(r.calibrated for r in samples))

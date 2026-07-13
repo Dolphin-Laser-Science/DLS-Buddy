@@ -64,10 +64,6 @@ def set_tooltips_enabled(on: bool) -> None:
     _TooltipGate.enabled = bool(on)
 
 
-def tooltips_enabled() -> bool:
-    return _TooltipGate.enabled
-
-
 # ---------------------------------------------------------------------------
 # The "?" help badge
 # ---------------------------------------------------------------------------
@@ -131,13 +127,6 @@ class HelpBadge(QtWidgets.QToolButton):
         if ev.type() == QtCore.QEvent.Type.PaletteChange:
             self._apply_palette()
         super().changeEvent(ev)
-
-    def setHelp(self, text: str = '', *, bullets: Optional[Sequence[str]] = None) -> None:
-        html = text or ''
-        if bullets:
-            html = (html + _bullets(bullets)) if html else _bullets(bullets)
-        self._html = html
-        self.setToolTip(html)
 
     def _popup(self) -> None:
         # Programmatic show — independent of the passive-tooltip gate, so the badge is
