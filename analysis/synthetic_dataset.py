@@ -575,3 +575,95 @@ def write_parameters_txt(out_dir: str, profile_name: str,
     with open(path, 'w', encoding='utf-8') as fh:
         fh.write('\n'.join(lines) + '\n')
     return path
+
+
+# ===========================================================================
+# Alpha-selection gap-case dataset (stresses CONTIN's regularization selector)
+# ===========================================================================
+# Correlograms the Clean/Messy homologous series lacks: a broad/polydisperse
+# unimodal, a closely-spaced bimodal, and a well-separated bimodal at three noise
+# levels. They exercise CONTIN alpha selection (GCV / L-curve / F-test) on the hard
+# inversion cases -- a broad mode that legitimately needs heavier smoothing, and
+# noisy bimodals a poor selector over-smooths into a single peak. (name, populations,
+# noise level, seed, sample label.)
+ALPHA_SELECTION_CASES = [
+    ('DLS - Broad unimodal (Rh 50nm, CV 0.5)',
+     [SyntheticPopulation(rh_nm=50.0, weight=1.0, spread_cv=0.5)],
+     0.003, 101, 'Broad unimodal in Water'),
+    ('DLS - Close bimodal (40nm + 90nm)',
+     [SyntheticPopulation(rh_nm=40.0, weight=1.0),
+      SyntheticPopulation(rh_nm=90.0, weight=1.0)],
+     0.003, 102, 'Close bimodal in Water'),
+    ('DLS - Wide bimodal (30nm + 200nm) noise 0.001',
+     [SyntheticPopulation(rh_nm=30.0, weight=1.0),
+      SyntheticPopulation(rh_nm=200.0, weight=1.0)],
+     0.001, 111, 'Wide bimodal in Water, noise 0.001'),
+    ('DLS - Wide bimodal (30nm + 200nm) noise 0.003',
+     [SyntheticPopulation(rh_nm=30.0, weight=1.0),
+      SyntheticPopulation(rh_nm=200.0, weight=1.0)],
+     0.003, 113, 'Wide bimodal in Water, noise 0.003'),
+    ('DLS - Wide bimodal (30nm + 200nm) noise 0.010',
+     [SyntheticPopulation(rh_nm=30.0, weight=1.0),
+      SyntheticPopulation(rh_nm=200.0, weight=1.0)],
+     0.010, 120, 'Wide bimodal in Water, noise 0.010'),
+]
+
+
+def generate_alpha_selection_dataset(out_dir: str) -> List[str]:
+    """Regenerate the alpha-selection gap-case set (test-data/Synthetic Alpha-Selection/).
+
+    Writes one loadable ALV ``.ASC`` per :data:`ALPHA_SELECTION_CASES` entry (same
+    format and system as the Clean/Messy sets: PEG-in-water optics at 532 nm, all
+    angles + a count-rate trace per file) plus a ``parameters.txt``. Fixed seeds, so
+    re-running reproduces the same bytes. Returns the file paths written.
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+    written: List[str] = []
+    for stem, pops, noise, seed, label in ALPHA_SELECTION_CASES:
+        dls = build_multi_angle_dls(
+            pops, angles_deg=DEFAULT_DLS_ANGLES, wavelength_nm=DEFAULT_WAVELENGTH_NM,
+            solvent_refractive_index=DEFAULT_N_SOLVENT, temperature_K=DEFAULT_TEMPERATURE_K,
+            viscosity_Pa_s=DEFAULT_VISCOSITY_PA_S, noise_level=noise, trace_cv=0.03,
+            drift=0.0, spikes=0, label=label,
+            concentration_g_per_mL=DEFAULT_DLS_SINGLE_MG * 1e-3, seed=seed)
+        written.append(write_alv_asc(
+            os.path.join(out_dir, stem + '.ASC'), dls, viscosity_cp=DEFAULT_VISCOSITY_CP))
+    written.append(_write_alpha_selection_parameters(out_dir))
+    return written
+
+
+def _write_alpha_selection_parameters(out_dir: str) -> str:
+    """Human-readable parameters.txt for the alpha-selection gap-case set."""
+    import os
+    lines = [
+        'DLS Buddy — Synthetic Alpha-Selection test data', '=' * 50, '',
+        'DLS correlograms that stress CONTIN\'s regularization-parameter (alpha)',
+        'selection. Same optical system as the Clean/Messy sets (PEG-in-water,',
+        '532 nm); load the .ASC files exactly as those (all angles are in one file;',
+        'analyze the ~90 deg angle). Enter polymer name + solvent (water); temperature,',
+        'viscosity, refractive index and wavelength are read from the file.', '',
+        'GLOBAL PARAMETERS (Data-tab confirmation step):',
+        f'  Solvent refractive index: {DEFAULT_N_SOLVENT}',
+        f'  Viscosity               : {DEFAULT_VISCOSITY_CP} cP',
+        f'  Temperature             : {DEFAULT_TEMPERATURE_C} C',
+        f'  Wavelength              : {DEFAULT_WAVELENGTH_NM:g} nm', '',
+        'CASES (ground truth — what the distribution methods should recover):', '',
+        '  Broad unimodal            : single mode, median Rh = 50 nm, log-normal',
+        '                              CV 0.5 (broad). Needs heavier smoothing; a good',
+        '                              selector keeps ONE peak and does not under-smooth.',
+        '  Close bimodal             : 40 + 90 nm (~2x separation, near the resolution',
+        '                              limit) — the hard inversion case.',
+        '  Wide bimodal (x3)         : 30 + 200 nm at noise 0.001 / 0.003 / 0.010.',
+        '                              A good selector keeps TWO peaks even at 0.010;',
+        '                              an over-smoothing one merges them into a single',
+        '                              intermediate peak.', '',
+        'Use CONTIN and compare the GCV (default), L-curve, and F-test selectors',
+        '(DLS tab -> Distribution -> CONTIN alpha selection). GCV is the robust default;',
+        'the L-curve tends to smooth more heavily on this kernel. See the',
+        'Theory-and-Equations-Guide (CONTIN) for the methods.',
+    ]
+    path = os.path.join(out_dir, 'parameters.txt')
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    return path

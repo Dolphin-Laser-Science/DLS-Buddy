@@ -175,6 +175,11 @@ class SLSModule(QtWidgets.QWidget):
         # _run_method, or None when nothing exportable is shown. Wrapping it lets the
         # one export button serve every method without the handler re-deriving state.
         self._export: Optional[Tuple[str, object]] = None
+        # The single concentration the current debye/guinier plot was drawn for. The
+        # click-to-mask hit-test must use THIS, not a fresh conc_combo read: the combo
+        # stays enabled for debye/guinier and changing it doesn't redisplay, so a live
+        # read would mask a point on a concentration that isn't on screen (F-36).
+        self._plotted_conc: object = None
         self._zimm_k = 1.0              # Zimm grid spacing, shared with the overlay
         # Unmasked Rayleigh series from the last run, keyed by (sample, fraction):
         # the masked-point overlay and click hit-testing read this instead of
@@ -253,6 +258,12 @@ class SLSModule(QtWidgets.QWidget):
         self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
         left.addWidget(self.flag_label)
+        # Passive ⓘ notices carried on the result (e.g. dropped non-positive points) —
+        # a neutral qualifier tier, separate from the severity-tracking flag_label above.
+        # The analysis emits the same text via warnings.warn (keep-both).
+        self.notes_label = ThemedLabel('', size=11)
+        self.notes_label.setWordWrap(True)
+        left.addWidget(self.notes_label)
 
         self.figure = Figure(figsize=(5.5, 4.6))
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
@@ -277,6 +288,9 @@ class SLSModule(QtWidgets.QWidget):
                                  '"Per-sample calibration" only to override one sample.',
                                  'Rg and the calibration-free product survive without '
                                  'calibration; Mw and absolute A₂ do not.',
+                                 'A standard temperature <b>outside 10–50 °C</b> is '
+                                 'flagged: the toluene Rayleigh-ratio correction is '
+                                 'extrapolated beyond its validated table there.',
                              ])
         form = QtWidgets.QFormLayout(box)
         _adapt_form(form)      # wrap long rows + grow fields so nothing clips
@@ -317,6 +331,16 @@ class SLSModule(QtWidgets.QWidget):
         # "Calibration k_c" — distinct from the Zimm spacing k: k_c is
         # the Rayleigh-ratio-per-intensity calibration constant, not the q²+k·c grid k.
         form.addRow('Calibration k_c:', self.kc_label)
+
+        # Neutral ⓘ note next to k_c: fires when the standard temperature is outside the
+        # 10–50 °C toluene Rayleigh table (extrapolated k_c). The physics layer emits the
+        # same text via warnings.warn (keep-both, audit F-04-GUI).
+        self.cal_temp_note = ThemedLabel('', size=11)
+        self.cal_temp_note.setWordWrap(True)
+        self.cal_temp_note.setToolTip(
+            'Shown when the standard temperature is outside 10–50 °C: the toluene '
+            'Rayleigh-ratio correction is extrapolated beyond its validated table.')
+        form.addRow('', self.cal_temp_note)
 
         self.apply_button = QtWidgets.QPushButton('Update')
         self.apply_button.clicked.connect(self._on_apply)
@@ -361,7 +385,10 @@ class SLSModule(QtWidgets.QWidget):
         self.method_combo.setToolTip(
             'Zimm / Berry: thermodynamic Mw, Rg and A₂ (extrapolated to zero angle and '
             'zero concentration). Debye / Guinier / single-angle: apparent (one '
-            'condition). Calibration-free 2·A₂·Mw needs no calibration.')
+            'condition). Calibration-free 2·A₂·Mw needs no calibration. '
+            'Excess Rayleigh ratio: ΔR vs angle for each concentration (arbitrary '
+            'scale if uncalibrated) — the measured scattering itself, not a fitted '
+            'Mw/Rg.')
         self.method_combo.currentIndexChanged.connect(self._on_method_changed)
         form.addRow('Method:', self.method_combo)
 
@@ -535,6 +562,9 @@ class SLSModule(QtWidgets.QWidget):
         self.depol_note.clear()
 
     def _on_compute_depol(self) -> None:
+        if runner().is_busy:              # cabannes_corrected_mw reads SampleResult
+            busy_notice(self)             # fields a background Zimm fit writes non-atomically
+            return
         mode = self.depol_mode_combo.currentData()
         try:
             if mode == 'ratio':
@@ -661,11 +691,11 @@ class SLSModule(QtWidgets.QWidget):
             self._populate_mask_lists()
             self._refresh_mw_display()
             # Redisplay the last analysis run on this (sample, fraction) from its cache
-            # (no recompute); otherwise show a blank plot.
+            # (no recompute); otherwise show the pre-run placeholder.
             if (self.sample_id, self._fraction) in self._last_run_by_sample:
                 self._redisplay_cached(self.sample_id, self._fraction)
             else:
-                self._clear_plot()
+                self._clear_plot('Press Run to see the Zimm/Debye plot.')
         else:
             self._populate_fraction_combo()   # clears it
             self._populate_mask_lists()       # clears the lists
@@ -774,11 +804,22 @@ class SLSModule(QtWidgets.QWidget):
         self.flag_label.setToolTip('')
         self.flag_label.setRole('error')   # reset the tier so a stale qualifier
         self.flag_label.setBold(True)      # color never survives a state switch
+        set_flag(self.notes_label, '', problem=False)   # drop stale result notes
+        # The Export button + closure are bound to a specific (sample, fraction)'s
+        # result. Reset them on EVERY state switch, not only the not-runnable branch:
+        # switching to a runnable-but-never-run sample/fraction must not leave the
+        # button enabled over a blank plot, firing the PREVIOUS sample's export (F-34).
+        # A cache redisplay or a fresh run re-enables it (_redisplay_cached / done).
+        self._disable_export()
         if not runnable:
-            self.export_button.setEnabled(False)
-            self._export = None
             self.status.clear()
-            self._clear_plot()
+            self._clear_plot('Load SLS intensities to see the Zimm/Debye plot.')
+
+    def _disable_export(self) -> None:
+        """Unbind the Export button from any prior result (no result is on screen).
+        The redisplay/run paths re-enable it once a result is drawn."""
+        self.export_button.setEnabled(False)
+        self._export = None
 
     # ------------------------------------------------------------ fraction ---
     def _populate_fraction_combo(self) -> None:
@@ -806,13 +847,15 @@ class SLSModule(QtWidgets.QWidget):
         self._fraction = self.fraction_combo.currentData()
         self._ran = False
         self._run_epoch += 1             # drop any in-flight fit for the old fraction
+        self._disable_export()           # unbind the prior fraction's export (F-34);
+                                         # a cache redisplay below re-enables it
         self._populate_axis_selectors()
         self._populate_mask_lists()
         self._refresh_mw_display()
         if (self.sample_id, self._fraction) in self._last_run_by_sample:
             self._redisplay_cached(self.sample_id, self._fraction)
         else:
-            self._clear_plot()
+            self._clear_plot('Press Run to see the Zimm/Debye plot.')
 
     def _populate_axis_selectors(self) -> None:
         frac = self._fraction
@@ -845,6 +888,10 @@ class SLSModule(QtWidgets.QWidget):
     @QtCore.Slot(bool)
     def _on_per_sample_toggled(self, checked: bool) -> None:
         if self._suppress_cal or self.sample_id is None:
+            return
+        if runner().is_busy:              # disable_sample_calibration pops the
+            busy_notice(self)             # COMMITTED dict a running fit reads
+            self._sync_calibration_scope()   # revert the checkbox to committed state
             return
         if checked:
             self.controller.enable_sample_calibration(self.sample_id)
@@ -883,6 +930,8 @@ class SLSModule(QtWidgets.QWidget):
         sid = self.sample_id
         scope = ('per-sample' if (sid is not None
                  and self.controller.has_sample_calibration(sid)) else 'session')
+        set_flag(self.cal_temp_note,
+                 self.controller.preview_calibration_note(sid) or '', problem=False)
         try:
             preview = self.controller.preview_k_c(sid)
         except Exception as exc:
@@ -1129,6 +1178,7 @@ class SLSModule(QtWidgets.QWidget):
         c = self.controller
         sig = c.settings.no_uncertainty_sig_figs    # ±-less results (R², qRg, single-angle Mw)
         self._export = None
+        self._plotted_conc = conc           # the conc this plot is drawn for (F-36)
         self.flag_label.setToolTip('')      # cleared per display; set per-method below
         if method in ('zimm', 'berry'):
             rr = payload['rr']
@@ -1271,6 +1321,12 @@ class SLSModule(QtWidgets.QWidget):
                 '' if calibrated else
                 'uncalibrated: ΔR is on an arbitrary scale.',
                 problem=not calibrated)
+        # Passive ⓘ result notes (uniform across every method that returns a result —
+        # rayleigh carries a per-c series, not a scalar result, so it has none). One
+        # render site, tolerant getattr, so no method branch can silently drop them.
+        res_for_notes = payload.get('res')
+        notes = getattr(res_for_notes, 'notes', ()) if res_for_notes is not None else ()
+        set_flag(self.notes_label, '\n'.join(notes), problem=False)
         self._overlay_masked(method, sid)
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)      # single-angle method leaves ax None
@@ -1326,7 +1382,8 @@ class SLSModule(QtWidgets.QWidget):
                     pts.append((cc, float(ang),
                                 float(r.q2_nm2[i]) + self._zimm_k * cc, yy))
         elif method in ('debye', 'guinier'):
-            cc = self.conc_combo.currentData()
+            cc = self._plotted_conc          # the conc actually plotted, not a live
+                                             # conc_combo read (F-36)
             r = next((x for x in full if x.concentration_g_per_mL == cc), None)
             if r is not None:
                 for i, ang in enumerate(r.angles_deg):
@@ -1483,7 +1540,7 @@ class SLSModule(QtWidgets.QWidget):
         self.figure.clf()
         self.ax = self.figure.add_subplot(1, 1, 1)
 
-    def _clear_plot(self) -> None:
+    def _clear_plot(self, message: Optional[str] = None) -> None:
         if self.ax is not None:
             try:
                 self.ax.set_xscale('linear')
@@ -1491,6 +1548,21 @@ class SLSModule(QtWidgets.QWidget):
                 pass
         self.figure.clf()
         self.ax = None
+        if message:
+            # Empty-state placeholder — FIGURE-level text (no Axes), and deliberately
+            # unlike the other tabs' placeholders. DDLS (`_clear`) and the Utilities
+            # sub-plots draw their message on a *persistent* axis they `.clear()` and
+            # reuse; SLS can't follow that pattern, because it recreates its axis on every
+            # real draw (`_setup_axes` → `clf()`+`add_subplot`) and holds `self.ax = None`
+            # while empty (the canvas click-guard `_on_canvas_click` relies on that).
+            # `figure.text` preserves the `None` contract AND creates no Axes — which
+            # matters: an earlier cut drew this via `clf()`+`add_subplot`, and recreating
+            # an Axes on every empty-state refresh churned matplotlib/Agg teardown enough
+            # that, across the many windows the gui-smoke suite builds, it tripped a Qt
+            # heap fault (0xc0000374, surfacing later in an unrelated test). `figure.text`
+            # leaves at most one Text artist (wiped by the next `clf()`), zero Axes.
+            # Neutral mpl grey (Qt theme tokens don't reach a Matplotlib canvas).
+            self.figure.text(0.5, 0.5, message, ha='center', va='center', color='#999')
         self.canvas.draw_idle()
         if hasattr(self, 'axis_bar'):
             self.axis_bar.attach(None)

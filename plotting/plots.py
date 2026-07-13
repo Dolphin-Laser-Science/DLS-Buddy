@@ -589,7 +589,7 @@ def plot_lcurve(lcurve, ax: Optional[Any] = None) -> PlotHandles:
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlabel(r'Residual norm $\|A x - y\|^2$')
-    ax.set_ylabel(r'Solution norm $\|x\|^2$')
+    ax.set_ylabel(r'Solution seminorm $\|L x\|^2$')
     ax.legend(frameon=False, fontsize=9)
     return PlotHandles(fig, ax, artists)
 

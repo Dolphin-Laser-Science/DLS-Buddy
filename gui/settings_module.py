@@ -40,6 +40,18 @@ _PLOT_UNIT_ROWS = [
 ]
 
 
+def _seed_combo(combo: QtWidgets.QComboBox, value, *, use_data: bool) -> None:
+    """Select ``value`` in ``combo`` (by data or text). If it isn't a current item —
+    e.g. a hand-edited settings.json, or a solvent later dropped from the library —
+    insert it as an extra entry rather than silently falling back to a different one,
+    so an untouched Apply writes the same value back instead of replacing it."""
+    idx = combo.findData(value) if use_data else combo.findText(value)
+    if idx < 0:
+        combo.addItem(str(value), value if use_data else None)
+        idx = combo.count() - 1
+    combo.setCurrentIndex(idx)
+
+
 class SettingsModule(QtWidgets.QWidget):
     """Editor for the global SettingsState (seed defaults + appearance)."""
 
@@ -271,15 +283,12 @@ class SettingsModule(QtWidgets.QWidget):
             rh_grid_min_nm=s.rh_grid_min_nm, rh_grid_max_nm=s.rh_grid_max_nm,
             rh_grid_points=s.rh_grid_points,
             lcurve_alpha_min=s.lcurve_alpha_min, lcurve_alpha_max=s.lcurve_alpha_max)
-        i = self.cumulant_method.findData(s.cumulant_method)
-        self.cumulant_method.setCurrentIndex(i if i >= 0 else 0)
+        _seed_combo(self.cumulant_method, s.cumulant_method, use_data=True)
         self.skip_channels.setValue(s.skip_initial_channels)
         self.geometry.setCurrentText(s.standard_geometry)
         self.qrg_max.setValue(s.guinier_qrg_max)
-        k = self.default_solvent.findText(s.default_solvent)
-        self.default_solvent.setCurrentIndex(k if k >= 0 else 0)
-        j = self.se_estimator.findData(s.se_estimator)
-        self.se_estimator.setCurrentIndex(j if j >= 0 else 0)
+        _seed_combo(self.default_solvent, s.default_solvent, use_data=False)
+        _seed_combo(self.se_estimator, s.se_estimator, use_data=True)
         for q, combo in self.plot_unit_combos.items():
             combo.setCurrentText(s.plot_units.get(q, U.default_unit(q)))
         self.no_unc_sig_figs.setValue(s.no_uncertainty_sig_figs)
@@ -289,8 +298,7 @@ class SettingsModule(QtWidgets.QWidget):
         self.theme.setCurrentText(s.theme)
         self.palette.setCurrentText(s.plot_palette)
         self.plot_match_theme.setChecked(s.plot_match_theme)
-        d = self.ui_density.findData(s.ui_density)
-        self.ui_density.setCurrentIndex(d if d >= 0 else 1)
+        _seed_combo(self.ui_density, s.ui_density, use_data=True)
         self.show_tooltips.setChecked(s.show_tooltips)
         self.reopen_last_session.setChecked(s.reopen_last_session)
 

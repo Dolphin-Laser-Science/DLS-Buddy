@@ -208,6 +208,14 @@ class CalibrationState:
             self.calibrant_intensity, self.calibrant_angle_deg, r_std,
             dark_count_rate=self.dark_count_rate)
 
+    def temperature_extrapolation_note(self) -> Optional[str]:
+        """The toluene Rayleigh-ratio extrapolation note for this standard temperature,
+        or None if it is inside the S&K 10-50 C table. Keys purely off the standard
+        temperature (the standard is toluene throughout, and compute_k_c always calls
+        rayleigh_ratio_toluene), so it surfaces even before a calibrant intensity is
+        entered. The GUI renders it next to k_c (audit F-04-GUI)."""
+        return phys.toluene_temperature_extrapolation_reason(self.standard_temperature_C)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             'calibrant_intensity': self.calibrant_intensity,
@@ -304,8 +312,8 @@ class SampleRho:
     rh_nm: float
     rg_label: str
     rh_label: str
-    rg_source: str               # 'computed' or 'user'
-    rh_source: str               # 'computed' or 'user'
+    rg_source: str               # 'computed' | 'picked' | 'user'
+    rh_source: str               # 'computed' | 'picked' | 'user'
     is_apparent: bool
     interpretation: str
     shape: str = ''              # concise architecture label (e.g. 'random coil')
@@ -315,6 +323,11 @@ class SampleRho:
     rg_se: Optional[float] = None   # regression SE of Rg (None if Rg has no honest ±),
     rh_se: Optional[float] = None   # and of Rh — carried so the display can round each
     #                                 value to the place its own σ supports (invariant 8)
+    # Passive ⓘ notices from the underlying RhoResult (e.g. Rg/Rh sample keys disagree).
+    # Structurally empty in the cross-sample path (Rg and Rh come from ONE SampleResult,
+    # so no keys are compared) — carried for a uniform surface + future cross-sample
+    # pairing. Same text also emitted via warnings.warn (keep-both).
+    notes: tuple = ()
 
 
 @dataclass
@@ -369,7 +382,10 @@ class Controller:
         # settings.json at the repo root (or defaults if absent). "Seed, never
         # override": GUI controls initialize from these, analysis methods fall back
         # to them when the caller passes None; the per-run value still wins.
-        self.settings = SettingsState.load()
+        # load_with_report also returns any invalid saved settings that were reverted to
+        # defaults, so the GUI can tell the user at startup (the controller stays Qt-free and
+        # holds only the plain list). Empty on the ordinary absent/valid-file cases.
+        self.settings, self.settings_load_problems = SettingsState.load_with_report()
         # Session-wide calibration (the default for every sample). Its geometry is
         # SEEDED from settings -- i.e. it is the starting value for a fresh session;
         # the user still edits it in the SLS calibration panel per their instrument.
@@ -622,6 +638,20 @@ class Controller:
             if field in allowed:
                 lm.working_params[src_key] = 'user'
 
+    def clear_library_solvent_field(self, item_id: str, field: str) -> None:
+        """Drop a solvent field's value + ``'library:primary'`` tag sample-wide when
+        the user clears the cell -- but only where the tag IS library (never disturbs a
+        ``'user'`` field). Mirrors the stale-value auto-clear in
+        ``autofill_solvent_props`` so a cleared library cell can't keep advertising a
+        library value (its provenance dot) on an EMPTY safety-critical cell. A later
+        solvent/temperature/wavelength change re-derives it -- autofill is blocked only
+        by a ``'user'`` tag, not by the absence of one, so dropping the tag is safe."""
+        if field not in self._SOLVENT_SOURCE_KEYS:
+            raise KeyError(f"{field!r} is not a solvent-autofill field.")
+        sid = self._sample_id_of(item_id)
+        targets = self._item_ids_in_sample(sid) if sid is not None else [item_id]
+        self._write_solvent_field(targets, field, None, None, only_if_library=True)
+
     def reautofill_after(self, item_id: str, changed_key: str) -> Optional[dict]:
         """Re-derive n/viscosity when the solvent, temperature, or wavelength
         changes. Returns the autofill status, or None if ``changed_key`` is not a
@@ -734,7 +764,8 @@ class Controller:
         """Which sample currently contains this measurement (by committed grouping)."""
         for sid, s in self.workspace.samples.items():
             if (item_id in s.dls_item_ids or item_id in s.sls_item_ids
-                    or item_id == s.solvent_reference_item_id):
+                    or item_id == s.solvent_reference_item_id
+                    or item_id in s.extra_solvent_reference_item_ids):
                 return sid
         return None
 
@@ -743,6 +774,7 @@ class Controller:
         ids = list(s.dls_item_ids) + list(s.sls_item_ids)
         if s.solvent_reference_item_id:
             ids.append(s.solvent_reference_item_id)
+        ids += list(s.extra_solvent_reference_item_ids)
         return ids
 
     def dirty_keys(self, item_id: str) -> List[str]:
@@ -899,8 +931,21 @@ class Controller:
 
     @staticmethod
     def _commit_calibration(cal: CalibrationState) -> None:
-        """Recompute k_c in place (so working and its committed copy agree)."""
-        cal.k_c = cal.compute_k_c()
+        """Recompute k_c in place (so working and its committed copy agree).
+
+        compute_k_c() can raise ValueError -- an unspecified/invalid geometry
+        (audit F-05) or an unsupported standard wavelength. (An out-of-range standard
+        temperature only WARNS and still computes -- audit F-04 -- so it does not
+        reach here.) Treat a raise like compute_k_c's own "not enough info" case and
+        commit k_c = None (uncomputable -> the result is flagged uncalibrated), rather
+        than letting it crash the Update handler -- the preview surface (preview_k_c)
+        has already shown the user the specific reason before they commit. Fail-loud
+        on the preview, degrade gracefully on commit.
+        """
+        try:
+            cal.k_c = cal.compute_k_c()
+        except ValueError:
+            cal.k_c = None
 
     def undo_to_committed(self) -> None:
         """Discard all un-committed edits (working <- committed)."""
@@ -998,6 +1043,11 @@ class Controller:
 
     def committed_k_c(self, sample_id: Optional[str] = None) -> Optional[float]:
         return self._committed_calibration(sample_id).k_c
+
+    def preview_calibration_note(self, sample_id: Optional[str] = None) -> Optional[str]:
+        """The toluene-temperature extrapolation note for the working calibration in
+        scope, or None. Mirrors preview_k_c; the GUI surfaces it next to k_c (F-04-GUI)."""
+        return self._working_calibration(sample_id).temperature_extrapolation_note()
 
     # ---- per-sample calibration override (session-wide is the default) ----
     def has_sample_calibration(self, sample_id: str) -> bool:
@@ -1134,10 +1184,11 @@ class Controller:
                 or (r.source_kind == 'replicate_avg'
                     and str(r.source_set).split('|')[0] == 'cumulant'))}
         # 4. reset a SampleResult Rh that came from a cumulant replicate average,
-        #    never overwriting a hand-entered (user) value.
+        #    never overwriting a hand-entered ('user') or explicitly-picked ('picked')
+        #    value -- an explicit pick is a deliberate choice, protected like a manual one.
         for sample in self.workspace.samples.values():
             for r in sample.fraction_results.values():
-                if (r.rh_source != 'user'
+                if (r.rh_source not in ('user', 'picked')
                         and r.rh_nm is not None
                         and self._is_cumulant_replicate_label(r.rh_label)):
                     r.rh_nm = None
@@ -1851,11 +1902,11 @@ class Controller:
     def _write_replicate_rh(self, sample_id: str, fraction: Optional[str],
                             rh_stats, method: str):
         """Write the replicate-averaged Rh +/- SE into the sample, respecting a
-        user override. Returns (written, skip_reason)."""
+        user override or explicit pick. Returns (written, skip_reason)."""
         r = self.workspace.samples[sample_id].result_for(fraction)
-        if r.rh_source == 'user' and r.rh_nm is not None:
-            return False, ("the sample already has a hand-entered Rh, which is not "
-                           "overwritten.")
+        if r.rh_source in ('user', 'picked') and r.rh_nm is not None:
+            return False, ("the sample already has a hand-entered or explicitly-picked "
+                           "Rh, which is not overwritten.")
         label = (f"DLS replicate average ({rh_stats.n} runs, {method}); "
                  f"± = SD/√N across runs (ISO 22412)")
         r.rh_nm = float(rh_stats.mean)
@@ -1920,7 +1971,7 @@ class Controller:
         self.results[('zimm', sample_id, method, fraction)] = res
         # attach Mw/Rg/A2 to this fraction's sample result, marking provenance.
         s = self.workspace.samples[sample_id].result_for(fraction)
-        if s.mw_source != 'user':       # never clobber a manual Mw
+        if s.mw_source not in ('user', 'picked'):   # never clobber a manual or picked Mw
             s.mw_g_per_mol = res.mw_g_per_mol
             s.mw_source = 'computed'
             s.calibrated = res.calibrated
@@ -1929,14 +1980,14 @@ class Controller:
             s.mw_label = (
                 f"{method.capitalize()} extrapolation, {n_conc} concentrations "
                 f"(thermodynamic{cal_note})")
-        if s.rg_source != 'user':       # nor a manual Rg
+        if s.rg_source not in ('user', 'picked'):   # nor a manual or picked Rg
             s.rg_nm = res.rg_nm
             s.rg_source = 'computed'
             s.rg_apparent = res.is_apparent      # False: Zimm/Berry are thermodynamic
             s.rg_label = (
                 f"{method.capitalize()} extrapolation, {n_conc} concentrations "
                 f"(thermodynamic, R² = {_fmt_r2(float(res.r_squared))})")
-        if s.a2_source != 'user':       # nor a hand-set A2 (reserved external path)
+        if s.a2_source not in ('user', 'picked'):   # nor a hand-set (reserved) or picked A2
             # Write the whole A2 bundle atomically, mirroring set_sample_a2 — an SE,
             # calibration flag and label must never be left stale beside a new value
             # (invariant 8: a uncertainty never travels with the wrong estimate).
@@ -2141,7 +2192,7 @@ class Controller:
         if model in ('sphere', 'both'):
             out['sphere'] = depol_engine.sphere_dimensions_from_diffusion(
                 res.d_t_m2_s, res.d_r_rad2_s, temperature_K=t_k, viscosity_Pa_s=eta,
-                d_r_se=res.d_r_se)
+                d_t_se=res.d_t_se, d_r_se=res.d_r_se)
         if model in ('rod', 'both'):
             out['rod'] = depol_engine.rod_dimensions_from_diffusion(
                 res.d_t_m2_s, res.d_r_rad2_s, temperature_K=t_k, viscosity_Pa_s=eta,
@@ -2978,7 +3029,8 @@ class Controller:
             rg_source=r.rg_source, rh_source=r.rh_source,
             is_apparent=is_apparent, interpretation=rr.interpretation,
             shape=rr.shape, rho_se=rr.rho_se, se_estimator=rho_estimator,
-            rg_se=unc.se_or_none(r.rg_se), rh_se=unc.se_or_none(r.rh_se))
+            rg_se=unc.se_or_none(r.rg_se), rh_se=unc.se_or_none(r.rh_se),
+            notes=rr.notes)
 
     def samples_pairable_rho(self) -> List[str]:
         """Sample ids that have both DLS and SLS (rho = Rg/Rh is possible)."""
@@ -3156,7 +3208,8 @@ class Controller:
         return exporter.export_distribution(
             d, file_path, axis=axis,
             alpha_selection_method=getattr(result, 'alpha_selection_method', None),
-            ftest_prob_reject=getattr(result, 'ftest_prob_reject', None))
+            ftest_prob_reject=getattr(result, 'ftest_prob_reject', None),
+            alpha_at_ceiling=getattr(result, 'alpha_at_ceiling', False))
 
     def export_gamma_q2(self, result, file_path: str) -> str:
         return exporter.export_gamma_q2(result, file_path)

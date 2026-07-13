@@ -331,8 +331,10 @@ class AxisControlBar(QtWidgets.QWidget):
         self.setEnabled(ax is not None)
         self.sync()
 
-    def sync(self) -> None:
-        """Repopulate the controls from the current axes' scales and limits."""
+    def sync(self, *, clear_note: bool = True) -> None:
+        """Repopulate the controls from the current axes' scales and limits.
+        ``clear_note=False`` lets a caller resync the combo/edits to the actual axes
+        state without wiping a note it just set (e.g. a rejected scale change)."""
         if self._ax is None:
             return
         self._suppress = True
@@ -341,7 +343,8 @@ class AxisControlBar(QtWidgets.QWidget):
         (x0, x1), (y0, y1) = self._ax.get_xlim(), self._ax.get_ylim()
         self.x_min.setText(f'{x0:.4g}'); self.x_max.setText(f'{x1:.4g}')
         self.y_min.setText(f'{y0:.4g}'); self.y_max.setText(f'{y1:.4g}')
-        self.note.clear()
+        if clear_note:
+            self.note.clear()
         self._suppress = False
 
     # ---- handlers ----
@@ -349,11 +352,19 @@ class AxisControlBar(QtWidgets.QWidget):
         if self._suppress or self._ax is None:
             return
         self.note.clear()
+        if scale == 'log':
+            lo, _ = self._ax.get_xlim() if axis == 'x' else self._ax.get_ylim()
+            if lo <= 0:
+                self.note.setText(f'{axis}: log min must be > 0')
+                self.sync(clear_note=False)   # revert the combo to the unchanged scale
+                return
         try:
             (self._ax.set_xscale if axis == 'x' else self._ax.set_yscale)(scale)
             self._canvas.draw_idle()
         except Exception:
             self.note.setText(f'cannot set {axis} {scale}')
+            self.sync(clear_note=False)
+            return
         self.sync()
 
     def _apply_limits(self) -> None:
@@ -361,14 +372,21 @@ class AxisControlBar(QtWidgets.QWidget):
             return
         self.note.clear()
         try:
-            self._apply_axis('x', self.x_min, self.x_max, self.x_scale.currentText())
-            self._apply_axis('y', self.y_min, self.y_max, self.y_scale.currentText())
+            x_lo, x_hi = self._validate_axis(
+                'x', self.x_min, self.x_max, self.x_scale.currentText())
+            y_lo, y_hi = self._validate_axis(
+                'y', self.y_min, self.y_max, self.y_scale.currentText())
         except ValueError as exc:
             self.note.setText(str(exc))
             return
+        self._ax.set_xlim(x_lo, x_hi)
+        self._ax.set_ylim(y_lo, y_hi)
         self._canvas.draw_idle()
 
-    def _apply_axis(self, axis: str, lo_edit, hi_edit, scale: str) -> None:
+    def _validate_axis(self, axis: str, lo_edit, hi_edit, scale: str) -> tuple:
+        """Parse + validate one axis's edited limits WITHOUT applying them, so both
+        axes can be checked before either is mutated (a valid X must not be applied
+        if Y then turns out invalid)."""
         cur = self._ax.get_xlim() if axis == 'x' else self._ax.get_ylim()
         lo = self._parse(lo_edit, cur[0])
         hi = self._parse(hi_edit, cur[1])
@@ -376,7 +394,7 @@ class AxisControlBar(QtWidgets.QWidget):
             raise ValueError(f'{axis}: min must be < max')
         if scale == 'log' and lo <= 0:
             raise ValueError(f'{axis}: log min must be > 0')
-        (self._ax.set_xlim if axis == 'x' else self._ax.set_ylim)(lo, hi)
+        return lo, hi
 
     @staticmethod
     def _parse(edit: QtWidgets.QLineEdit, default: float) -> float:

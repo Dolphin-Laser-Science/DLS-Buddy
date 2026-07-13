@@ -260,8 +260,11 @@ class LoadedTrace:
 class SampleResult:
     """Analysis outputs attached to a sample.
 
-    Each quantity records its provenance: 'computed' (from an analysis run) or
-    'user' (entered by hand). The user override matters for systems where the
+    Each quantity records its provenance: 'computed' (an auto-selected analysis
+    result), 'picked' (a result the user explicitly chose in Cross-Sample), or
+    'user' (entered by hand). Both 'picked' and 'user' are deliberate choices and
+    are never overwritten by a later analysis run (only a fresh explicit pick or
+    manual entry replaces them). The user override matters for systems where the
     measured Mw is biased -- e.g. PVP in a deep eutectic solvent, where co-solvent
     adsorption skews Mw, so the trustworthy value is the one characterized in
     water and entered manually. Cross-sample scaling plots (Rg-Mw, A2-Mw) should

@@ -604,6 +604,12 @@ class SLSFilePreview:
     standard_rayleigh_ratio_file: Optional[float] = None
     standard_refractive_index: Optional[float] = None
 
+    # --- passive load-time notices ---
+    # Glyph-less, human-readable notes the parser attaches (e.g. negative intensities
+    # after background subtraction). The load flow surfaces these as a passive ⓘ
+    # message; the parser also emits the same text via warnings.warn (keep-both).
+    notes: tuple = ()
+
     def missing_required_fields(self) -> List[str]:
         required = {
             'angles_deg': self.angles_deg,

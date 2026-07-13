@@ -416,6 +416,10 @@ class DebyeResult:
     well_conditioned: bool = True
     cond: float = float('nan')                # condition number of the design
     reliability_note: str = ''                # ill-conditioned reason, if any
+    # Passive, glyph-less notices for the GUI ⓘ tier (e.g. dropped non-positive
+    # points) -- the same text the module also emits via warnings.warn. Empty here
+    # (Debye is a plain linear fit with no such drop); carried for a uniform surface.
+    notes: tuple = ()
 
 
 @dataclass
@@ -439,6 +443,9 @@ class SingleAngleResult:
     well_conditioned: bool = True
     cond: float = float('nan')                # NaN: no design matrix for a single datum
     reliability_note: str = ''                # ill-conditioned reason, if any
+    # Passive ⓘ notices, for a uniform SLS-result surface (this method has no
+    # drop/warn site of its own, so it stays empty). See DebyeResult.notes.
+    notes: tuple = ()
 
 
 @dataclass
@@ -477,6 +484,9 @@ class GuinierResult:
     well_conditioned: bool = True
     cond: float = float('nan')                # condition number of the design
     reliability_note: str = ''                # ill-conditioned reason, if any
+    # Passive ⓘ notices, for a uniform SLS-result surface (this method has no
+    # drop/warn site of its own, so it stays empty). See DebyeResult.notes.
+    notes: tuple = ()
 
 
 def debye_analysis(rayleigh_result: RayleighRatioResult,
@@ -786,6 +796,10 @@ class ZimmBerryResult:
     well_conditioned: bool = True
     cond: float = float('nan')                # condition number of the design
     reliability_note: str = ''                # ill-conditioned reason, if any
+    # Passive, glyph-less notices for the GUI ⓘ tier (e.g. the Berry drop of
+    # non-positive Kc/dR points) -- the same text the module also emits via
+    # warnings.warn (kept for the headless/stderr path).
+    notes: tuple = ()
 
 
 @dataclass
@@ -819,6 +833,9 @@ class CalibrationFreeA2Result:
     cond: float = float('nan')             # condition number of the design
     reliability_note: str = ''             # ill-conditioned reason, if any
     two_a2_mw_reliable: bool = True        # False if the design is ill-conditioned
+    # Passive, glyph-less notices for the GUI ⓘ tier (e.g. dropped non-positive
+    # excess-Rayleigh points) -- the same text also emitted via warnings.warn.
+    notes: tuple = ()
 
 
 def _collect_zimm_points(rayleigh_results: Sequence[RayleighRatioResult]):
@@ -887,6 +904,7 @@ def zimm_analysis(
             f"Zimm/Berry analysis needs at least two angles, got {n_ang}."
         )
 
+    notes: list = []       # passive ⓘ notices surfaced on the result (keep-both)
     if method == 'berry':
         # Berry uses sqrt(Kc/dR); a non-positive Kc/dR (noise or an
         # over-subtracted solvent reference, especially at high angle) has no
@@ -895,12 +913,14 @@ def zimm_analysis(
         nonpos = ~(kc_over_dR > 0)
         if np.any(nonpos):
             n_drop = int(nonpos.sum())
-            warnings.warn(
+            # Single source of the message -> both the note and the warning.
+            msg = (
                 f"Berry analysis dropped {n_drop} point(s) with a non-positive "
                 "Kc/dR (noise or over-subtracted solvent reference) before the "
-                "square root. If this removes too many points, use Zimm instead.",
-                RuntimeWarning, stacklevel=2,
+                "square root. If this removes too many points, use Zimm instead."
             )
+            notes.append(msg)
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
             q2, c, kc_over_dR = q2[~nonpos], c[~nonpos], kc_over_dR[~nonpos]
             n_conc = np.unique(c).size
             n_ang = np.unique(np.round(q2, 12)).size
@@ -1038,6 +1058,7 @@ def zimm_analysis(
         extrapolation_agreement_rel=agree,
         se_estimator=estimator,
         well_conditioned=mf.well_conditioned, cond=mf.cond, reliability_note=note,
+        notes=tuple(notes),
     )
 
 
@@ -1046,7 +1067,6 @@ def calibration_free_a2(
     angle_deg: float,
     reference_index: int = 0,
     mw_g_per_mol: Optional[float] = None,
-    use_excess_intensity=None,
     estimator: str = 'hc3',
     cond_limit: float = unc.COND_LIMIT,
 ) -> CalibrationFreeA2Result:
@@ -1139,16 +1159,20 @@ def calibration_free_a2(
     # in exactly the low-contrast systems this calibration-free estimator targets)
     # would give a negative or infinite Y and silently corrupt the slope/intercept.
     # Mirror the Berry non-positive-Kc/dR drop above.
+    notes: list = []       # passive ⓘ notices surfaced on the result (keep-both)
     pos = excess > 0
     if not np.all(pos):
         n_drop = int((~pos).sum())
-        warnings.warn(
+        # Single source of the message -> both the note and the warning. Keep the
+        # "non-positive excess" phrasing (a regression test matches on it).
+        msg = (
             f"calibration-free A2 dropped {n_drop} point(s) with a non-positive "
             "excess Rayleigh ratio (noise or over-subtracted solvent reference) "
             "before forming Y(c). If this removes too many points, the "
-            "calibration-free A2 is unreliable for this dataset.",
-            RuntimeWarning, stacklevel=2,
+            "calibration-free A2 is unreliable for this dataset."
         )
+        notes.append(msg)
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
         conc, excess = conc[pos], excess[pos]
         if conc.size < 2:
             raise ValueError(
@@ -1192,4 +1216,5 @@ def calibration_free_a2(
         se_estimator=estimator,
         well_conditioned=fit.well_conditioned, cond=fit.cond, reliability_note=note,
         two_a2_mw_reliable=fit.well_conditioned,
+        notes=tuple(notes),
     )

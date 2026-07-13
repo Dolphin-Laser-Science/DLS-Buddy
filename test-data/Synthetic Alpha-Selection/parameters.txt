@@ -1,0 +1,31 @@
+DLS Buddy — Synthetic Alpha-Selection test data
+==================================================
+
+DLS correlograms that stress CONTIN's regularization-parameter (alpha)
+selection. Same optical system as the Clean/Messy sets (PEG-in-water,
+532 nm); load the .ASC files exactly as those (all angles are in one file;
+analyze the ~90 deg angle). Enter polymer name + solvent (water); temperature,
+viscosity, refractive index and wavelength are read from the file.
+
+GLOBAL PARAMETERS (Data-tab confirmation step):
+  Solvent refractive index: 1.33
+  Viscosity               : 0.89 cP
+  Temperature             : 25.0 C
+  Wavelength              : 532 nm
+
+CASES (ground truth — what the distribution methods should recover):
+
+  Broad unimodal            : single mode, median Rh = 50 nm, log-normal
+                              CV 0.5 (broad). Needs heavier smoothing; a good
+                              selector keeps ONE peak and does not under-smooth.
+  Close bimodal             : 40 + 90 nm (~2x separation, near the resolution
+                              limit) — the hard inversion case.
+  Wide bimodal (x3)         : 30 + 200 nm at noise 0.001 / 0.003 / 0.010.
+                              A good selector keeps TWO peaks even at 0.010;
+                              an over-smoothing one merges them into a single
+                              intermediate peak.
+
+Use CONTIN and compare the GCV (default), L-curve, and F-test selectors
+(DLS tab -> Distribution -> CONTIN alpha selection). GCV is the robust default;
+the L-curve tends to smooth more heavily on this kernel. See the
+Theory-and-Equations-Guide (CONTIN) for the methods.

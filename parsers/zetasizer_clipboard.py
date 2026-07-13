@@ -245,6 +245,25 @@ class ZetasizerClipboardParser(BaseDLSParser):
                 f"({n_bad} malformed rows)."
             )
 
+        # The n_bad guard above only inspects the LAG cell, so a foreign file with a
+        # numeric first column but non-numeric record columns would slip through and store
+        # a meaningless all-NaN correlogram (F-24). Reject the FOREIGN-file case up front:
+        # a numeric lag axis with NO record column carrying any numeric value is not
+        # Zetasizer clipboard data with its record columns intact.
+        #
+        # A MIXED file (some valid columns, one header-present-but-all-NaN column) is NOT
+        # silently dropped: every record column is emitted, and an all-NaN one then fails
+        # LOUDLY at build via the correlogram finite guard (naming its series) -- exactly as
+        # a partially-NaN record already does. Fail-loud, never a silent partial load
+        # (invariant 2 / this cluster's theme). Arrays are built once here and reused below.
+        corr = {i: np.array(values[i], dtype=float) for i in record_cols}
+        if not any(np.any(np.isfinite(a)) for a in corr.values()):
+            raise ParseError(
+                f"{file_path!r} has a numeric lag axis but no record column with any "
+                f"numeric value (every 'Record N' column is non-numeric). This does not "
+                f"look like Zetasizer clipboard data with its record columns intact."
+            )
+
         delay_times_s = np.array(lag_us, dtype=float) * _MICROSECONDS_TO_SECONDS
         abs_path = os.path.abspath(file_path)
 
@@ -253,7 +272,7 @@ class ZetasizerClipboardParser(BaseDLSParser):
                 source_file=abs_path,
                 instrument_name='Malvern Zetasizer',
                 delay_times_s=delay_times_s.copy(),
-                correlogram=np.array(values[i], dtype=float),
+                correlogram=corr[i],
                 sample_label=labels[i] if labels[i] else None,
             )
             for i in record_cols

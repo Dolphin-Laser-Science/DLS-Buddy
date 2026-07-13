@@ -60,6 +60,7 @@ Change history
 """
 
 import math
+import warnings
 from typing import Optional
 
 
@@ -309,13 +310,47 @@ _TOLUENE_DEPOL_V_TEMP_COEFFICIENT: float = -0.00135   # per °C  (absolute)
 _TOLUENE_RAYLEIGH_REF_TEMP_C: float = 25.0
 _WAVELENGTH_MATCH_TOLERANCE_NM: float = 2.0
 
+# Temperature validity range for the R_VV(T), rho_v(T) corrections: the span of the
+# Sivokhin & Kazantsev 2021 tables (Rvv and rho_v tabulated 10-50 C). Outside this
+# the linear coefficients above are unvalidated extrapolation; we WARN (not raise --
+# owner 2026-07-11) so elevated-temperature calibrations still run, but the
+# extrapolation is never silent (audit F-04).
+_TOLUENE_RAYLEIGH_TEMP_MIN_C: float = 10.0
+_TOLUENE_RAYLEIGH_TEMP_MAX_C: float = 50.0
+
 _RAYLEIGH_GEOMETRIES = ('VV', 'VU', 'VH')
+
+
+def toluene_temperature_extrapolation_reason(temperature_C: float) -> Optional[str]:
+    """The extrapolation note for a toluene-standard temperature, or None if in range.
+
+    Single source of truth for the wording: `rayleigh_ratio_toluene` emits it via
+    `warnings.warn` (headless/stderr + tests), and the GUI surfaces the same string as
+    a neutral note next to the calibration k_c (audit F-04-GUI). Glyph-less and
+    self-contained so either surface can lead it with its own preamble/marker.
+
+    Returns None when `temperature_C` is inside the S&K 10-50 C table; otherwise a
+    message stating the value is extrapolated (the value is used, not blocked -- so
+    elevated-temperature calibrations still run).
+    """
+    if _TOLUENE_RAYLEIGH_TEMP_MIN_C <= temperature_C <= _TOLUENE_RAYLEIGH_TEMP_MAX_C:
+        return None
+    # No author-year citation here: this string is also rendered on-screen (the GUI
+    # calibration note), and house convention keeps citations out of UI prose (in the
+    # Theory guide instead -- doc_style_guide R6.1). The source (Sivokhin & Kazantsev
+    # 2021) is cited in this function's docstring and the Theory-and-Equations-Guide.
+    return (
+        f"Temperature {temperature_C:g} C is outside the "
+        f"{_TOLUENE_RAYLEIGH_TEMP_MIN_C:g}-{_TOLUENE_RAYLEIGH_TEMP_MAX_C:g} C table of "
+        f"the toluene Rayleigh-ratio temperature correction; the value is EXTRAPOLATED "
+        f"and its accuracy is not validated there."
+    )
 
 
 def rayleigh_ratio_toluene(
     wavelength_nm: float,
     temperature_C: float,
-    geometry: str = 'VV',
+    geometry: Optional[str] = None,
     depolarization_ratio_v: Optional[float] = None,
 ) -> float:
     """Rayleigh ratio of toluene in cm^-1, for a chosen scattering geometry.
@@ -340,8 +375,11 @@ def rayleigh_ratio_toluene(
     temperature_C : float
         Measurement temperature in degrees Celsius.
     geometry : str
-        'VV' (default), 'VU', or 'VH'. Use 'VU' for an instrument with a
-        vertically polarized laser and no polarization analyzer.
+        'VV', 'VU', or 'VH' -- REQUIRED (no default). Use 'VU' for an instrument
+        with a vertically polarized laser and no polarization analyzer (e.g. the
+        BI-200SM). Passing None (or omitting it) raises: the geometry must be
+        explicit, since VV vs VU differ by (1 + rho_v) ~ 1.35 on the absolute
+        scale and a wrong default would silently corrupt every calibrated Mw/A2.
     depolarization_ratio_v : float, optional
         rho_v = I_VH / I_VV for toluene. If omitted, the temperature-dependent
         value from Sivokhin & Kazantsev 2021 is used (0.346 at 25 C). Supply your
@@ -355,7 +393,15 @@ def rayleigh_ratio_toluene(
     Raises
     ------
     ValueError
-        If the wavelength is unsupported or the geometry is not VV/VU/VH.
+        If the geometry is unspecified (None) or not VV/VU/VH, or if the wavelength
+        is unsupported.
+
+    Warns
+    -----
+    UserWarning
+        If the temperature is outside the 10-50 C table of the S&K correction (the
+        value is extrapolated, not blocked -- so elevated-temperature calibrations
+        still work, but the extrapolation is flagged).
 
     Notes
     -----
@@ -367,11 +413,29 @@ def rayleigh_ratio_toluene(
     For wavelengths not in the table, add a properly sourced R_VV to
     _TOLUENE_RVV_25C; do not interpolate (R ~ lambda^-4.2).
     """
+    if geometry is None:
+        raise ValueError(
+            "geometry must be specified: one of 'VV', 'VU', or 'VH' (VU for a "
+            "vertically polarized laser with no analyzer, e.g. the BI-200SM). "
+            "There is no default -- VV vs VU differ by (1 + rho_v) ~ 1.35 on the "
+            "absolute scale, so a silent default would corrupt calibrated Mw/A2."
+        )
     geometry = geometry.upper()
     if geometry not in _RAYLEIGH_GEOMETRIES:
         raise ValueError(
             f"geometry must be one of {_RAYLEIGH_GEOMETRIES}, got {geometry!r}."
         )
+
+    # The S&K temperature correction is tabulated only over 10-50 C; outside it the
+    # linear R_VV(T)/rho_v(T) coefficients are EXTRAPOLATED. WARN (do not raise) so
+    # elevated-temperature calibrations still work, but the extrapolation is never
+    # silent (audit F-04; owner 2026-07-11 -- warn, not raise, since reline SLS runs
+    # hot). Keep-both: the same reason string is surfaced in the GUI as a neutral note
+    # next to the calibration k_c via the controller (audit F-04-GUI); this warning is
+    # the headless/stderr + pytest.warns channel.
+    reason = toluene_temperature_extrapolation_reason(temperature_C)
+    if reason is not None:
+        warnings.warn(reason, stacklevel=2)
 
     # Nearest supported wavelength within tolerance.
     best_match, best_distance = None, float('inf')
@@ -657,8 +721,8 @@ def cabannes_isotropic_factor(rho_v: float) -> float:
     so rho_v = R_HV / R_VV = (3/5) delta^2 / (1 + (4/5) delta^2). Eliminating
     delta^2 gives R_VV (1 - (4/3) rho_v) = R_iso exactly. Equivalently, the
     per-molecule optics I_VV ~ abar^2 + (4/45) gamma^2, I_VH ~ (3/45) gamma^2
-    give the same 4/3 = (4/45)/(3/45) (Kerker; Berne & Pecora 1976) -- the two
-    routes agree.
+    give the same 4/3 = (4/45)/(3/45) (Kerker 1969, Ch. 10 Sec. 10.2; Berne &
+    Pecora 2000) -- the two routes agree.
 
     Parameters
     ----------
@@ -720,6 +784,7 @@ def cabannes_isotropic_factor_natural(rho_u: float) -> float:
 
     Notes
     -----
+    The (6 - 7 rho_u)/(6 + 6 rho_u) form is Kerker 1969, Ch. 9 Sec. 9.1c (p. 498).
     Coumou, Mackor & Hijmans (1964); verified to reproduce Coumou's Table 3
     (benzene rho_u = 0.42 -> total/isotropic = 1/f = 2.78).
     """

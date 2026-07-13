@@ -46,6 +46,7 @@ from gui.plot_controls import (
     make_vertical_plot_stack, attach_residual_resizer, themed_navtoolbar,
 )
 from gui.export_helper import export_to_csv
+from exporting.export import alpha_selection_note
 from gui.help import add_help_to_groupbox, section_header
 from gui.plot_overlays import draw_excluded_markers, reissue_legend_preserving_title
 from gui.theme import ThemedLabel, color as theme_color, set_flag
@@ -448,7 +449,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
             help_text=_PICKER_HELP, help_bullets=_PICKER_BULLETS)
         self.checklist.selectionChanged.connect(self._on_selection_changed)
 
-        box = QtWidgets.QGroupBox('Parametric fit')
+        box = QtWidgets.QGroupBox('Parametric Fit')
         add_help_to_groupbox(box, 'Fit the correlogram to get a size (Rh).', bullets=[
             'Pick a <b>method</b>, set the <b>delay window</b> (the τ range fitted), '
             'then <b>Run</b>.',
@@ -475,6 +476,10 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self.order_spin = QtWidgets.QSpinBox()
         self.order_spin.setRange(1, 3)
         self.order_spin.setValue(self.controller.settings.cumulant_order)
+        self.order_spin.setToolTip(
+            'Degree of the cumulant polynomial fit of ln(g₂−1): 1 = size (D) only, '
+            '2 adds PDI (polydispersity), 3 adds skew. Applies to the cumulant method '
+            'only — greyed out for the other methods.')
         form.addRow('Cumulant order:', self.order_spin)
         win, self.tau_min, self.tau_max, self.tau_unit = _delay_window_row()
         form.addRow('Delay window:', win)
@@ -1100,8 +1105,16 @@ class _CorrelogramTab(QtWidgets.QWidget):
             # substitute — label it '(failed)', and the Rh/Gamma cells read 'n/a'.
             method_lbl = res.method + ('' if res.success else ' (failed)')
             baseline_lbl = q(res.baseline) if res.method == 'nonlinear' else '—'
-            return [q(res.gamma_s_inv), q(res.rh_nm),
-                    f'{q(res.pdi)} {"✓" if res.pdi_valid else "⚠>0.3"}',
+            # PDI cell: value + reliability glyph when measured; an explicit
+            # 'unmeasured' for an order-1 fit (no mu2 term) so a blank PDI is never
+            # read as a confirmed monodisperse PDI = 0 (audit F-09).
+            if math.isfinite(res.pdi):
+                pdi_cell = f'{q(res.pdi)} {"✓" if res.pdi_valid else "⚠>0.3"}'
+            elif res.order < 2:
+                pdi_cell = 'unmeasured (order 1)'
+            else:
+                pdi_cell = q(res.pdi)   # 'n/a' — a failed/degenerate fit (row flagged)
+            return [q(res.gamma_s_inv), q(res.rh_nm), pdi_cell,
                     q(res.mu2_s_inv2), str(res.order), method_lbl, baseline_lbl]
         if key == 'single':
             return [q(res.mode.gamma_s_inv), q(res.mode.rh_nm),
@@ -1154,9 +1167,14 @@ class _CorrelogramTab(QtWidgets.QWidget):
         # the one no-uncertainty knob so a value never reads at two precisions in one view.
         q = lambda v: format_fixed_sig(v, self._no_unc_sig())
         if key == 'cumulant':
-            flag = ('' if r.pdi_valid else
-                    f'⚠ PDI = {q(r.pdi)} > 0.3: cumulant size unreliable for this '
-                    'polydispersity — prefer a distribution method.')
+            # Warn only when PDI is MEASURED and out of range. An order-1 fit has no
+            # PDI (unmeasured, NaN) but a perfectly reliable Rh, so it must not raise
+            # the '> 0.3 size unreliable' flag (audit F-09).
+            if math.isfinite(r.pdi) and not r.pdi_valid:
+                flag = (f'⚠ PDI = {q(r.pdi)} > 0.3: cumulant size unreliable for this '
+                        'polydispersity — prefer a distribution method.')
+            else:
+                flag = ''
             return 'Cumulant fit (see table).', flag
         if key == 'single':
             return (f'Single exp: Γ = {q(r.mode.gamma_s_inv)} s⁻¹   '
@@ -1223,9 +1241,9 @@ class _DistributionTab(QtWidgets.QWidget):
                                  'least free, most stable.',
                                  'These are distribution-weighted, not z-average — '
                                  'compare against the cumulant Rh.',
-                                 '<b>CONTIN α selection</b>: L-curve corner (default, '
-                                 'robust) or the F-test option (see the Theory-and-Equations-Guide) '
-                                 'for legacy comparison. '
+                                 '<b>CONTIN α selection</b>: GCV (default, '
+                                 'self-calibrating), the L-curve corner, or the F-test '
+                                 '(see the Theory-and-Equations-Guide). '
                                  'For the F-test, a higher “probability to reject” gives '
                                  'a smoother fit, lower gives more detail.',
                              ])
@@ -1262,14 +1280,17 @@ class _DistributionTab(QtWidgets.QWidget):
         # methods need different controls, so only the selected method's control is
         # shown (owner: show/hide, not gray-out — no confusing inert fields).
         self.alpha_method = QtWidgets.QComboBox()
+        self.alpha_method.addItem('GCV (generalized cross-validation)', 'gcv')
         self.alpha_method.addItem('L-curve corner', 'lcurve')
         self.alpha_method.addItem('F-test (probability to reject)', 'ftest')
         self.alpha_method.setToolTip(
             'How CONTIN chooses its regularization α automatically.\n'
-            '• L-curve corner (default): the elbow of the fit-vs-smoothness trade-off '
-            '— modern and robust.\n'
+            '• GCV (default): generalized cross-validation — self-calibrating and '
+            'robust for this kernel; the recommended choice.\n'
+            '• L-curve corner: the maximum-curvature elbow of the fit-vs-smoothness '
+            'trade-off (tends to smooth more heavily).\n'
             '• F-test: the smoothest solution whose fit is not significantly worse than '
-            'the best — for comparison against legacy CONTIN output. '
+            'the best — for comparison against legacy CONTIN output.\n'
             'See the Theory-and-Equations-Guide (CONTIN).')
         form.addRow('CONTIN α selection:', self.alpha_method)
         self.alpha_min = QtWidgets.QLineEdit()
@@ -1579,15 +1600,16 @@ class _DistributionTab(QtWidgets.QWidget):
             notes.append('CONTIN runs an α sweep per measurement — this can be slow.')
         # α-selection provenance: every CONTIN run this pass shares the same selector
         # (seeded from one control), so one note names it (method disclosure —
-        # a distribution is never ambiguous about how α was chosen).
+        # a distribution is never ambiguous about how α was chosen). The wording comes
+        # from the shared `alpha_selection_note` helper the CSV export also uses, so the
+        # two surfaces can't drift as selectors are added (audit F-23). A user-supplied
+        # α returns '' here (the α input control already shows it).
         contin_res = next((r for _i, k, r in self._results if k == 'contin'), None)
-        sel = getattr(contin_res, 'alpha_selection_method', None)
-        if sel == 'ftest':
-            p = getattr(contin_res, 'ftest_prob_reject', None)
-            notes.append(f'CONTIN α by F-test (p={p:.2f})' if p is not None
-                         else 'CONTIN α by F-test')
-        elif sel == 'lcurve':
-            notes.append('CONTIN α by L-curve corner')
+        alpha_note = alpha_selection_note(
+            getattr(contin_res, 'alpha_selection_method', None),
+            getattr(contin_res, 'ftest_prob_reject', None), style='gui')
+        if alpha_note:
+            notes.append(alpha_note)
         if self.controller.is_dirty() and self._results:
             notes.append('(ran on last committed values)')
         if _is_stale(self.controller, self._results_sig):
@@ -1596,11 +1618,18 @@ class _DistributionTab(QtWidgets.QWidget):
         self.status.setText('   '.join(notes))
         # A skipped run is a data/operational problem, not a muted status note: render it
         # on the red flag label via the shared renderer, matching the Correlogram tab
-        # (style guide §5 R5.5). Empty text clears it when nothing was skipped.
+        # (style guide §5 R5.5). A CONTIN α pinned to the sweep ceiling is a
+        # data-conditional over-regularization caution (GCV's flat-minimum failure mode),
+        # kept on the same visible flag. Empty text clears it when neither fired.
+        flag_msgs = []
         failures = getattr(self, '_failures', None)
-        set_flag(self.flag_label,
-                 ('skipped: ' + '; '.join(failures)) if failures else '',
-                 problem=True)
+        if failures:
+            flag_msgs.append('skipped: ' + '; '.join(failures))
+        if any(getattr(r, 'alpha_at_ceiling', False)
+               for _i, k, r in self._results if k == 'contin'):
+            flag_msgs.append('CONTIN α hit the sweep ceiling (possible over-'
+                             'regularization) — inspect the L-curve or widen the α range')
+        set_flag(self.flag_label, '; '.join(flag_msgs), problem=True)
         self._refresh_results()
 
     def _refresh_results(self) -> None:
@@ -1809,6 +1838,12 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
         rl.addWidget(self.flag_label)
+        # Passive ⓘ notices carried on the result (e.g. a mixed sample identity) — a
+        # neutral qualifier tier, separate from the severity-tracking flag_label above.
+        # The analysis emits the same text via warnings.warn (keep-both).
+        self.notes_label = ThemedLabel('', size=11)
+        self.notes_label.setWordWrap(True)
+        rl.addWidget(self.notes_label)
 
         vstack = make_vertical_plot_stack(
             [controls, tsec, rsec], sizes=[200, 220, 160],
@@ -1872,6 +1907,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self.item_id = item_id
         self._runnable = runnable
         self.flag_label.clear()
+        set_flag(self.notes_label, '', problem=False)   # drop stale result notes
         sid = self._sample_id()
         if sid != self._last_sid:
             self._run_epoch += 1     # re-pointed: drop any in-flight run's result
@@ -2218,6 +2254,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             if it is not None:
                 it.setText('—')
         self.flag_label.clear()
+        set_flag(self.notes_label, '', problem=False)   # drop stale result notes
 
     @QtCore.Slot()
     def _on_export(self) -> None:
@@ -2268,6 +2305,9 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self.canvas.draw_idle()
         self.axis_bar.attach(self.ax)
         set_flag(self.flag_label, flag, problem=problem)
+        # Passive ⓘ result notes (e.g. a mixed sample identity), neutral tier — the
+        # same text the analysis also emits via warnings.warn (keep-both).
+        set_flag(self.notes_label, '\n'.join(getattr(res, 'notes', ())), problem=False)
 
     def _gray_points(self, sid: str) -> bool:
         """Gray × the computed points that are NOT ticked, from the run's per-point
@@ -2428,9 +2468,12 @@ class _DDLSTab(QtWidgets.QWidget):
             return
         self.item_id = item_id
         self._runnable = runnable
-        self.run_button.setEnabled(runnable)
         self.flag_label.clear()
         sid = self._sample_id()
+        # Run needs a runnable (DLS) measurement AND an assigned sample: _on_run only
+        # warns when sid is None, so an enabled button over an ungrouped measurement is
+        # a false affordance. Mirror the Γ-q²/D-c tabs this one's docstring follows (F-33).
+        self.run_button.setEnabled(runnable and sid is not None)
         if sid != self._last_sid:
             self._run_epoch += 1     # re-pointed: drop any in-flight run's result
         self.export_button.setEnabled(runnable and sid is not None and sid in self._cache)
@@ -2579,14 +2622,19 @@ class _DDLSTab(QtWidgets.QWidget):
         epoch = self._run_epoch
 
         def work():
-            # ONE thunk for both calls, in this order: the second (full) call
-            # overwrites results[('ddls', sid)], which ddls_shape reads lazily
-            # on the main thread when drawing — running full last keeps that
-            # cache warm so no Monte-Carlo re-run happens on the GUI thread.
+            # ONE thunk for both calls. Run order is load-bearing: run_ddls writes
+            # results[('ddls', sid)] each call (last-write-wins), and ddls_shape reads
+            # THAT cache lazily on the main thread when drawing/exporting the shape
+            # models. Run the EXCLUDED fit LAST so the cache — hence the shape models —
+            # matches the D_t/D_r shown in the table, not the un-excluded angles (F-32).
+            # The un-excluded `full` (run first, only when excluding) is kept solely to
+            # draw the excluded-point markers; a cached result also keeps ddls_shape from
+            # re-running the Monte-Carlo fit on the GUI thread.
+            full = (controller.run_ddls(sid, rod_length_nm=rod) if excl else None)
             res, info = controller.run_ddls(
                 sid, rod_length_nm=rod, exclude_angles=excl)
-            full = (controller.run_ddls(sid, rod_length_nm=rod)
-                    if excl else (res, info))
+            if full is None:
+                full = (res, info)
             return (res, info), full
 
         def done(payload) -> None:

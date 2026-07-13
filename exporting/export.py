@@ -220,14 +220,19 @@ def export_correlogram_fit(measurement, result, file_path: str,
     cls = type(result).__name__
     columns.append(_scalar_column('RMS error', '', result.rms_error))
     if cls == 'CumulantResult':
+        # An order-1 cumulant has no mu2 term, so PDI is UNMEASURED (NaN), not zero
+        # (audit F-09). Mark that in the Comments so the blank/NaN PDI cell is never
+        # misread on import as a failed fit -- the Rh is fully reliable.
+        pdi_comment = ('unmeasured: order-1 cumulant has no mu2 term'
+                       if result.order < 2 else '')
         columns += [
             _scalar_column('Cumulant order', '', result.order),
             _scalar_column('Cumulant method', '', getattr(result, 'method', 'linear')),
             _scalar_column('Gamma', '1/s', result.gamma_s_inv),
             _scalar_column('Rh', 'nm', result.rh_nm),
             _scalar_column('D', 'm^2/s', result.d_m2_s),
-            _scalar_column('PDI', '', result.pdi),
-            _scalar_column('PDI valid', '', result.pdi_valid),
+            _scalar_column('PDI', '', result.pdi, pdi_comment),
+            _scalar_column('PDI valid', '', result.pdi_valid, pdi_comment),
             _scalar_column('mu2', '1/s^2', result.mu2_s_inv2),
             _scalar_column('beta', '', result.beta),
             _scalar_column('baseline B', '', getattr(result, 'baseline', 0.0)),
@@ -261,10 +266,61 @@ def export_correlogram_fit(measurement, result, file_path: str,
     return write_origin_csv(file_path, columns, delimiter)
 
 
+# Canonical vocabulary for how a CONTIN alpha was chosen -- ONE mapping behind both
+# the CSV Comments cell (export_distribution) and the GUI status note
+# (gui/dls_module). Historically these were parallel if/elif ladders kept in sync by
+# hand, and the export copy was twice left behind when a new selector shipped (audit
+# F-23): the 'gcv' default and the sweep-ceiling caution both reached the GUI first.
+# Add a new selector here and BOTH surfaces pick it up.
+_ALPHA_SELECTOR_NAMES = {
+    'gcv': 'GCV',
+    'ftest': 'F-test',
+    'lcurve': 'L-curve corner',
+    'user': 'user-supplied',
+}
+# The export-side ceiling suffix phrase (contains "sweep ceiling", pinned by a test).
+_ALPHA_CEILING_PHRASE = 'sweep ceiling -- possible over-regularization'
+
+
+def alpha_selection_note(selection_method: Optional[str],
+                         ftest_prob_reject: Optional[float] = None, *,
+                         at_ceiling: bool = False, style: str = 'export') -> str:
+    """Human string describing how a CONTIN alpha was chosen, for the given surface.
+
+    One shared mapping behind both the CSV Comments cell (`export_distribution`,
+    `style='export'`) and the GUI status note (`gui/dls_module`, `style='gui'`), so a
+    new selector value is added in exactly one place instead of two parallel ladders.
+    Returns '' for an unknown/None selector (NNLS/lognormal pass no method).
+
+    Wording is kept verbatim to what each surface already shipped:
+      - export: "alpha by GCV", "alpha by F-test, p_reject=0.50", "alpha user-supplied";
+                appends " (at <sweep ceiling ...>)" when `at_ceiling` (so the export can
+                never again forget the over-regularization caution).
+      - gui:    "CONTIN α by GCV", "CONTIN α by F-test (p=0.50)". The GUI shows a
+                user-supplied alpha in its input control and the ceiling caution on its
+                own flag label, so neither is repeated here (returns '' for 'user';
+                `at_ceiling` is ignored under `style='gui'`).
+    """
+    name = _ALPHA_SELECTOR_NAMES.get(selection_method)
+    if name is None:
+        return ''
+    if style == 'gui' and selection_method == 'user':
+        return ''
+    lead = 'CONTIN α ' if style == 'gui' else 'alpha '
+    note = lead + (name if selection_method == 'user' else 'by ' + name)
+    if selection_method == 'ftest' and ftest_prob_reject is not None:
+        note += (f' (p={ftest_prob_reject:.2f})' if style == 'gui'
+                 else f', p_reject={ftest_prob_reject:.2f}')
+    if style == 'export' and at_ceiling:
+        note += f' (at {_ALPHA_CEILING_PHRASE})'
+    return note
+
+
 def export_distribution(result, file_path: str, axis: str = 'rh',
                         delimiter: str = ',', *,
                         alpha_selection_method: Optional[str] = None,
-                        ftest_prob_reject: Optional[float] = None) -> str:
+                        ftest_prob_reject: Optional[float] = None,
+                        alpha_at_ceiling: bool = False) -> str:
     """Export an NNLS or CONTIN distribution (DistributionResult).
 
     Writes the size/rate grid and the normalized weights. With axis='rh' the
@@ -302,16 +358,13 @@ def export_distribution(result, file_path: str, axis: str = 'rh',
     ]
     # CONTIN records how alpha was chosen in the alpha column's Comments cell, so a
     # distribution is never ambiguous about its regularization (mirrors the SLS
-    # provenance-in-Comments convention). NNLS/lognormal pass no selection method.
-    if alpha_selection_method == 'ftest':
-        alpha_note = (f'alpha by F-test, p_reject={ftest_prob_reject:.2f}'
-                      if ftest_prob_reject is not None else 'alpha by F-test')
-    elif alpha_selection_method == 'lcurve':
-        alpha_note = 'alpha by L-curve corner'
-    elif alpha_selection_method == 'user':
-        alpha_note = 'alpha user-supplied'
-    else:
-        alpha_note = ''
+    # provenance-in-Comments convention). The wording -- and the sweep-ceiling
+    # over-regularization caution -- come from the shared `alpha_selection_note`
+    # helper the GUI status note also uses, so the two can't drift (audit F-23).
+    # NNLS/lognormal pass no selection method -> ''.
+    alpha_note = alpha_selection_note(
+        alpha_selection_method, ftest_prob_reject,
+        at_ceiling=alpha_at_ceiling, style='export')
     columns += [
         _scalar_column('Method', '', result.method),
         _scalar_column('alpha', '', result.alpha, comments=alpha_note),
@@ -332,9 +385,9 @@ def export_lcurve(lcurve, file_path: str, delimiter: str = ',') -> str:
     columns = [
         OriginColumn('alpha', '', 'regularization parameter',
                      np.asarray(lcurve.alphas, dtype=float)),
-        OriginColumn('Residual norm', '', '||A x - y||^2',
+        OriginColumn('Residual norm', '', '||M^.5 (A x - y)||^2 (weighted)',
                      np.asarray(lcurve.residual_norms, dtype=float)),
-        OriginColumn('Solution norm', '', '||x||^2',
+        OriginColumn('Solution seminorm', '', '||L x||^2',
                      np.asarray(lcurve.solution_norms, dtype=float)),
         _scalar_column('Optimal alpha', '', lcurve.optimal_alpha),
         _scalar_column('Optimal index', '', lcurve.optimal_index),
@@ -399,6 +452,8 @@ def export_ddls(result, file_path: str, *, shapes=None,
         _scalar_column('D_r', 'rad^2/s', result.d_r_rad2_s, 'mean of per-angle values'),
         _scalar_column('D_r SE', 'rad^2/s', result.d_r_se, 'statistical only'),
         _scalar_column('Rh_t', 'nm', result.rh_t_nm, 'Stokes radius from D_t'),
+        _scalar_column('Rh_t SE', 'nm', result.rh_t_se,
+                       comments=_se_note(result) or 'statistical (over angles)'),
         _scalar_column('tau_rot', 's', result.rotational_time_s, '1 / (6 D_r)'),
         _scalar_column('N angles', '', result.n_angles),
         _scalar_column('Method', '', result.method),
@@ -424,6 +479,7 @@ def export_ddls(result, file_path: str, *, shapes=None,
                                'MODEL: sphere (Stokes-Einstein-Debye), not measured'),
                 _scalar_column('Sphere R(D_r) SE', 'nm', sphere.radius_rot_se),
                 _scalar_column('Sphere R(D_t)=Rh', 'nm', sphere.radius_trans_nm),
+                _scalar_column('Sphere R(D_t)=Rh SE', 'nm', sphere.radius_trans_se),
                 _scalar_column('Sphericity ratio', '', sphere.sphericity_ratio,
                                'R(D_r)/Rh; 1 = sphere'),
                 _scalar_column('Sphere consistent', '', sphere.is_consistent),
@@ -433,7 +489,12 @@ def export_ddls(result, file_path: str, *, shapes=None,
 
 def export_concentration_extrapolation(result, file_path: str,
                                        delimiter: str = ',') -> str:
-    """Export a D-vs-c concentration extrapolation (ConcentrationExtrapolationResult)."""
+    """Export a D-vs-c concentration extrapolation (ConcentrationExtrapolationResult).
+
+    The kD column's Comments cell carries the reliability note (D0 <= 0 sign flip or an
+    ill-conditioned design) when kD is unreliable, mirroring the SLS Mw/A2 exporters via
+    `_reliability_comment`; a healthy fit leaves it unmarked."""
+    kd_comment = _reliability_comment(result, result.kd_reliable)
     columns = [
         OriginColumn('Concentration', 'g/mL', '',
                      np.asarray(result.concentrations_g_per_mL, dtype=float)),
@@ -445,7 +506,8 @@ def export_concentration_extrapolation(result, file_path: str,
         _scalar_column('Rh0', 'nm', result.rh0_nm),
         _scalar_column('Rh0 SE', 'nm', result.rh0_se,
                        comments=_se_note(result) or 'statistical (over concentrations)'),
-        _scalar_column('kD', 'mL/g', result.kd_mL_per_g),
+        _scalar_column('kD', 'mL/g', result.kd_mL_per_g,
+                       comments=kd_comment or 'diffusion interaction parameter'),
         _scalar_column('kD SE', 'mL/g', result.kd_se,
                        comments=_se_note(result) or 'statistical (over concentrations)'),
         _scalar_column('Slope', 'm^2/s/(g/mL)', result.slope),
@@ -457,6 +519,19 @@ def export_concentration_extrapolation(result, file_path: str,
 # ===========================================================================
 # SLS exporters
 # ===========================================================================
+
+# The one wording for a scale-dependent (excess-Rayleigh) column that is on an
+# arbitrary scale because the run was uncalibrated. Kept in one place so a reword
+# can't drift across the Rayleigh/Zimm/reliability exporters (they were parallel
+# copies -- the same class of divergence F-23 removed for the CONTIN alpha note).
+_UNCALIBRATED_SCALE_NOTE = 'uncalibrated, arbitrary scale'
+
+
+def _scale_note(calibrated: bool) -> str:
+    """Comments-cell marker for a scale-dependent column: the uncalibrated note when
+    `calibrated` is False, else '' (the silent calibrated default)."""
+    return '' if calibrated else _UNCALIBRATED_SCALE_NOTE
+
 
 def _se_note(result) -> str:
     """Comments-cell label for a ± column: names the estimator only when it is the
@@ -480,7 +555,7 @@ def _reliability_comment(result, reliable: bool = True) -> str:
     flag is False for another reason, a generic unreliable marker; else '' (the caller's
     default APPARENT/thermodynamic note fills in)."""
     if not getattr(result, 'calibrated', True):
-        return 'uncalibrated, arbitrary scale'
+        return _UNCALIBRATED_SCALE_NOTE
     note = getattr(result, 'reliability_note', '') or ''
     if note:
         return note
@@ -497,7 +572,7 @@ def export_rayleigh_ratio(result, file_path: str, delimiter: str = ',') -> str:
     rows, so the Origin import is unaffected). A calibrated result is the default
     and is left unmarked.
     """
-    scale_note = '' if result.calibrated else 'uncalibrated, arbitrary scale'
+    scale_note = _scale_note(result.calibrated)
     columns = [
         OriginColumn('Angle', 'deg', '', np.asarray(result.angles_deg, dtype=float)),
         OriginColumn('q', 'nm^-1', 'scattering vector', np.asarray(result.q_nm_inv, dtype=float)),
@@ -616,8 +691,7 @@ def export_rayleigh_series(results, file_path: str, delimiter: str = ',') -> str
         dR.extend(list(np.asarray(r.excess_rayleigh_cm_inv, dtype=float)))
         kc.extend(list(np.asarray(r.kc_over_dR_mol_per_g, dtype=float)))
 
-    scale_note = ('' if all(r.calibrated for r in samples)
-                  else 'uncalibrated, arbitrary scale')
+    scale_note = _scale_note(all(r.calibrated for r in samples))
     columns = [
         OriginColumn('Concentration', 'g/mL', '', conc),
         OriginColumn('Angle', 'deg', '', angle),
@@ -638,6 +712,11 @@ def export_zimm(rayleigh_results, zimm_result, file_path: str,
     Origin Zimm-plot workflow. The thermodynamic results from `zimm_result` are
     appended as labeled scalar columns. The per-concentration and per-angle
     extrapolated intercepts are also written, for drawing the Zimm grid lines.
+
+    If the run is uncalibrated, the Kc/dR ordinate columns and both intercept
+    columns (Kc/dR-scale) carry the "uncalibrated, arbitrary scale" note in their
+    Comments header, exactly as the sibling Rayleigh exporters do -- no extra rows,
+    so the Origin import is unaffected. Rg still survives (slope-derived).
 
     Parameters
     ----------
@@ -661,13 +740,20 @@ def export_zimm(rayleigh_results, zimm_result, file_path: str,
         raise ValueError("No non-zero-concentration results to export.")
     samples.sort(key=lambda r: r.concentration_g_per_mL)
 
+    # The Kc/dR ordinate and both extrapolated intercepts are on the excess-Rayleigh
+    # scale, so an uncalibrated run makes them arbitrary-scale -- stamp the same note
+    # the sibling Rayleigh exporters use (export_rayleigh_ratio/_series), no extra rows.
+    # Rg survives an uncalibrated Zimm (slope-derived), so the export is still useful;
+    # the marker just prevents a re-import to Origin being mistaken for absolute scale.
+    scale_note = _scale_note(all(r.calibrated for r in samples))
+
     # Shared abscissa from the first sample.
     q2 = np.asarray(samples[0].q2_nm2, dtype=float)
     columns = [OriginColumn('q^2', 'nm^-2', 'scattering vector squared', q2)]
     for r in samples:
         c_mg = r.concentration_g_per_mL * 1000.0
         columns.append(OriginColumn(
-            f'Kc/dR (c={c_mg:.4g} mg/mL)', 'mol/g', 'Zimm ordinate',
+            f'Kc/dR (c={c_mg:.4g} mg/mL)', 'mol/g', scale_note or 'Zimm ordinate',
             np.asarray(r.kc_over_dR_mol_per_g, dtype=float),
             parameter=f'{r.concentration_g_per_mL:.6g}',
         ))
@@ -675,14 +761,14 @@ def export_zimm(rayleigh_results, zimm_result, file_path: str,
     # Extrapolated grid intercepts (for plotting the c->0 and q->0 lines).
     columns.append(OriginColumn(
         'Intercept vs c', 'mol/g' if zimm_result.method == 'zimm' else '(mol/g)^0.5',
-        'q->0 intercept per concentration',
+        scale_note or 'q->0 intercept per concentration',
         np.asarray(zimm_result.intercept_per_concentration, dtype=float)))
     columns.append(OriginColumn(
         'Concentration (grid)', 'g/mL', 'for the q->0 line',
         np.asarray(zimm_result.concentrations_g_per_mL, dtype=float)))
     columns.append(OriginColumn(
         'Intercept vs q^2', 'mol/g' if zimm_result.method == 'zimm' else '(mol/g)^0.5',
-        'c->0 intercept per angle',
+        scale_note or 'c->0 intercept per angle',
         np.asarray(zimm_result.intercept_per_angle, dtype=float)))
     columns.append(OriginColumn(
         'q^2 (grid)', 'nm^-2', 'for the c->0 line',

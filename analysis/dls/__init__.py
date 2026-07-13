@@ -42,17 +42,21 @@ the Siegert relation:
 
     g2(tau) - 1 = beta |g1(tau)|^2
 
-where beta is the coherence factor (intercept). We fit g2(tau) - 1 directly
-(beta floating), rather than linearizing to g1 by taking a square root, because
-the noise lives on g2 - 1 and the square-root transform both distorts that noise
-and fails where g2 - 1 dips negative in the baseline. (A linearized-g1 option may
-be added later.)
+where beta is the coherence factor (intercept). The PARAMETRIC fits (cumulants,
+single/double/KWW exponentials) fit g2(tau) - 1 directly (beta floating), rather
+than linearizing to g1 by taking a square root, because the noise lives on g2 - 1
+and a naive square-root transform distorts that noise and fails where g2 - 1 dips
+negative in the baseline. The DISTRIBUTION methods (NNLS/CONTIN/lognormal) DO invert
+the field ACF g1 -- the accepted-standard Laplace inversion -- but recover it with a
+SIGN-PRESERVING square root (so the baseline noise stays zero-mean, not rectified
+into a pedestal) and statistically WEIGHTED residuals; see analysis/dls/distributions.py.
 
-A consequence of the Siegert relation is a FACTOR OF 2 in every decay exponent:
-for a single mode, g2 - 1 = beta exp(-2 Gamma tau). Throughout this package the
-fits carry that factor of 2 explicitly and we always report Gamma as the
-physical g1 decay rate, from which D = Gamma / q^2 and the hydrodynamic radius
-follows by Stokes-Einstein, Rh = kB T / (6 pi eta D).
+A consequence of the Siegert relation is a FACTOR OF 2 in the decay exponent of the
+PARAMETRIC fits: for a single mode, g2 - 1 = beta exp(-2 Gamma tau), and those fits
+carry the factor of 2 explicitly. The distribution methods instead invert g1 with a
+single-Gamma kernel exp(-Gamma tau) (no factor of 2). Either way we always report
+Gamma as the physical g1 decay rate, from which D = Gamma / q^2 and the hydrodynamic
+radius follows by Stokes-Einstein, Rh = kB T / (6 pi eta D).
 
 The cumulant relation (Koppel 1972; Frisken 2001; Salazar et al. 2023 Eqs. 8-9)
 in this convention is:
@@ -86,6 +90,7 @@ from __future__ import annotations
 
 from analysis.dls._common import _apply_tau_window
 from analysis.dls.cumulants import (
+    CUMULANT_MIN_RH_NM,
     CUMULANT_PDI_VALIDITY_LIMIT,
     CumulantResult,
     fit_cumulants,
@@ -126,6 +131,7 @@ from analysis.dls.replicate import (
 
 __all__ = [
     # constants
+    'CUMULANT_MIN_RH_NM',
     'CUMULANT_PDI_VALIDITY_LIMIT',
     # cumulants
     'CumulantResult',

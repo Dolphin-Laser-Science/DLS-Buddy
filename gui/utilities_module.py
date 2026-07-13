@@ -232,7 +232,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         w = QtWidgets.QWidget()
         _, left, right = make_split_panels(w, left_min_width=220, sizes=(220, 580))
 
-        left.addWidget(section_header('Traces to plot', 'Inspect count-rate traces '
+        left.addWidget(section_header('Traces to Plot', 'Inspect count-rate traces '
                                       'for drift, dust and stationarity.', bullets=[
             'Tick one or more traces to overlay them; the focused trace drives the '
             'stats line and the diagnostic sub-plot.',
@@ -496,6 +496,14 @@ class UtilitiesModule(QtWidgets.QWidget):
                 lambda: (self._set_diag_text(focus, focus_stats, prefix=prefix),
                          self._update_diag()))
         else:
+            # Fallback (no focus, or its statistics raised): _update_diag warms the
+            # histogram/block-variance on the GUI thread, skipping the heavy-trace
+            # worker route above. Confirmed safe (audit F-40): run_trace_statistics
+            # cannot raise for a HEAVY trace -- it only raises on an empty array
+            # (mutually exclusive with heavy) or a bad baseline method/parameter (both
+            # hard-coded valid), and a build() failure makes _update_diag fail fast
+            # rather than compute heavily. So this branch never runs a heavy synchronous
+            # compute in practice; left synchronous deliberately.
             self._update_diag()
 
     def _cr_transform(self, mode: str, baseline_cps):
@@ -707,7 +715,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             if not previews:                     # no instrument matched → generic
                 previews = self._load_generic_trace(path)
                 if previews is None:             # user canceled the units prompt
-                    return
+                    break                        # keep already-committed traces visible
                 if not previews:
                     unreadable.append(os.path.basename(path))
                     continue
@@ -1098,8 +1106,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         folder = self.syn_folder.text().strip()
         eta_cp = self._synth_viscosity_Pa_s() * 1e3
         do_inject = self.syn_ws_check.isChecked()
-        inj_concs = self._synth_floats(self.syn_concs.text())
-        inj_conc0 = (inj_concs[0] if inj_concs else 0.6) * 1e-3
+        inj_conc0 = ctx['concs'][0] if ctx['concs'] else 0.6 * 1e-3
         inj_T = self._synth_temperature_K()
         inj_eta = self._synth_viscosity_Pa_s()
         preview_keys = [k for k in active

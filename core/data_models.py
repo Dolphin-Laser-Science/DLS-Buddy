@@ -237,25 +237,48 @@ def is_recognized_solvent(raw_name: str) -> bool:
     return raw_name.strip().lower() in _SOLVENT_ALIASES
 
 
+def unrecognized_solvent_reason(raw_name: str) -> Optional[str]:
+    """A short, human-readable reason `raw_name` is not in the recognized solvent
+    vocabulary (so its sample key uses the name as-entered), or ``None`` if it is.
+
+    Pure and side-effect-free: the SINGLE source of truth for the message text,
+    shared by the load-time warning (:func:`_warn_if_unrecognized_solvent`) and the
+    Data-tab's passive note, so the two never drift. Mirrors
+    :func:`implausible_metadata_reasons`: the returned text is glyph-less and
+    self-contained, so a caller can lead it with its own framing (a UserWarning
+    preamble + developer hint, or a GUI ``ⓘ`` note).
+    """
+    if is_recognized_solvent(raw_name):
+        return None
+    canonical = normalize_solvent_name(raw_name)
+    return (
+        f"solvent name {raw_name!r} is not in the recognized vocabulary; "
+        f"used {canonical!r} as-entered for sample matching"
+    )
+
+
 def _warn_if_unrecognized_solvent(raw_name: str) -> None:
     """Emit a one-time UserWarning if raw_name is not in the vocabulary.
 
     Called from the measurement classes' __post_init__ so the warning fires
     once when a measurement is created, not every time its sample_key is
-    accessed. Deduplicated per unique canonical name across the session.
+    accessed. Deduplicated per unique canonical name across the session. The GUI
+    surfaces the same check as a passive note via
+    :func:`unrecognized_solvent_reason` (the shared source of the message text).
     """
-    if is_recognized_solvent(raw_name):
+    reason = unrecognized_solvent_reason(raw_name)
+    if reason is None:
         return
     canonical = normalize_solvent_name(raw_name)
     if canonical in _warned_unrecognized_solvents:
         return
     _warned_unrecognized_solvents.add(canonical)
+    # Capitalize the shared reason for a sentence lead, and append the
+    # developer-only hint (not shown in the GUI note).
     warnings.warn(
-        f"Solvent name {raw_name!r} is not in the recognized solvent "
-        f"vocabulary; using {canonical!r} as-is for the sample key. If this "
-        f"is a real solvent you use often, add it to _SOLVENT_ALIASES in "
-        f"core/data_models.py to silence this warning and ensure consistent "
-        f"matching.",
+        reason[0].upper() + reason[1:] + ". If this is a real solvent you use "
+        "often, add it to _SOLVENT_ALIASES in core/data_models.py to silence "
+        "this warning and ensure consistent matching.",
         UserWarning,
         stacklevel=3,
     )
@@ -523,6 +546,12 @@ class IntensityTrace:
         _require_same_length(
             self.times_s, self.count_rates_cps, "times_s", "count_rates_cps"
         )
+        # Reject nan/inf on BOTH arrays before any physical check. _require_non_negative_array
+        # below uses np.any(arr < 0), which admits nan AND +inf (nan comparisons are False,
+        # +inf >= 0), so it is NOT a finite guard -- the correlogram sibling (DLSMeasurement)
+        # finite-checks its arrays and this one must too (rule-10 fail-loud symmetry).
+        _require_finite_array(self.times_s, "times_s")
+        _require_finite_array(self.count_rates_cps, "count_rates_cps")
         # Raw photon count rates are physically non-negative; a negative value is a
         # corrupt/over-subtracted trace, not real data. Reject it here rather than
         # let it bias downstream statistics (mean, baseline, blocking).
@@ -756,6 +785,10 @@ class SLSMeasurement:
         _require_same_length(
             self.angles_deg, self.intensities, "angles_deg", "intensities"
         )
+        # Reject nan/inf intensities, mirroring DLSMeasurement's correlogram guard.
+        # (angles_deg is finite-checked as a side effect of the per-angle range loop
+        # below; intensities has no such check, so guard it explicitly -- rule-10.)
+        _require_finite_array(self.intensities, "intensities")
         for angle in self.angles_deg:
             _require_scattering_angle(angle, "each value in angles_deg")
         _require_non_empty_string(self.polymer_name, "polymer_name")

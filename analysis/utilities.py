@@ -111,6 +111,9 @@ class RhoResult:
     sample_key: Optional[SampleKey] = None
     keys_matched: Optional[bool] = None   # None if keys not supplied
     rho_se: Optional[float] = None        # propagated from Rg, Rh SEs (both required)
+    # passive, glyph-less notices for the GUI ⓘ tier (e.g. Rg/Rh keys disagree) --
+    # the same text the module also emits via warnings.warn (keep-both).
+    notes: tuple = ()
 
 
 # ===========================================================================
@@ -286,6 +289,7 @@ def compute_rho(
 
     keys_matched: Optional[bool] = None
     matched_key: Optional[SampleKey] = None
+    notes: list = []       # passive ⓘ notices surfaced on the result (keep-both)
     if rg_sample_key is not None and rh_sample_key is not None:
         keys_matched = (
             rg_sample_key.polymer_name == rh_sample_key.polymer_name
@@ -307,6 +311,7 @@ def compute_rho(
             )
             if require_match:
                 raise ValueError(msg)
+            notes.append(msg)   # single source -> both the note and the warning
             warnings.warn(msg, UserWarning, stacklevel=2)
 
     rho = rg_nm / rh_nm
@@ -322,6 +327,7 @@ def compute_rho(
         sample_key=matched_key,
         keys_matched=keys_matched,
         rho_se=rho_se,
+        notes=tuple(notes),
     )
 
 
@@ -693,7 +699,14 @@ def generate_synthetic_correlogram(
             radii = np.geomspace(lo, hi, n_grid_per_population)
             pdf = (1.0 / (radii * sigma_ln * math.sqrt(2.0 * math.pi))) * \
                   np.exp(-(np.log(radii) - mu_ln) ** 2 / (2.0 * sigma_ln ** 2))
-            a = pdf / pdf.sum() * p.weight   # normalize to the population weight
+            # Discretize the continuous pdf onto the GEOMETRIC grid: the per-bin
+            # mass is pdf(r)*dr, and on a log-spaced grid dr = r*d(ln r) with
+            # d(ln r) constant, so the discrete weight is proportional to pdf*r.
+            # Omitting the r Jacobian centres the emitted spectrum's geometric
+            # mean at rh_nm/(1+CV^2) instead of the intended median rh_nm
+            # (-8% at CV=0.3, -19.5% at CV=0.5). (audit F-06)
+            a = pdf * radii
+            a = a / a.sum() * p.weight   # normalize to the population weight
         for r, amp in zip(radii, a, strict=True):
             d = stokes_einstein_diffusion_coefficient(r * 1e-9, temperature_K, viscosity_Pa_s)
             gammas.append(d * q ** 2)

@@ -25,7 +25,7 @@ from typing import Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from core.data_models import implausible_metadata_reasons
+from core.data_models import implausible_metadata_reasons, unrecognized_solvent_reason
 from core.workspace import _DLS_PARAM_KEYS, _SLS_PARAM_KEYS
 from app.controller import _SHARED_PARAM_KEYS
 from app import units as U
@@ -163,6 +163,8 @@ class DataModule(QtWidgets.QWidget):
                 'index looks like a unit slip (e.g. 2980 K for 298 K, or n = 13.3 for '
                 '1.33) a note below the table flags it as implausible — double-check '
                 'it, then keep or correct it as you see fit.',
+                'A solvent name not in the recognized vocabulary also shows a note '
+                'below the table; it is used as-entered for sample matching.',
                 'Tip: press <b>Enter</b> in a value to jump to the next field.',
             ]))
         self.table = QtWidgets.QTableWidget(0, 3)
@@ -219,6 +221,14 @@ class DataModule(QtWidgets.QWidget):
         self.plausibility_note = ThemedLabel('', size=11)
         self.plausibility_note.setWordWrap(True)
         layout.addWidget(self.plausibility_note)
+        # Passive unrecognized-solvent note (the committed name is not in the solvent
+        # vocabulary, so it is used as-entered for sample matching): the same neutral ⓘ
+        # tier. Kept separate from the plausibility note — an unknown name and a unit
+        # slip are different messages. Shares its text with the load-time warning via
+        # core.data_models.unrecognized_solvent_reason so the two never drift.
+        self.solvent_note = ThemedLabel('', size=11)
+        self.solvent_note.setWordWrap(True)
+        layout.addWidget(self.solvent_note)
 
         row = QtWidgets.QHBoxLayout()
         self.update_button = QtWidgets.QPushButton('Update')
@@ -264,6 +274,7 @@ class DataModule(QtWidgets.QWidget):
             self.pending.setText('')
             self.autofill_note.setText('')
             self.plausibility_note.setText('')
+            self.solvent_note.setText('')
             # The provenance legend is data-dependent chrome (R8.2): hide it on an empty
             # table so an unpopulated tab doesn't explain a dot that isn't there.
             self.legend.hide()
@@ -344,7 +355,9 @@ class DataModule(QtWidgets.QWidget):
         combo.setToolTip(
             'Solvent for this sample. Choosing a library solvent auto-fills the '
             'refractive index (and, for DLS, the viscosity) from the temperature and '
-            'wavelength; type any name for a solvent not in the library.')
+            'wavelength; type any name for a solvent not in the library. A name that '
+            'is not in the recognized vocabulary shows a note below the table and is '
+            'used as-entered for sample matching.')
         # Dropdown pick fires textActivated; a hand-typed name fires editingFinished on
         # the line edit. Both route to the same handler; the handler no-ops when the
         # value is unchanged, so the (harmless) double-fire on a pick costs nothing.
@@ -378,7 +391,10 @@ class DataModule(QtWidgets.QWidget):
             unit = _FIXED_UNIT.get(key, '')
             item = QtWidgets.QTableWidgetItem(unit)
             item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-            item.setForeground(QtCore.Qt.GlobalColor.gray)
+            # Muted secondary text from a theme token, NOT a raw Qt.GlobalColor.gray
+            # (which freezes on a theme switch — see the module header + style guide §1
+            # R1.1/R1.2). Re-resolved on a PaletteChange by _refresh_unit_colors.
+            item.setForeground(theme_color(self, 'muted'))
             self.table.setItem(row, 2, item)
 
     def _display_text(self, key: str, v, working: Optional[dict] = None) -> str:
@@ -501,10 +517,15 @@ class DataModule(QtWidgets.QWidget):
                 value = entered          # fixed-unit numbers are already canonical
         # A direct edit of n or viscosity claims that field as user-owned (sample-wide)
         # BEFORE the write, so library autofill never overwrites it. Only a real typed
-        # value claims it; clearing the cell leaves the tag so a library value can still
-        # re-derive on the next temperature/wavelength change.
-        if key in _SOLVENT_VALUE_KEYS and value is not None:
-            self.controller.mark_solvent_field_user(self.item_id, key)
+        # value claims it. Clearing a library-filled cell instead drops its
+        # 'library:primary' tag, so the provenance dot never keeps claiming a library
+        # value on an EMPTY safety-critical cell (F-45); a later solvent/T/λ change
+        # still re-derives it (autofill is blocked only by a 'user' tag).
+        if key in _SOLVENT_VALUE_KEYS:
+            if value is not None:
+                self.controller.mark_solvent_field_user(self.item_id, key)
+            else:
+                self.controller.clear_library_solvent_field(self.item_id, key)
         # Sample-shared params are entered once and propagate to every
         # measurement in the sample; per-measurement axes stay local.
         if key in _SHARED_PARAM_KEYS:
@@ -830,7 +851,20 @@ class DataModule(QtWidgets.QWidget):
             if self.item_id is not None:
                 self._refresh_provenance()
                 self._refresh_dirty()      # re-resolve the edited-cell tint for the theme
+                self._refresh_unit_colors()  # re-resolve the muted Units-column text
         super().changeEvent(ev)
+
+    def _refresh_unit_colors(self) -> None:
+        """Re-apply the muted theme token to the fixed-unit cells (column 2).
+
+        Their foreground is set once at build time, so a raw colour would freeze on a
+        light/dark switch (style guide §1 R1.1/R1.2). Only the fixed-unit rows carry a
+        `QTableWidgetItem` here; the unit-*picker* rows hold a combo cell widget
+        (`item(r, 2) is None`) and are skipped."""
+        for r in range(len(self.keys)):
+            cell = self.table.item(r, 2)
+            if cell is not None:
+                cell.setForeground(theme_color(self, 'muted'))
 
     def _refresh_pending(self) -> None:
         dirty = self.item_id is not None and self.controller.is_dirty()
@@ -840,8 +874,9 @@ class DataModule(QtWidgets.QWidget):
         self.undo_button.setEnabled(
             self.item_id is not None and self.controller.can_undo())
         # Every mutation path (edit, commit, undo, reset, autofill) and selection change
-        # routes through here, so refresh the plausibility note from the same hook.
+        # routes through here, so refresh the passive notes from the same hook.
         self._refresh_plausibility()
+        self._refresh_solvent_note()
 
     def _refresh_plausibility(self) -> None:
         """Show a passive ⓘ note when the working temperature / refractive index is
@@ -858,6 +893,22 @@ class DataModule(QtWidgets.QWidget):
         msg = ('Check for a unit slip — ' + '; '.join(reasons)
                + '. Used exactly as entered.') if reasons else ''
         set_flag(self.plausibility_note, msg, problem=False)
+
+    def _refresh_solvent_note(self) -> None:
+        """Show a passive ⓘ note when the working solvent name is not in the recognized
+        vocabulary (so it is used as-entered for sample matching). Non-blocking — the
+        name is user-owned. The reason text is defined once, in
+        core.data_models.unrecognized_solvent_reason, shared with the load-time warning
+        so the GUI note and the warning can never disagree."""
+        if self.item_id is None:
+            set_flag(self.solvent_note, '', problem=False)
+            return
+        working = self.controller.workspace.measurements[self.item_id].working_params
+        name = working.get(_SOLVENT_KEY)
+        # A cleared/blank name is not "unrecognized" — it is simply unset; don't nag.
+        reason = (unrecognized_solvent_reason(name)
+                  if isinstance(name, str) and name.strip() else None)
+        set_flag(self.solvent_note, reason or '', problem=False)
 
     def _set_enabled(self, on: bool) -> None:
         self.table.setEnabled(on)

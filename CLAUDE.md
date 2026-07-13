@@ -78,10 +78,15 @@ badges always work on click.
    points are genuinely independent, and label it as **excluding** calibration/dn-dc
    systematics. Use the shared `analysis/uncertainty.py` toolkit (HC3
    heteroscedasticity-consistent covariance; delta-method propagation; `format_pm`
-   display). Do **NOT** report a ± from a **single correlogram** (its lag channels are
-   correlated, Schätzel 1990 → OLS under-reports; ISO 22412 uses repeats). No SE for
-   NNLS/CONTIN (ill-posed) or single-angle Mw (one datum). Every new SE must be
-   **Monte-Carlo-validated** against the sampling SD before it ships. When adding or
+   display). The default reporting is **conservative** — HC3 never anti-conservative under
+   non-uniform precision; a less-robust classical **OLS** SE is offered only as a labelled,
+   opt-in choice for literature comparability, and the chosen estimator is recorded on the
+   result and emitted in exports. Do **NOT** report a ± from a **single correlogram** (its lag
+   channels are correlated, Schätzel 1990 → OLS under-reports; ISO 22412 uses repeats). No SE
+   for NNLS/CONTIN (ill-posed) or single-angle Mw (one datum). Every SE that propagates through
+   a **nonlinear** transform must be **Monte-Carlo-validated** against the sampling SD before it
+   ships (a linear pass-through of an already-validated covariance inherits that validation).
+   When adding or
    modifying ANY analysis, state how it treats uncertainty and document the formula in the
    Theory-and-Equations-Guide (numbered LaTeX), exactly as the analysis itself is documented.
 9. **No owner-machine specifics in the product or docs.** The program (code, config,
@@ -141,9 +146,10 @@ Top-level packages (each with an `__init__.py`) using top-level package imports
 ├── core/
 │   ├── data_models.py        # SampleKey, DLSMeasurement, SLSMeasurement, solvent vocab
 │   └── workspace.py          # LoadedMeasurement/Trace, SampleResult, Sample, Workspace, sessions
-├── parsers/                  # base_parser + per-instrument (brookhaven/generic/zetasizer/alv) + trace
+├── parsers/                  # base_parser + per-instrument (brookhaven/generic/zetasizer clipboard+export/alv) + trace
 ├── physics/
-│   └── constants.py          # kB, NA, q, Stokes-Einstein, optical constant K, toluene Rayleigh
+│   ├── constants.py          # kB, NA, q, Stokes-Einstein, optical constant K, toluene Rayleigh
+│   └── solvents.py           # solvent property library: n(λ,T) + η(T) (provenance-tagged, overridable)
 ├── analysis/
 │   ├── dls/                  # cumulants, exponentials, distributions, angular, replicate (+ _common)
 │   ├── sls.py                # unified calibration, Debye, Zimm/Berry, calibration-free A₂
@@ -203,13 +209,15 @@ Python's standard-library `io` and breaks imports. Use `exporting/`.
 ## Current state
 
 **Complete and validated:** data model; all parsers (Brookhaven DLS/SLS/trace, generic
-DLS/SLS/trace, Zetasizer clipboard, ALV .ASC multi-angle + single-angle); physics constants
-(geometry-aware Rayleigh); utilities + synthetic generator; DLS engine; SLS engine
+DLS/SLS/trace, Zetasizer clipboard + export, ALV .ASC multi-angle + single-angle); physics
+constants (geometry-aware Rayleigh) + solvent property library; utilities + synthetic generator; DLS engine; SLS engine
 (unified calibration, Debye, Zimm/Berry, calibration-free A₂); Origin export; matplotlib
 plotting; workspace + controller (grouping, commit/working state, sessions).
 
 **GUI:** all six tabs built and validated headless. **Data** (parameter confirmation,
-commit/undo/highlight, shared-param propagation, Unit column). **DLS** (cumulant / single
+commit/undo/highlight, shared-param propagation, Unit column, and a solvent property library that *proposes*
+transparent, provenance-tagged, freely-overridable refractive-index / viscosity defaults —
+never dn/dc). **DLS** (cumulant / single
 / double / KWW / NNLS / CONTIN / lognormal, shared τ window + baseline, multi-measurement
 co-plotting, DDLS sub-tab). **SLS** (per-sample calibration panel → k_c; Zimm / Berry /
 Debye / Guinier / single-angle / calibration-free A₂ / Rayleigh; manual-Mw override; data
@@ -242,8 +250,11 @@ VH (analyzer) acquisition path remains hardware-gated.
 - **Hybrid workspace grouping**: auto-propose by sample key (polymer, solvent,
   rounded-temperature) + manual override (sidebar right-click).
 - **Calibration is a visible panel in the SLS section.**
-- **Threading: designed-for, not enabled.** Every expensive call is a single controller
-  method so it can move to a worker thread later without touching widgets.
+- **Threading: enabled for the heavy calls.** Each expensive analysis call is dispatched to
+  a single worker thread (one job in flight app-wide); the controller stays Qt-free. The GUI
+  shows a busy cursor + status message while a fit runs and refuses workspace mutations
+  (commit/load/mask/settings) during it. Fast ops (cumulant/exp fit, preview, commits) stay
+  synchronous. There is no Cancel (a running scipy call can't be safely interrupted).
 - **Flags are GUI-owned overlays**, never baked into matplotlib figures or export data.
   Saved plot images must be clean. In exports, an uncalibrated result writes "uncalibrated,
   arbitrary scale" into the **Comments** cell of the affected columns only.
@@ -252,9 +263,7 @@ VH (analyzer) acquisition path remains hardware-gated.
 
 ## Planned (recorded, not yet built)
 
-- Threading enablement; a solvent property library and solute/polymer library (intensity →
-  volume/number with an explicit scattering model + validity limits); reload-from-source;
-  session schema versioning once the data model stabilizes; caching the per-sample SLS fits
-  the Cross-Sample tab recomputes on each refresh; an A₂ source picker and a visual peak
-  picker in the DLS distribution view; packaging.
+- A solute/polymer scattering-model library (intensity → volume/number with an explicit
+  scattering model + validity limits); reload-from-source; session schema versioning once the
+  data model stabilizes; a visual peak picker in the DLS distribution view; packaging.
 - A real VH (analyzer) depolarized acquisition path (hardware-gated).

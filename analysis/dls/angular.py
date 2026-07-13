@@ -70,6 +70,9 @@ class GammaQ2Result:
     # every eligible measurement's per-point Γ/q²/D_app + quality tag, attached by the
     # controller run so the GUI table/graying come from the run.
     all_points: Optional[list] = None
+    # passive, glyph-less notices for the GUI ⓘ tier (e.g. a mixed sample identity)
+    # -- the same text the module also emits via warnings.warn (keep-both).
+    notes: tuple = ()
 
 
 @dataclass
@@ -93,9 +96,22 @@ class ConcentrationExtrapolationResult:
     rh0_se: Optional[float] = None
     kd_se: Optional[float] = None
     se_estimator: str = 'hc3'             # covariance estimator behind the SEs
+    # Reliability of the 1/coefficient kD = slope/D0 (the DLS sibling of the SLS
+    # Mw = 1/intercept family; rule 10). kD sign-flips when D0 <= 0 -- a WELL-conditioned
+    # fit (a steep +slope extrapolating D0 below zero) can still produce a finite,
+    # false-confident kD ±, which `well_conditioned` alone does NOT catch -- so kD is
+    # gated on BOTH a D0 > 0 sign guard and the numerical-health flag. The value is still
+    # returned (flag, don't NaN the whole result); `reliability_note` says why.
+    kd_reliable: bool = True
+    well_conditioned: bool = True         # numerical-health of the [1, c] design
+    cond: float = float('nan')            # condition number of the D-vs-c design
+    reliability_note: str = ''            # reason kD is unreliable (sign flip / ill-conditioned)
     # every eligible measurement's per-point D_app + quality tag, attached by the
     # controller run so the GUI table/graying come from the run.
     all_points: Optional[list] = None
+    # passive, glyph-less notices for the GUI ⓘ tier (e.g. a mixed system) -- the
+    # same text the module also emits via warnings.warn (keep-both).
+    notes: tuple = ()
 
 
 # ---------------------------------------------------------------------------
@@ -219,14 +235,17 @@ def analyze_gamma_q2(
         )
 
     # Check they are the same sample (sample_key ignores angle, so all should match).
+    notes: list = []       # passive ⓘ notices surfaced on the result (keep-both)
     keys = {m.sample_key for m in measurements}
     if len(keys) > 1:
-        warnings.warn(
-            "Measurements passed to analyze_gamma_q2 do not all share the same "
-            "sample identity (polymer/solvent/concentration/temperature). Gamma "
-            "vs q^2 assumes one sample across angles.",
-            UserWarning, stacklevel=2,
+        # Single source of the message -> both the note and the warning.
+        msg = (
+            "Measurements do not all share the same sample identity "
+            "(polymer/solvent/concentration/temperature). Γ vs q² assumes one "
+            "sample across angles."
         )
+        notes.append(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
 
     angles = np.array([m.angle_deg for m in measurements], dtype=float)
     if np.unique(angles).size < 2:
@@ -293,6 +312,7 @@ def analyze_gamma_q2(
         r2_threshold=r2_threshold, intercept_rel_threshold=intercept_rel_threshold,
         d_se=unc.se_or_none(d_se), rh_se=unc.se_or_none(rh_se),
         se_estimator=estimator,
+        notes=tuple(notes),
     )
 
 
@@ -308,6 +328,7 @@ def extrapolate_diffusion_vs_concentration(
     skip_initial_channels: int = 0,
     cumulant_method: str = 'linear',
     estimator: str = 'hc3',
+    cond_limit: float = unc.COND_LIMIT,
 ) -> ConcentrationExtrapolationResult:
     """Extrapolate the apparent diffusion coefficient to infinite dilution.
 
@@ -350,14 +371,16 @@ def extrapolate_diffusion_vs_concentration(
         )
 
     # Warn if polymer/solvent/temperature are not consistent.
+    notes: list = []       # passive ⓘ notices surfaced on the result (keep-both)
     ids = {(m.polymer_name, m.solvent_name, m.temperature_K) for m in measurements}
     if len(ids) > 1:
-        warnings.warn(
-            "Measurements passed to extrapolate_diffusion_vs_concentration do not "
-            "all share polymer/solvent/temperature. Concentration extrapolation "
-            "assumes one system.",
-            UserWarning, stacklevel=2,
+        # Single source of the message -> both the note and the warning.
+        msg = (
+            "Measurements do not all share polymer/solvent/temperature. "
+            "Concentration extrapolation assumes one system."
         )
+        notes.append(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
 
     conc = np.array([m.concentration_g_per_mL for m in measurements], dtype=float)
     if np.unique(conc).size < 2:
@@ -376,18 +399,39 @@ def extrapolate_diffusion_vs_concentration(
     order = np.argsort(conc)
     conc, d_app = conc[order], d_app[order]
 
-    lf = unc.linear_fit(conc, d_app, estimator)  # D(c) = D0 + slope*c; cov [intercept, slope]
+    lf = unc.linear_fit(conc, d_app, estimator, cond_limit)  # D(c)=D0+slope*c; cov [intercept, slope]
     slope, intercept = lf.slope, lf.intercept
     d0 = float(intercept)
     r2 = lf.r_squared
-    kd = float(slope / d0) if d0 != 0 else float('nan')
+    # kD = slope/D0 is a 1/coefficient quantity: guard on D0 > 0 (not just != 0). A
+    # non-positive infinite-dilution D0 is unphysical AND makes kD sign-flip (a good-
+    # solvent +slope misread as poor-solvent), so we do not report kD/kD_se from it --
+    # mirroring the rh0 guard just below (rule 10).
+    kd = float(slope / d0) if d0 > 0 else float('nan')
 
     # Statistical SEs: D0 from the intercept; kD = slope/D0 through the 2x2 cov.
     d0_se = unc.se_or_none(lf.intercept_se)
     kd_se = None
-    if d0 != 0 and math.isfinite(lf.intercept_se):
+    if d0 > 0 and math.isfinite(lf.intercept_se):
         kd_se = unc.se_or_none(unc.propagate(
             [-slope / d0 ** 2, 1.0 / d0], lf.cov))    # order [intercept, slope]
+
+    # Reliability of kD: a finite value from a D0 > 0, well-conditioned fit. When False
+    # the value is still shown (flag, don't NaN) with the reason on `reliability_note`.
+    # The D0 <= 0 sign flip is NOT a conditioning failure (the design can be perfectly
+    # well-conditioned), so it needs its own guard -- distinct from `well_conditioned`.
+    kd_reliable = bool(d0 > 0 and lf.well_conditioned and math.isfinite(kd))
+    if d0 <= 0:
+        reliability_note = (
+            "D0 <= 0: the infinite-dilution diffusion coefficient extrapolated "
+            "non-physical, so kD = slope/D0 sign-flips and its ± is not defensible -- "
+            "add lower concentrations closer to c -> 0.")
+    elif not lf.well_conditioned:
+        reliability_note = (
+            f"ill-conditioned D-vs-c design (cond={lf.cond:.1e}); kD numerically "
+            "unreliable -- add concentrations or widen their spread.")
+    else:
+        reliability_note = ''
 
     temperature_K = measurements[0].temperature_K
     eta = measurements[0].viscosity_Pa_s
@@ -404,4 +448,7 @@ def extrapolate_diffusion_vs_concentration(
         n_concentrations=int(np.unique(conc).size),
         d0_se=d0_se, rh0_se=unc.se_or_none(rh0_se), kd_se=kd_se,
         se_estimator=estimator,
+        kd_reliable=kd_reliable, well_conditioned=lf.well_conditioned,
+        cond=lf.cond, reliability_note=reliability_note,
+        notes=tuple(notes),
     )

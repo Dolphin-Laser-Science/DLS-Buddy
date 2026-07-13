@@ -366,6 +366,11 @@ class DDLSResult:
     d_r_rad2_s: float                  # mean of d_r_per_angle
     d_r_se: Optional[float]            # SD/sqrt(n) across angles; None for n < 2
     rh_t_nm: float                     # Stokes-Einstein radius from D_t
+    # Rh_t ∝ D_t^-1: the fractional error carries over exactly (sigma_Rh/Rh = sigma_D/D),
+    # so this is the already-validated reciprocal pass-through of d_t_se (power_law_se,
+    # exponent -1) -- the SAME conversion the DLS-angular sibling GammaQ2Result.rh_se uses
+    # (rule 10). None whenever d_t_se is (single angle -> no ensemble SE).
+    rh_t_se: Optional[float]
     rotational_time_s: float           # 1 / (6 D_r), the VH relaxation time
     # bookkeeping
     n_angles: int
@@ -469,6 +474,11 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
     # Stokes-Einstein radius from D_t (translational), and the VH relaxation time.
     rh_t_nm = (stokes_einstein_rh(d_t, temperature_K, viscosity_Pa_s) * 1e9
                if (have_t_and_eta and d_t > 0) else float('nan'))
+    # Rh_t inherits d_t_se by the exact fractional relation (Rh_t ∝ D_t^-1), the same
+    # already-validated reciprocal pass-through used for GammaQ2Result.rh_se (invariant 8;
+    # no separate MC gate needed -- see power_law_se's carve-out note). None when d_t_se is.
+    rh_t_se = (unc.power_law_se(rh_t_nm, d_t, d_t_se, -1)
+               if math.isfinite(rh_t_nm) else None)
     rotational_time_s = (1.0 / (6.0 * d_r)) if d_r > 0 else float('nan')
 
     # qL single-exponential guard (only if a rod length is known).
@@ -495,7 +505,7 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
         d_r_per_angle=d_r_per_angle, qL=qL,
         d_t_m2_s=d_t, d_t_se=d_t_se,
         d_r_rad2_s=d_r, d_r_se=d_r_se,
-        rh_t_nm=rh_t_nm, rotational_time_s=rotational_time_s,
+        rh_t_nm=rh_t_nm, rh_t_se=rh_t_se, rotational_time_s=rotational_time_s,
         n_angles=n, method=method, single_exponential_valid=single_exp_valid,
         notes=' '.join(notes), se_estimator=estimator)
 
@@ -531,6 +541,7 @@ class SphereShapeResult:
     radius_rot_nm: float            # R from D_r (Stokes-Einstein-Debye)
     radius_rot_se: Optional[float]
     radius_trans_nm: float          # R from D_t (= Stokes/hydrodynamic radius Rh)
+    radius_trans_se: Optional[float]  # inherited from d_t_se (R_trans ∝ D_t^-1)
     sphericity_ratio: float         # radius_rot / radius_trans (1 for a true sphere)
     is_consistent: bool             # |ratio - 1| within tolerance -> sphere plausible
     note: str = ''
@@ -553,6 +564,7 @@ class RodShapeResult:
 def sphere_dimensions_from_diffusion(
         d_t_m2_s: float, d_r_rad2_s: float, *,
         temperature_K: float, viscosity_Pa_s: float,
+        d_t_se: Optional[float] = None,
         d_r_se: Optional[float] = None,
         sphericity_tol: float = 0.15) -> SphereShapeResult:
     """Sphere-model radii from D_t and D_r, with a sphericity consistency check.
@@ -562,7 +574,9 @@ def sphere_dimensions_from_diffusion(
     so `sphericity_ratio` = R_rot/R_trans should be ~1; a ratio outside
     1 +/- `sphericity_tol` flags that the particle is not spherical (e.g. a rod,
     where R_rot > R_trans). R_rot's SE propagates from D_r by the delta method
-    (R ∝ D_r^(-1/3) -> SE(R)/R = (1/3) SE(D_r)/D_r).
+    (R ∝ D_r^(-1/3) -> SE(R)/R = (1/3) SE(D_r)/D_r); R_trans's SE propagates from D_t as
+    the reciprocal Stokes radius (R_trans ∝ D_t^-1 -> SE(R)/R = SE(D_t)/D_t), the same
+    already-validated pass-through as the DLS-angular Rh_se / DDLS rh_t_se (invariant 8).
     """
     r_rot_nm = phys.sphere_radius_from_rotational_diffusion(
         d_r_rad2_s, temperature_K, viscosity_Pa_s) * 1e9
@@ -570,6 +584,8 @@ def sphere_dimensions_from_diffusion(
     ratio = r_rot_nm / r_trans_nm if r_trans_nm > 0 else float('nan')
     r_rot_se = (r_rot_nm * (1.0 / 3.0) * (d_r_se / d_r_rad2_s)
                 if (d_r_se is not None and d_r_rad2_s > 0) else None)
+    r_trans_se = (unc.power_law_se(r_trans_nm, d_t_m2_s, d_t_se, -1)
+                  if math.isfinite(r_trans_nm) else None)
     consistent = math.isfinite(ratio) and abs(ratio - 1.0) <= sphericity_tol
     note = ('R from D_r and R from D_t agree -> a sphere is a plausible model.'
             if consistent else
@@ -578,8 +594,8 @@ def sphere_dimensions_from_diffusion(
             f'model (ratio > 1 is the rod signature).')
     return SphereShapeResult(
         radius_rot_nm=r_rot_nm, radius_rot_se=unc.se_or_none(r_rot_se),
-        radius_trans_nm=r_trans_nm, sphericity_ratio=ratio,
-        is_consistent=consistent, note=note)
+        radius_trans_nm=r_trans_nm, radius_trans_se=unc.se_or_none(r_trans_se),
+        sphericity_ratio=ratio, is_consistent=consistent, note=note)
 
 
 def _solve_rod_pld(d_t_m2_s: float, d_r_rad2_s: float,

@@ -401,6 +401,18 @@ class BrookhavenTraceParser(BaseTraceParser):
                 f"expected at least {_TRACE_DATA_START_ROW + 1}."
             )
 
+        # --- strict format sniff: the header row (row 2) must be the Brookhaven
+        #     count-rate header 'Time (seconds),Count Rate (kcps)'. Without it this
+        #     is not a Brookhaven trace file -- reject so the loader can try another
+        #     parser (otherwise a plain two-column table -- e.g. an HH:MM:SS timestamp
+        #     with a bare cps column -- would be silently accepted and its cps values
+        #     wrongly rescaled x1000 as if they were kcps, corrupting every trace
+        #     diagnostic). Mirrors the correlogram sibling's C(t) sniff (hardened S36).
+        if 'count rate' not in lines[_TRACE_HEADER_ROW].lower():
+            raise ParseError(
+                f"{file_path!r} is not a Brookhaven count-rate trace: its second "
+                f"row is not the expected 'Time (seconds),Count Rate (kcps)' header.")
+
         # --- row 1: sample label ---
         sample_label = _extract_label(lines[_TRACE_LABEL_ROW])
 

@@ -47,6 +47,36 @@ from analysis.dls._common import (
 # generally considered unreliable above this polydispersity index.
 CUMULANT_PDI_VALIDITY_LIMIT = 0.3
 
+# Minimum physically meaningful hydrodynamic radius (nm) for a cumulant fit. A fit
+# that returns an Rh below this has almost certainly chased a short-lag artifact
+# into Gamma rather than measured a real particle (even a bare solvent molecule is
+# ~0.1 nm), so such a degenerate nonlinear fit is rejected. Exposed as a documented
+# module constant per invariant 3 (thresholds are documented defaults, not buried
+# magic numbers), mirroring CUMULANT_PDI_VALIDITY_LIMIT. (audit F-12)
+CUMULANT_MIN_RH_NM = 0.2
+
+
+def _pdi_and_validity(order: int, mu2: float, gamma: float) -> tuple[float, bool]:
+    """Polydispersity index PDI = mu2 / gamma^2 and its reliability flag.
+
+    An order-1 cumulant fits ONLY the mean decay rate Gamma -- it has no curvature
+    (mu2) term -- so the polydispersity is UNMEASURED, not zero. Report PDI = NaN
+    (not 0.0) so it is never mis-stated as a confirmed-monodisperse PDI = 0.000
+    (audit F-09; invariant-8 spirit: omit when none is honest). For order >= 2, PDI
+    is meaningful; pdi_valid requires it finite, non-negative (a negative mu2 from an
+    over-subtracted baseline or a negative Gamma is physically impossible), and at or
+    below the validity limit. NaN correctly fails that test, so order-1 is never
+    marked reliable. Both fit paths (linear, nonlinear) share this to stay in lockstep
+    (rule 10).
+    """
+    if order < 2:
+        pdi = float('nan')
+    else:
+        pdi = mu2 / gamma ** 2 if gamma != 0 else float('nan')
+    valid = bool(math.isfinite(pdi) and 0.0 <= pdi <= CUMULANT_PDI_VALIDITY_LIMIT
+                 and gamma > 0)
+    return pdi, valid
+
 
 @dataclass
 class CumulantResult:
@@ -184,12 +214,7 @@ def _fit_cumulants_linear(
     gamma = -c[1] / 2.0
     mu2 = c[2] if order >= 2 else 0.0
     mu3 = (-3.0 * c[3]) if order >= 3 else None
-    # PDI = mu2 / gamma^2. pdi_valid (below) additionally requires pdi >= 0 and
-    # gamma > 0: a negative mu2 (over-subtracted baseline) or a negative decay rate
-    # (an increasing/anti-correlated g2-1) is physically impossible, so a fit that
-    # produces one must not be marked reliable even if |pdi| happens to fall under
-    # the 0.3 limit.
-    pdi = mu2 / gamma ** 2 if gamma != 0 else float('nan')
+    pdi, pdi_valid = _pdi_and_validity(order, mu2, gamma)
 
     q = _measurement_q_m(measurement)
     d = gamma / q ** 2 if gamma > 0 else float('nan')
@@ -214,8 +239,7 @@ def _fit_cumulants_linear(
         mu2_s_inv2=mu2,
         mu3_s_inv3=mu3,
         pdi=pdi,
-        pdi_valid=bool(math.isfinite(pdi) and 0.0 <= pdi <= CUMULANT_PDI_VALIDITY_LIMIT
-                       and gamma > 0),
+        pdi_valid=pdi_valid,
         d_m2_s=d,
         rh_nm=rh,
         q_m_inv=q,
@@ -332,7 +356,7 @@ def _fit_cumulants_nonlinear(
         # unphysically tiny Rh (the fit chased a short-lag artifact into Gamma).
         if not (math.isfinite(gamma) and gamma > 0 and math.isfinite(beta) and beta > 0):
             ok = False
-        elif math.isfinite(rh) and rh < 0.2:
+        elif math.isfinite(rh) and rh < CUMULANT_MIN_RH_NM:
             ok = False
     if not ok:
         # D2 (owner decision 2026-07-07): a failed nonlinear fit returns NaN physical
@@ -350,12 +374,7 @@ def _fit_cumulants_nonlinear(
             n_skipped=int(skip_initial_channels or 0),
             method='nonlinear', baseline=nan, success=False)
 
-    # PDI = mu2 / gamma^2. pdi_valid (below) additionally requires pdi >= 0 and
-    # gamma > 0: a negative mu2 (over-subtracted baseline) or a negative decay rate
-    # (an increasing/anti-correlated g2-1) is physically impossible, so a fit that
-    # produces one must not be marked reliable even if |pdi| happens to fall under
-    # the 0.3 limit.
-    pdi = mu2 / gamma ** 2 if gamma != 0 else float('nan')
+    pdi, pdi_valid = _pdi_and_validity(order, mu2, gamma)
     fitted = f(tau, *popt)
     residuals = g2m1 - fitted
     # D3: report rms_error over the SAME cutoff-masked (high-amplitude, short-lag)
@@ -381,8 +400,7 @@ def _fit_cumulants_nonlinear(
         mu2_s_inv2=mu2,
         mu3_s_inv3=mu3,
         pdi=pdi,
-        pdi_valid=bool(math.isfinite(pdi) and 0.0 <= pdi <= CUMULANT_PDI_VALIDITY_LIMIT
-                       and gamma > 0),
+        pdi_valid=pdi_valid,
         d_m2_s=d,
         rh_nm=rh,
         q_m_inv=q,

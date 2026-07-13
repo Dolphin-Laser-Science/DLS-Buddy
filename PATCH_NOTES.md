@@ -3,9 +3,156 @@
 User-facing summary of what each release changed, plus a running list of known
 issues.
 
-Versioning is pre-1.0 `0.MINOR.PATCH`: MINOR for new user-facing capability,
+Versioning follows `MAJOR.MINOR.PATCH`: MINOR for new user-facing capability,
 PATCH for fixes/polish. The version is set in `version.py` and shown in the GUI
 window title.
+
+---
+
+## 1.0.0 — First stable release (2026-07-13)
+
+The first stable release of DLS Buddy — a general-purpose, instrument-agnostic platform for
+analyzing static and dynamic light scattering (SLS/DLS) from polymer solutions.
+
+Everything is in place and validated:
+
+- **Loading** from Brookhaven, Malvern Zetasizer, and ALV files, with a generic plain-text
+  fallback — the load buttons carry no vendor name; the format is auto-detected.
+- **DLS engine** — cumulants, single / double / stretched-exponential fits, NNLS and CONTIN
+  size distributions, Γ–q² and concentration extrapolation, and true-replicate averaging.
+- **SLS engine** — calibration, Zimm and Berry, Debye and Guinier, and the calibration-free
+  2·A₂·Mw product. Apparent vs thermodynamic results are always distinguished.
+- **Depolarized DLS** (VU/VV/VH), the ρ = Rg/Rh and power-law scaling cross-sample tools,
+  the solvent-property library, and Origin-compatible CSV export.
+- **The desktop application** — six tabs (Data, DLS, SLS, Cross-Sample, Utilities, Settings)
+  with a sidebar workspace navigator, light/dark theming, and two-tier in-program help.
+
+Uncertainty is reported where the fitted points are genuinely independent and labelled as
+excluding calibration/dn-dc systematics; it is omitted where none is honest. Mw and absolute
+A₂ are flagged when a run is uncalibrated, while Rg and the calibration-free product survive.
+
+This release also incorporates the pre-1.0 hardening pass: numerical and uncertainty rigor,
+fail-loud input validation, provenance carried through exports, GUI stale-state and plumbing
+fixes, and the help / consistency polish from the 0.23.x line.
+
+Start with the Quickstart, User Manual, and Theory-and-Equations guides under `docs/`.
+
+---
+
+## 0.23.5 — In-program help & label polish (2026-07-12)
+
+*No change to any calculation or result value. Part of the pre-1.0 audit.*
+
+- **More controls now explain themselves.** The DLS **Cumulant order** spin has a tooltip
+  (what the order means — 1 = size only, 2 adds PDI, 3 adds skew — and why it greys out for
+  the other methods), and the SLS method list's tooltip now describes the **Excess Rayleigh
+  ratio** option it previously skipped.
+- **The empty SLS plot now says what to do.** Before a fit (or for a sample with no SLS data)
+  the Zimm/Debye plot area showed a blank white rectangle; it now shows a short centered note
+  ("Load SLS intensities…" / "Press Run…"), matching the depolarized-DLS plot.
+- **Consistent capitalization.** A few section titles now use Title Case like their neighbours
+  ("Parametric Fit", "Traces to Plot"), and the User-Manual matches the in-app names for the
+  Solvent Library, Display Units, and Paired Angles controls.
+- **Theming fix.** The parameter table's fixed-unit text (e.g. the "°" and "nm" cells) now
+  follows the light/dark theme instead of staying a fixed grey.
+
+---
+
+## 0.23.4 — On-screen flag for hot-calibration extrapolation (2026-07-12)
+
+*No change to any calculation or result value. Part of the pre-1.0 audit.*
+
+- **Calibrating above 50 °C (or below 10 °C) now shows an on-screen note.** The toluene
+  Rayleigh-ratio temperature correction is validated only over 10–50 °C; outside that range the
+  calibration constant k_c is extrapolated. That extrapolation was already computed (never
+  blocked, so elevated-temperature reline work keeps running) but was flagged only to the
+  terminal. The SLS Calibration panel now shows a neutral ⓘ note next to k_c whenever the standard
+  temperature is outside the table, so the extrapolation is visible in the app. It clears when the
+  temperature returns to the 10–50 °C range.
+
+---
+
+## 0.23.3 — GUI plumbing fixes (2026-07-12)
+
+*Fixes only — no change to any calculation or result value. Part of the pre-1.0 audit.*
+
+- **Removing a sample with a second solvent blank now removes it completely.** If a sample
+  had two c = 0 SLS blanks (the second parked as a retrievable "extra" reference), "Remove
+  sample" could previously leave the extra blank behind — it would reappear after the next
+  regroup — or, if you selected only the extra blank, silently do nothing at all. Both are
+  fixed; the extra blank is now a full member of the sample for grouping, removal, and
+  shared-parameter edits.
+- **A trace load cancelled partway through a multi-file batch no longer hides already-loaded
+  traces.** Loading several trace files where a later one falls back to the plain-text format
+  and you cancel its units prompt used to leave the earlier files loaded into the workspace
+  but invisible in the sidebar until an unrelated refresh. The sidebar now updates
+  immediately, and you still get the "some traces not loaded" notice for the ones that
+  didn't load.
+- **A rejected log-scale axis change now explains why.** Picking "log" for a plot axis whose
+  limits include zero or a negative value now shows the reason ("log min must be > 0")
+  instead of silently reverting with no message.
+- Smaller robustness fixes: unchecking a sample's per-sample calibration mid-fit, the
+  Depolarization panel's Mw read, a Settings dropdown holding a value outside its list, a
+  partial axis-limit edit, a multi-sample manual-entry queue, and a synthetic-generator
+  concentration edge case are all now guarded consistently with the rest of the app.
+
+---
+
+## 0.23.2 — Deliberate picks preserved + clearer uncalibrated exports (2026-07-12)
+
+*Fixes only — no change to any calculation or result value. Part of the pre-1.0 audit.*
+
+- **A value you explicitly picked in Cross-Sample is no longer overwritten by a re-run.**
+  If you chose a specific Mw, Rg, A₂ or Rh for a sample from the source picker, re-running a
+  Zimm/Berry fit (or a replicate average) now leaves your choice in place — exactly as a
+  hand-entered value already was. Previously the re-run silently reset it to the auto-selected
+  default. To adopt a fresh fit, pick it again.
+- **Uncalibrated Zimm exports now flag every arbitrary-scale column.** When you export an
+  uncalibrated Zimm/Berry dataset, the per-concentration Kc/dR columns and the extrapolated
+  intercepts now carry the same "uncalibrated, arbitrary scale" note their Mw/A₂ already did,
+  so a re-import into Origin can't be mistaken for absolute scale. (Rg stays valid — it doesn't
+  depend on the calibration — and is left unmarked, as before.)
+
+---
+
+## 0.23.1 — Sturdier settings + stricter file loading (2026-07-12)
+
+*Robustness only — no change to any calculation or result value. Part of the pre-1.0
+fail-loud audit: close a set of gaps where a bad input file or a hand-edited settings file
+could be silently misread instead of caught.*
+
+- **Invalid saved settings are now repaired or reported, never silently wrong.** If your
+  `settings.json` has been hand-edited (or left over from a different build) and a value has
+  the wrong type, the app now fixes it when the intent is unambiguous (e.g. `"2"` → 2) and,
+  when it can't, resets just that setting to its default and tells you at startup which ones
+  and what they are now — instead of either crashing or quietly running with a value you
+  didn't intend. A settings file that isn't a valid settings object no longer prevents the
+  app from starting.
+- **Foreign files are rejected more reliably on load.** A count-rate trace, a Zetasizer
+  clipboard export with unreadable record columns, or a static-scattering intensity list
+  containing non-numeric (`NaN`/`inf`) values is now refused at load with a clear message,
+  rather than being partly accepted and silently corrupting the numbers downstream. Every
+  supported instrument file still loads exactly as before.
+
+---
+
+## 0.23.0 — Analysis warnings now visible in the app (2026-07-10)
+
+*No change to any calculation or result value — several signals the analysis already
+produced were only ever written to a console the packaged app doesn't show, and are now
+surfaced in the window as passive **ⓘ** notes.*
+
+- **Unrecognized solvent name** (Data tab). Typing a solvent that isn't in the recognized
+  vocabulary now shows a note below the parameter table: the name is used as-entered for
+  sample matching. (Previously silent in the app.)
+- **Dropped non-physical points** (SLS tab). When a Berry or calibration-free A₂ fit drops
+  points with a non-positive value before its square root / ratio, the count and reason now
+  appear as a note under the result — so a quietly shrunk fit is no longer invisible.
+- **Negative intensities on load** (generic SLS files). Loading a plain-text SLS file that
+  contains negative intensities (possible after background subtraction) now reports it in a
+  short "loaded with notes" dialog; the values are still stored and used as-entered.
+- Under the hood, the same messages continue to be emitted on the console for scripted/headless
+  use — nothing was removed, only made visible.
 
 ---
 
@@ -1061,8 +1208,6 @@ before formal version numbers existed. Capabilities as of this release:
 
 - **DPLS/DDLS not yet tested on real depolarized data** — validated only against
   synthetic ground truth so far.
-- **`divide by zero` RuntimeWarning** from `analysis/utilities.fit_count_rate_histogram`
-  when a histogram bin is empty (chi-squared term). Harmless but noisy; guard pending.
 - **Visual peak picker** in the DLS distribution view is planned (peaks are already
   offered as Rh sources elsewhere, but not click-selectable in the plot).
 - **Session JSON is not yet schema-versioned** — old sessions may not load after a

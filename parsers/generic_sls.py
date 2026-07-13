@@ -220,24 +220,26 @@ class GenericSLSParser(BaseSLSParser):
 
         # Warn on negative intensities rather than raising, because some
         # instruments report small negative values after background subtraction.
+        # Surface the same message both ways (keep-both): a passive note carried on
+        # the preview (-> a load-time ⓘ in the GUI) and a UserWarning (stderr/headless).
+        notes: tuple = ()
         negative_intensities = [v for v in intensities if v < 0]
         if negative_intensities:
             import warnings
-            warnings.warn(
-                f"{len(negative_intensities)} negative intensity value(s) "
-                f"found in {file_path!r}. This can occur after background "
-                f"subtraction. Negative values will be stored as-is; verify "
-                f"that the data is physically reasonable before proceeding "
-                f"with analysis.",
-                UserWarning,
-                stacklevel=2,
+            note = (
+                f"{len(negative_intensities)} negative intensity value(s) found "
+                "(can occur after background subtraction). Stored as-is; verify the "
+                "data is physically reasonable before proceeding with analysis."
             )
+            notes = (note,)
+            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
 
         preview = SLSFilePreview(
             source_file=os.path.abspath(file_path),
             instrument_name='Generic (plain-text)',
             angles_deg=np.array(angles, dtype=float),
             intensities=np.array(intensities, dtype=float),
+            notes=notes,
             # All physical parameters intentionally left as None.
         )
         return [preview]

@@ -126,12 +126,19 @@ class CrossSampleModule(QtWidgets.QWidget):
         # one sample. Rows/points/source-panel all operate on units.
         self._row_units: List[Tuple[str, Optional[str]]] = []
         self._current_unit: Optional[Tuple[str, Optional[str]]] = None
+        # The (sid, fraction) the MANUAL-entry widgets are currently bound to. Tracked
+        # separately from _current_unit (which _focus_sample/_on_fraction_combo set
+        # BEFORE they repopulate the panel) so the panel can tell a real target change
+        # from a same-target repopulate, and clear a stale typed value on the former (F-42).
+        self._manual_unit: Optional[Tuple[str, Optional[str]]] = None
         self._size_quantity = 'rg'               # top scaling plot: 'rg' or 'rh'
         self._show_all_single = False            # reveal the single-condition tail
         self._suppress = False                   # guard signal storms on rebuild
-        # Hand-entered Rg/Rh/Mw typed while the worker was busy, keyed by which,
-        # applied (re-checking) once it frees — a precious value is never dropped.
-        self._pending_manual: Dict[str, tuple] = {}
+        # Hand-entered Rg/Rh/Mw typed while the worker was busy, applied (re-checking)
+        # once it frees — a precious value is never dropped. Keyed by (which, sid, frac),
+        # NOT by which alone: queuing the same quantity for two different samples while
+        # busy must not silently drop the first (F-43).
+        self._pending_manual: Dict[Tuple[str, str, Optional[str]], tuple] = {}
         self._build_ui()
         self.refresh()
 
@@ -691,11 +698,34 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.sampleFocusRequested.emit(sid)
 
     def set_focused_sample(self, sid: Optional[str]) -> None:
-        """Focus `sid` in the source panel to follow the shell's active sample. No-op if
-        the sample isn't in the Cross universe (no SLS data) — Cross is aggregate over
-        SLS-bearing samples, and its include/exclude membership is unchanged."""
-        if sid and self._sample_combo_index(sid) >= 0:
-            self._focus_sample(sid)                  # new sample → first fraction
+        """Focus `sid` in the source panel to follow the shell's active sample. Two
+        out-of-universe cases, distinguished so the panel is never silently out of sync
+        with the shell (F-44); membership is unchanged either way:
+          - `sid` has no SLS data → not part of Cross (aggregate over SLS-bearing
+            samples); keep the current panel (the documented no-op).
+          - `sid` HAS SLS data but is currently excluded (unticked) → show an
+            excluded-state notice rather than keep showing the PREVIOUS sample."""
+        if not sid:
+            return
+        if self._sample_combo_index(sid) >= 0:
+            self._focus_sample(sid)                  # included → focus, first fraction
+        elif sid in self._included:                  # SLS-bearing but excluded
+            self._show_excluded_notice(sid)
+        # else: no SLS data — not a Cross sample; keep the current panel (no-op).
+
+    def _show_excluded_notice(self, sid: str) -> None:
+        """Source-panel empty-state for a sample the shell focused that is excluded
+        from Cross-Sample (unticked in the membership list). Mirrors the no-samples
+        empty-state (disable the box, drop the current unit so a later action can't
+        write to a stale sample) but explains why (F-44)."""
+        self._current_unit = None
+        self.source_box.setEnabled(False)
+        sample = self.controller.workspace.samples.get(sid)
+        label = _sample_label(sample) if sample is not None else sid
+        self.interp.setText(
+            f'{label} is excluded from Cross-Sample (unticked in the membership list). '
+            'Re-tick it to pick sources or enter manual values.')
+        self.selectionChanged.emit()                 # clear the tree mirror
 
     @QtCore.Slot(int)
     def _on_fraction_combo(self, _index: int) -> None:
@@ -727,6 +757,21 @@ class CrossSampleModule(QtWidgets.QWidget):
         return ids
 
     def _populate_source_panel(self, sid: str, fraction: Optional[str]) -> None:
+        # A typed-but-unsubmitted manual value is bound to the sample it was typed for.
+        # When the panel switches to a DIFFERENT (sample, fraction), clear the manual
+        # entry widgets so a later "Set" can't write the stale text into the newly
+        # focused sample as trusted 'user' provenance (F-42). Compare against
+        # _manual_unit (the panel's own last target), NOT _current_unit — the callers
+        # set _current_unit before repopulating. Clear only on a real target change: a
+        # repopulate for the SAME unit (e.g. a background refresh or Show-all toggle)
+        # must not wipe what the user is mid-typing. The manual widgets have no
+        # textChanged/toggled slots, so clearing fires nothing.
+        if self._manual_unit != (sid, fraction):
+            for edit in (self.rg_manual, self.rh_manual, self.mw_manual):
+                edit.clear()
+            self.rg_manual_apparent.setChecked(False)
+            self.rh_manual_apparent.setChecked(False)
+        self._manual_unit = (sid, fraction)
         self._current_unit = (sid, fraction)
         # Manual-entry placeholders follow the active Display-units choice.
         self.rg_manual.setPlaceholderText(self._radius_unit())
@@ -778,7 +823,13 @@ class CrossSampleModule(QtWidgets.QWidget):
             rho = self.controller.compute_sample_rho(sid, fraction)
             flag = ('  [apparent ρ — at least one input is a single-condition '
                     'value]' if rho.is_apparent else '')
-            self.interp.setText(f'{rho.interpretation}{flag}')
+            # Passive ⓘ notices from the underlying RhoResult (e.g. Rg/Rh keys disagree);
+            # normally empty here since the pair comes from one sample. One ⓘ heads the
+            # note block, matching the set_flag(problem=False) convention the SLS/DLS
+            # notes surfaces use. Same text also emitted via warnings.warn (keep-both).
+            note_lines = getattr(rho, 'notes', ())
+            notes = ('\nⓘ ' + '\n'.join(note_lines)) if note_lines else ''
+            self.interp.setText(f'{rho.interpretation}{flag}{notes}')
         except Exception as exc:
             self.interp.setText(str(exc))
 
@@ -954,7 +1005,7 @@ class CrossSampleModule(QtWidgets.QWidget):
             # set_manual_* writes SampleResult, which a background fit is reading —
             # but a hand-entered value is precious and must not be dropped. Queue
             # it and apply once the worker frees (re-checking, never concurrently).
-            self._pending_manual[which] = (sid, frac, value, apparent)
+            self._pending_manual[(which, sid, frac)] = (value, apparent)
             run_when_idle(self._flush_manual)
             self.interp.setText(
                 'Entry queued — it will apply when the running analysis finishes.')
@@ -962,7 +1013,8 @@ class CrossSampleModule(QtWidgets.QWidget):
         self._apply_manual(which, sid, frac, value, apparent)
         edit.clear()
 
-    def _apply_manual(self, which, sid, frac, value, apparent) -> None:
+    def _apply_manual(self, which, sid, frac, value, apparent, *,
+                      repopulate: bool = True) -> None:
         if which == 'mw':
             self.controller.set_manual_mw(sid, value, frac)
         else:
@@ -970,7 +1022,8 @@ class CrossSampleModule(QtWidgets.QWidget):
                       else self.controller.set_manual_rh)
             setter(sid, value, is_apparent=apparent, fraction=frac)
         self._recompute()
-        self._populate_source_panel(sid, frac)
+        if repopulate:
+            self._populate_source_panel(sid, frac)
 
     def _flush_manual(self) -> None:
         """Apply queued hand-entered values once the worker frees. Re-checks busy
@@ -982,6 +1035,10 @@ class CrossSampleModule(QtWidgets.QWidget):
             return
         pending, self._pending_manual = self._pending_manual, {}
         edits = {'rg': self.rg_manual, 'rh': self.rh_manual, 'mw': self.mw_manual}
-        for which, (sid, frac, value, apparent) in pending.items():
-            self._apply_manual(which, sid, frac, value, apparent)
+        for (which, sid, frac), (value, apparent) in pending.items():
+            self._apply_manual(which, sid, frac, value, apparent, repopulate=False)
             edits[which].clear()
+        # Restore the panel to the sample actually in focus, not whichever queued
+        # entry happened to apply last (F-92).
+        if self._current_unit is not None:
+            self._populate_source_panel(*self._current_unit)

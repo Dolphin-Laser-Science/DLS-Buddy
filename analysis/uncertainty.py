@@ -329,7 +329,17 @@ def ratio_se(a: float, a_se: Optional[float],
 
     Returns None unless both SEs are available and a, b are non-zero (so the
     fractional terms are defined). Used for rho = Rg/Rh (Rg from SLS, Rh from DLS —
-    independent measurements)."""
+    independent measurements) and rho_v = I_VH/I_VV (depolarization).
+
+    Invariant-8 carve-out (Monte-Carlo-characterized; see tests/test_uncertainty
+    test_ratio_se_montecarlo_* and Theory-and-Equations-Guide §6.2). This first-order
+    (delta-method) ratio SE tracks the sampling SD to within a few percent while the
+    DENOMINATOR's fractional error is small, and is mildly ANTI-conservative (under-
+    reports ~5-10%) once the denominator CV grows past ~0.15 — the heavy tail of 1/b as b
+    approaches zero. The direction is set by which channel is noisy: rho = Rg/Rh at a
+    viscous-solvent Rh CV of 0.10-0.15 under-reports ~4-10%; rho_v = I_VH/I_VV is IMMUNE
+    (its noisy channel, I_VH, is the numerator). The honest remedy for a weak denominator
+    is more points/replicates (a smaller denominator CV), not a wider algebraic SE."""
     if a_se is None or b_se is None:
         return None
     if a == 0 or b == 0 or not (math.isfinite(a_se) and math.isfinite(b_se)):
@@ -342,7 +352,18 @@ def power_law_se(f_value: float, x_value: float, x_se: Optional[float],
     """SE of f = k * x^exponent from x's SE: |exponent| |f| (x_se/|x|).  (Eq. 53)
 
     For Rh = kT/(6 pi eta D) ~ D^-1, exponent = -1 gives sigma_Rh/Rh = sigma_D/D.
-    Returns None if x_se is None/non-finite or x is zero."""
+    Returns None if x_se is None/non-finite or x is zero.
+
+    Invariant-8 note for the reciprocal (exponent = -1, e.g. Rh = C/D and Rh0 = C/D0).
+    This is the first-order (delta-method) SE of a nonlinear transform, NOT a linear
+    pass-through: it is the exact fractional relation sigma_f/f = |exponent| sigma_x/x,
+    Monte-Carlo-validated against the sampling SD of C/D (tests/test_uncertainty
+    test_power_law_se_reciprocal_montecarlo). It tracks the sampling spread where a real
+    multi-angle Gamma-q^2 fit lives (sigma_D/D <~ 0.05) and is mildly anti-conservative
+    (~10% under) only once sigma_D/D reaches ~0.15, with the reciprocal tail dominating
+    beyond ~0.3 — see the ratio_se carve-out and Theory-and-Equations-Guide §6.2. (A
+    positive/fractional exponent — e.g. the sphere radius R ∝ D_r^(1/3) — is well-behaved
+    and needs no such caveat.)"""
     if x_se is None or not math.isfinite(x_se) or x_value == 0:
         return None
     return abs(exponent) * abs(f_value) * (x_se / abs(x_value))

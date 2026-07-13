@@ -113,6 +113,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_current(self.current_item)
             self.cross_module.refresh()
         self._on_tab_changed(self.tabs.currentIndex())
+        # If any saved setting was invalid and reverted to its default on load, tell the
+        # user once -- so a hand-edit that didn't take is visible, not silently ignored.
+        # Deferred one event-loop tick so the dialog is parented to the shown window.
+        if self.controller.settings_load_problems:
+            QtCore.QTimer.singleShot(0, self._report_settings_problems)
+
+    def _report_settings_problems(self) -> None:
+        """Surface the invalid-settings reversions collected at load (F-17/F-25). Mirrors the
+        load-notes pattern in `_on_load_sls`: a non-blocking notice that names each field, its
+        rejected value, and the default now in effect."""
+        problems = self.controller.settings_load_problems
+        if not problems:
+            return
+        QtWidgets.QMessageBox.warning(
+            self, 'Some settings were reset',
+            'Some saved settings were invalid and reverted to defaults. Set them again '
+            'in the Settings tab if needed.\n\n  ' + '\n  '.join(problems))
+        self.controller.settings_load_problems = []   # shown once per launch
 
     # ------------------------------------------------------------------ UI ---
     def _build_ui(self) -> None:
@@ -441,6 +459,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not paths:
             return
         first_id, n_files, n_meas, unreadable = None, 0, 0, []
+        parse_notes = []                     # passive load-time ⓘ notices from parsers
         for path in paths:
             previews = self._autodetect(path, _SLS_PARSERS)
             if not previews:                 # fall back to a plain two-column table
@@ -457,10 +476,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 params = {k: getattr(p, k, None) for k in _SLS_PARAM_KEYS}
                 iid = self.controller.add_loaded('sls', raw, params, source_path=path)
                 first_id = first_id or iid
+                for note in getattr(p, 'notes', ()):     # e.g. negative intensities
+                    parse_notes.append(f'{os.path.basename(path)}: {note}')
             n_files += 1
             n_meas += len(previews)
         self._finish_load(first_id, n_files, n_meas, unreadable,
                           'SLS intensity export', warn_blanks=True)
+        if parse_notes:
+            QtWidgets.QMessageBox.information(
+                self, 'Loaded with notes',
+                'The data was loaded and is used as-entered. Notes:\n\n  '
+                + '\n  '.join(parse_notes))
 
     def _finish_load(self, first_id, n_files: int, n_meas: int,
                      unreadable: list, kind_desc: str,
@@ -830,6 +856,7 @@ class MainWindow(QtWidgets.QMainWindow):
         total_in_samples = sum(
             len(s.dls_item_ids) + len(s.sls_item_ids)
             + (1 if s.solvent_reference_item_id else 0)
+            + len(s.extra_solvent_reference_item_ids)
             for sid in touched_sids
             for s in [self.controller.workspace.samples.get(sid)] if s
         )
@@ -1019,6 +1046,7 @@ class MainWindow(QtWidgets.QMainWindow):
             all_meas += list(s.dls_item_ids) + list(s.sls_item_ids)
             if s.solvent_reference_item_id:
                 all_meas.append(s.solvent_reference_item_id)
+            all_meas += list(s.extra_solvent_reference_item_ids)
         if not all_meas:
             return
         label_str = ' + '.join(labels) if labels else 'sample'
