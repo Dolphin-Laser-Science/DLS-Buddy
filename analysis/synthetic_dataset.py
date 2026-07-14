@@ -610,7 +610,7 @@ ALPHA_SELECTION_CASES = [
 
 
 def generate_alpha_selection_dataset(out_dir: str) -> List[str]:
-    """Regenerate the alpha-selection gap-case set (test-data/Synthetic Alpha-Selection/).
+    """Regenerate the alpha-selection gap-case set (test-data/Synthetic/Alpha-Selection/).
 
     Writes one loadable ALV ``.ASC`` per :data:`ALPHA_SELECTION_CASES` entry (same
     format and system as the Clean/Messy sets: PEG-in-water optics at 532 nm, all

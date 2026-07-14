@@ -310,7 +310,7 @@ def isotropic_rayleigh_ratio(r_vv: float, rho_v: float) -> float:
 # fitter (analysis.dls.fit_cumulants) already returns the field rate Gamma, so feed
 # THAT in -- do not pass an intensity (2*Gamma) rate, or D_r and D_t come out 2x.
 #
-# Recovery strategy (see test-data/Synthetic DPLS/parameters.txt): take D_t from
+# Recovery strategy (see test-data/Synthetic/DPLS/parameters.txt): take D_t from
 # the VV channel (Gamma_VV = q^2 D_t is the whole VV signal, cleanly measured), and
 # D_r from the per-angle difference (Gamma_VH - Gamma_VV)/6. Fitting D_t as the
 # SLOPE of Gamma_VH vs q^2 is ill-conditioned when rotation dominates (the slope is

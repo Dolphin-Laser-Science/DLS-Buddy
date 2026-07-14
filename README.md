@@ -1,22 +1,18 @@
 # DLS Buddy
 
 A general-purpose, instrument-agnostic Python platform for analyzing **static and
-dynamic light scattering (SLS/DLS)** data from polymer solutions. Correctness-first:
-every physical parameter is user-supplied, results are validated against synthetic
-ground truth and real datasets, and apparent vs. thermodynamic (and calibrated vs.
-uncalibrated) results are always distinguished.
+dynamic light scattering (SLS/DLS)** data.
 
 ## Features
 
 - **Instrument-agnostic loading** with auto-detection: Brookhaven, Malvern
-  Zetasizer, ALV `.ASC` (multi-angle), and a plain-text fallback.
+  Zetasizer, ALV, and a plain-text fallback.
 - **DLS**: cumulants, single/double/KWW exponentials, NNLS, CONTIN, lognormal;
   Γ–q² and concentration extrapolation; multi-measurement co-plotting; replicate
-  averaging (ISO 22412).
-- **SLS**: single-point calibration, Zimm/Berry/Debye/Guinier, single-angle,
-  calibration-free A₂, data masking, manual-Mw override.
-- **Cross-sample**: ρ = R_g/R_h and R_g–M_w / A₂–M_w scaling, with provenance-aware
-  source pickers.
+  averaging.
+- **SLS**: Zimm/Berry/Debye/Guinier, single-angle, calibration-free *A*₂, data masking.
+- **Cross-sample**: ρ = *R*<sub>g</sub>/*R*<sub>h</sub> and *R*<sub>g</sub>–*M*<sub>w</sub> /
+  *A*₂–*M*<sub>w</sub> scaling, with provenance-aware source pickers.
 - **Depolarized scattering (DPLS/DDLS)**: depolarization ratio, Cabannes split,
   rotational diffusion.
 - **Utilities, Settings, Origin-compatible CSV export**, and a matplotlib plotting
@@ -66,8 +62,6 @@ python -m gui.main
 - [`7. AI-Use-Statement.txt`](docs/7.%20AI-Use-Statement.txt) — how this project was built, in the author's words.
 - [`PATCH_NOTES.md`](PATCH_NOTES.md) — what changed per release, plus known issues.
 - [`CLAUDE.md`](CLAUDE.md) — architecture invariants for contributors.
-- [`Synthetic Stress corpus`](test-data/Synthetic%20Stress/expected-outcomes.md) — adversarial
-  edge-case test files and how the program is expected to handle each.
 
 ## License
 

@@ -9,6 +9,33 @@ window title.
 
 ---
 
+## 1.0.5 — DLS correlogram polish (2026-07-14)
+
+- **DLS → Correlogram: "tick all at concentration / angle".** The correlogram measurement
+  picker gains the same two bulk selectors the Distribution sub-tab already had — tick every
+  listed measurement sharing a concentration (mg/mL) or an angle (°) in one click.
+- **Baseline markers are easier to see.** The correlogram's baseline carets and shaded region
+  changed from gray to purple, so they stand out against the data and stay clearly distinct
+  from the green fit-window markers.
+- **Linear delay-time views frame the decay.** On the linear-τ correlogram views (lin-lin and
+  log-lin, including the side thumbnails), the delay-time axis now auto-frames to the decay of
+  the slowest ticked curve instead of the full lag range, so the correlogram's decay is centered
+  rather than crushed against the origin. The conventional log-τ main view is unchanged.
+
+---
+
+## 1.0.4 — Documentation refresh (2026-07-14)
+
+- **Docs:** a pass over all three guides (Quickstart, User-Manual, Theory-and-Equations)
+  for clarity and consistency — tighter prose, consistent terminology ("Rayleigh ratio"
+  throughout, "lognormal"), correct subscripts, and citations collected in one numbered
+  reference list at the end of the Theory guide. The User-Manual's file-format sections are
+  reordered (generic formats first) and renumbered consistently; the solvent-library chapter
+  is trimmed to the essentials. No change to how the program computes anything.
+- **Repo:** the bundled `test-data/` is regrouped into `Real/` and `Synthetic/` folders.
+
+---
+
 ## 1.0.3 — Smaller saved sessions (2026-07-13)
 
 - **Polish:** saved session files (`.lsjson`) are now written compactly instead of

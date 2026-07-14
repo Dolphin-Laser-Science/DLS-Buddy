@@ -25,6 +25,7 @@ it on reselection (no recompute).
 from __future__ import annotations
 
 import math
+from collections import namedtuple
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -65,6 +66,47 @@ _SCALE_XY = {
     'log-lin': ('linear', 'log'),
     'log-log': ('log', 'log'),
 }
+
+# Characteristic decay scales of a ticked correlogram set, in canonical SECONDS, used to
+# frame the linear-τ views (and, later, to place a 1/e / inflection guide line — see
+# _decay_frame). All taken over the SLOWEST ticked curve.
+_DecayFrame = namedtuple('_DecayFrame', 'plateau tau_1e_s tau_end_s data_max_s')
+
+
+def _decay_frame(curves) -> Optional['_DecayFrame']:
+    """Characteristic decay scales, in canonical SECONDS, of an iterable of
+    ``(delay_times_s, g2m1)`` correlograms, taken over the SLOWEST curve (largest 1/e
+    time — the smallest angle → longest decay, so a frame built from it keeps every faster
+    curve visible). Returns None when there is no usable curve. Qt-free so it is unit
+    tested directly.
+
+    Fields (see :class:`_DecayFrame`): ``plateau`` (peak g₂−1 of that curve, i.e. β),
+    ``tau_1e_s`` (first lag where g₂−1 falls to plateau/e — the robust steep-region
+    characteristic time, and exactly where a future 1/e guide line would sit),
+    ``tau_end_s`` (last lag still above ~5 % of the plateau — the "mostly decayed" point),
+    ``data_max_s`` (largest lag across ALL curves)."""
+    best = None                    # (plateau, tau_1e, tau_end) of the slowest curve so far
+    data_max = 0.0
+    for tau, g2 in curves:
+        tau = np.asarray(tau, dtype=float)
+        g2 = np.asarray(g2, dtype=float)
+        if tau.size == 0 or not np.isfinite(g2).any():
+            continue
+        data_max = max(data_max, float(np.nanmax(tau)))
+        g0 = float(np.nanmax(g2))
+        if not (g0 > 0):
+            continue
+        # 1/e crossing sits in the STEEP part of the decay → robust to the noisy tail
+        # (first downward crossing); the last 5 %-crossing marks where it is gone.
+        below_1e = np.where(g2 <= g0 / math.e)[0]
+        tau_1e = float(tau[below_1e[0]]) if below_1e.size else float(tau[-1])
+        above_5 = np.where(g2 > 0.05 * g0)[0]
+        tau_end = float(tau[above_5[-1]]) if above_5.size else tau_1e
+        if best is None or tau_1e > best[1]:      # keep the slowest (largest τ_1e)
+            best = (g0, tau_1e, tau_end)
+    if best is None or data_max <= 0:
+        return None
+    return _DecayFrame(best[0], best[1], best[2], data_max)
 
 class _AnalysisRegion:
     """The shared DLS analysis region (all in seconds), edited on the Correlogram
@@ -392,8 +434,9 @@ _SUMMARY_PICKER_BULLETS = [
 _GROUP_FIELD_CONC = ('concentration_g_per_mL', 'concentration',
                      lambda c: f'{c * 1000:g} mg/mL')
 _GROUP_FIELD_ANGLE = ('angle_deg', 'angle', lambda a: f'{a:g}°')
-# Distribution is cross-sample, so it offers both; its help gains one extra bullet.
-_DIST_PICKER_BULLETS = _PICKER_BULLETS + [
+# The cross-sample pickers (Correlogram + Distribution) offer both group-tick fields, so
+# their help gains one extra bullet over the bare picker.
+_GROUP_PICKER_BULLETS = _PICKER_BULLETS + [
     '<b>Tick all at concentration / angle</b> ticks every listed measurement '
     'sharing the chosen value (concentration in mg/mL, angle in °).',
 ]
@@ -446,7 +489,8 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self.checklist = MeasurementPicker(
             self.controller, self.selection, kinds=('dls',),
             label_fn=_meas_label, header_fn=_sample_header,
-            help_text=_PICKER_HELP, help_bullets=_PICKER_BULLETS)
+            help_text=_PICKER_HELP, help_bullets=_GROUP_PICKER_BULLETS,
+            group_fields=(_GROUP_FIELD_CONC, _GROUP_FIELD_ANGLE))
         self.checklist.selectionChanged.connect(self._on_selection_changed)
 
         box = QtWidgets.QGroupBox('Parametric Fit')
@@ -454,7 +498,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
             'Pick a <b>method</b>, set the <b>delay window</b> (the τ range fitted), '
             'then <b>Run</b>.',
             'Drag the markers on the plot, or type values. The <b>window</b> handles '
-            '(green carets) sit at the <b>top</b>; the <b>baseline</b> handles (gray '
+            '(green carets) sit at the <b>top</b>; the <b>baseline</b> handles (purple '
             'carets) at the <b>bottom</b> — so grab the top or bottom half to pick one '
             'when they overlap.',
             'The <b>baseline region</b> sets where g₂−1 → 0 is estimated (used by the '
@@ -886,7 +930,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
     # top, baseline carets at the bottom (the disambiguation described above).
     # _BASE_HANDLE_Y is kept a touch above the bottom so the caret never lands in
     # the residual-resize gap band below main_ax.
-    _WIN_COLOR, _BASE_COLOR = '#2ca02c', '#888'
+    _WIN_COLOR, _BASE_COLOR = '#2ca02c', '#7e57c2'   # window green, baseline purple
     _WIN_HANDLE_Y, _BASE_HANDLE_Y = 0.96, 0.05
 
     def _draw_markers(self) -> None:
@@ -925,8 +969,8 @@ class _CorrelogramTab(QtWidgets.QWidget):
                 r.tau_max_s * tfac, 'v', self._WIN_COLOR, self._WIN_HANDLE_Y)
         if r.base_lo_s is not None and r.base_hi_s is not None:
             lo, hi = sorted((r.base_lo_s * tfac, r.base_hi_s * tfac))
-            self._base_span = self.main_ax.axvspan(lo, hi, color='#999', alpha=0.12,
-                                                   label='baseline region')
+            self._base_span = self.main_ax.axvspan(lo, hi, color=self._BASE_COLOR,
+                                                   alpha=0.12, label='baseline region')
             self._markers['base_lo'] = self.main_ax.axvline(
                 r.base_lo_s * tfac, color=self._BASE_COLOR, ls='--', lw=1.2)
             self._handle_glyphs['base_lo'] = _caret(
@@ -936,37 +980,37 @@ class _CorrelogramTab(QtWidgets.QWidget):
             self._handle_glyphs['base_hi'] = _caret(
                 r.base_hi_s * tfac, '^', self._BASE_COLOR, self._BASE_HANDLE_Y)
 
+    # A linear-τ view is framed to this multiple of the slowest curve's 1/e decay time,
+    # so the decay sits roughly centered rather than crushed at the origin. Set
+    # empirically (a single exp reaches ~5 % of its plateau at 3·τ_1e, so ×5 leaves a
+    # little tail room); tuned on the real multi-angle set + a synthetic clean set.
+    _LINEAR_FRAME_K = 5.0
+
+    def _decay_characteristics(self) -> Optional[_DecayFrame]:
+        """Decay scales of the currently-ticked correlograms (seconds), via the Qt-free
+        :func:`_decay_frame`. Kept display-agnostic so both the linear-τ framing and any
+        later 1/e guide-line overlay can reuse it."""
+        return _decay_frame(self._raw.values())
+
     def _linear_x_clamp_display(self) -> Optional[float]:
-        """Upper x-limit (display units) for a LINEAR-x correlogram view so a very long
-        lag range (e.g. τ_max ~ 1e6 µs) doesn't crush the decay against the origin
-        without crushing the decay against the origin. Returns None when the decay
-        already fills most of the range
-        (the normal case), so the clamp only ever SHRINKS an over-wide linear view and
-        never touches a well-scaled one."""
-        tfac = _disp_factor('time')
-        decay_end = 0.0
-        data_max = 0.0
-        for tau, g2 in self._raw.values():
-            tau = np.asarray(tau, dtype=float)
-            g2 = np.asarray(g2, dtype=float)
-            if tau.size == 0 or not np.isfinite(g2).any():
-                continue
-            g0 = np.nanmax(g2)
-            data_max = max(data_max, float(tau.max()))
-            if not (g0 > 0):
-                continue
-            # Last delay where the signal is still above ~1 % of its peak (robust to a
-            # stray sub-threshold point in the noise tail — use the LAST, not the first).
-            above = np.where(g2 > 0.01 * g0)[0]
-            end = float(tau[above[-1]]) if above.size else float(tau[-1])
-            decay_end = max(decay_end, end)
-        if decay_end <= 0 or data_max <= 0:
+        """Upper x-limit (DISPLAY units) for a LINEAR-τ correlogram view (lin-lin /
+        log-lin), chosen so the decay sits roughly centered instead of crushed at the
+        origin — the default full lag range (out to ~1e6 µs) buries a decay that
+        completes decades earlier. Frame to ``_LINEAR_FRAME_K × τ_1e`` of the *slowest*
+        ticked curve (its 1/e time sits at ~1/K of the axis, the mostly-decayed 5 % point
+        near the middle), capped at the measured range. We deliberately key off τ_1e — the
+        robust steep-region characteristic time — and NOT the 5 %-decayed point: one curve
+        with a long shallow tail (a noisy aggregate mode) would otherwise blow the frame
+        out and re-crush every other curve. That tail stays readable in the log views.
+        Returns None when nothing is ticked, or when the ticked data has no usable
+        positive-plateau decay to frame on (both fall through to full-range autoscale)."""
+        dc = self._decay_characteristics()
+        if dc is None:
             return None
-        upper = min(data_max, 3.0 * decay_end)
-        # Only clamp when it meaningfully shrinks the view (data runs well past the decay).
-        if upper >= 0.95 * data_max:
+        upper = min(self._LINEAR_FRAME_K * dc.tau_1e_s, dc.data_max_s)
+        if upper <= 0:
             return None
-        return upper * tfac
+        return upper * _disp_factor('time')
 
     def _redraw(self) -> None:
         for ax in (self.main_ax, self.resid_ax, *self.side_axes):
@@ -984,7 +1028,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
             ax.set_visible(True)
         ws = self.controller.workspace.measurements
         xs, ys = _SCALE_XY[self._scales[0]]
-        x_clamp = self._linear_x_clamp_display()   # None unless a pathological long lag
+        x_clamp = self._linear_x_clamp_display()   # frames linear-τ views on the decay
         # main view: overlay every ticked measurement (data + its fit, same color)
         for iid, (tau, g2) in self._raw.items():
             col = self.selection.color_for(iid)
@@ -997,9 +1041,9 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self.main_ax.set_title(f'Correlogram — {self._scales[0]}')
         self._draw_markers()                     # window + baseline handles
         if xs == 'linear':
-            # Pin a linear delay axis to 0 (negative τ is meaningless) and, on a very
-            # long lag range, clamp the right to the decay region so it isn't crushed at
-            # the origin. Done before the residual copies the x-lim below.
+            # Pin a linear delay axis to 0 (negative τ is meaningless) and frame the right
+            # to the decay region so it sits centered, not crushed at the origin. Done
+            # before the residual copies the x-lim below.
             right = x_clamp if x_clamp is not None else self.main_ax.get_xlim()[1]
             self.main_ax.set_xlim(0.0, right)
         handles, labels = self.main_ax.get_legend_handles_labels()
@@ -1033,7 +1077,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
                 plot_correlogram_scaled(sax, tau, g2, ft, fg, xscale=sxs, yscale=sys,
                                         compact=True, color=col,
                                         marker=self.selection.marker_for(iid))
-            if sxs == 'linear':                   # pin to 0; clamp the crush
+            if sxs == 'linear':                   # pin to 0; frame on the decay
                 right = x_clamp if x_clamp is not None else sax.get_xlim()[1]
                 sax.set_xlim(0.0, right)
             sax.set_title(name, fontsize=8)
@@ -1227,7 +1271,7 @@ class _DistributionTab(QtWidgets.QWidget):
         self.checklist = MeasurementPicker(
             self.controller, self.selection, kinds=('dls',),
             label_fn=_meas_label, header_fn=_sample_header,
-            help_text=_PICKER_HELP, help_bullets=_DIST_PICKER_BULLETS,
+            help_text=_PICKER_HELP, help_bullets=_GROUP_PICKER_BULLETS,
             group_fields=(_GROUP_FIELD_CONC, _GROUP_FIELD_ANGLE))
         self.checklist.selectionChanged.connect(self._on_selection_changed)
 
