@@ -1,0 +1,104 @@
+Date/Time,1/1/2026 12:00:00 PM
+Sample ID,PS linear 400k in water
+Operator ID,Synthetic
+Sample Liquid,water
+Refractive Index of Sample Liquid,1.33
+Refractive Index Inc. (dn/dc) (mL/g),0.135
+Calibration Constant,3.1496E-10
+Calibration Liquid,Toluene
+Refractive Index of Calibration Liquid,1.496
+Rayleigh Ratio of Calibration Liquid,3.1496E-05
+Wavelength (nm),532
+'A' Dark Count Rate,0
+Number of Angles Measured,12
+Angle 1 (degrees),35
+Angle 2 (degrees),45
+Angle 3 (degrees),55
+Angle 4 (degrees),65
+Angle 5 (degrees),75
+Angle 6 (degrees),85
+Angle 7 (degrees),95
+Angle 8 (degrees),105
+Angle 9 (degrees),115
+Angle 10 (degrees),125
+Angle 11 (degrees),135
+Angle 12 (degrees),145
+Number of Concentrations Measured,6
+Concentration 1 (mg/mL),0
+Concentration 2 (mg/mL),0.2
+Concentration 3 (mg/mL),0.4
+Concentration 4 (mg/mL),0.6
+Concentration 5 (mg/mL),1
+Concentration 6 (mg/mL),1.4
+Intensity - Concentration 1 - Angle 1,10461
+Intensity - Concentration 1 - Angle 2,8485
+Intensity - Concentration 1 - Angle 3,7325
+Intensity - Concentration 1 - Angle 4,6620
+Intensity - Concentration 1 - Angle 5,6212
+Intensity - Concentration 1 - Angle 6,6023
+Intensity - Concentration 1 - Angle 7,6023
+Intensity - Concentration 1 - Angle 8,6212
+Intensity - Concentration 1 - Angle 9,6620
+Intensity - Concentration 1 - Angle 10,7325
+Intensity - Concentration 1 - Angle 11,8485
+Intensity - Concentration 1 - Angle 12,10461
+Intensity - Concentration 2 - Angle 1,153275
+Intensity - Concentration 2 - Angle 2,121537
+Intensity - Concentration 2 - Angle 3,102790
+Intensity - Concentration 2 - Angle 4,90644
+Intensity - Concentration 2 - Angle 5,83426
+Intensity - Concentration 2 - Angle 6,78599
+Intensity - Concentration 2 - Angle 7,77380
+Intensity - Concentration 2 - Angle 8,77837
+Intensity - Concentration 2 - Angle 9,81619
+Intensity - Concentration 2 - Angle 10,88532
+Intensity - Concentration 2 - Angle 11,100299
+Intensity - Concentration 2 - Angle 12,122053
+Intensity - Concentration 3 - Angle 1,286019
+Intensity - Concentration 3 - Angle 2,229773
+Intensity - Concentration 3 - Angle 3,193456
+Intensity - Concentration 3 - Angle 4,171619
+Intensity - Concentration 3 - Angle 5,157571
+Intensity - Concentration 3 - Angle 6,148716
+Intensity - Concentration 3 - Angle 7,146492
+Intensity - Concentration 3 - Angle 8,146752
+Intensity - Concentration 3 - Angle 9,152835
+Intensity - Concentration 3 - Angle 10,166521
+Intensity - Concentration 3 - Angle 11,191944
+Intensity - Concentration 3 - Angle 12,232165
+Intensity - Concentration 4 - Angle 1,420115
+Intensity - Concentration 4 - Angle 2,333959
+Intensity - Concentration 4 - Angle 3,283780
+Intensity - Concentration 4 - Angle 4,250117
+Intensity - Concentration 4 - Angle 5,229834
+Intensity - Concentration 4 - Angle 6,219147
+Intensity - Concentration 4 - Angle 7,211967
+Intensity - Concentration 4 - Angle 8,215335
+Intensity - Concentration 4 - Angle 9,224868
+Intensity - Concentration 4 - Angle 10,244036
+Intensity - Concentration 4 - Angle 11,277041
+Intensity - Concentration 4 - Angle 12,338600
+Intensity - Concentration 5 - Angle 1,664610
+Intensity - Concentration 5 - Angle 2,531808
+Intensity - Concentration 5 - Angle 3,452622
+Intensity - Concentration 5 - Angle 4,401282
+Intensity - Concentration 5 - Angle 5,368103
+Intensity - Concentration 5 - Angle 6,345198
+Intensity - Concentration 5 - Angle 7,339964
+Intensity - Concentration 5 - Angle 8,342856
+Intensity - Concentration 5 - Angle 9,359387
+Intensity - Concentration 5 - Angle 10,392860
+Intensity - Concentration 5 - Angle 11,445968
+Intensity - Concentration 5 - Angle 12,541076
+Intensity - Concentration 6 - Angle 1,904299
+Intensity - Concentration 6 - Angle 2,718216
+Intensity - Concentration 6 - Angle 3,612509
+Intensity - Concentration 6 - Angle 4,540008
+Intensity - Concentration 6 - Angle 5,497227
+Intensity - Concentration 6 - Angle 6,467343
+Intensity - Concentration 6 - Angle 7,456564
+Intensity - Concentration 6 - Angle 8,461502
+Intensity - Concentration 6 - Angle 9,484614
+Intensity - Concentration 6 - Angle 10,527347
+Intensity - Concentration 6 - Angle 11,603200
+Intensity - Concentration 6 - Angle 12,729723

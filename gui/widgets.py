@@ -11,7 +11,9 @@ Small cross-module Qt widget helpers that don't belong to any one tab:
   select-all/none, grouped by sample). Promoted from the DLS-only checklist so all tabs
   share one look and one model, and the sidebar can mirror "what's selected";
 * the **bulk group-tick row** (`GroupTickBar`) — a "tick all at concentration / angle"
-  helper shared by the Γ-q²/D-c tabs and the Distribution picker.
+  helper shared by the Γ-q²/D-c tabs and the Distribution picker;
+* the **offered-source picker** (`SourcePicker`) — the one affordance for "this input
+  can come from more than one place; which one?".
 
 The tab-bar fix widens each tab's **size hint** rather than applying a `QTabBar::tab`
 stylesheet — a stylesheet would override Fusion's native tab painting (flat, unstyled
@@ -24,11 +26,36 @@ Nothing here imports analysis/physics — pure Qt presentation (it does use the 
 
 from __future__ import annotations
 
+import re
 from typing import Callable, Iterable, Optional, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from core.data_models import IDENTITY_FORM_BY_FIELD
 from gui.help import section_header
+
+
+def confirm_regroup_losses(parent, controller, losses) -> bool:
+    """THE one "Replace stored results?" confirm, shared by every surface that
+    pre-checks a regroup (Data-tab Update, SLS Update, the sidebar moves, Undo)
+    so the same custody event can never ask differently by entry point. True
+    when there is nothing to ask or the user proceeds; Cancel is the default
+    and the caller applies nothing on it."""
+    if not losses:
+        return True
+    resp = QtWidgets.QMessageBox.question(
+        parent, 'Replace stored results?',
+        controller.regroup_losses_message(losses),
+        QtWidgets.QMessageBox.StandardButton.Yes
+        | QtWidgets.QMessageBox.StandardButton.Cancel,
+        QtWidgets.QMessageBox.StandardButton.Cancel)
+    return resp == QtWidgets.QMessageBox.StandardButton.Yes
+
+# A cell/header is rendered as rich text ONLY when it holds a recognised markup tag —
+# never merely because it contains a '<'. This is a safety heuristic: a value like
+# "qRg < 1.3" must take the plain path, not be mis-parsed as an (unclosed) tag and mangled.
+# Keep this list in step with the tags the label strings actually use.
+_HTML_TAG = re.compile(r'</?(?:sub|sup|b|i)>')
 from gui.theme import color, ThemedLabel
 
 # Extra horizontal room added to every tab's size hint, in device-independent px.
@@ -50,12 +77,36 @@ def value_unit_row(value_widget: QtWidgets.QWidget,
 
 
 # ---------------------------------------------------------------------------
+# Passive load-time notices (the ⓘ channel)
+# ---------------------------------------------------------------------------
+# The title is a shared string on purpose: the DLS, SLS and trace loaders all render this
+# box, and a user who has seen "Loaded with notes" once should recognise it whichever
+# button they pressed (ui_style_guide §9 — one name per concept). The loader tests assert
+# on it, so a rename is caught rather than diverging per tab.
+PARSE_NOTES_TITLE = 'Loaded with notes'
+
+
+def show_parse_notes(parent: QtWidgets.QWidget, notes: Sequence[str]) -> None:
+    """Render passive parser notices as one ⓘ box. No-op when there are none.
+
+    Lives here rather than in `main_window` because the trace loader (Utilities) does not
+    go through `_finish_load` and would otherwise need its own copy -- the two-of-three
+    wiring that leaves the third loader silently opted out (rule 10)."""
+    if not notes:
+        return
+    QtWidgets.QMessageBox.information(
+        parent, PARSE_NOTES_TITLE,
+        'The data was loaded and is used as-entered. Notes:\n\n  '
+        + '\n  '.join(notes))
+
+
+# ---------------------------------------------------------------------------
 # Empty-state call-to-action (style guide §8, R8.1)
 # ---------------------------------------------------------------------------
 # The first-launch workspace CTA: it names the two sidebar Load buttons a newcomer must
 # find. Reused across the data-scoped tabs' content areas so an empty workspace onboards
 # instead of showing full chrome over blank tables/plots (findings 4.1, 4.2).
-LOAD_CTA = '← Load a DLS correlogram or SLS intensities to begin'
+LOAD_CTA = '← Load data to begin'
 
 
 class EmptyState(QtWidgets.QWidget):
@@ -79,6 +130,51 @@ class EmptyState(QtWidgets.QWidget):
 
     def setText(self, text: str) -> None:
         self._label.setText(text)
+
+
+# ---------------------------------------------------------------------------
+# Grouped dropdowns (the section-header idiom)
+# ---------------------------------------------------------------------------
+
+# A long dropdown whose entries fall into two kinds reads better as two labelled blocks than
+# as one list with a suffix on every second row, where the suffix repeats the same word down
+# the column. Qt has no first-class section header for a QComboBox, but a combo populated
+# with addItem() is backed by a QStandardItemModel, so an ordinary row becomes one by
+# clearing its enabled/selectable flags: Qt paints it in the disabled colour (correct in
+# both themes) and keyboard navigation steps straight over it.
+
+def add_combo_section_header(combo: QtWidgets.QComboBox, text: str) -> None:
+    """Append a non-selectable, bold section header row to `combo`.
+
+    Only valid on a combo populated through ``addItem`` (so its model is a
+    ``QStandardItemModel``) and left NON-editable — an editable combo would let the
+    user type the header text as if it were a value.
+
+    Callers must make sure the current index does not land on a header; use
+    :func:`first_selectable_index` after populating.
+    """
+    combo.addItem(text)
+    item = combo.model().item(combo.count() - 1)
+    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEnabled
+                  & ~QtCore.Qt.ItemFlag.ItemIsSelectable)
+    font = item.font()
+    font.setBold(True)
+    item.setFont(font)
+
+
+def first_selectable_index(combo: QtWidgets.QComboBox) -> int:
+    """Index of the first row a user could actually choose, or -1 if there is none.
+
+    Skips section headers and separators. A freshly populated combo defaults to
+    index 0, which is a header whenever the list opens with one, so callers select
+    this instead.
+    """
+    model = combo.model()
+    for i in range(combo.count()):
+        item = model.item(i)
+        if item is not None and item.flags() & QtCore.Qt.ItemFlag.ItemIsSelectable:
+            return i
+    return -1
 
 
 class RoomyTabBar(QtWidgets.QTabBar):
@@ -152,15 +248,112 @@ class GripSplitter(QtWidgets.QSplitter):
 
 
 # ---------------------------------------------------------------------------
+# Rich-text table cells (subscripts/superscripts in a QTableWidget)
+# ---------------------------------------------------------------------------
+# A QTableWidgetItem renders plain text only, so `M<sub>w</sub>` / `cm<sup>-1</sup>` show
+# their raw tags -- and letters like w/g/c/r have no Unicode subscript, so HTML is the only
+# way to render them as true subscripts. This delegate paints a cell's DisplayRole text as
+# rich text so those quantities read correctly in a table. Presentation only; apply with
+# `view.setItemDelegateForColumn(col, RichTextDelegate(view))`.
+
+class RichTextDelegate(QtWidgets.QStyledItemDelegate):
+    """Paint a table/list cell's text as HTML (for M<sub>w</sub>, k<sub>c</sub>, …)."""
+
+    def paint(self, painter, option, index) -> None:
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        if not _HTML_TAG.search(opt.text):      # plain cell (no markup tag): default path
+            super().paint(painter, option, index)
+            return
+        text = opt.text
+        opt.text = ''                           # draw the background/selection ourselves,
+        style = opt.widget.style() if opt.widget else QtWidgets.QApplication.style()
+        style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter,
+                          opt.widget)            # then paint the rich text on top
+        doc = QtGui.QTextDocument()
+        doc.setDefaultFont(opt.font)
+        doc.setHtml(text)
+        selected = bool(opt.state & QtWidgets.QStyle.StateFlag.State_Selected)
+        ctx = QtGui.QAbstractTextDocumentLayout.PaintContext()
+        role = (QtGui.QPalette.ColorRole.HighlightedText if selected
+                else QtGui.QPalette.ColorRole.Text)
+        ctx.palette.setColor(QtGui.QPalette.ColorRole.Text, opt.palette.color(role))
+        rect = style.subElementRect(
+            QtWidgets.QStyle.SubElement.SE_ItemViewItemText, opt, opt.widget)
+        painter.save()
+        painter.translate(rect.topLeft())
+        painter.translate(0, max(0.0, (rect.height() - doc.size().height()) / 2.0))
+        painter.setClipRect(rect.translated(-rect.topLeft()))
+        doc.documentLayout().draw(painter, ctx)
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        if not _HTML_TAG.search(opt.text):
+            return super().sizeHint(option, index)
+        doc = QtGui.QTextDocument()
+        doc.setDefaultFont(opt.font)
+        doc.setHtml(opt.text)
+        return QtCore.QSize(int(doc.idealWidth()) + 4, int(doc.size().height()))
+
+
+class RichTextHeaderView(QtWidgets.QHeaderView):
+    """A horizontal table header that renders its section labels as HTML, so quantity
+    names in a HEADER (R<sub>g</sub>, R<sub>h</sub>, ρ = R<sub>g</sub>/R<sub>h</sub>) show
+    their subscripts — a plain QHeaderView paints header text without HTML. The
+    RichTextDelegate only reaches data *cells*, so tables that name quantities in the
+    header row need this. Apply with `table.setHorizontalHeader(RichTextHeaderView(table))`.
+    Presentation only."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(QtCore.Qt.Orientation.Horizontal, parent)
+        self.setSectionsClickable(True)
+        self.setHighlightSections(True)
+
+    def paintSection(self, painter, rect, logical_index) -> None:
+        if not rect.isValid():
+            return
+        model = self.model()
+        text = '' if model is None else str(
+            model.headerData(logical_index, QtCore.Qt.Orientation.Horizontal,
+                             QtCore.Qt.ItemDataRole.DisplayRole) or '')
+        if not _HTML_TAG.search(text):
+            super().paintSection(painter, rect, logical_index)
+            return
+        # Paint the section chrome (background/border) with no text, then the rich text.
+        opt = QtWidgets.QStyleOptionHeader()
+        self.initStyleOption(opt)
+        opt.rect = rect
+        opt.section = logical_index
+        opt.text = ''
+        painter.save()
+        self.style().drawControl(
+            QtWidgets.QStyle.ControlElement.CE_Header, opt, painter, self)
+        painter.restore()
+        doc = QtGui.QTextDocument()
+        doc.setDefaultFont(self.font())
+        doc.setHtml(text)
+        ctx = QtGui.QAbstractTextDocumentLayout.PaintContext()
+        ctx.palette.setColor(
+            QtGui.QPalette.ColorRole.Text,
+            self.palette().color(QtGui.QPalette.ColorRole.ButtonText))
+        painter.save()
+        painter.translate(rect.left() + 4,
+                          rect.top() + max(0.0, (rect.height() - doc.size().height()) / 2.0))
+        painter.setClipRect(0, 0, rect.width() - 4, rect.height())
+        doc.documentLayout().draw(painter, ctx)
+        painter.restore()
+
+
+# ---------------------------------------------------------------------------
 # Shared measurement-selection layer (SelectionModel + MeasurementPicker)
 # ---------------------------------------------------------------------------
-# One idiom for "which measurements is this tab analyzing?", used by every analysis
-# tab: real checkboxes, INCLUDE-semantics (tick = use it), select-all/none, grouped by
-# sample. The model is GUI-side only (not persisted — the controller stays
-# Qt-free/stateless about selection; analysis calls take the ticked
-# ids inline via `include_ids`). The picker is a thin view over a model; two pickers can
-# share one model (e.g. the DLS Correlogram + Distribution overlay) and stay in lock-step
-# because both react to the model's `changed` signal.
+# One idiom for "which measurements is this tab analyzing?", used by every analysis tab:
+# real checkboxes, INCLUDE-semantics (tick = use it), select-all/none, grouped by sample.
+# The model is GUI-side only and not persisted -- the controller stays Qt-free and stateless
+# about selection, analysis calls taking the ticked ids inline via `include_ids`. The picker
+# is a thin view; two pickers sharing one model stay in lock-step via its `changed` signal.
 
 class SelectionModel(QtCore.QObject):
     """An ordered, unique set of measurement ``item_id`` strings currently ticked for
@@ -471,15 +664,20 @@ class MeasurementPicker(QtWidgets.QWidget):
 
     def _on_group_tick(self, key: str, value) -> None:
         """Tick every listed leaf whose committed ``key`` matches ``value`` (float-safe),
-        adding to the current selection (never unticking)."""
+        adding to the current selection (never unticking). "Same value?" goes through
+        the shared identity comparison form for the field (core/data_models.py), so
+        the tick can never group differently from the engine's distinctness gates;
+        a field with no identity form falls back to exact equality (the value came
+        verbatim from the same committed set, so exact match is the safe default)."""
+        form = IDENTITY_FORM_BY_FIELD.get(key, lambda v: v)
         try:
-            target = round(float(value), 9)
+            target = form(float(value))
         except (TypeError, ValueError):
             return
         match = []
         for iid in self._leaf_by_id:
             v = self._group_value(iid, key)
-            if v is not None and round(float(v), 9) == target:
+            if v is not None and form(float(v)) == target:
                 match.append(iid)
         self._model.set_many(match, True)
 
@@ -624,3 +822,87 @@ class SampleSelector(QtWidgets.QWidget):
 
     def _on_changed(self, _i: int) -> None:
         self.sampleChanged.emit(self.current_sample_id() or '')
+
+
+# ---------------------------------------------------------------------------
+# Offered-source picker
+# ---------------------------------------------------------------------------
+# Static, so the help inventory can resolve them (a count spliced into the sentence
+# would make the tooltip invisible to that scan for no reader benefit).
+_SOURCE_PICKER_TOOLTIP = (
+    'Fill this value from one of the available sources. Nothing is written until '
+    'you choose, and a value you typed is replaced only because you asked.')
+_SOURCE_PICKER_EMPTY_TOOLTIP = (
+    'Nothing else offers a value for this input, so there is nothing to choose '
+    'between. Type a value instead.')
+
+
+class SourcePicker(QtWidgets.QWidget):
+    """Choose which of several offered sources fills one input.
+
+    THE offer/commit affordance (architecture invariant 3). Several places in the
+    program can propose a value for the same input -- a measurement's mean count
+    rate may come from a linked count-rate trace, from that trace's outlier-clipped
+    mean, or from the instrument file's own scalar -- and the program must offer
+    them transparently rather than pick one silently. The shape is always:
+
+        <thing>_offers(consumer_id)      enumerate candidates; WRITE NOTHING
+        apply_<thing>_offer(id, source)  adopt one into the WORKING tier
+        the choice travels as provenance on whatever is computed from it
+
+    This widget is the user-facing half of that contract and knows nothing about
+    what it is picking: it renders a button, asks for an offer, and hands the
+    chosen source back. Deliberately general, because more than one input has this
+    shape -- a solvent blank chosen from several c = 0 measurements is the same
+    question, and should not grow a second, differently-behaved affordance.
+
+    An offer is a mapping with ``source`` (the tag stored as provenance), ``value``
+    and ``label`` (what the value is, in words). ``value_format`` renders the value
+    for display; the default is str.
+    """
+
+    picked = QtCore.Signal(str)      # the chosen offer's `source` tag
+
+    def __init__(self, text: str = 'From…', *, parent=None,
+                 title: str = 'Choose a source',
+                 prompt: str = 'Fill this value from:') -> None:
+        super().__init__(parent)
+        self._title = title
+        self._prompt = prompt
+        self._offers = []
+        self._format = str
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.button = QtWidgets.QPushButton(text)
+        self.button.clicked.connect(self._on_clicked)
+        layout.addWidget(self.button)
+        layout.addStretch(1)
+        self.set_offers([])
+
+    def set_offers(self, offers, *, value_format=None) -> None:
+        """Show the candidates. With none, the button disables and says why."""
+        self._offers = list(offers or [])
+        if value_format is not None:
+            self._format = value_format
+        self.button.setEnabled(bool(self._offers))
+        self.button.setToolTip(
+            _SOURCE_PICKER_TOOLTIP if self._offers
+            else _SOURCE_PICKER_EMPTY_TOOLTIP)
+
+    def _entries(self):
+        return ['{0} — {1}'.format(self._format(o['value']), o['label'])
+                for o in self._offers]
+
+    def _on_clicked(self) -> None:
+        if not self._offers:
+            return
+        # editable=False is load-bearing: the dialog returns the TEXT, so a user who
+        # could edit it could return a string matching no offer.
+        text, ok = QtWidgets.QInputDialog.getItem(
+            self, self._title, self._prompt, self._entries(), 0, False)
+        if not ok or not text:
+            return
+        entries = self._entries()
+        if text in entries:
+            self.picked.emit(self._offers[entries.index(text)]['source'])

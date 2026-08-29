@@ -6,7 +6,7 @@ dynamic light scattering (SLS/DLS)** data.
 ## Features
 
 - **Instrument-agnostic loading** with auto-detection: Brookhaven, Malvern
-  Zetasizer, ALV, and a plain-text fallback.
+  Zetasizer, ALV, NanoTemper Prometheus Panta, and a plain-text fallback.
 - **DLS**: cumulants, single/double/KWW exponentials, NNLS, CONTIN, lognormal;
   Γ–q² and concentration extrapolation; multi-measurement co-plotting; replicate
   averaging.

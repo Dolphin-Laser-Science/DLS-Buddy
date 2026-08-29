@@ -1,0 +1,56 @@
+DLS Buddy -- Synthetic BERRY test data
+======================================
+
+Why this set exists
+-------------------
+Every other committed Zimm set in this repo is built with form_factor_model='guinier',
+which makes Kc/dR EXACTLY linear in q^2 by construction. On data like that Berry and Zimm
+return the same Rg, always -- so Berry's reason for existing has never been exercised by
+committed synthetic data.
+
+These two sets are built from the full DEBYE coil form factor instead, at Rg large enough
+that qRg leaves the Guinier regime. There the true Kc/dR curves upward in q^2 and a
+straight Zimm extrapolation over-reads Rg.
+
+WHAT THE SETS ACTUALLY DO -- measured on these exact files, not predicted:
+
+  set             estimator   Rg (nm)     vs truth   A2           vs truth
+  coil Rg 80nm    Zimm        96.1        1.20x      4.11e-05     1.03x
+                  Berry       73.0        0.91x      2.88e-05     0.72x
+  coil Rg 150nm   Zimm        214.4       1.43x      2.09e-05     1.05x
+                  Berry       106.8       0.71x      1.18e-05     0.59x
+
+Berry is the better estimator of Rg here, which is what the set is for. It does NOT
+"track the truth": it UNDER-reads Rg, and on A2 it is markedly WORSE than Zimm. Neither
+estimator is good this far past the Guinier regime -- the set exercises the DIFFERENCE
+between them, and that is all it should be read for.
+
+
+GLOBAL PARAMETERS (enter at the Data-tab confirmation step)
+-----------------------------------------------------------
+  Solvent                 : water
+  Solvent refractive index: 1.33
+  Viscosity               : 0.89 cP
+  Temperature             : 25.0 C (298.15 K)
+  Wavelength              : 532 nm
+  dn/dc                   : 0.135 mL/g
+
+SLS CALIBRATION (SLS tab calibration panel)
+-------------------------------------------
+  Standard toluene (VU); calibrant intensity 100000 at 90 deg
+
+
+GROUND TRUTH
+------------
+  sample          Mw         Rg (nm)  A2         qRg at 135 deg
+  coil Rg 80nm    2e+06      80       4e-05      2.32
+  coil Rg 150nm   8e+06      150      2e-05      4.35
+
+  Angles          30, 45, 60, 75, 90, 105, 120, 135 deg
+  Concentrations  0, 0.5, 1, 1.5, 2 mg/mL (the 0 is the solvent blank)
+  noise_level     0.005
+  Form factor     debye (Gaussian coil) -- NOT the guinier expansion
+
+The Guinier approximation is conventionally trusted to qRg ~ 1.3. Both samples here sit
+well past it at the back angles, which is the regime the comparison is about; the Rg 80 nm
+set is the milder case and the Rg 150 nm set the severe one.

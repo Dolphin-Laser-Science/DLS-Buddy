@@ -25,34 +25,24 @@ from typing import Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from core.data_models import implausible_metadata_reasons, unrecognized_solvent_reason
-from core.workspace import _DLS_PARAM_KEYS, _SLS_PARAM_KEYS
+from core.data_models import implausible_metadata_reasons
+from core.workspace import _DLS_PARAM_KEYS, _SLS_PARAM_KEYS, blank_label
 from app.controller import _SHARED_PARAM_KEYS
 from app import units as U
-from analysis.uncertainty import format_value_at_uncertainty
+from analysis.uncertainty import format_fixed_sig, format_value_at_uncertainty
+from gui.field_labels import PARAM_LABELS
 from gui.help import section_header
+from gui.solvent_picker import OTHER_DATA, index_of_solvent, populate_solvent_combo
 from gui.theme import ThemedLabel, set_flag, color as theme_color, token as theme_token
+from gui.widgets import SourcePicker, confirm_regroup_losses
 from gui.worker import busy_notice, runner
 
 
-# Unit labels now live in the dedicated Unit column, so the parameter names here
-# carry no unit suffix.
-_PARAM_LABELS = {
-    'label':       'Label',
-    # User-facing label is "Solute name" (samples need not be polymers); the
-    # internal field stays `polymer_name` to avoid a data-model/session rename.
-    'polymer_name': 'Solute name',
-    'solvent_name': 'Solvent name',
-    'concentration_g_per_mL': 'Concentration',
-    'temperature_K': 'Temperature',
-    'angle_deg': 'Scattering angle',
-    'wavelength_nm': 'Wavelength',
-    'solvent_refractive_index': 'Solvent refractive index',
-    'viscosity_Pa_s': 'Viscosity',
-    'dn_dc_mL_per_g': 'dn/dc',
-    'mw_fraction': 'Mw fraction',
-    'analyzer_geometry': 'Polarization (DDLS)',
-}
+# Internal field name -> user-facing label. Unit labels live in the dedicated Unit
+# column, so no name carries a unit suffix. The map is shared (the DLS skipped-run
+# warnings humanize field names from it too) — its single source of truth is
+# gui/field_labels.py.
+_PARAM_LABELS = PARAM_LABELS
 _STRING_KEYS = {'label', 'polymer_name', 'solvent_name', 'mw_fraction'}
 # Polarization/analyzer geometry: a dropdown, not a typed value. The blank label
 # means "unspecified" (None) -- ordinary polarized DLS, ignored by the depolarized
@@ -60,10 +50,31 @@ _STRING_KEYS = {'label', 'polymer_name', 'solvent_name', 'mw_fraction'}
 _GEOMETRY_KEY = 'analyzer_geometry'
 _GEOMETRY_BLANK = '—'
 _GEOMETRY_OPTIONS = (_GEOMETRY_BLANK, 'VV', 'VH', 'VU')
-# Solvent name: an EDITABLE dropdown over the primary-tier library solvents (free
-# text is preserved for non-library solvents + the existing alias/normalize path).
-# Picking / editing it re-derives n and (for DLS) viscosity from the library.
+# Chain type: a sample-level architecture label (Linear reference / Branched target)
+# for the Cross-Sample branching contraction factors g and h. A fixed-vocabulary combo
+# like geometry, but SHARED across the sample's measurements like the solvent name
+# (entered once, propagated) -- so it is committed via set_shared_param and rides the
+# normal Update / dirty-highlight / Reset machinery.
+_CHAIN_TYPE_KEY = 'chain_type'
+_CHAIN_TYPE_BLANK = '—'
+_CHAIN_TYPE_OPTIONS = (_CHAIN_TYPE_BLANK, 'Linear', 'Branched')
+_CHAIN_TYPE_TO_STORED = {'Linear': 'linear', 'Branched': 'branched'}   # display -> stored
+_CHAIN_TYPE_TO_DISPLAY = {'linear': 'Linear', 'branched': 'Branched'}  # stored -> display
+# Solvent blank: which c = 0 series THIS SLS series is referenced against. A dropdown
+# over the sample's blanks (stored as the blank's item_id, never a filename) whose
+# first entry is the automatic pairing -- the blank from this series' own source file,
+# else the sample reference (Workspace.solvent_reference_for). Per-measurement like
+# geometry; the row is hidden on a blank itself (and is an SLS key only). How the pairing was
+# made is computed on demand (Controller.solvent_blank_status) and shown in the combo's tooltip.
+_BLANK_KEY = 'solvent_blank_item_id'
+_BLANK_AUTO = 'auto'
+# Solvent name: a CLOSED dropdown over all library solvents (gui/solvent_picker.py)
+# plus an "Other…" entry that reveals a text box for a solvent the library does not
+# carry. Picking one re-derives n and (for DLS) viscosity from the library; a name
+# entered through Other… is stored verbatim and auto-fills nothing.
 _SOLVENT_KEY = 'solvent_name'
+# Every row whose value cell is a combo widget (tinted, not the hidden item).
+_COMBO_KEYS = (_GEOMETRY_KEY, _CHAIN_TYPE_KEY, _SOLVENT_KEY, _BLANK_KEY)
 # The two auto-fillable, provenance-tagged fields, and their sidecar source keys
 # (mirrors app.controller._SOLVENT_SOURCE_KEYS). A teal "library" dot is painted on
 # these cells' DecorationRole; a direct edit claims the field as user-owned.
@@ -72,18 +83,76 @@ _SOLVENT_SOURCE_KEYS = {
     'solvent_refractive_index': 'solvent_refractive_index_source',
     'viscosity_Pa_s': 'viscosity_Pa_s_source',
 }
+# The mean count rate and the sidecar recording where it came from (mirrors
+# app.controller._MEAN_CR_KEY / _MEAN_CR_SOURCE_KEY): 'trace:*', 'vendor' or 'user'.
+_MEAN_CR_KEY = 'mean_count_rate_cps'
+_MEAN_CR_SOURCE_KEY = 'mean_count_rate_cps_source'
 # Numeric params the user may enter in a choice of units (canonical value stored).
 # Maps the param key -> the units-module quantity name.
 _QUANTITY = {
     'concentration_g_per_mL': 'concentration',
     'temperature_K': 'temperature',
     'viscosity_Pa_s': 'viscosity',
+    # A unit picker rather than a fixed cps cell: the vendor scalar in an ALV file
+    # is printed in kHz, and forcing a hand conversion is exactly the unit-slip
+    # class the plausibility note exists to catch.
+    'mean_count_rate_cps': 'intensity',
+}
+
+# Every cell that carries a provenance dot: param key -> the method that returns
+# (dot token or None, tooltip). Data rather than a chain of branches, because the
+# trace family will add more of these and a per-field `elif` inside the paint loop
+# is how two of them end up disagreeing about the no-dot case.
+_PROVENANCE_FIELDS = {
+    'solvent_refractive_index': '_solvent_dot',
+    'viscosity_Pa_s': '_solvent_dot',
+    'mean_count_rate_cps': '_count_rate_dot',
 }
 # Numeric params with a single fixed unit (already human-scale): shown, not chosen.
 _FIXED_UNIT = {
     'angle_deg': '°',
     'wavelength_nm': 'nm',
     'dn_dc_mL_per_g': 'mL/g',
+}
+
+# Passive tooltips on specific parameter-row LABELS (calculation nuance, honouring the
+# global "Show tooltips" gate at render). Kept terse; how-to lives in the group ? badge.
+_ROW_TOOLTIPS = {
+    'solvent_blank_item_id': (
+        'The c = 0 solvent measurement subtracted from this series to form its excess '
+        'Rayleigh ratio. "auto" pairs the blank recorded in this series\' own file, else '
+        'the sample\'s reference blank (the first one loaded). Pick a blank here when '
+        'the file carried none, or the automatic pairing is not the one you measured. '
+        'The dropdown tooltip says which blank is in use and why.'),
+    'mean_count_rate_cps': (
+        'Average photon count rate for this run, in the unit chosen beside it. Proposed '
+        'from a linked count-rate trace (plain or outlier-clipped mean — the cell tooltip '
+        'says which) or from the instrument file\'s own value; yours as soon as you type '
+        'one, and then never re-derived away. Not used by the size or Mw fits — it feeds '
+        'the count-rate diagnostics. See the Theory-and-Equations-Guide.'),
+    'dn_dc_mL_per_g': (
+        'Refractive-index increment of THIS polymer in THIS solvent. Hand-entered '
+        'only — never proposed or guessed, because the optical constant K goes as '
+        '(dn/dc)², so an error enters Mw squared. May be left BLANK: no measured value '
+        'exists for some polymers, and for particle dispersions the quantity is not '
+        'defined. Blank runs every analysis and leaves Rg, the form-factor sizes and '
+        '2·A₂·Mw exact; only Mw and the absolute A₂ are then on an arbitrary optical '
+        'scale, and are flagged as such. Zero is refused — it would collapse the whole '
+        'Kc/ΔR ordinate. Negative is legal. See the Theory-and-Equations-Guide.'),
+    'solute_refractive_index': (
+        'Refractive index of the PARTICLE/solute itself (not the solvent, not dn/dc). '
+        'Optional and hand-entered — never guessed. Sets the contrast m = solute / solvent '
+        'index for the RDG and Mie sphere models: re-weighting a DLS distribution to '
+        'volume/number, and (on the SLS side) the full-Mie form-factor P(q) fit. For the '
+        'core-shell model it is the CORE index (paired with the shell refractive index). '
+        'Leave blank for ordinary DLS/SLS, the Rayleigh (very small particle) reweighting, or '
+        'the analytic sphere/coil/ellipsoid form factors. See the Theory-and-Equations-Guide.'),
+    'shell_refractive_index': (
+        'Refractive index of the coating/SHELL of a core-shell (coated) particle. Optional and '
+        'hand-entered — never guessed. Used only by the SLS core-shell form-factor P(q) fit, '
+        'which pairs it with the solute (core) index to form the two contrasts m1 = core / '
+        'solvent, m2 = shell / solvent. Leave blank for every other model. See the '
+        'Theory-and-Equations-Guide.'),
 }
 
 
@@ -127,6 +196,13 @@ class DataModule(QtWidgets.QWidget):
         self._selected_ids: Tuple[str, ...] = ()
         self.keys: Tuple[str, ...] = ()
         self._suppress = False
+        # The solvent row's (closed combo, Other text box) pair, and whether the user
+        # has chosen Other but not yet typed a name. Rebuilt per measurement in
+        # _build_solvent_cell; None while no solvent row exists (an SLS/DLS key set
+        # always has one, but set_measurement(None) clears the table).
+        self._solvent_widgets: Optional[Tuple[QtWidgets.QComboBox,
+                                              QtWidgets.QLineEdit]] = None
+        self._solvent_other_mode = False
         # Current display unit per quantity (canonical value is always what's
         # stored). Defaults to the human-scale unit; the user's choice persists
         # across measurement switches within the session.
@@ -149,22 +225,48 @@ class DataModule(QtWidgets.QWidget):
                 '<b>All:</b> solute &amp; solvent name, temperature, wavelength, '
                 'refractive index.',
                 '<b>DLS (size):</b> + viscosity, scattering angle.',
-                '<b>SLS (Mw, A₂):</b> + dn/dc, concentration, and a calibration.',
+                '<b>SLS (Mw, A₂):</b> + concentration, a calibration, and dn/dc. '
+                'Leave <b>dn/dc blank</b> if you do not have one (no published value, '
+                'or a particle dispersion): everything still runs, and only M<sub>w</sub> '
+                'and absolute A₂ are flagged as being on an arbitrary scale. '
+                'R<sub>g</sub> and the sizes are unaffected.',
                 'Identity &amp; optics are shared across the sample (enter once); '
                 'concentration and angle are per-measurement.',
-                '<b>Solvent library:</b> pick a solvent and the refractive index '
-                '(and viscosity) auto-fill from temperature + wavelength, rounded '
-                'at the last digit the library can stand behind.',
+                '<b>Solvent blank (SLS):</b> each series is referenced against the '
+                'c = 0 blank from its own file, else the sample\'s reference blank. '
+                'Pick a different one in the <b>Solvent blank</b> row when the file '
+                'carried none or the pairing is wrong; the dropdown tooltip says which '
+                'blank is in use.',
+                '<b>Solvent library:</b> pick a solvent under <b>Measured properties</b> '
+                'and the refractive index (and viscosity) auto-fill from temperature + '
+                'wavelength, rounded at the last digit the library can stand behind.',
+                'Solvents under <b>Estimated properties</b> are offered but <b>not</b> '
+                'auto-filled — their data is too weak to put a number into an analysis, '
+                'so you enter n (and viscosity) yourself. A note below the table says so '
+                'when you pick one; Utilities ▸ Solvent Explorer shows the estimates.',
                 'Library values re-derive when you change temperature or wavelength; '
                 'a value you type by hand is never overwritten.',
-                'A teal dot marks a library value; no dot means your own value. '
-                'dn/dc is never proposed — always enter it yourself.',
+                'A teal dot marks a value the program proposed — from the solvent '
+                'library, a linked count-rate trace, or the file itself; no dot '
+                'means your own value. dn/dc is never proposed — enter it yourself '
+                'or leave it blank.',
+                '<b>Mean count rate</b> (DLS): offered from a linked count-rate '
+                'trace or from the file\'s own value, each labelled — it reaches an '
+                'analysis only when you press <b>Update</b>. A value you type is '
+                'never overwritten, and if it differs from the linked trace a note '
+                'below the table says so.',
                 'Values are used exactly as entered. If a temperature or refractive '
                 'index looks like a unit slip (e.g. 2980 K for 298 K, or n = 13.3 for '
                 '1.33) a note below the table flags it as implausible — double-check '
                 'it, then keep or correct it as you see fit.',
-                'A solvent name not in the recognized vocabulary also shows a note '
-                'below the table; it is used as-entered for sample matching.',
+                'For a solvent the library does not carry, choose <b>Other…</b> and '
+                'type its name. The name is stored exactly as you type it and nothing '
+                'is guessed from it — enter its refractive index (and viscosity) '
+                'yourself. Only capitalisation is ignored when matching measurements '
+                'into one sample, so <i>H2O</i> and <i>water</i> are two samples.',
+                '<b>Chain type</b> (optional): tag a sample <b>Linear</b> (a reference '
+                'for the Cross-Sample branching laws) or <b>Branched</b> (gets the '
+                'contraction factors g and h); shared across the sample.',
                 'Tip: press <b>Enter</b> in a value to jump to the next field.',
             ]))
         self.table = QtWidgets.QTableWidget(0, 3)
@@ -221,18 +323,37 @@ class DataModule(QtWidgets.QWidget):
         self.plausibility_note = ThemedLabel('', size=11)
         self.plausibility_note.setWordWrap(True)
         layout.addWidget(self.plausibility_note)
-        # Passive unrecognized-solvent note (the committed name is not in the solvent
-        # vocabulary, so it is used as-entered for sample matching): the same neutral ⓘ
-        # tier. Kept separate from the plausibility note — an unknown name and a unit
-        # slip are different messages. Shares its text with the load-time warning via
-        # core.data_models.unrecognized_solvent_reason so the two never drift.
-        self.solvent_note = ThemedLabel('', size=11)
-        self.solvent_note.setWordWrap(True)
-        layout.addWidget(self.solvent_note)
-
+        # Committed mean count rate vs the linked trace's own mean. Its own label
+        # rather than a share of plausibility_note's: a unit slip in T/n is a
+        # different, safety-relevant fact that must not be crowded out by this one.
+        # Refreshed from _refresh_pending (not from an edit event), because it is a
+        # standing fact about the measurement, not something that happened.
+        self.trace_divergence_note = ThemedLabel('', size=11)
+        self.trace_divergence_note.setWordWrap(True)
+        layout.addWidget(self.trace_divergence_note)
+        # The mean count rate is the one parameter more than one place can propose,
+        # so it gets the shared offer affordance rather than a bespoke control. It
+        # sits beside the divergence note because the two answer the same question
+        # ("where did this number come from, and does it agree?"), and beneath the
+        # table because it fills a cell rather than being one.
+        cr_row = QtWidgets.QHBoxLayout()
+        cr_row.setContentsMargins(0, 0, 0, 0)
+        self.count_rate_source_label = ThemedLabel('', size=11)
+        self.count_rate_picker = SourcePicker(
+            'From…', title='Mean count rate',
+            prompt='Fill the mean count rate from:')
+        self.count_rate_picker.picked.connect(self._on_count_rate_source_picked)
+        cr_row.addWidget(self.count_rate_source_label)
+        cr_row.addWidget(self.count_rate_picker)
+        cr_row.addStretch(1)
+        self._count_rate_row = cr_row
+        layout.addLayout(cr_row)
         row = QtWidgets.QHBoxLayout()
         self.update_button = QtWidgets.QPushButton('Update')
-        self.update_button.setToolTip('Update the edited parameters to the sample.')
+        self.update_button.setToolTip(
+            'Update the edited parameters to the sample. If the change regroups '
+            'samples, stored results follow; you are asked first if a merge '
+            'would drop a hand-entered or picked value.')
         self.update_button.clicked.connect(self._on_update)
         self.undo_button = QtWidgets.QPushButton('Undo')
         self.undo_button.setToolTip(
@@ -274,7 +395,7 @@ class DataModule(QtWidgets.QWidget):
             self.pending.setText('')
             self.autofill_note.setText('')
             self.plausibility_note.setText('')
-            self.solvent_note.setText('')
+            self.trace_divergence_note.setText('')
             # The provenance legend is data-dependent chrome (R8.2): hide it on an empty
             # table so an unpopulated tab doesn't explain a dot that isn't there.
             self.legend.hide()
@@ -308,18 +429,24 @@ class DataModule(QtWidgets.QWidget):
             name = QtWidgets.QTableWidgetItem(_PARAM_LABELS.get(key, key))
             name.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
             name.setData(QtCore.Qt.ItemDataRole.UserRole, key)
+            if key in _ROW_TOOLTIPS:
+                name.setToolTip(_ROW_TOOLTIPS[key])
             self.table.setItem(r, 0, name)
             # An empty, non-editable value item always exists (so _refresh_dirty can
             # address it); for the geometry / solvent rows a combo widget is laid over
             # it (the underlying item is non-editable — the combo owns the value).
             value_item = QtWidgets.QTableWidgetItem('')
-            if key in (_GEOMETRY_KEY, _SOLVENT_KEY):
+            if key in _COMBO_KEYS:
                 value_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
             self.table.setItem(r, 1, value_item)
             if key == _GEOMETRY_KEY:
                 self._build_geometry_cell(r)
+            elif key == _CHAIN_TYPE_KEY:
+                self._build_chain_type_cell(r)
             elif key == _SOLVENT_KEY:
                 self._build_solvent_cell(r)
+            elif key == _BLANK_KEY:
+                self._build_blank_cell(r)
             else:
                 # Drop any cell widget left over from a previous measurement whose
                 # key tuple put a combo at this row (setItem does NOT remove a cell
@@ -342,34 +469,69 @@ class DataModule(QtWidgets.QWidget):
         combo.currentTextChanged.connect(self._on_geometry_changed)
         self.table.setCellWidget(row, 1, combo)
 
-    def _build_solvent_cell(self, row: int) -> None:
-        """Value column for the solvent row: an EDITABLE dropdown over the primary-tier
-        library solvents. Editable keeps free-text entry for non-library solvents and
-        the existing normalize/alias path; picking or typing one re-derives n/viscosity
-        from the library (via the controller)."""
+    def _build_chain_type_cell(self, row: int) -> None:
+        """Value column for the chain-type row: a Linear / Branched / — dropdown. A
+        sample-level architecture tag; propagated sample-wide (set_shared_param)."""
         combo = QtWidgets.QComboBox()
-        combo.setEditable(True)
-        combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
-        combo.addItem('')                                      # a blank/"none" option
-        combo.addItems(self.controller.available_solvents('primary'))
+        combo.addItems(_CHAIN_TYPE_OPTIONS)
+        combo.setToolTip(
+            'Polymer architecture of this sample, for the Cross-Sample branching '
+            'contraction factors: Linear = a reference that defines the linear Rg–Mw '
+            'and Rh–Mw laws; Branched = a target that gets g (from Rg) and/or h (from '
+            'Rh); — = untagged. Entered once and shared across the sample’s '
+            'measurements. See the Theory-and-Equations-Guide.')
+        combo.currentTextChanged.connect(self._on_chain_type_changed)
+        self.table.setCellWidget(row, 1, combo)
+
+    def _build_solvent_cell(self, row: int) -> None:
+        """Value column for the solvent row: a CLOSED dropdown over all 19 library
+        solvents (grouped into measured/estimated sections by gui.solvent_picker), plus
+        an ``Other…`` entry that reveals a text box beside it.
+
+        Closed rather than editable, because that is what lets the rest of the program
+        store a solvent name verbatim: a picked value is canonical by construction, so
+        nothing downstream has to guess whether a typed "H2O" meant water. Free text is
+        still available — it is just an explicit choice now, and a name entered that way
+        is its own sample and gets no library n/η (the user supplies both by hand).
+
+        The combo and the text box live in one container widget so the table cell can
+        hold both; ``_solvent_widgets`` gives the refresh path a handle on the pair.
+        """
+        combo = QtWidgets.QComboBox()
+        populate_solvent_combo(combo, include_blank=True, include_other=True)
         combo.setToolTip(
             'Solvent for this sample. Choosing a library solvent auto-fills the '
             'refractive index (and, for DLS, the viscosity) from the temperature and '
-            'wavelength; type any name for a solvent not in the library. A name that '
-            'is not in the recognized vocabulary shows a note below the table and is '
-            'used as-entered for sample matching.')
-        # Dropdown pick fires textActivated; a hand-typed name fires editingFinished on
-        # the line edit. Both route to the same handler; the handler no-ops when the
-        # value is unchanged, so the (harmless) double-fire on a pick costs nothing.
-        combo.textActivated.connect(self._on_solvent_changed)
-        combo.lineEdit().editingFinished.connect(
-            lambda c=combo: self._on_solvent_changed(c.currentText()))
+            'wavelength. Choose Other… to name a solvent the library does not carry — '
+            'the name is then used exactly as you type it, and you enter its '
+            'refractive index (and viscosity) yourself.')
+        combo.activated.connect(self._on_solvent_picked)
+
+        other = QtWidgets.QLineEdit()
+        other.setPlaceholderText('Solvent name')
+        other.setToolTip(
+            'Name of a solvent not in the library. Stored exactly as typed and used '
+            'as-is to match this measurement to its sample.')
+        other.hide()
+        other.editingFinished.connect(self._on_solvent_typed)
         # Enter in the solvent field advances to the next field, matching every other
-        # text value (the section help promises it). Deferred so _on_solvent_changed
+        # text value (the section help promises it). Deferred so _on_solvent_typed
         # commits + repopulates first (returnPressed fires before editingFinished).
-        combo.lineEdit().returnPressed.connect(
+        other.returnPressed.connect(
             lambda: QtCore.QTimer.singleShot(0, self._advance_from_solvent))
-        self.table.setCellWidget(row, 1, combo)
+
+        holder = QtWidgets.QWidget()
+        box = QtWidgets.QHBoxLayout(holder)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(4)
+        box.addWidget(combo, 1)
+        box.addWidget(other, 1)
+        # Enter-to-advance walks cell widgets and focuses them; the proxy sends that
+        # focus to the combo rather than the bare container.
+        holder.setFocusProxy(combo)
+        self._solvent_widgets = (combo, other)
+        self._solvent_other_mode = False
+        self.table.setCellWidget(row, 1, holder)
 
     def _build_unit_cell(self, row: int, key: str) -> None:
         """Unit column: a unit-picker combo for convertible quantities, a static
@@ -423,6 +585,17 @@ class DataModule(QtWidgets.QWidget):
                         U.from_canonical(q, float(v), unit),
                         U.from_canonical(q, float(sigma), unit))
                 return format_value_at_uncertainty(float(v), sigma)   # n: dimensionless
+        # A mean count rate the PROGRAM derived is a computed quantity with no ±, so
+        # it follows the house rule for those: the Settings no-uncertainty
+        # significant figures, not the raw 10-digit float. A value the user typed is
+        # echoed exactly as entered, like every other hand-entered cell.
+        if (key == _MEAN_CR_KEY and working is not None
+                and isinstance(v, (int, float))
+                and (working.get(_MEAN_CR_SOURCE_KEY) or '') not in ('', 'user')):
+            q = _QUANTITY[key]
+            return format_fixed_sig(
+                U.from_canonical(q, float(v), self._units[q]),
+                self.controller.settings.no_uncertainty_sig_figs)
         if key in _QUANTITY:
             return _fmt_num(U.from_canonical(_QUANTITY[key], float(v),
                                              self._units[_QUANTITY[key]]))
@@ -472,10 +645,16 @@ class DataModule(QtWidgets.QWidget):
                 v = working.get(key)
                 combo.setCurrentText(v if v in _GEOMETRY_OPTIONS else _GEOMETRY_BLANK)
                 continue
+            if key == _CHAIN_TYPE_KEY:
+                combo = self.table.cellWidget(r, 1)
+                combo.setCurrentText(
+                    _CHAIN_TYPE_TO_DISPLAY.get(working.get(key), _CHAIN_TYPE_BLANK))
+                continue
             if key == _SOLVENT_KEY:
-                # setCurrentText on an editable combo does NOT emit textActivated /
-                # editingFinished, so this never re-enters the handler.
-                self.table.cellWidget(r, 1).setCurrentText(working.get(key) or '')
+                self._show_solvent(working.get(key))
+                continue
+            if key == _BLANK_KEY:
+                self._populate_blank_cell(r, working)
                 continue
             self.table.item(r, 1).setText(
                 self._display_text(key, working.get(key), working))
@@ -515,11 +694,26 @@ class DataModule(QtWidgets.QWidget):
                                        self._units[_QUANTITY[key]])
             else:
                 value = entered          # fixed-unit numbers are already canonical
+        # dn/dc = 0 is refused by SLSMeasurement (it collapses the Kc/ΔR ordinate), and
+        # catching it here rather than at Run saves a commit-then-fail round trip. The
+        # RULE lives on the model, which still enforces it for every other entry path;
+        # this is only the early, friendlier surface for the one route a user types on.
+        if key == 'dn_dc_mL_per_g' and value == 0:
+            QtWidgets.QMessageBox.warning(
+                self, 'dn/dc cannot be zero',
+                'A dn/dc of zero would make the optical constant K zero and collapse '
+                'the whole Kc/ΔR ordinate, so no molecular weight could come from it.'
+                '\n\nIf you do not have a value, leave the cell BLANK instead. Every '
+                'analysis still runs; Rg and the form-factor sizes are exact, and '
+                'only Mw and the absolute A₂ are flagged as being on an arbitrary '
+                'optical scale.')
+            self._revert_cell(item.row(), key)
+            return
         # A direct edit of n or viscosity claims that field as user-owned (sample-wide)
         # BEFORE the write, so library autofill never overwrites it. Only a real typed
         # value claims it. Clearing a library-filled cell instead drops its
         # 'library:primary' tag, so the provenance dot never keeps claiming a library
-        # value on an EMPTY safety-critical cell (F-45); a later solvent/T/λ change
+        # value on an EMPTY safety-critical cell; a later solvent/T/λ change
         # still re-derives it (autofill is blocked only by a 'user' tag).
         if key in _SOLVENT_VALUE_KEYS:
             if value is not None:
@@ -579,6 +773,64 @@ class DataModule(QtWidgets.QWidget):
         self.table.setCurrentCell(list(self.keys).index(_SOLVENT_KEY), 1)
         self._advance_to_next_field()
 
+    def _build_blank_cell(self, row: int) -> None:
+        """Value column for the solvent-blank row: an auto / <blank> dropdown.
+        Its entries depend on the sample, so they are filled in _populate."""
+        combo = QtWidgets.QComboBox()
+        combo.currentIndexChanged.connect(self._on_blank_changed)
+        self.table.setCellWidget(row, 1, combo)
+
+    def _populate_blank_cell(self, row: int, working: dict) -> None:
+        """Fill the solvent-blank dropdown from the sample's blanks and show which
+        one is in use. Hidden on a blank itself (it references nothing) and when the
+        sample has no blank at all (nothing to choose)."""
+        combo = self.table.cellWidget(row, 1)
+        if combo is None:
+            return
+        conc = working.get('concentration_g_per_mL')
+        sid = self.controller.workspace.sample_id_of(self.item_id)
+        blanks = self.controller.workspace.blank_candidates(sid) if sid else []
+        hide = (conc is not None and conc == 0) or not blanks
+        self.table.setRowHidden(row, hide)
+        if hide:
+            return
+        combo.clear()
+        combo.addItem(_BLANK_AUTO, None)
+        for b in blanks:
+            # The same folder/file name the tooltip and the export use.
+            combo.addItem(f'{blank_label(b)}  [{b.item_id}]', b.item_id)
+        wanted = working.get(_BLANK_KEY)
+        idx = combo.findData(wanted) if wanted else 0
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._refresh_blank_tooltip(combo)
+
+    def _refresh_blank_tooltip(self, combo) -> None:
+        """Describe the WORKING selection (what is picked, committed or not), so
+        the tooltip can never contradict the index beside it."""
+        status = self.controller.solvent_blank_status(self.item_id, use_working=True)
+        how = {'user': 'your choice',
+               'auto:same-file': 'automatic — the blank from this series\' own file',
+               'auto:sample': 'automatic — the sample reference blank'}.get(
+                   status['source'], status['source'])
+        tip = (f'In use: {status["label"] or "none"} ({how}).'
+               if status['item_id'] else 'No solvent blank in this sample.')
+        if status['note']:
+            tip += f' Note: {status["note"]}.'
+        combo.setToolTip(tip)
+
+    def _on_blank_changed(self, index: int) -> None:
+        """Solvent-blank dropdown changed: store the chosen blank's item_id
+        (None = automatic pairing) on this series only."""
+        if self._suppress or self.item_id is None:
+            return
+        combo = self.sender()
+        value = combo.itemData(index) if combo is not None else None
+        self.controller.set_param(self.item_id, _BLANK_KEY, value)
+        if combo is not None:
+            self._refresh_blank_tooltip(combo)
+        self._refresh_dirty()
+        self._refresh_pending()
+
     def _on_geometry_changed(self, text: str) -> None:
         """Polarization dropdown changed: store the per-measurement geometry."""
         if self._suppress or self.item_id is None:
@@ -588,15 +840,128 @@ class DataModule(QtWidgets.QWidget):
         self._refresh_dirty()
         self._refresh_pending()
 
-    def _on_solvent_changed(self, text: str) -> None:
-        """Solvent combo picked / typed: store the shared solvent name, then re-derive
-        n (and viscosity) from the library at the sample's temperature + wavelength."""
+    def _on_chain_type_changed(self, text: str) -> None:
+        """Chain-type dropdown changed: store the sample-shared architecture tag
+        (propagated across the sample's measurements, like the solvent name)."""
         if self._suppress or self.item_id is None:
             return
-        value = text.strip() or None
+        value = _CHAIN_TYPE_TO_STORED.get(text)          # '—' -> None
+        self.controller.set_shared_param(self.item_id, _CHAIN_TYPE_KEY, value)
+        self._refresh_dirty()
+        self._refresh_pending()
+
+    def _show_solvent(self, name) -> None:
+        """Display the stored solvent `name` in the closed combo + Other text box.
+
+        A name the library carries selects its row (matched caselessly, so a Zetasizer
+        file's ``Water`` finds ``water``). Anything else — a name typed here, or one an
+        instrument recorded — shows as *Other* with the string in the text box, so a
+        free-text solvent survives a round trip through the table instead of being
+        silently dropped on the next refresh. ``_solvent_other_mode`` covers the moment
+        between choosing *Other* and typing anything into it, when there is no stored
+        name to infer the state from.
+        """
+        combo, other = self._solvent_widgets
+        # Hiding a focused QLineEdit emits editingFinished, which would re-enter the
+        # commit path; suppress for the duration. Saved/restored rather than set to
+        # False, because _populate() calls this inside its own suppressed block.
+        was_suppressed = self._suppress
+        self._suppress = True
+        try:
+            self._show_solvent_unguarded(combo, other, name)
+        finally:
+            self._suppress = was_suppressed
+
+    def _show_solvent_unguarded(self, combo, other, name) -> None:
+        i = index_of_solvent(combo, name)
+        free_text = isinstance(name, str) and name.strip() and i < 0
+        if self._solvent_other_mode or free_text:
+            combo.setCurrentIndex(combo.findData(OTHER_DATA))
+            other.setText(name if free_text else '')
+            other.show()
+        else:
+            combo.setCurrentIndex(i if i >= 0 else 0)      # 0 = the blank "not set" row
+            other.clear()
+            other.hide()
+
+    def select_solvent(self, name) -> None:
+        """Choose `name` as if the user had worked the solvent control.
+
+        A library solvent goes through the dropdown; anything else goes through the
+        Other text box; a blank clears the field. The public entry point for driving
+        this control from outside the widget (the screenshot harness and the GUI
+        tests), so they exercise the same routing a click does instead of a private
+        handler that could drift away from it.
+        """
+        if self.item_id is None:
+            return
+        combo, _other = self._solvent_widgets
+        i = index_of_solvent(combo, name)
+        self._solvent_other_mode = False
+        self._commit_solvent(combo.itemData(i) if i >= 0 else name)
+
+    def _on_solvent_picked(self, index: int) -> None:
+        """A row of the closed solvent dropdown was activated by the user.
+
+        ``activated`` fires on user action only, never on a programmatic
+        ``setCurrentIndex``, so the refresh path cannot re-enter this.
+        """
+        if self._suppress or self.item_id is None:
+            return
+        combo, other = self._solvent_widgets
+        if combo.itemData(index) == OTHER_DATA:
+            # Nothing to commit yet — the name is whatever they are about to type.
+            # Deliberately does NOT clear the stored solvent: abandoning the text box
+            # without typing leaves the previous value intact rather than wiping it.
+            self._solvent_other_mode = True
+            other.clear()
+            other.show()
+            other.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+            return
+        self._solvent_other_mode = False
+        self._commit_solvent(combo.itemData(index))
+
+    def _on_solvent_typed(self) -> None:
+        """The Other text box lost focus / was submitted: commit what was typed.
+
+        An empty box has TWO meanings and only one of them clears the solvent:
+
+        * **never typed** — the user chose Other… and then clicked away or tabbed off
+          without entering anything. ``editingFinished`` fires on any focus-out, typed
+          or not, so this arrives here looking identical to a deliberate clear. It must
+          leave the stored name alone: committing '' would blank the solvent the user
+          never asked to change, and take its library-derived n and viscosity with it.
+          ``_solvent_other_mode`` is exactly the flag for "chose Other…, typed nothing
+          yet", so it distinguishes the two.
+        * **cleared** — the box was already showing a free-text name and the user
+          emptied it. ``_solvent_other_mode`` is False there (the name came from the
+          stored value, not from an unfinished pick), so the clear commits normally.
+        """
+        if self._suppress or self.item_id is None:
+            return
+        _combo, other = self._solvent_widgets
+        if self._solvent_other_mode and not other.text().strip():
+            # Abandoned without typing: restore the display to whatever is stored and
+            # commit nothing. Leaving other_mode set would strand the empty box on the
+            # next refresh, so it is dropped first.
+            self._solvent_other_mode = False
+            working = self.controller.workspace.measurements[
+                self.item_id].working_params
+            self._show_solvent(working.get(_SOLVENT_KEY))
+            return
+        self._solvent_other_mode = False
+        self._commit_solvent(other.text())
+
+    def _commit_solvent(self, name) -> None:
+        """Store the shared solvent name, then re-derive n (and viscosity) from the
+        library at the sample's temperature + wavelength. The name is stored VERBATIM;
+        a name the library does not carry simply autofills nothing, and the user enters
+        n and η themselves (invariant 3 — no guessed physics)."""
+        value = (name or '').strip() or None
         working = self.controller.workspace.measurements[self.item_id].working_params
         if working.get(_SOLVENT_KEY) == value:
-            return                        # unchanged (e.g. editingFinished after a pick)
+            self._show_solvent(value)     # unchanged, but the widget pair may not be
+            return
         self.controller.set_shared_param(self.item_id, _SOLVENT_KEY, value)
         status = self.controller.reautofill_after(self.item_id, _SOLVENT_KEY)
         self._populate()
@@ -631,6 +996,12 @@ class DataModule(QtWidgets.QWidget):
             busy_notice(self.update_button)
             return
         self._apply_edits_to_selection()
+        # An identity edit can regroup samples and drop a stored hand-entered /
+        # picked value with them — ask first, before anything commits (the one
+        # shared confirm; Cancel leaves every edit pending, nothing applied).
+        if not confirm_regroup_losses(self, self.controller,
+                                      self.controller.commit_regroup_losses()):
+            return
         self.controller.commit()
         self._populate()           # working == committed now -> highlights clear
         self._refresh_pending()
@@ -639,6 +1010,12 @@ class DataModule(QtWidgets.QWidget):
     def _on_undo(self) -> None:
         if runner().is_busy:
             busy_notice(self.undo_button)
+            return
+        # Undo restores parameters, never results — so an Undo that re-scatters
+        # a previously-merged sample destroys its carried values exactly like a
+        # forward scatter. Same ask, same Cancel-is-inert (nothing is undone).
+        if not confirm_regroup_losses(self, self.controller,
+                                      self.controller.undo_regroup_losses()):
             return
         grouping_changed = self.controller.undo()
         self._populate()
@@ -650,6 +1027,9 @@ class DataModule(QtWidgets.QWidget):
 
     def _on_reset(self) -> None:
         if self.item_id is None:
+            return
+        if runner().is_busy:          # the Update/Undo siblings' guard, same reason
+            busy_notice(self.reset_button)
             return
         ids = self._sample_scope_ids()
         n = len(ids)
@@ -689,7 +1069,7 @@ class DataModule(QtWidgets.QWidget):
         self._suppress = True
         for r, key in enumerate(self.keys):
             is_dirty = key in dirty
-            if key in (_GEOMETRY_KEY, _SOLVENT_KEY):
+            if key in _COMBO_KEYS:
                 # The value cell holds a combo widget; tint it (not the hidden item).
                 combo = self.table.cellWidget(r, 1)
                 if combo is not None:
@@ -726,21 +1106,52 @@ class DataModule(QtWidgets.QWidget):
         working = self.controller.workspace.measurements[self.item_id].working_params
         self._suppress = True
         for r, key in enumerate(self.keys):
-            if key not in _SOLVENT_VALUE_KEYS:
+            builder = _PROVENANCE_FIELDS.get(key)
+            if builder is None:
                 continue
             cell = self.table.item(r, 1)
             if cell is None:
                 continue
-            src = working.get(_SOLVENT_SOURCE_KEYS[key])
-            if src == 'library:primary':
-                cell.setData(QtCore.Qt.ItemDataRole.DecorationRole,
-                             self._dot_pixmap('lib_primary'))
-                cell.setToolTip(self._lib_tooltip(key, working))
-            else:
-                cell.setData(QtCore.Qt.ItemDataRole.DecorationRole, None)
-                cell.setToolTip('Your value — overrides the library.'
-                                if working.get(key) is not None else '')
+            token, tip = getattr(self, builder)(key, working)
+            cell.setData(QtCore.Qt.ItemDataRole.DecorationRole,
+                         self._dot_pixmap(token) if token else None)
+            cell.setToolTip(tip)
         self._suppress = False
+
+    def _solvent_dot(self, key: str, working: dict):
+        """Dot token + tooltip for a solvent-library field."""
+        if working.get(_SOLVENT_SOURCE_KEYS[key]) == 'library:primary':
+            return 'lib_primary', self._lib_tooltip(key, working)
+        return None, ('Your value — overrides the library.'
+                      if working.get(key) is not None else '')
+
+    def _count_rate_dot(self, key: str, working: dict):
+        """Dot token + tooltip for the mean count rate.
+
+        Matches on the tag FAMILY, so the plain/outlier-clipped distinction can be
+        refined inside the tag without this having to follow. Where the file recorded
+        its own mean count rate, that number rides along in the tooltip: comparing it
+        against what is in the cell is what catches a clipped trace section or a
+        trace paired with the wrong angle.
+        """
+        src = working.get(_MEAN_CR_SOURCE_KEY)
+        family = (src or '').split(':')[0]
+        vendor = working.get('vendor_mean_count_rate_cps')
+        extra = ''
+        if vendor is not None:
+            extra = f" The file itself recorded {vendor:.4g} cps."
+        if family == 'trace':
+            method = ('outlier-clipped mean' if src.endswith('sigma_clipped')
+                      else 'mean')
+            return 'lib_primary', (
+                f'From the linked count-rate trace ({method}). Editable; a value '
+                f'you type is never overwritten.{extra}')
+        if family == 'vendor':
+            return 'lib_primary', (
+                "From the instrument file's own mean count rate. Editable; a "
+                "value you type is never overwritten.")
+        return None, (f'Your value — used exactly as entered.{extra}'
+                      if working.get(key) is not None else '')
 
     def _dot_pixmap(self, role: str) -> QtGui.QPixmap:
         """A small filled-circle pixmap in the theme color for ``role`` (rebuilt on
@@ -766,8 +1177,9 @@ class DataModule(QtWidgets.QWidget):
         tooltip — it points to the Theory-and-Equations-Guide instead."""
         name = working.get(_SOLVENT_KEY)
         # A cleared solvent name can linger with a stale 'library:primary' tag, so a
-        # falsy/non-string name would reach solvent_property_info -> normalize_solvent_name
-        # -> name.strip() (AttributeError, NOT caught below). Guard it here.
+        # falsy/non-string name would reach solvent_property_info -> _lookup ->
+        # casefold_identity_name -> name.strip() (AttributeError, NOT caught below).
+        # Guard it here.
         if not isinstance(name, str) or not name.strip():
             return 'Library value (primary).'
         try:
@@ -807,23 +1219,78 @@ class DataModule(QtWidgets.QWidget):
         color tracks a light/dark switch (a QLabel stylesheet color would freeze)."""
         teal = theme_token(self, 'lib_primary')
         self.legend.setText(
-            f'<span style="color:{teal}">●</span> library value (auto-filled)'
+            f'<span style="color:{teal}">●</span> proposed value (the solvent '
+            'library, or a mean count rate from a linked trace or the file)'
             ' &nbsp;·&nbsp; no dot = your value &nbsp;·&nbsp; '
             'a value you type is never overwritten')
 
     def _apply_autofill_status(self, status: Optional[dict]) -> None:
-        """Show / clear the non-blocking out-of-window note from an autofill attempt.
+        """Show / clear the non-blocking note from an autofill attempt.
+
         The engine has already declined to fill and cleared any stale library value;
-        here we only surface the hint (manual entry always works)."""
+        this only surfaces the hint (manual entry always works). It dispatches on
+        ``status['reason']`` — the field that says WHY the engine declined — rather than
+        on which fields it cleared. Those are different questions, and answering the
+        second in place of the first is what made a missing temperature report itself as
+        "outside the library range": every refusal branch clears stale values, so
+        ``out_of_range`` alone cannot tell one refusal from another.
+        """
+        status = status or {}
+        reason = status.get('reason')
+        solvent = self.controller.workspace.measurements[
+            self.item_id].working_params.get(_SOLVENT_KEY)
+
         # Only surface fields that are actually parameters of THIS measurement kind:
         # viscosity is not an SLS field, so an out-of-range viscosity there must not
         # tell the user to hand-enter a value SLS never uses (the RI still filled).
-        oor = [f for f in ((status or {}).get('out_of_range') or []) if f in self.keys]
-        if not (oor and (status or {}).get('tier') == 'primary'):
+        oor = [f for f in (status.get('out_of_range') or []) if f in self.keys]
+        # 'cleared' says whether the user just LOST values they could see. Every refusal
+        # branch clears, so it qualifies a message rather than choosing one.
+        cleared = ' The values that were there have been cleared.' if oor else ''
+
+        if reason == 'not a primary-tier solvent':
+            # Two situations share this reason and need different sentences.
+            # status['tier'] tells them apart: 'estimate' is a library solvent whose data
+            # is too weak to auto-fill, and the Explorer WILL show it; None is a name the
+            # library does not carry at all, where pointing the user at the Explorer sends
+            # them somewhere the name does not appear. Saying something is not optional
+            # either way — silence looks identical to a successful fill, and the two blank
+            # fields are the ones Rh and Mw are computed from. Deliberately NOT gated on
+            # anything having been cleared: a fresh measurement has nothing stale to clear.
+            if status.get('tier') == 'estimate':
+                self.autofill_note.setText(
+                    f'{solvent} has estimated properties, so nothing was filled in — '
+                    f'enter the refractive index (and viscosity) yourself.{cleared} '
+                    f'Utilities ▸ Solvent Explorer shows the library’s estimates.')
+            else:
+                self.autofill_note.setText(
+                    f'{solvent} is not in the solvent library, so nothing was filled in — '
+                    f'enter the refractive index (and viscosity) yourself.{cleared}')
+            return
+
+        if reason == 'need both temperature and wavelength':
+            # A refusal for want of a CONDITION, not a solvent. Silent here would mean a
+            # library value the user could see simply vanished when they blanked the
+            # temperature, with nothing on screen connecting the two.
+            self.autofill_note.setText(
+                f'The library needs both a temperature and a wavelength to propose '
+                f'values for {solvent}.{cleared}')
+            return
+
+        if reason == 'no solvent':
+            # Same shape, the other missing input. Only worth a sentence when something
+            # was actually lost — an empty measurement with no solvent yet is the normal
+            # starting state, and nagging about it would be noise.
+            self.autofill_note.setText(
+                ('The library needs a solvent name to propose values.' + cleared)
+                if oor else '')
+            return
+
+        # The range message belongs ONLY to the branch that actually evaluated the
+        # library and found the condition outside its box — reason is None there.
+        if not (oor and reason is None and status.get('tier') == 'primary'):
             self.autofill_note.setText('')
             return
-        solvent = self.controller.workspace.measurements[
-            self.item_id].working_params.get(_SOLVENT_KEY)
         try:
             info = self.controller.solvent_property_info(solvent)
         except (ValueError, TypeError):
@@ -876,7 +1343,8 @@ class DataModule(QtWidgets.QWidget):
         # Every mutation path (edit, commit, undo, reset, autofill) and selection change
         # routes through here, so refresh the passive notes from the same hook.
         self._refresh_plausibility()
-        self._refresh_solvent_note()
+        self._refresh_trace_divergence()
+        self._refresh_count_rate_offers()
 
     def _refresh_plausibility(self) -> None:
         """Show a passive ⓘ note when the working temperature / refractive index is
@@ -894,24 +1362,80 @@ class DataModule(QtWidgets.QWidget):
                + '. Used exactly as entered.') if reasons else ''
         set_flag(self.plausibility_note, msg, problem=False)
 
-    def _refresh_solvent_note(self) -> None:
-        """Show a passive ⓘ note when the working solvent name is not in the recognized
-        vocabulary (so it is used as-entered for sample matching). Non-blocking — the
-        name is user-owned. The reason text is defined once, in
-        core.data_models.unrecognized_solvent_reason, shared with the load-time warning
-        so the GUI note and the warning can never disagree."""
+    def _refresh_trace_divergence(self) -> None:
+        """Show a passive ⓘ note when the mean count rate being edited disagrees
+        with the linked count-rate trace's own mean.
+
+        A disclosure, never a refusal: the value is used exactly as entered. Reads
+        the WORKING params so the note tracks the cell the user is editing, and
+        renders both numbers in the row's currently selected display unit so the
+        note and the cell can never appear to contradict each other.
+        """
         if self.item_id is None:
-            set_flag(self.solvent_note, '', problem=False)
+            set_flag(self.trace_divergence_note, '', problem=False)
             return
-        working = self.controller.workspace.measurements[self.item_id].working_params
-        name = working.get(_SOLVENT_KEY)
-        # A cleared/blank name is not "unrecognized" — it is simply unset; don't nag.
-        reason = (unrecognized_solvent_reason(name)
-                  if isinstance(name, str) and name.strip() else None)
-        set_flag(self.solvent_note, reason or '', problem=False)
+        lm = self.controller.workspace.measurements.get(self.item_id)
+        if lm is None or lm.kind != 'dls':
+            set_flag(self.trace_divergence_note, '', problem=False)
+            return
+        st = self.controller.mean_count_rate_status(self.item_id, use_working=True)
+        if not st['diverges']:
+            set_flag(self.trace_divergence_note, '', problem=False)
+            return
+        unit = self._units.get('intensity', 'cps')
+        shown = U.from_canonical('intensity', st['value'], unit)
+        trace = U.from_canonical('intensity', st['trace_mean_cps'], unit)
+        pct = st['rel_diff']
+        pct_txt = f' ({pct * 100:+.0f} %)' if pct is not None else ''
+        set_flag(self.trace_divergence_note,
+                 f'Mean count rate differs from the linked trace: '
+                 f'{_fmt_num(shown)} vs {_fmt_num(trace)} {unit}{pct_txt}. '
+                 f'Used exactly as entered.',
+                 problem=False)
+
+    def _refresh_count_rate_offers(self) -> None:
+        """Show which sources could fill this measurement's mean count rate.
+
+        Reports what is on offer; writes nothing (invariant 3). Hidden entirely for
+        a non-DLS item, where the parameter does not exist.
+        """
+        lm = (self.controller.workspace.measurements.get(self.item_id)
+              if self.item_id is not None else None)
+        if lm is None or lm.kind != 'dls':
+            self.count_rate_source_label.setText('')
+            self.count_rate_picker.set_offers([])
+            self.count_rate_picker.setVisible(False)
+            return
+        self.count_rate_picker.setVisible(True)
+        offers = self.controller.mean_count_rate_offers(self.item_id)
+        unit = self._units.get('intensity', 'cps')
+        self.count_rate_picker.set_offers(
+            offers,
+            value_format=lambda v: '{0} {1}'.format(
+                _fmt_num(U.from_canonical('intensity', v, unit)), unit))
+        source = lm.working_params.get(_MEAN_CR_SOURCE_KEY)
+        self.count_rate_source_label.setText(
+            'Mean count rate source: {0}'.format(source) if source
+            else 'Mean count rate: not set')
+
+    def _on_count_rate_source_picked(self, source: str) -> None:
+        """Adopt an offered mean count rate into the working params.
+
+        A deliberate user action, so it may replace a typed value -- they asked for
+        it. It lands in the WORKING tier like any other edit and reaches the sample
+        only through Update, so the commit path is unchanged.
+        """
+        if self.item_id is None:
+            return
+        if self.controller.apply_mean_count_rate_offer(self.item_id, source):
+            # The same repaint every other edit path ends in: the table (cell,
+            # dirty tint, provenance dot) and the pending indicator + notes.
+            self._populate()
+            self._refresh_pending()
 
     def _set_enabled(self, on: bool) -> None:
         self.table.setEnabled(on)
         self.update_button.setEnabled(on)
         self.undo_button.setEnabled(on)
         self.reset_button.setEnabled(on)
+        self.count_rate_picker.setEnabled(on)

@@ -32,6 +32,8 @@ API and import surface are unchanged -- everything below is re-exported here, so
     distributions.py  NNLS / CONTIN / lognormal + peaks + Rh<->Gamma axis helper
     angular.py        Gamma-q^2, concentration extrapolation, Rh<->Gamma converters
     replicate.py      true-replicate correlogram averaging
+    modes.py          mode-resolved dynamics: per-run mode extraction (the mode
+                      map), per-family Gamma-q^2 fits, fast/slow amplitude report
 
 Formulation and conventions
 ---------------------------
@@ -88,9 +90,17 @@ without recomputation.
 
 from __future__ import annotations
 
-from analysis.dls._common import _apply_tau_window
+from analysis.dls._common import (
+    _apply_tau_window,
+    _d_from_gamma,
+    baseline_over_window,
+    DIFFUSIVE_INTERCEPT_REL_MAX,
+    DIFFUSIVE_R2_MIN,
+    MIN_DECAY_COMPLETENESS,
+)
 from analysis.dls.cumulants import (
     CUMULANT_MIN_RH_NM,
+    CUMULANT_MAX_RH_NM,
     CUMULANT_PDI_VALIDITY_LIMIT,
     CumulantResult,
     fit_cumulants,
@@ -114,6 +124,8 @@ from analysis.dls.distributions import (
     fit_contin,
     fit_lognormal,
     fit_nnls,
+    integrate_between,
+    validate_integration_bounds,
 )
 from analysis.dls.angular import (
     ConcentrationExtrapolationResult,
@@ -126,12 +138,31 @@ from analysis.dls.angular import (
 from analysis.dls.replicate import (
     AveragedCorrelogramResult,
     average_replicate_correlograms,
+    check_replicate_identity,
+)
+from analysis.dls.modes import (
+    DEFAULT_AMPLITUDE_FLOOR,
+    MODE_SOURCES,
+    AmplitudeRatioResult,
+    ModeExtraction,
+    ModeFamilyFitResult,
+    ModeMapRun,
+    ModePoint,
+    amplitude_vs_q,
+    extract_modes,
+    fit_mode_family,
 )
 
 __all__ = [
     # constants
     'CUMULANT_MIN_RH_NM',
+    'CUMULANT_MAX_RH_NM',
     'CUMULANT_PDI_VALIDITY_LIMIT',
+    'DIFFUSIVE_R2_MIN',
+    'DIFFUSIVE_INTERCEPT_REL_MAX',
+    'MIN_DECAY_COMPLETENESS',
+    # shared helpers
+    'baseline_over_window',
     # cumulants
     'CumulantResult',
     'fit_cumulants',
@@ -153,6 +184,8 @@ __all__ = [
     'fit_contin',
     'distribution_axis',
     'find_distribution_peaks',
+    'integrate_between',
+    'validate_integration_bounds',
     # angular / front-end
     'GammaQ2Result',
     'ConcentrationExtrapolationResult',
@@ -163,6 +196,22 @@ __all__ = [
     # replicate averaging
     'AveragedCorrelogramResult',
     'average_replicate_correlograms',
+    'check_replicate_identity',
+    # mode-resolved dynamics (the mode map)
+    'DEFAULT_AMPLITUDE_FLOOR',
+    'MODE_SOURCES',
+    'ModePoint',
+    'ModeExtraction',
+    'ModeMapRun',
+    'ModeFamilyFitResult',
+    'AmplitudeRatioResult',
+    'extract_modes',
+    'fit_mode_family',
+    'amplitude_vs_q',
     # private helper used by the headless DLS validators
     '_apply_tau_window',
+    # D = Gamma/q^2 with its guards -- re-exported so the CONTROLLER's per-point vetting
+    # table computes it the same way the engines do, instead of keeping an inline copy
+    # that disagreed with the fit about which points are usable.
+    '_d_from_gamma',
 ]

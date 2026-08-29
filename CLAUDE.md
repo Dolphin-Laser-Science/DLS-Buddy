@@ -58,12 +58,44 @@ badges always work on click.
    common internal data model; all analysis and GUI code operate ONLY on that common
    model. Adding a new instrument format = one new parser file; analysis and GUI are
    never touched.
-3. **Nothing hard-coded** that is instrument-, solvent-, or polymer-specific. All
-   physical parameters (refractive index, wavelength, temperature, viscosity, dn/dc,
-   angle) are always user-supplied.
+3. **No hidden, hard-coded, or unoverridable physics.** Pure analysis functions contain
+   nothing instrument-, solvent-, or polymer-specific; they operate only on the explicit
+   physical parameters handed to them (refractive index, wavelength, temperature,
+   viscosity, dn/dc, angle), and every such parameter is user-owned. The program may
+   *offer* a physical value as a convenience — the solvent-property library proposes
+   refractive index and viscosity from a chosen solvent, temperature, and wavelength,
+   for solvents whose sources meet its dense-data grade (lower-grade solvents surface
+   their values for reference without proposing them) —
+   but only as a transparent, provenance-tagged, freely-overridable default that reaches
+   the analysis solely through the user's explicit commit. **dn/dc is never proposed,
+   defaulted, or guessed** — it is strictly hand-entered. It may be left absent: the SLS
+   engine then computes on a disclosed arbitrary optical scale (K = 1) with every
+   scale-dependent output flagged unreliable — absence is honest, a guessed value never is.
 4. **Diagnostic flags come from general light-scattering criteria**, never system-specific
    thresholds. Where a threshold is needed it is a function parameter with a sensible,
    documented default — not a magic number for one solvent.
+   **What a reliability flag promises:** a flag
+   answers **"did this method's preconditions hold for this fit?"** — never "is this a good
+   answer?"
+   1. A flag is **False when a precondition of the method failed on this run, and its note
+      names that precondition — never a proxy.** Preconditions include: the measurement
+      contains what the method fits (e.g. a mode's decay completes inside the lag window —
+      the `Γ·Δτ` criterion, `analysis/dls/_common.py`); required physical inputs are present
+      (viscosity, calibration); and the reported value is one the method can meaningfully
+      produce (finite, within the physics the method describes) — value-range is one
+      precondition among several, not the definition. Independently failed preconditions are
+      each stated; neither implies the other.
+   2. A flag is **not a fit-quality score, and does not police the user's point selection.**
+      A user who masks, windows or sub-selects owns that choice; the program discloses what
+      it did and does not second-guess the intent. A flag turning green under such a
+      selection is not a defect — this clause is citable to **decline** a finding.
+   **Flag-not-refuse:** a failed precondition flags the result, it
+   does not withhold it — a computed value is always reported, carrying its flag, because
+   the number is real output the user may legitimately need. NaN is reserved for the cases
+   where no honest number exists, each a documented exception (e.g. the sub-floor cumulant
+   Rh, an afterpulsing artifact rather than a measurement). Presentation (tier, glyph,
+   colour) is the GUI style's business; this invariant governs meaning and where a
+   threshold may come from.
 5. **Controller sits between the GUI and the engine.** No analysis logic in the GUI. The
    controller is pure Python (no Qt imports) so the GUI framework can be swapped by
    rewriting only the widget shell.
@@ -86,7 +118,10 @@ badges always work on click.
    for NNLS/CONTIN (ill-posed) or single-angle Mw (one datum). Every SE that propagates through
    a **nonlinear** transform must be **Monte-Carlo-validated** against the sampling SD before it
    ships (a linear pass-through of an already-validated covariance inherits that validation).
-   When adding or
+   Where a single-shot SE rests on **few, high-leverage points** (a short concentration
+   ladder, a ratio of two fitted coefficients), no residual-based estimator is unbiased: the
+   honest target is HC3's **conservative** SE, disclosed as such, with more points or
+   replicates as the route to an unbiased ±. When adding or
    modifying ANY analysis, state how it treats uncertainty and document the formula in the
    Theory-and-Equations-Guide (numbered LaTeX), exactly as the analysis itself is documented.
 9. **No owner-machine specifics in the product or docs.** The program (code, config,
@@ -100,7 +135,7 @@ badges always work on click.
 - Stokes–Einstein `Rh = kT / (6π η D)`; T and η always required, never assumed.
 - `(n_solvent / n_standard)²` correction is **mandatory** on excess Rayleigh ratios
   whenever the solvent differs from the calibration standard.
-- Toluene Rayleigh factor is **always computed from Sivokhin & Kazantsev (2021)** via
+- Toluene Rayleigh ratio is **always computed from Sivokhin & Kazantsev (2021)** via
   `physics/constants.py`, with an explicit **geometry** (VU / VV / VH). Never use a
   vendor/instrument-stored Rayleigh value. Key facts: `R_VV(532 nm, 25 °C) = 2.34e-5
   cm⁻¹` (Takahashi et al. 2019); `R_VU = R_VV·(1 + ρv)`, `R_VH = R_VV·ρv`; the
@@ -116,7 +151,7 @@ badges always work on click.
   scattering, and the error enters Mw squared. Treat it as user-supplied and important;
   never guess it.
 - **Vendor calibration constants are display-only.** They go stale after a re-alignment
-  and often carry outdated Rayleigh factors. The program computes its own k_c from one
+  and often carry outdated Rayleigh ratios. The program computes its own k_c from one
   calibrant point (intensity, angle, standard + geometry).
 - Some systems have **Mw biased by preferential co-solvent adsorption**, so a trustworthy
   Mw may be characterized in a different solvent and **entered by hand**. `SampleResult`
@@ -141,38 +176,13 @@ Top-level packages (each with an `__init__.py`) using top-level package imports
 ├── requirements.txt          # pinned deps (Python 3.13 venv)
 ├── docs/                     # user-facing docs: 1. Quickstart-Guide.pdf, 2. User-Manual.pdf,
 │                             #   3. Theory-and-Equations-Guide.pdf, 4. Code-Map.md,
-│                             #   5. Citation-Index.md (generated citation index)
+│                             #   5. Citation-Index.md (generated citation index),
+│                             #   6. Acknowledgements.md, 7. AI-Use-Statement.txt
 ├── test-data/                # datasets used by validation
-├── core/
-│   ├── data_models.py        # SampleKey, DLSMeasurement, SLSMeasurement, solvent vocab
-│   └── workspace.py          # LoadedMeasurement/Trace, SampleResult, Sample, Workspace, sessions
-├── parsers/                  # base_parser + per-instrument (brookhaven/generic/zetasizer clipboard+export/alv) + trace
-├── physics/
-│   ├── constants.py          # kB, NA, q, Stokes-Einstein, optical constant K, toluene Rayleigh
-│   └── solvents.py           # solvent property library: n(λ,T) + η(T) (provenance-tagged, overridable)
-├── analysis/
-│   ├── dls/                  # cumulants, exponentials, distributions, angular, replicate (+ _common)
-│   ├── sls.py                # unified calibration, Debye, Zimm/Berry, calibration-free A₂
-│   ├── depolarization.py     # static DPLS + DDLS rotational diffusion + rod/sphere shape models
-│   ├── uncertainty.py        # HC3 covariance, delta-method, replicate mean/SE, format_pm
-│   ├── synthetic_dataset.py  # reusable synthetic-data engine (forward models + writers)
-│   ├── trace_analysis.py     # intensity-trace diagnostics
-│   └── utilities.py          # i·sinθ, ρ=Rg/Rh, scaling power-law, candidate picker, synth correlogram
-├── exporting/
-│   └── export.py             # Origin-compatible CSV  (NOT "io/": a top-level io/ shadows stdlib io)
-├── plotting/
-│   └── plots.py              # matplotlib; ax-accepting, handle-returning, no show()
-├── app/
-│   ├── controller.py         # framework-agnostic controller (commit/working state, sessions)
-│   ├── settings.py           # SettingsState: global seed defaults + appearance
-│   ├── units.py              # pure boundary layer: human-scale entry/read, canonical storage
-│   └── version.py            # single source of truth for __version__
-└── gui/                      # PySide6 widgets only — no analysis/physics
-    ├── main.py               # entry point: python -m gui.main
-    ├── main_window.py        # shell: sidebar navigator + six module tabs
-    ├── data_module.py / dls_module.py / sls_module.py / cross_module.py
-    ├── utilities_module.py / settings_module.py
-    ├── plot_controls.py / export_helper.py / help.py
+│
+└── (product code)            # top-level packages: core/ parsers/ physics/ analysis/
+                              #   exporting/ plotting/ app/ gui/. Per-package purpose
+                              #   and per-file detail: docs/4. Code-Map.md.
 ```
 
 **Gotcha:** do not name the export package `io/`. A top-level `io` package shadows
@@ -208,29 +218,40 @@ Python's standard-library `io` and breaks imports. Use `exporting/`.
 
 ## Current state
 
-**Complete and validated:** data model; all parsers (Brookhaven DLS/SLS/trace, generic
-DLS/SLS/trace, Zetasizer clipboard + export, ALV .ASC multi-angle + single-angle); physics
+**Complete and validated:** data model; all parsers (Brookhaven DLS/SLS/trace + raw `.dat`, generic
+DLS/SLS/trace, Zetasizer clipboard + export, ALV .ASC multi-angle + single-angle, NanoTemper Panta `.xlsx`); physics
 constants (geometry-aware Rayleigh) + solvent property library; utilities + synthetic generator; DLS engine; SLS engine
 (unified calibration, Debye, Zimm/Berry, calibration-free A₂); Origin export; matplotlib
-plotting; workspace + controller (grouping, commit/working state, sessions).
+plotting; workspace + controller (grouping, commit/working state, sessions). The
+**form-factor / optical scattering model** is a pluggable abstraction — Rayleigh, RDG, full
+Mie, core–shell, with no hard-coded R⁶ shortcut; its Rg (and calibrated Mw) feed the
+Cross-Sample ρ = Rg/Rh and scaling pickers, flagged model-dependent, and a degenerate
+ellipsoid / core–shell fit stays selectable rather than being silently excluded.
 
 **GUI:** all six tabs built and validated headless. **Data** (parameter confirmation,
 commit/undo/highlight, shared-param propagation, Unit column, and a solvent property library that *proposes*
 transparent, provenance-tagged, freely-overridable refractive-index / viscosity defaults —
 never dn/dc). **DLS** (cumulant / single
-/ double / KWW / NNLS / CONTIN / lognormal, shared τ window + baseline, multi-measurement
-co-plotting, DDLS sub-tab). **SLS** (per-sample calibration panel → k_c; Zimm / Berry /
+/ double / KWW / NNLS / CONTIN / lognormal, weighted volume/surface/number size
+distributions, shared τ window + baseline, multi-measurement co-plotting,
+replicate averaging with the platform's first single-sample dynamic ±, and the
+Correlogram / Distribution / Γ vs q² / D vs c / Mode Map / DDLS / Summary sub-tabs — the Γ vs q²
+and D vs c views being the extrapolated, thermodynamic-tier paths). **SLS** (per-sample
+calibration panel → k_c; Zimm / Berry /
 Debye / Guinier / single-angle / calibration-free A₂ / Rayleigh; manual-Mw override; data
-masking; a Depolarization calculator). **Cross-Sample** (ρ = Rg/Rh table + Rg–Mw / A₂–Mw
+masking; a Depolarization calculator). **Cross-Sample** (ρ = Rg/Rh table + an
+**Architecture** sub-tab — branching contraction factors g and h, chain type, and the
+random-branching index — + Rg–Mw / A₂–Mw
 log–log scaling; provenance-aware source pickers). **Utilities** (Traces store with
-diagnostics; I·sin θ check; synthetic generator). **Settings** (seed defaults +
+diagnostics; I·sin θ check; synthetic generator; Solvent Explorer sub-tab). **Settings** (seed defaults +
 light/dark theme + plot palette + input/display units via `app/units.py`).
 
 **Depolarized scattering (DPLS/DDLS)** is built and feature-complete, validated headless
 against synthetic VV/VH ground truth and published tables: static depolarization
 (depolarization ratios, Cabannes correction, optical anisotropy δ²), dynamic DDLS
 (rotational diffusion D_r = (Γ_VH − Γ_VV)/6, Zero & Pécora 1982 / Pecora 1964), and shape
-models (rod: Tirado 1984; sphere: Balog 2015) with Monte-Carlo / delta-method SEs. A real
+models (rod: Tirado 1984; sphere: Balog 2015; ellipsoid: Perrin/Tanford, with
+prolate/oblate degeneracy handling) with Monte-Carlo / delta-method SEs. A real
 VH (analyzer) acquisition path remains hardware-gated.
 
 ## Locked GUI decisions
@@ -263,7 +284,11 @@ VH (analyzer) acquisition path remains hardware-gated.
 
 ## Planned (recorded, not yet built)
 
-- A solute/polymer scattering-model library (intensity → volume/number with an explicit
-  scattering model + validity limits); reload-from-source; session schema versioning once the
-  data model stabilizes; a visual peak picker in the DLS distribution view; packaging.
-- A real VH (analyzer) depolarized acquisition path (hardware-gated).
+- Reload-from-source; a visual
+  peak picker in the DLS distribution view (the backend peak-averaging exists and is
+  report-only; the click-to-pick UI is not built); packaging. (Session files are
+  **versioned**: a session saved by an older schema is refused with a clear message,
+  deliberately without a migration path — re-analysis from source data is the recovery
+  route.)
+- A real VH (analyzer) depolarized acquisition path (hardware-gated — the development
+  instrument is VU geometry, with no analyzer).

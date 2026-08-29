@@ -50,6 +50,7 @@ Change history
 from __future__ import annotations
 
 import os
+import warnings
 from typing import List
 
 import numpy as np
@@ -155,11 +156,15 @@ class GenericSLSParser(BaseSLSParser):
         # Try UTF-8 first; fall back to latin-1 for instruments that write
         # non-ASCII degree symbols or other characters in their output.
         try:
-            with open(file_path, encoding='utf-8', newline='') as fh:
-                raw_lines = [line.rstrip('\r\n') for line in fh]
-        except UnicodeDecodeError:
-            with open(file_path, encoding='latin-1', newline='') as fh:
-                raw_lines = [line.rstrip('\r\n') for line in fh]
+            try:
+                with open(file_path, encoding='utf-8', newline='') as fh:
+                    raw_lines = [line.rstrip('\r\n') for line in fh]
+            except UnicodeDecodeError:
+                with open(file_path, encoding='latin-1', newline='') as fh:
+                    raw_lines = [line.rstrip('\r\n') for line in fh]
+        except OSError as exc:
+            # A file the OS refuses to read is a plain ParseError (see generic_dls.py).
+            raise ParseError(f"Could not read {file_path!r}: {exc}") from exc
 
         lines = [l for l in raw_lines if l.strip()]
 
@@ -218,20 +223,27 @@ class GenericSLSParser(BaseSLSParser):
                 f"contains intensities (not the other way around)."
             )
 
-        # Warn on negative intensities rather than raising, because some
-        # instruments report small negative values after background subtraction.
-        # Surface the same message both ways (keep-both): a passive note carried on
+        # Two passive notices, each surfaced both ways (keep-both): a note carried on
         # the preview (-> a load-time ⓘ in the GUI) and a UserWarning (stderr/headless).
-        notes: tuple = ()
+        # First, rows skipped under the bad-row ceiling -- tolerated, not hidden.
+        found_notes = []
+        if n_bad:
+            found_notes.append(
+                f"{n_bad} of {total} row(s) could not be read as two numbers and were "
+                f"skipped; {len(angles)} loaded. If a skipped row was meant to carry data, fix it "
+                f"in the file and re-load."
+            )
+        # Then negative intensities: warn rather than raise, because some instruments
+        # report small negative values after background subtraction.
         negative_intensities = [v for v in intensities if v < 0]
         if negative_intensities:
-            import warnings
-            note = (
+            found_notes.append(
                 f"{len(negative_intensities)} negative intensity value(s) found "
                 "(can occur after background subtraction). Stored as-is; verify the "
                 "data is physically reasonable before proceeding with analysis."
             )
-            notes = (note,)
+        notes = tuple(found_notes)
+        for note in notes:
             warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
 
         preview = SLSFilePreview(

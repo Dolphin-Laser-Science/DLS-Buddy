@@ -47,3 +47,35 @@ def reissue_legend_preserving_title(ax: Any, *, fontsize: int,
     leg = ax.get_legend()
     title: Optional[str] = leg.get_title().get_text() if leg is not None else None
     ax.legend(frameon=frameon, fontsize=fontsize, title=title or None)
+
+
+#: Neutral grey for an empty-plot placeholder message. A Matplotlib canvas colour, not a
+#: Qt theme token (theme tokens don't reach the canvas). Same value the SLS tab used.
+PLACEHOLDER_GRAY = '#999999'
+
+
+def show_plot_placeholder(figure: Any, canvas: Any, message: str, *,
+                          axes: Iterable[Any] = (),
+                          clear_figure: bool = False) -> Any:
+    """Render a plot area's empty-state as a single centred grey message with no visible
+    plot box — the shared "nothing to show yet" look used by every DLS/SLS plot tab.
+
+    Two paths, one look. A tab that keeps **persistent axes** passes them in ``axes`` and
+    they are hidden (so no blank 0–1 box reads as broken); a tab that **rebuilds its axes
+    on every draw** (SLS) passes ``clear_figure=True`` to wipe them. Either way the message
+    is drawn with :meth:`figure.text` — a single Text artist, **no new Axes** — which is
+    deliberate: recreating an Axes on each empty-state refresh churned Matplotlib/Agg
+    teardown enough to trip a Windows heap fault across the many windows the gui-smoke
+    suite builds.
+
+    Returns the Text artist so a persistent-axes caller can ``.remove()`` it (and re-show
+    its axes) before the next real draw. A ``clear_figure`` caller need not keep it — the
+    next ``figure.clf()`` wipes it."""
+    if clear_figure:
+        figure.clf()
+    else:
+        for ax in axes:
+            ax.set_visible(False)
+    txt = figure.text(0.5, 0.5, message, ha='center', va='center', color=PLACEHOLDER_GRAY)
+    canvas.draw_idle()
+    return txt

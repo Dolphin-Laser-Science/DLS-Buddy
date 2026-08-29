@@ -32,6 +32,79 @@ Four primary objects live here:
     DLSMeasurement - one DLS correlogram measured at one angle.
     SLSMeasurement - one SLS angular series measured at one concentration.
 
+The combination doctrine -- may these measurements be combined? (owner-ruled 2026-08-13)
+-----------------------------------------------------------------------------------------
+
+Membership is a proposal; combination is a contract; results follow the sample,
+not its id. The workspace groups measurements into a sample as a bookkeeping
+proposal (the auto-key plus the user's manual override) -- membership never by
+itself licenses combining measurements in one fit. What an analysis may combine
+is governed by two rules; every site that decides it points here and names the
+rule it implements:
+
+Rule 1 (partition). A fit or average never spans a user-set partition tag
+(mw_fraction, polarization state). Enforced structurally -- a mixed set is
+never eligible -- with the engine refusal as backstop, naming the field and the
+remedy. Refusal exists ONLY here, and its criterion is the category error: the
+pooled number would estimate nothing (Gamma_VH = Gamma_VV + 6 D_r; a mean over
+two Mw fractions describes neither). A merely DEGRADED number -- one that
+estimates a real quantity badly -- is never refused; it computes and discloses
+under rule 2, the same flag-don't-block treatment PDI > 0.3 and an out-of-range
+Rh already get.
+
+Rule 1's listed tags are EXAMPLES, not the boundary (owner-ruled 2026-08-19).
+The criterion is the category error -- the combined object has no referent --
+and two things it is NOT.
+
+It is not about trustworthiness. A number with a real referent that is merely
+degraded, apparent, unanchored, or on an arbitrary scale is never refused,
+however strongly its caveat is worded. A per-mode Zimm on a domain-type mode is
+the worked case: its Mw rests on an unverifiable contrast assumption and its
+disclosure says so in the strongest words the guide uses -- and it still
+computes, ungated, because an apparent Mw for a real mode is a poor estimate of
+something, not an estimate of nothing.
+
+It is not about a fit's own axes. A Zimm regresses across concentration by
+construction (the c coefficient IS 2 A2), and sample_group_key drops
+concentration on purpose because a ladder is one sample. What cannot happen is a
+single measurement OBJECT claiming two: an SLSMeasurement holds one
+concentration_g_per_mL, so collating two into it writes a false record rather
+than a poor estimate. That is the object-vs-fit divergence sample_group_key
+already calls intentional, stated here because this is where a site author
+reasons about combination.
+
+So the refusing surfaces are wider than the two tags: check_replicate_identity
+compares eight fields, and every one of them is a field whose disagreement makes
+the AVERAGE describe no real condition.
+
+Rule 2 (disclosure). Everything else combines, and anything surprising about
+the combination is stated where it travels: on the result itself when there is
+one (notes -> export Comments), on the row or label when it is eligibility
+(grayed + reason), as a passive hint when the program cannot verify the hazard
+(an untagged multi-Mw series: Mw is an output, not an identity field). Silence
+is never a mode where a user is present or a durable value is written -- and a
+passive path (candidates, auto-select) never writes a durable value rule 1
+would refuse. Identity fields (polymer, solvent, temperature -- compared only
+through the shared comparison forms in this file) sit under THIS rule, not
+rule 1: a within-sample identity mix is constructible only by the user's own
+manual override, the hybrid grouping model makes that the user's call, and the
+note travels to exports.
+
+Dialogs guard the destruction of stored values; they never license
+computations. A confirm can legitimate deleting the user's own stored result
+(a regroup that would drop it); consent cannot make a meaningless number
+meaningful, so there is no ask-and-proceed on any fit or averaging path.
+
+Standing surfaces (a classification aid for the next site author, not policy):
+refuse (the replicate-identity check, the controller's mixed-polarization
+refusal, the DDLS cross-bucket check) is rule 1's backstop; warn-and-continue
+(the Gamma-vs-q2 identity note), filter-and-disclose (the DLS tab's grayed
+other-fraction rows) and the passive hint (the SLS pooling hint) are rule 2 at
+three surfaces; silent grouping is not a mode -- the sidebar IS the workspace
+proposal's disclosure surface, and levels self-derived from one array are not
+identity decisions at all; silent filtering survives only where no user is
+addressable (the Rh candidate tiers), and the offered label still discloses.
+
 Implementation note:
     These are @dataclasses (Optional[X] fields default to None where a
     measurement can exist without them). We pass eq=False because the objects
@@ -70,6 +143,22 @@ Change history
             pair into the rotational diffusion coefficient D_r = (Gamma_VH -
             Gamma_VV)/6 (analysis/depolarization.analyze_ddls). Non-breaking (None
             default); workspace.build() forwards it.
+2026-08-06  Solvent identity: the program no longer guesses. (data_models v5)
+            The controlled vocabulary (_SOLVENT_ALIASES and its normalize /
+            is_recognized / warn helpers) is DELETED. A solvent name is stored
+            verbatim -- whatever was picked, typed, or recorded by the instrument --
+            and compared only after strip + casefold, in key construction. Nothing
+            is mapped: "H2O" is its own sample, not water. Polymer names now get
+            that same rule (previously case-preserving), so the two identity fields
+            behave identically. Temperature moves from six significant figures to
+            the shared 0.1 K bucket in round_temperature_for_identity(), which
+            core/workspace.sample_group_key uses too -- one computation, so the
+            two notions of sample identity cannot drift apart again.
+2026-08-13  The combination doctrine stated once. (data_models v6)
+            "May these measurements be combined?" now has one answer -- the
+            two-rule doctrine above. Every identity-deciding consumer carries a
+            one-line pointer naming the rule it implements instead of deriving
+            its own; the doctrine text lives only here.
 """
 
 from __future__ import annotations
@@ -111,9 +200,10 @@ class SampleKey(NamedTuple):
     concentration and temperature in two different solvents is two physically
     different samples (different chain conformation, different solvent quality).
     Including solvent lets you compare, e.g., PVP in water vs PVP in reline
-    without their keys colliding. Solvent names are normalized against a small
-    controlled vocabulary (see normalize_solvent_name) so that "water", "Water",
-    and "H2O" all map to the same key.
+    without their keys colliding. Solvent and polymer names are compared after
+    strip + casefold and nothing more, so "water", "Water" and " WATER " are one
+    key while "H2O" is its own -- the program does not guess that an abbreviation
+    means a particular solvent (see make_sample_key).
 
     This granularity is deliberately more than the rho = Rg/Rh use case strictly
     needs (which pairs extrapolated c->0 results), because more granularity is
@@ -122,8 +212,8 @@ class SampleKey(NamedTuple):
 
     IMPORTANT: build these with make_sample_key(), not by calling SampleKey(...)
     directly. The factory rounds the floating-point fields so that values which
-    are "the same number" in physical terms compare as equal, and normalizes the
-    solvent name against the controlled vocabulary.
+    are "the same number" in physical terms compare as equal, and applies the
+    strip + casefold rule to the two name fields.
     """
     polymer_name: str
     solvent_name: str
@@ -132,156 +222,75 @@ class SampleKey(NamedTuple):
 
 
 # ---------------------------------------------------------------------------
-# Solvent name controlled vocabulary
+# Identity-field comparison
 # ---------------------------------------------------------------------------
+
+# These are the comparison primitives BENEATH the combination doctrine (module
+# docstring above): they answer "do these fields match?", never "may these be
+# combined?" -- that question is the doctrine's, and its consumers point there.
+
+# The one rule, applied to BOTH identity name fields (polymer and solvent) on every path --
+# picked from the library, typed by hand, or recorded by the instrument:
 #
-# Solvent names are normalized against this table before being placed in a
-# SampleKey, so that common spelling/casing variants map to one canonical form
-# and do not break joins. The table maps a lowercased input string to its
-# canonical name. To add a solvent, add its variants here. Unrecognized names
-# are used as-is (lowercased + stripped) with a one-time warning -- the program
-# stays usable, the user just gets nudged toward a canonical name.
+#     store   verbatim, exactly as it arrived
+#     compare strip + casefold, in key construction only
+#     map     never
 
-_SOLVENT_ALIASES = {
-    # water
-    'water': 'water',
-    'h2o': 'water',
-    'di water': 'water',
-    'deionized water': 'water',
-    'distilled water': 'water',
-    'milliq': 'water',
-    'milli-q': 'water',
-    # toluene
-    'toluene': 'toluene',
-    # reline (choline chloride : urea 1:2 deep eutectic solvent)
-    'reline': 'reline',
-    # glycerol
-    'glycerol': 'glycerol',
-    'glycerine': 'glycerol',
-    'glycerin': 'glycerol',
-    # tetrahydrofuran
-    'thf': 'thf',
-    'tetrahydrofuran': 'thf',
-    # dimethylformamide
-    'dmf': 'dmf',
-    'dimethylformamide': 'dmf',
-    'n,n-dimethylformamide': 'dmf',
-    # dimethyl sulfoxide
-    'dmso': 'dmso',
-    'dimethyl sulfoxide': 'dmso',
-    'dimethylsulfoxide': 'dmso',
-    # chloroform
-    'chloroform': 'chloroform',
-    'chcl3': 'chloroform',
-    # dichloromethane
-    'dcm': 'dcm',
-    'dichloromethane': 'dcm',
-    'methylene chloride': 'dcm',
-    # acetone
-    'acetone': 'acetone',
-    # methanol
-    'methanol': 'methanol',
-    'meoh': 'methanol',
-    # ethanol
-    'ethanol': 'ethanol',
-    'etoh': 'ethanol',
-    # acetonitrile
-    'acetonitrile': 'acetonitrile',
-    'mecn': 'acetonitrile',
-    'acn': 'acetonitrile',
-    # benzene
-    'benzene': 'benzene',
-    # cyclohexane
-    'cyclohexane': 'cyclohexane',
-    # hexane
-    'hexane': 'hexane',
-    'n-hexane': 'hexane',
-    # ethyl acetate
-    'ethyl acetate': 'ethyl acetate',
-    'etoac': 'ethyl acetate',
-    # n-methyl-2-pyrrolidone
-    'nmp': 'nmp',
-    'n-methyl-2-pyrrolidone': 'nmp',
-    # ethylene glycol
-    'ethylene glycol': 'ethylene glycol',
-    # carbon tetrachloride
-    'carbon tetrachloride': 'ccl4',
-    'ccl4': 'ccl4',
-    'tetrachloromethane': 'ccl4',
-    # carbon disulfide
-    'carbon disulfide': 'cs2',
-    'carbon disulphide': 'cs2',
-    'cs2': 'cs2',
-}
-
-# Tracks which unrecognized solvent names have already triggered a warning,
-# so the user is warned once per unique name rather than once per measurement.
-_warned_unrecognized_solvents: set = set()
+# There is deliberately no controlled vocabulary folding "H2O" or "MilliQ" into canonical
+# names. The program does not guess what a name means: casefolding is not a guess, because
+# "Water" and "water" are the same characters, but deciding "H2O" means water is. Instrument
+# metadata makes the point -- a Zetasizer's dispersant cell is free text typed by the
+# operator, and "My Phosphate Buffer" is an ordinary value for it. So "H2O" is its own
+# sample and the user supplies its refractive index and viscosity by hand (invariant 3).
+# A picked value being canonical BY CONSTRUCTION also leaves no normalization for two call
+# sites to disagree about. See core/workspace.sample_group_key.
 
 
-def normalize_solvent_name(raw_name: str) -> str:
-    """Return the canonical form of a solvent name (silent; no warning).
+def casefold_identity_name(raw_name: str) -> str:
+    """The comparison form of an identity name: stripped and casefolded, nothing else.
 
-    Strips whitespace, lowercases, and looks up the controlled vocabulary.
-    If the name is not recognized, returns the cleaned (stripped + lowercased)
-    string unchanged. This function never warns; it is safe to call repeatedly
-    (e.g. on every sample_key access). Use is_recognized_solvent() to decide
-    whether to warn.
+    Used for BOTH polymer_name and solvent_name, by both notions of sample
+    identity (:func:`make_sample_key` here and ``core.workspace.sample_group_key``).
+    Callers store the original string; only keys see this form.
+
+    ``str.casefold`` rather than ``str.lower`` because it is the Unicode-correct
+    caseless-matching operation -- German "STRASSE" and "Straße" compare equal,
+    which ``lower`` gets wrong. For the ASCII solvent names in the library the two
+    agree, so this costs nothing and is right for a name the user typed.
     """
-    cleaned = raw_name.strip().lower()
-    return _SOLVENT_ALIASES.get(cleaned, cleaned)
+    return raw_name.strip().casefold()
 
 
-def is_recognized_solvent(raw_name: str) -> bool:
-    """True if raw_name (after strip + lowercase) is in the controlled vocabulary."""
-    return raw_name.strip().lower() in _SOLVENT_ALIASES
+# Temperature is bucketed rather than compared exactly, because no experiment holds a set
+# point to better than about 0.05 C and a finer key splits one sample on thermometer noise.
+# One decimal place (0.1 K) is deliberately COARSER than the six significant figures
+# concentration uses: concentration is a number you dilute to, temperature one you approach.
+
+# The bucket is placed in CELSIUS, not Kelvin, and that is load-bearing. Set points are
+# chosen in Celsius and the conversion adds exactly 0.15, so 20, 25, 30, 35 and 50 C land
+# EXACTLY on 0.1 K bin edges -- bucketing in Kelvin would split a sample at 25.00 C over a
+# microkelvin of noise, the modal case rather than a rare one. Rounding the Celsius value
+# puts each at a bin CENTRE, 0.05 C clear of either edge. Not tuning to a lab or instrument
+# (invariant 4): it is the unit the number was chosen in. Known limitation, accepted: any
+# rounding bucket splits at ITS edges, so 25.04 and 25.06 C land either side of one. The
+# remedy is the manual regrouping that already ships, NOT a clustering algorithm.
+TEMPERATURE_GROUP_DECIMALS = 1
+_KELVIN_AT_ZERO_CELSIUS = 273.15
 
 
-def unrecognized_solvent_reason(raw_name: str) -> Optional[str]:
-    """A short, human-readable reason `raw_name` is not in the recognized solvent
-    vocabulary (so its sample key uses the name as-entered), or ``None`` if it is.
+def round_temperature_for_identity(temperature_K: float) -> float:
+    """Bucket a temperature to 0.1 C for sample identity, returned in Kelvin.
 
-    Pure and side-effect-free: the SINGLE source of truth for the message text,
-    shared by the load-time warning (:func:`_warn_if_unrecognized_solvent`) and the
-    Data-tab's passive note, so the two never drift. Mirrors
-    :func:`implausible_metadata_reasons`: the returned text is glyph-less and
-    self-contained, so a caller can lead it with its own framing (a UserWarning
-    preamble + developer hint, or a GUI ``ⓘ`` note).
+    THE single computation behind both notions of sample identity, so there is no
+    second predicate that can be sized differently from the first (CLAUDE.md rule
+    12). ``core.workspace.sample_group_key`` imports this rather than rounding on
+    its own; that function handles its own None-tolerance before calling here.
+
+    Two temperatures in the same bucket return the same float, which is all a key
+    needs -- the value is a bucket label, never a temperature to compute with.
     """
-    if is_recognized_solvent(raw_name):
-        return None
-    canonical = normalize_solvent_name(raw_name)
-    return (
-        f"solvent name {raw_name!r} is not in the recognized vocabulary; "
-        f"used {canonical!r} as-entered for sample matching"
-    )
-
-
-def _warn_if_unrecognized_solvent(raw_name: str) -> None:
-    """Emit a one-time UserWarning if raw_name is not in the vocabulary.
-
-    Called from the measurement classes' __post_init__ so the warning fires
-    once when a measurement is created, not every time its sample_key is
-    accessed. Deduplicated per unique canonical name across the session. The GUI
-    surfaces the same check as a passive note via
-    :func:`unrecognized_solvent_reason` (the shared source of the message text).
-    """
-    reason = unrecognized_solvent_reason(raw_name)
-    if reason is None:
-        return
-    canonical = normalize_solvent_name(raw_name)
-    if canonical in _warned_unrecognized_solvents:
-        return
-    _warned_unrecognized_solvents.add(canonical)
-    # Capitalize the shared reason for a sentence lead, and append the
-    # developer-only hint (not shown in the GUI note).
-    warnings.warn(
-        reason[0].upper() + reason[1:] + ". If this is a real solvent you use "
-        "often, add it to _SOLVENT_ALIASES in core/data_models.py to silence "
-        "this warning and ensure consistent matching.",
-        UserWarning,
-        stacklevel=3,
-    )
+    celsius = float(temperature_K) - _KELVIN_AT_ZERO_CELSIUS
+    return round(celsius, TEMPERATURE_GROUP_DECIMALS) + _KELVIN_AT_ZERO_CELSIUS
 
 
 def _round_to_sig_figs(value: float, sig_figs: int) -> float:
@@ -299,6 +308,71 @@ def _round_to_sig_figs(value: float, sig_figs: int) -> float:
     return round(value, decimals)
 
 
+def round_concentration_for_identity(concentration_g_per_mL: float) -> float:
+    """Bucket a concentration for identity / distinctness comparisons, in g/mL.
+
+    THE one concentration comparison form -- the same SAMPLE_KEY_SIG_FIGS
+    rounding :func:`make_sample_key` applies, promoted so the eligibility and
+    distinctness sites (distinct-concentration count gates, duplicate-ladder
+    detection, the GUI's tick-all-at matching) cannot size their own decimals
+    differently from the key that groups the data. Two concentrations that are
+    one value to the sample key are one value to every consumer.
+
+    A non-finite value passes through unchanged, exactly as the site-local
+    ``round(c, 12)`` this form replaced did: a comparison form compares, it
+    never validates -- a nan/inf must surface at the input that produced it,
+    not as a crash in a passive display hint reading committed parameters.
+    """
+    c = float(concentration_g_per_mL)
+    if not math.isfinite(c):
+        return c
+    return _round_to_sig_figs(c, SAMPLE_KEY_SIG_FIGS)
+
+
+# Angle identity bucket: two runs are "at the same angle" when their angles agree
+# to 3 decimal places. Angles arrive as fixed instrument text with no per-run
+# drift mechanism, so this is a float-formatting guard, not a tolerance. Angle is
+# not a SampleKey field (it is an axis within a sample), which is why this form
+# lives beside the key primitives rather than inside them.
+ANGLE_IDENTITY_DECIMALS = 3
+
+
+def round_angle_for_identity(angle_deg: float) -> float:
+    """Bucket a scattering angle for identity comparisons ("same angle?").
+
+    THE one angle comparison form, shared by the DDLS VV/VH pairing, the Rh
+    candidate tiers' angle grouping, and the GUI's tick-all-at-angle matching --
+    so no consumer buckets the same physical question at its own precision.
+    """
+    return round(float(angle_deg), ANGLE_IDENTITY_DECIMALS)
+
+
+def polarization_state(geometry: Optional[str]) -> Optional[str]:
+    """THE one mapping from an analyzer-geometry label to a polarization state.
+
+    Only 'VV' and 'VH' select a polarization; 'VU' records no analyzer in the beam
+    and an absent tag means the user has not said -- one unpolarized class, never
+    distinct tokens (combination doctrine rule 1, this module's docstring). Shared
+    by the interactive fits' mixed-polarization refusal, the Rh candidate tiers' VH
+    exclusion, the DDLS pairing, and the derived-static-series collation, so no two
+    sites can classify one label differently.
+
+    Lives here rather than in a consumer because it is a comparison primitive like
+    the forms above, and its consumers now span app/ and analysis/.
+    """
+    return geometry if geometry in ('VV', 'VH') else None
+
+
+# THE one field-name -> identity-comparison-form registry, so no GUI surface can
+# carry its own copy of the mapping and drift from a sibling's (the mapping-level
+# version of the per-site drift the forms above exist to end). A field absent
+# here has no identity form -- compare it exactly or not at all.
+IDENTITY_FORM_BY_FIELD = {
+    'angle_deg': round_angle_for_identity,
+    'concentration_g_per_mL': round_concentration_for_identity,
+}
+
+
 def make_sample_key(
     polymer_name: str,
     solvent_name: str,
@@ -307,24 +381,24 @@ def make_sample_key(
 ) -> SampleKey:
     """Canonical constructor for SampleKey. Always use this, never SampleKey().
 
-    Normalization applied:
-      - polymer_name: surrounding whitespace stripped; case preserved.
-      - solvent_name: normalized against the controlled vocabulary
-        (stripped, lowercased, mapped to canonical form). This function does
-        NOT warn on unrecognized solvents; the measurement classes warn once
-        at construction via _warn_if_unrecognized_solvent.
-      - concentration and temperature: rounded to SAMPLE_KEY_SIG_FIGS
-        significant figures so floating-point noise cannot break a join.
+    Comparison forms applied:
+      - polymer_name and solvent_name: stripped + casefolded, nothing mapped
+        (:func:`casefold_identity_name`). Both name fields get the SAME rule --
+        they are the same kind of thing, and treating them differently is what
+        let the two notions of sample identity drift apart.
+      - temperature: bucketed to 0.1 K by :func:`round_temperature_for_identity`,
+        the shared computation ``core.workspace.sample_group_key`` also uses.
+      - concentration: rounded to SAMPLE_KEY_SIG_FIGS significant figures so
+        floating-point noise (e.g. a mg/mL -> g/mL conversion) cannot break a join.
     """
-    name = polymer_name.strip()
-    solvent = normalize_solvent_name(solvent_name)
+    name = casefold_identity_name(polymer_name)
+    solvent = casefold_identity_name(solvent_name)
     # Concentration may be absent for a DLS-only measurement (size/diffusion
     # analysis does not use it). Keep None in the key so such measurements still
     # join by (polymer, solvent, temperature) without colliding with a real c.
     conc = (None if concentration_g_per_mL is None
-            else _round_to_sig_figs(float(concentration_g_per_mL),
-                                    SAMPLE_KEY_SIG_FIGS))
-    temp = _round_to_sig_figs(float(temperature_K), SAMPLE_KEY_SIG_FIGS)
+            else round_concentration_for_identity(concentration_g_per_mL))
+    temp = round_temperature_for_identity(temperature_K)
     return SampleKey(name, solvent, conc, temp)
 
 
@@ -357,14 +431,39 @@ def _require_same_length(a, b, name_a: str, name_b: str) -> None:
         )
 
 
+# The two scalar guards below test FINITENESS explicitly. Neither comparison does it for
+# them, and the asymmetry is easy to misread: `not (v > 0)` rejects nan but ADMITS +inf,
+# while `v < 0` admits BOTH nan and +inf. A non-finite physical scalar that survives here
+# reaches the engine and crashes it far from the cause -- an infinite refractive index
+# gives q = inf, and np.polyfit answers that with a bare "SVD did not converge". Tokens
+# like `inf`, `nan` and `1e400` all parse straight through the GUI's float(text), so this
+# is a typo away (2026-07-31 spec-01; mirrors the _require_finite_array guard on the
+# measured arrays and the explicit dn/dc check on SLSMeasurement).
+
 def _require_positive(value, field_name: str) -> None:
-    if value is None or not (value > 0):
-        raise ValueError(f"{field_name} must be a positive number, got {value!r}.")
+    if value is None or not (math.isfinite(value) and value > 0):
+        raise ValueError(
+            f"{field_name} must be a positive finite number, got {value!r}."
+        )
 
 
 def _require_non_negative(value, field_name: str) -> None:
-    if value is None or value < 0:
-        raise ValueError(f"{field_name} must be zero or positive, got {value!r}.")
+    if value is None or not (math.isfinite(value) and value >= 0):
+        raise ValueError(
+            f"{field_name} must be a finite number, zero or positive, got {value!r}."
+        )
+
+
+def _require_finite_or_none(value, field_name: str) -> None:
+    """Reject a non-finite scalar, but accept None and accept zero.
+
+    For optional fields where the required property is that the number IS a number --
+    a display-only vendor constant, say -- rather than that it is physically positive.
+    """
+    if value is not None and not math.isfinite(value):
+        raise ValueError(
+            f"{field_name} must be a finite number, got {value!r}."
+        )
 
 
 def _require_scattering_angle(value, field_name: str) -> None:
@@ -473,7 +572,7 @@ def _warn_if_implausible_metadata(temperature_K, refractive_index) -> None:
 # Polarization/analyzer geometry of a measurement, as (incident, analyzer):
 #   VV  vertical incident, vertical analyzer     -- ordinary polarized intensity
 #   VH  vertical incident, horizontal analyzer   -- depolarized intensity (DPLS)
-#   VU  vertical incident, no analyzer           -- e.g. the BI-200SM
+#   VU  vertical incident, no analyzer           -- vertical laser, no analyzer
 # None means the geometry was not recorded (legacy / unspecified). This vocabulary
 # matches the Rayleigh-geometry codes in physics/constants.py; it is duplicated here
 # (not imported) to keep core/ free of any physics/ dependency. The depolarization
@@ -494,6 +593,35 @@ def _normalize_analyzer_geometry(value, field_name: str):
     if code not in ANALYZER_GEOMETRIES:
         raise ValueError(
             f"{field_name} must be one of {ANALYZER_GEOMETRIES} or None, got {value!r}."
+        )
+    return code
+
+
+# Polymer chain architecture of a SAMPLE, for the Cross-Sample branching readouts:
+#   'linear'    a linear reference (defines the linear Rg-Mw / Rh-Mw law)
+#   'branched'  a branched target (gets a contraction factor g and/or h)
+# None means untagged -- treated as linear for the Scaling-plot fit, but NOT used as an
+# architecture linear reference, which requires an explicit tag. A sample-level LABEL, never
+# a grouping key: linear and branched are already different polymers. Stored per-measurement
+# in committed_params, never on the pure measurement/analysis objects.
+CHAIN_TYPES = ('linear', 'branched')
+
+
+def _normalize_chain_type(value, field_name: str = 'chain_type'):
+    """Return the canonical lower-case chain-type code, or None. Raise if invalid."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{field_name} must be a string (one of {CHAIN_TYPES}) or None, "
+            f"got {value!r}."
+        )
+    code = value.strip().lower()
+    if code == '':
+        return None
+    if code not in CHAIN_TYPES:
+        raise ValueError(
+            f"{field_name} must be one of {CHAIN_TYPES} or None, got {value!r}."
         )
     return code
 
@@ -608,9 +736,11 @@ class DLSMeasurement:
         confirmation layer; the value is multiplied by 1e-3 before storage.
     sample_label, instrument_name, source_file
         Provenance carried from the source file where available.
-    trace
-        Optional associated IntensityTrace. May be attached after
-        construction: measurement.trace = some_trace.
+
+    A count-rate trace recorded beside this correlogram is NOT held here. Traces
+    live in one place -- the workspace's own trace store, keyed by trace_id, with
+    an optional measurement_id back-reference -- so that a solvent or calibrant
+    trace, which belongs to no measurement, is representable by the same surface.
     """
 
     # --- measured data ---
@@ -634,6 +764,13 @@ class DLSMeasurement:
 
     # --- optional ---
     viscosity_Pa_s: Optional[float] = None
+    # Solute (particle) refractive index, hand-entered per sample. Consumed ONLY by the
+    # out-of-Rayleigh (RDG) intensity->volume/number reweighting (analysis/optical_model.py)
+    # and the planned Phase-3 Mie treatment, which form m = n_solute/solvent_refractive_index.
+    # Treated like dn/dc: NEVER proposed, defaulted, or guessed (invariant 3) -- it is
+    # material-specific and there is no particle library. Blank (None) is valid for pure
+    # DLS/cumulant runs and for Rayleigh-limit reweighting (which needs no contrast).
+    solute_refractive_index: Optional[float] = None
     # Polarization/analyzer geometry of this correlogram, as (incident, analyzer):
     # 'VV' (polarized), 'VH' (depolarized), 'VU' (no analyzer), or None if not
     # recorded. The depolarized dynamic analysis pairs a VV with a VH correlogram
@@ -648,7 +785,6 @@ class DLSMeasurement:
     sample_label: Optional[str] = None
     instrument_name: Optional[str] = None
     source_file: Optional[str] = None
-    trace: Optional[IntensityTrace] = None
 
     def __post_init__(self) -> None:
         self.delay_times_s = _as_1d_float_array(self.delay_times_s, "delay_times_s")
@@ -670,9 +806,10 @@ class DLSMeasurement:
                 self.concentration_g_per_mL, "concentration_g_per_mL")
         if self.viscosity_Pa_s is not None:
             _require_positive(self.viscosity_Pa_s, "viscosity_Pa_s")
+        if self.solute_refractive_index is not None:
+            _require_positive(self.solute_refractive_index, "solute_refractive_index")
         self.analyzer_geometry = _normalize_analyzer_geometry(
             self.analyzer_geometry, "analyzer_geometry")
-        _warn_if_unrecognized_solvent(self.solvent_name)
         _warn_if_implausible_metadata(
             self.temperature_K, self.solvent_refractive_index)
 
@@ -697,8 +834,7 @@ class DLSMeasurement:
             f"c={c_str}, "
             f"T={self.temperature_K:g} K, "
             f"angle={self.angle_deg:g} deg, "
-            f"n_points={self.delay_times_s.size}, "
-            f"trace={'yes' if self.trace is not None else 'no'})"
+            f"n_points={self.delay_times_s.size})"
         )
 
 
@@ -730,7 +866,29 @@ class SLSMeasurement:
 
     Required optics
     ---------------
-    wavelength_nm, solvent_refractive_index, dn_dc_mL_per_g
+    wavelength_nm, solvent_refractive_index
+
+    Optional optics
+    ---------------
+    dn_dc_mL_per_g -- may be absent (None). It enters ONLY the optical constant
+    K, which multiplies the whole Kc/dR ordinate and therefore cancels in every
+    coefficient ratio: every Rg, the form-factor radii and axial ratio, and the
+    calibration-free 2*A2*Mw are unchanged by it. An absent dn/dc is the same
+    kind of absence as an absent calibration constant -- an unknown factor on the
+    ordinate -- so it is handled the same way: K = 1 (an arbitrary optical scale),
+    the result carries dn_dc_supplied = False and a note, and the outputs that DO
+    ride on the scale (absolute Mw, absolute A2) are flagged unreliable. This is
+    not a proposed value (invariant 3): nothing is guessed, and the substitution
+    travels with the result that discloses it.
+
+    A SUPPLIED value must be finite and NONZERO. Zero is refused because K is
+    proportional to (dn/dc)^2, so it collapses the entire Kc/dR ordinate; the
+    form-factor fits then normalised that degenerate ordinate and returned a
+    fabricated Rg and Mw flagged reliable. Blank is the honest entry for a user who
+    has no value to give, which is why zero is refused rather than accommodated
+    (a typed zero is a claim, not an absence). Negative increments stay legal:
+    the sign cancels in the square, and a solute less refractive than its solvent
+    genuinely has one.
 
     Optional calibration reference  (informational; NOT used in analysis)
     ----------------------------------------------------------------------
@@ -754,7 +912,28 @@ class SLSMeasurement:
     # --- optics ---
     wavelength_nm: float
     solvent_refractive_index: float
-    dn_dc_mL_per_g: float
+    # Optional: absent (None) is legal and disclosed, NOT defaulted -- see the class
+    # docstring's "Optional optics". This is the last field without a default, so
+    # giving it one needs no reordering; every field below already has one.
+    dn_dc_mL_per_g: Optional[float] = None
+
+    # --- optional ---
+    # Solute (particle) refractive index, hand-entered per sample. Consumed ONLY by the
+    # full-Mie form-factor P(q) fit, which forms m = n_solute/solvent_refractive_index -- the
+    # contrast entering the Mie scattering arithmetic. Treated like dn/dc: NEVER proposed,
+    # defaulted, or guessed (invariant 3), being material-specific with no particle library.
+    # Blank (None) is valid for every non-Mie SLS run. Mirrors
+    # DLSMeasurement.solute_refractive_index; for the core-shell fit it is the CORE index.
+    solute_refractive_index: Optional[float] = None
+
+    # Shell (coating) refractive index for the core-shell form-factor P(q) fit
+    # (analysis/sls.core_shell_form_factor_analysis), which forms m1 = n_core/solvent_RI and
+    # m2 = n_shell/solvent_RI -- the two contrasts of the coated sphere. Here
+    # solute_refractive_index is reused as the CORE index and this is the SHELL index. Treated
+    # like solute_refractive_index / dn_dc: NEVER proposed, defaulted, or guessed (invariant 3)
+    # -- material-specific, no particle library. Blank (None) is valid for every non-core-shell
+    # SLS run (only the core-shell model consumes it).
+    shell_refractive_index: Optional[float] = None
 
     # --- optional calibration reference (informational only) ---
     calibration_constant: Optional[float] = None
@@ -797,20 +976,47 @@ class SLSMeasurement:
         _require_positive(self.wavelength_nm, "wavelength_nm")
         _require_positive(self.solvent_refractive_index, "solvent_refractive_index")
         _require_non_negative(self.concentration_g_per_mL, "concentration_g_per_mL")
-        # dn/dc is deliberately never defaulted (invariant 3 -- the central
-        # low-contrast vulnerability), so the common "not yet entered" path
-        # arrives here as None. Guard it explicitly, like the DLS build guards
-        # viscosity, so the user sees the clear ValueError below rather than a
-        # TypeError from math.isfinite(None) deep in the build.
-        if self.dn_dc_mL_per_g is None or not math.isfinite(self.dn_dc_mL_per_g):
-            raise ValueError(
-                f"dn_dc_mL_per_g must be a finite number, "
-                f"got {self.dn_dc_mL_per_g!r}."
-            )
+        # dn/dc: ABSENT (None) is legal and disclosed -- see the class docstring's
+        # "Optional optics" for why, and what the analyses then report. What is refused
+        # is a SUPPLIED value that cannot be a real increment: non-finite, or exactly
+        # zero (K is proportional to (dn/dc)^2, so zero collapses the whole Kc/dR
+        # ordinate and no molecular weight can come from it). NEGATIVE stays legal --
+        # the sign cancels in the square, and a solute less refractive than its solvent
+        # genuinely has one -- so the predicate is NONZERO, never positive. Sizing it to
+        # positivity would refuse real samples.
+        if self.dn_dc_mL_per_g is not None:
+            if not math.isfinite(self.dn_dc_mL_per_g):
+                raise ValueError(
+                    f"dn_dc_mL_per_g must be a finite number or left blank, "
+                    f"got {self.dn_dc_mL_per_g!r}."
+                )
+            if self.dn_dc_mL_per_g == 0:
+                raise ValueError(
+                    "dn_dc_mL_per_g must not be zero: the optical constant K is "
+                    "proportional to (dn/dc)^2, so zero collapses the whole Kc/dR "
+                    "ordinate and no molecular weight can come from it. Leave dn/dc "
+                    "blank instead -- Rg, the form-factor sizes and the "
+                    "calibration-free 2*A2*Mw are all still computed, and Mw/A2 are "
+                    "reported on a disclosed arbitrary scale."
+                )
+        if self.solute_refractive_index is not None:
+            _require_positive(self.solute_refractive_index, "solute_refractive_index")
+        if self.shell_refractive_index is not None:
+            _require_positive(self.shell_refractive_index, "shell_refractive_index")
+        # The vendor calibration record, as read from the instrument file. These are
+        # DISPLAY-ONLY: the program computes its own k_c from a calibrant point, and the
+        # value the SLS engine uses arrives as a function argument from the calibration
+        # panel, not from this field. So the property required here is FINITENESS, not
+        # positivity -- a stale or uncalibrated instrument legitimately writes 0, and
+        # rejecting that would make the whole file unloadable over a number nothing reads.
+        # Guarded at all because an unvalidated physical scalar is a hole; the predicate is
+        # matched to the property, since over-inclusion is safe in COVERAGE, not strictness.
+        for _name in ("calibration_constant", "standard_rayleigh_ratio_file",
+                      "standard_refractive_index"):
+            _require_finite_or_none(getattr(self, _name), _name)
         self.analyzer_geometry = _normalize_analyzer_geometry(
             self.analyzer_geometry, "analyzer_geometry"
         )
-        _warn_if_unrecognized_solvent(self.solvent_name)
         _warn_if_implausible_metadata(
             self.temperature_K, self.solvent_refractive_index)
 

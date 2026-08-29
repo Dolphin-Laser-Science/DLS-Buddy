@@ -18,6 +18,8 @@ Usage: build one under a figure canvas, then call `attach(ax)` after each
 
 from __future__ import annotations
 
+import math
+import os
 from typing import Optional
 
 from PySide6 import QtCore, QtWidgets
@@ -36,28 +38,57 @@ from gui.theme import ThemedLabel
 class _WhiteSaveToolbar(NavigationToolbar2QT):
     """A matplotlib navigation toolbar whose Save button always writes a WHITE figure,
     regardless of the on-screen "match app theme" setting (locked export policy, style
-    guide R10.3). It recolours the live figure to white via
-    `plotting.plots.apply_figure_theme`, reuses matplotlib's own save dialog + savefig,
-    then restores the on-screen theme. When the plot is already white (the default) this
-    is a harmless no-op recolour."""
+    guide R10.3). The recolour/save/restore lives in `plotting.plots.save_figure_via`
+    (the policy's single implementation, shared with `save_figure_white`); this class
+    only wraps matplotlib's own save dialog in it. When the plot is already white (the
+    default) the recolour is a harmless no-op.
+
+    When built with a controller it also ties matplotlib's save dialog into the
+    app's remembered export folder (`settings.last_export_dir`): the dialog starts
+    there, and the folder the user actually saves into is persisted back. The
+    channel is matplotlib's own `rcParams['savefig.directory']`, which its Qt save
+    dialog reads before and writes after a save (only when started non-empty —
+    guaranteed here by the Documents fallback in `export_start_dir`)."""
+
+    def __init__(self, canvas, parent, controller=None):
+        super().__init__(canvas, parent)
+        self._controller = controller
 
     def save_figure(self, *args):
-        from plotting.plots import apply_figure_theme, onscreen_plot_dark
-        fig = self.canvas.figure
-        prev_dark = onscreen_plot_dark()
-        apply_figure_theme(fig, dark=False)
-        try:
-            super().save_figure(*args)          # mpl's file dialog + savefig (white bg)
-        finally:
-            apply_figure_theme(fig, dark=prev_dark)
-            self.canvas.draw_idle()
+        import matplotlib as mpl
+        from plotting.plots import save_figure_via
+        before = None
+        if self._controller is not None:
+            from gui.export_helper import export_start_dir, remember_export_dir
+            before = export_start_dir(self._controller)
+            mpl.rcParams['savefig.directory'] = before
+        parent_save = super().save_figure       # bind here; a lambda has no __class__ cell
+        save_figure_via(self.canvas.figure, lambda: parent_save(*args))
+        if self._controller is not None:
+            after = mpl.rcParams['savefig.directory']
+            if after and after != before:
+                # matplotlib wrote the chosen folder back -> the user saved somewhere
+                # new; remember it (append a dummy basename: remember_* takes a path).
+                remember_export_dir(self._controller, os.path.join(after, 'x'))
 
 
-def themed_navtoolbar(canvas, parent):
+def themed_navtoolbar(canvas, parent, controller=None):
     """A matplotlib `NavigationToolbar` whose Save always exports white (see
     `_WhiteSaveToolbar`). Drop-in replacement for `NavigationToolbar(canvas, parent)`
-    at every embedded-plot site."""
-    return _WhiteSaveToolbar(canvas, parent)
+    at every embedded-plot site. Pass the controller to seed/remember the shared
+    export folder across CSV exports and plot saves."""
+    return _WhiteSaveToolbar(canvas, parent, controller)
+
+
+def set_plot_export_name(canvas, stem: str) -> None:
+    """Give this canvas's save dialog a meaningful suggested filename (instead of
+    matplotlib's `image.png` fallback for embedded canvases). `stem` may carry an
+    extension (e.g. a CSV suggested name — shared with the Export button); it is
+    dropped in favour of the user's default plot filetype. Call at figure-refresh
+    time with the analysis on screen."""
+    bare = stem.rsplit('.', 1)[0] if '.' in stem else stem
+    canvas.get_default_filename = \
+        lambda: f'{bare}.{canvas.get_default_filetype()}'
 
 
 def make_canvas_expanding(canvas, min_height: int = 170,
@@ -221,6 +252,10 @@ class _ResidualResizer:
         label. When we can measure the fit's x-axis extent at draw
         time we put the grip just below it; otherwise (no renderer yet, or nothing on
         the fit's x-axis reaches into the gap) we fall back to the geometric midpoint."""
+        # No gap to grip while the plot is in its empty-state (axes hidden) — suppress the
+        # grip line and its drag band so no stray dash floats over the placeholder message.
+        if not (self.main_ax.get_visible() and self.resid_ax.get_visible()):
+            return None
         try:
             mpos = self.main_ax.get_position()
             rpos = self.resid_ax.get_position()
@@ -315,6 +350,14 @@ class AxisControlBar(QtWidgets.QWidget):
         row.addWidget(auto)
         self.note = ThemedLabel('', role='error', size=11)
         row.addWidget(self.note)
+        # One passive tooltip on every control: the bar starts DISABLED on each plot
+        # tab and stays so until a plot is drawn, and a greyed control with no word
+        # of why is the widget audit's most-hit class. Per control, not on the bar:
+        # a tooltip is read off the hovered widget itself.
+        for w in (self.x_scale, self.x_min, self.x_max,
+                  self.y_scale, self.y_min, self.y_max, auto):
+            w.setToolTip('Axis scale and limits of the plot above; '
+                         'available once a plot is drawn.')
         self.setEnabled(False)
 
     def _edit(self) -> QtWidgets.QLineEdit:
@@ -390,8 +433,8 @@ class AxisControlBar(QtWidgets.QWidget):
         cur = self._ax.get_xlim() if axis == 'x' else self._ax.get_ylim()
         lo = self._parse(lo_edit, cur[0])
         hi = self._parse(hi_edit, cur[1])
-        if not (lo < hi):
-            raise ValueError(f'{axis}: min must be < max')
+        if not (math.isfinite(lo) and math.isfinite(hi) and lo < hi):
+            raise ValueError(f'{axis}: min must be < max, both finite numbers')
         if scale == 'log' and lo <= 0:
             raise ValueError(f'{axis}: log min must be > 0')
         return lo, hi

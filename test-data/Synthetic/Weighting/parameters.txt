@@ -1,0 +1,45 @@
+DLS Buddy -- Synthetic DISTRIBUTION WEIGHTING test data
+=======================================================
+
+Why this set exists
+-------------------
+The program can reweight a recovered intensity distribution to a number, surface or volume
+basis, and the generator can forward-model an intensity distribution FROM a known
+composition -- but no committed file exercised the round trip. These two do.
+
+A WARNING THIS SET IS PARTLY ABOUT. A composition is ONE mixture whichever basis states
+it: N ~ comp / R^p with p = 0 / 2 / 3, so "1000 : 1 by number" and "1 : 1 by volume" are
+the SAME suspension, not two. Building one file per basis therefore produces identical
+files -- which is exactly what happened on the first attempt here. The two files below are
+two genuinely different MIXTURES, each reported on all three bases.
+
+Both are the same two sizes, 30 nm and 150 nm. The number ratios are chosen from the
+INTENSITY split they produce, because I1 ~ R^6 makes most bimodals unrecoverable in
+practice: at these sizes one 150 nm particle outshines (150/30)^6 = 15625 of the 30 nm ones.
+
+
+GLOBAL PARAMETERS (enter at the Data-tab confirmation step)
+-----------------------------------------------------------
+  Solvent                 : water
+  Solvent refractive index: 1.33
+  Viscosity               : 0.89 cP
+  Temperature             : 25.0 C (298.15 K)
+  Wavelength              : 532 nm
+
+
+GROUND TRUTH -- ratio of 30 nm to 150 nm, on each basis
+--------------------------------------------------------
+  file                   number     surface      volume     intensity 30nm  150nm
+  equal intensity         15625         625         125        0.500     0.500
+  large-dominant         1562.5        62.5        12.5        0.091     0.909
+
+  Angles          30, 45, 60, 75, 90, 105, 120, 135 deg
+  Scattering      Rayleigh (I1 ~ R^6, angle-independent), so the intensity weighting is
+                  the same at every angle and any angle may be used for the check
+  noise_level     0.003
+
+Recover an intensity distribution (CONTIN or NNLS) and reweight it. The number, surface
+and volume columns are three readings of the same recovered mixture, so ALL THREE must
+come back from ONE file -- that is the check, and it is stronger than comparing files.
+The `equal intensity` file is the easy case (both modes plainly visible); `large-dominant`
+is the one where the small mode is a tenth of the signal and can be lost.

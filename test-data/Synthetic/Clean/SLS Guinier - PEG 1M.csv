@@ -1,0 +1,44 @@
+Date/Time,1/1/2026 12:00:00 PM
+Sample ID,PEG 1M in Water
+Operator ID,Synthetic
+Sample Liquid,water
+Refractive Index of Sample Liquid,1.33
+Wavelength (nm),532
+'A' Dark Count Rate,0
+Number of Angles Measured,12
+Angle 1 (degrees),35
+Angle 2 (degrees),45
+Angle 3 (degrees),55
+Angle 4 (degrees),65
+Angle 5 (degrees),75
+Angle 6 (degrees),85
+Angle 7 (degrees),95
+Angle 8 (degrees),105
+Angle 9 (degrees),115
+Angle 10 (degrees),125
+Angle 11 (degrees),135
+Angle 12 (degrees),145
+Liquid Intensity - Angle 1,10460.7
+Liquid Intensity - Angle 2,8485.3
+Liquid Intensity - Angle 3,7324.6
+Liquid Intensity - Angle 4,6620.3
+Liquid Intensity - Angle 5,6211.7
+Liquid Intensity - Angle 6,6022.9
+Liquid Intensity - Angle 7,6022.9
+Liquid Intensity - Angle 8,6211.7
+Liquid Intensity - Angle 9,6620.3
+Liquid Intensity - Angle 10,7324.6
+Liquid Intensity - Angle 11,8485.3
+Liquid Intensity - Angle 12,10460.7
+Sample Intensity - Angle 1,934012.6
+Sample Intensity - Angle 2,723629.4
+Sample Intensity - Angle 3,597864.9
+Sample Intensity - Angle 4,508247.2
+Sample Intensity - Angle 5,449253.4
+Sample Intensity - Angle 6,410377.7
+Sample Intensity - Angle 7,392077.8
+Sample Intensity - Angle 8,384592.0
+Sample Intensity - Angle 9,387101.0
+Sample Intensity - Angle 10,413927.7
+Sample Intensity - Angle 11,464604.6
+Sample Intensity - Angle 12,558414.3

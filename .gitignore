@@ -27,3 +27,13 @@ Thumbs.db
 
 # Global user preferences written by the Settings tab (per-user, not code).
 /settings.json
+
+# IDE workspace config (per-machine, not code).
+.idea/
+.vscode/
+
+# Coverage output, if you run the suite with pytest-cov.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/

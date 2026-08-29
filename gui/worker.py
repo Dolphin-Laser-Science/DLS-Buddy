@@ -204,13 +204,35 @@ class AnalysisRunner(QtCore.QObject):
 
     # -- test helper ---------------------------------------------------------
     def wait_for_idle(self, timeout_ms: int = 30000) -> bool:
-        """Spin the event loop until idle (offscreen-safe). Test use only."""
+        """Spin the event loop until idle (offscreen-safe). Test use only.
+
+        IDLE MEANS BOTH CONDITIONS, and waiting on only the first is a real gap.
+        ``_current`` is cleared before ``_drain_idle`` runs, and a drained
+        callback may itself start a new job (see that method) -- so a caller that
+        waited on ``_current`` alone could return at the moment the queue was
+        about to dispatch, and hand the *next* test a busy runner. Both states
+        are checked here rather than leaving each caller to remember the second,
+        which is one predicate instead of one-per-call-site.
+
+        No hang risk: ``_idle_queue`` is only appended to while a job is live and
+        is snapshot-and-cleared in one pass, so at true rest it is empty; and the
+        deadline bounds the wait either way, returning False rather than
+        spinning.
+        """
         app = QtCore.QCoreApplication.instance()
         deadline = QtCore.QDeadlineTimer(timeout_ms)
-        while self._current is not None and not deadline.hasExpired():
+        while ((self._current is not None or self._idle_queue)
+                and not deadline.hasExpired()):
+            # Deliver queued cross-thread signals directly as well as via the
+            # dispatcher: on Windows the dispatcher's posted-event wake-up can
+            # be lost, after which processEvents() alone finds no pending
+            # messages and a queued finished-signal delivery stalls for tens of
+            # seconds. sendPostedEvents() drains the calling thread's posted-
+            # event queue synchronously, wake-up or no wake-up.
+            QtCore.QCoreApplication.sendPostedEvents()
             app.processEvents()
             QtCore.QThread.msleep(5)
-        return self._current is None
+        return self._current is None and not self._idle_queue
 
 
 _runner: Optional[AnalysisRunner] = None

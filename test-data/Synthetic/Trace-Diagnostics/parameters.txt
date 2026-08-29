@@ -1,0 +1,69 @@
+DLS Buddy -- Synthetic TRACE DIAGNOSTICS test data
+==================================================
+
+Why this set exists
+-------------------
+Three Utilities trace diagnostics had no synthetic case with a documented expected answer,
+even though the generator plants all three features and the Synthetic tab exposes them:
+the windowed-Hampel long-residence detector, the spectral (Welch PSD / periodogram)
+check, and the stationarity (ADF) test. Each file below plants exactly one feature, with
+a clean control built the same way so the control isolates it.
+
+Load with the generic trace parser: time = seconds, count rate = kcps.
+
+
+COMMON PARAMETERS
+-----------------
+  Duration        600 s at 1.0 s resolution (600 points)
+  Mean level      300 kcps
+  Scatter         trace_cv = 0.03, i.e. a FIXED 3 % relative Gaussian width
+                  (NOT shot noise -- at 300 kHz the two differ by ~30x, which is
+                  why the trace flagger uses a robust scale)
+
+
+GROUND TRUTH, file by file
+--------------------------
+  Trace - clean control.csv
+      Nothing planted. Expected ADF verdict: STATIONARY (the series is white noise
+      about a constant mean, so the unit-root null should be rejected). Measured:
+      `flag_outliers` flags 1 of 600 points (0.17 %) -- ordinary Gaussian tail at
+      k = 3.5, not a feature; `flag_outliers_windowed` flags none.
+
+  Trace - long-residence offset.csv
+      A step of +35 % of the mean, starting at t = 240 s and lasting 120 s
+      (so 240-360 s sits high, 120 of the 600 points = 20 % of the record).
+      This is the settled contamination a dust grain produces when it sits still in a
+      viscous medium, as distinct from a point spike passing through.
+
+      MEASURED, and the two detectors disagree by design:
+        `flag_outliers`          n_flagged = 120, fraction = 0.200 -- exactly the
+                                 planted span, t = 240-359 s
+        `flag_outliers_windowed` n_flagged = 0, n_events = 0 (75-pt window, K = 37)
+
+      The windowed detector ABSTAINING is correct, not a miss: its own docstring says
+      a moving window absorbs any feature longer than itself, and 120 points is far
+      longer than the window. So the GLOBAL band is the detector this file exercises;
+      the windowed one is exercised by point spikes, which this file does not plant.
+      (An earlier version of this note named the windowed detector as the one that
+      should fire -- it cannot.)
+
+  Trace - periodic 0.05 Hz.csv
+      A sinusoid at 0.05 Hz (20 s period) with amplitude 8 % of the mean. With 600 s of
+      record that is 30 full cycles, so the line is well resolved.
+      Expected: a clear peak at 0.05 Hz in the Welch PSD, well above the periodogram
+      false-alarm level. The clean control must NOT produce one.
+
+  Trace - drift (non-stationary).csv
+      A monotonic drift, no step and no sinusoid. Measured end-to-end slope over
+      the record: +33 % of the mean (the generator parameter is drift = 0.40).
+      Expected ADF verdict: NON-STATIONARY (fails to reject the unit-root null). This is
+      the case the ADF test exists for, and the clean control is its negative.
+
+
+Where these verdicts are pinned
+-------------------------------
+Every verdict above is asserted by tests/test_trace_analysis.py (added 2026-08-23), so a
+change that moves one of them turns the suite red rather than quietly re-baselining this
+file. The exact-count claims (offset n_flagged = 120, fraction 0.200; windowed 0 and 0)
+are asserted exactly; the fitted quantities are asserted as bounded ranges with the
+measured value recorded in each test's docstring.

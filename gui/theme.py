@@ -44,36 +44,43 @@ from PySide6 import QtCore, QtGui, QtWidgets
 # ---------------------------------------------------------------------------
 # Role → color, per theme
 # ---------------------------------------------------------------------------
-# Roles (semantic, not literal):
+# Roles are semantic, not literal. Light values stay clearly readable on white; dark values
+# are chosen for contrast on the dark base (Window/Base are 35–53 gray).
+
+# Text:
 #   header        — bold section-header text
 #   muted         — secondary body text (the darker gray notes)
 #   hint          — quieter, smaller hint text (the lighter gray notes)
+
+# Result status:
 #   error         — error / unreliable-result flags (a genuine data-quality problem)
 #   qualifier     — a neutral, expected result-type qualifier (e.g. "apparent (single
 #                   concentration)", "± statistical only"): a calm steel/slate accent,
 #                   distinct from the alarm-red `error`, so a fact-of-life caveat does not
 #                   read as a failure. Kept visible, just off the red channel.
+
+# Edit state:
 #   edited_bg     — CHANGED-but-uncommitted cell background: a calm, theme-aware tint
-#                   (derived from the `pending` amber family), NOT a full-saturation fill
-#                   (which reads as alarm and fails contrast in dark mode — style guide
-#                   §2 R2.4). Paired with a non-colour cue (italic cell text) so the
-#                   "edited" meaning never rests on colour alone (§10 R10.1).
+#                   (derived from the `pending` amber family), NOT a full-saturation fill,
+#                   which reads as alarm and fails contrast in dark mode (style guide §2
+#                   R2.4). Paired with a non-colour cue (italic cell text) so the "edited"
+#                   meaning never rests on colour alone (§10 R10.1).
 #   edited_fg     — readable text colour ON the edited_bg tint, per theme.
 #   pending       — "pending update" amber
+
+# Tree markers and badges:
 #   marker_group  — tree group-header rows (DLS / SLS / Traces)
 #   marker_active — derived / replicate-average tree leaves
 #   marker_selected — measurements ticked in the active tab (sidebar mirror + picker rows)
 #   badge         — the "?" help-badge outline + glyph
-#   lib_primary   — solvent-library provenance: a primary-tier auto-filled value (the
-#                   Data-tab teal dot + the Solvent Explorer primary badge). Teal, chosen
-#                   to avoid every taken meaning (yellow=dirty, amber=pending, red=error,
-#                   steel=qualifier, green/azure=markers).
-#   lib_estimate  — solvent-library provenance: an estimate-tier value (Solvent Explorer
-#                   badge only — estimate solvents are never auto-filled into a
-#                   measurement). Violet, previously unused.
-#
-# Light values keep today's intent but stay clearly readable on white; dark values are
-# chosen for contrast on the dark base (Window/Base are 35–53 gray).
+
+# Solvent-library provenance:
+#   lib_primary   — a primary-tier auto-filled value (the Data-tab teal dot + the Solvent
+#                   Explorer primary badge). Teal, chosen to avoid every taken meaning
+#                   (yellow=dirty, amber=pending, red=error, steel=qualifier,
+#                   green/azure=markers).
+#   lib_estimate  — an estimate-tier value (Solvent Explorer badge only — estimate solvents
+#                   are never auto-filled into a measurement). Violet.
 LIGHT_TOKENS = {
     'header':        '#1a1a1a',
     'muted':         '#4d4d4d',
@@ -227,7 +234,14 @@ def set_flag(label: ThemedLabel, text: str, *, problem: bool = True) -> None:
 
     The leading tier glyph is added HERE from ``problem`` — callers pass glyph-less
     text — so the glyph and the color tier can never disagree. This is the shared
-    renderer both the SLS and DLS tabs route through."""
+    renderer both the SLS and DLS tabs route through.
+
+    ONE glyph is prepended to the whole string, whatever it contains. A caller passing
+    ``'\\n'.join(...)`` therefore gets a marked first line and unmarked ones after it —
+    which is a known rough edge, not the intent. The family fix is to prepend per line
+    here, which changes every flag surface in the app and wants its figures re-captured,
+    so it is parked for a screenshot pass. Until then, a caller that needs each line
+    marked must split the label instead."""
     alarm = problem or not text
     label.setRole('error' if alarm else 'qualifier')
     label.setBold(alarm)

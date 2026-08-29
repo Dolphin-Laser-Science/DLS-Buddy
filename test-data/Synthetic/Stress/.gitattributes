@@ -6,4 +6,5 @@
 *.csv  -text
 *.txt  -text
 *.ASC  -text
+*.lsjson  -text
 # expected-outcomes.md is normal prose -- leave it diffable (not listed here).

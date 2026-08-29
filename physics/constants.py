@@ -157,9 +157,53 @@ def scattering_vector_q_m(
     return scattering_vector_q(angle_deg, wavelength_nm, solvent_refractive_index) * 1.0e9
 
 
+def optical_wavevector_k(
+    wavelength_nm: float,
+    solvent_refractive_index: float,
+) -> float:
+    """In-medium optical wavevector k = 2 * pi * n / lambda, in nm^-1.
+
+    The scattering vector q = 2k * sin(theta/2) reaches its back-scatter
+    maximum at q(180 deg) = 2k, so 2k bounds the physically reachable q range.
+    Used to cap drawn P(q) model grids: the Mie and coated-sphere form factors
+    are undefined past back-scatter (they clamp there, and a curve drawn past
+    2k would flatline). Both parameters are user-supplied; nothing is assumed.
+
+    Parameters
+    ----------
+    wavelength_nm : float
+        Vacuum wavelength of the laser in nanometres.
+    solvent_refractive_index : float
+        Refractive index of the medium at the measurement wavelength and
+        temperature.
+
+    Returns
+    -------
+    float
+        k in nm^-1.
+    """
+    return 2.0 * math.pi * solvent_refractive_index / wavelength_nm
+
+
 # ---------------------------------------------------------------------------
 # Dynamic light scattering — Stokes-Einstein equation
 # ---------------------------------------------------------------------------
+
+def _is_positive_finite(value) -> bool:
+    """True when a physical scalar is strictly positive AND a real number.
+
+    The bare ``value > 0`` idiom this replaces rejects NaN (every comparison with NaN is
+    False) but ADMITS ``+inf``, and the two failure modes look identical at a glance. That
+    asymmetry is not academic here: these functions divide by their arguments, so an
+    infinite D turns Rh = kT/(6 pi eta D) into a finite, plausible-looking **0.0** rather
+    than an error -- a wrong size reported with no ± to warn anyone.
+
+    One predicate for the whole module so the guards cannot drift apart per function: the
+    defect was found in `stokes_einstein_rh` and was equally present in every rate<->size
+    inverse beside it (2026-07-31 spec-01; CLAUDE.md rule 10/12).
+    """
+    return math.isfinite(value) and value > 0
+
 
 def stokes_einstein_rh(
     diffusion_coefficient_m2_per_s: float,
@@ -171,7 +215,9 @@ def stokes_einstein_rh(
     Definition:
         Rh = k_B * T / (6 * pi * eta * D)
 
-    Standard result (the Stokes-Einstein relation); see Chu (1991).
+    Standard result (the Stokes-Einstein relation); see Berne & Pecora (2000).
+    (Chu 1991 does not print this relation -- it converts D->size by an empirical
+    D=k_D M^-alpha scaling -- so it is not the source of record for it.)
 
     Parameters
     ----------
@@ -200,21 +246,24 @@ def stokes_einstein_rh(
     Raises
     ------
     ValueError
-        If any argument is non-positive (all three must be strictly
-        positive physical quantities).
+        If any argument is non-positive or non-finite (all three must be
+        strictly positive, finite physical quantities).
     """
-    if not (diffusion_coefficient_m2_per_s > 0):
+    # Refuse at the OPERATION rather than rely on each caller's gate being sized right,
+    # which is how +inf got through to a reported Rh = 0.0 nm (2026-07-31 spec-01).
+    # All three arguments, not only D: eta = inf gives Rh = 0.0 and T = inf gives Rh = inf.
+    if not _is_positive_finite(diffusion_coefficient_m2_per_s):
         raise ValueError(
-            f"diffusion_coefficient_m2_per_s must be positive, "
+            f"diffusion_coefficient_m2_per_s must be a positive finite number, "
             f"got {diffusion_coefficient_m2_per_s!r}."
         )
-    if not (temperature_K > 0):
+    if not _is_positive_finite(temperature_K):
         raise ValueError(
-            f"temperature_K must be positive, got {temperature_K!r}."
+            f"temperature_K must be a positive finite number, got {temperature_K!r}."
         )
-    if not (viscosity_Pa_s > 0):
+    if not _is_positive_finite(viscosity_Pa_s):
         raise ValueError(
-            f"viscosity_Pa_s must be positive, got {viscosity_Pa_s!r}."
+            f"viscosity_Pa_s must be a positive finite number, got {viscosity_Pa_s!r}."
         )
     return BOLTZMANN_K * temperature_K / (6.0 * math.pi * viscosity_Pa_s * diffusion_coefficient_m2_per_s)
 
@@ -250,14 +299,16 @@ def stokes_einstein_diffusion_coefficient(
     Raises
     ------
     ValueError
-        If any argument is non-positive.
+        If any argument is non-positive or non-finite.
     """
-    if not (rh_m > 0):
-        raise ValueError(f"rh_m must be positive, got {rh_m!r}.")
-    if not (temperature_K > 0):
-        raise ValueError(f"temperature_K must be positive, got {temperature_K!r}.")
-    if not (viscosity_Pa_s > 0):
-        raise ValueError(f"viscosity_Pa_s must be positive, got {viscosity_Pa_s!r}.")
+    if not _is_positive_finite(rh_m):
+        raise ValueError(f"rh_m must be a positive finite number, got {rh_m!r}.")
+    if not _is_positive_finite(temperature_K):
+        raise ValueError(
+            f"temperature_K must be a positive finite number, got {temperature_K!r}.")
+    if not _is_positive_finite(viscosity_Pa_s):
+        raise ValueError(
+            f"viscosity_Pa_s must be a positive finite number, got {viscosity_Pa_s!r}.")
     return BOLTZMANN_K * temperature_K / (6.0 * math.pi * viscosity_Pa_s * rh_m)
 
 
@@ -269,11 +320,13 @@ def stokes_einstein_diffusion_coefficient(
 # of the incident and detected light) because toluene is optically anisotropic.
 # For a vertically polarized laser the three relevant geometries are:
 #   VV  vertical incident, vertical analyzer           R_VV
-#   VU  vertical incident, NO analyzer (e.g. BI-200SM) R_VU = R_VV (1 + rho_v)
+#   VU  vertical incident, NO analyzer                 R_VU = R_VV (1 + rho_v)
 #   VH  vertical incident, horizontal analyzer         R_VH = R_VV rho_v
 # where rho_v = I_VH/I_VV is the (vertical) depolarization ratio. These follow
 # from R_VU = V_v + H_v with V_v = R_VV and H_v = R_VH = rho_v R_VV
-# (Brookhaven BI-200SM manual Sec. VIII; Wu 2010). The geometry MUST match the
+# (Brookhaven BI-200SM manual Sec. VIII; the R_VU = R_VV(1 + rho_v) identity
+# follows from rho_v = I_VH/I_VV and polarization-intensity additivity -- it is
+# NOT stated by Wu 2010). The geometry MUST match the
 # geometry in which the calibrant intensity was measured, or the absolute scale
 # is wrong by a factor of (1 + rho_v) ~ 1.35 for toluene.
 #
@@ -285,18 +338,22 @@ def stokes_einstein_diffusion_coefficient(
 #           9499 (Table 2). Also the source of the depolarization and temperature
 #           data below.
 # Other wavelengths can be added with a properly sourced R_VV; do not interpolate
-# (the wavelength dependence is steep, ~lambda^-4.2; Wu, Chem. Phys. 2010).
+# (the wavelength dependence is steep, ~lambda^-4.17 for toluene; Wu, Chem. Phys.
+# 2010, Eq. 4 -- benzene's raw power is 4.38 there, ~4.2 after its refractive-index
+# correction; neither is toluene's).
 _TOLUENE_RVV_25C: dict = {
     532.0: 2.34e-5,    # cm^-1, Takahashi et al. 2019
     660.0: 8.456e-6,   # cm^-1, Sivokhin & Kazantsev 2021, Table 2
 }
 
 # Temperature coefficient of R_VV: fractional change per °C. POSITIVE -- the
-# Rayleigh ratio rises with temperature (Sivokhin & Kazantsev 2021, Table 2:
-# Rvv from 8.00e-6 at 10 °C to 9.41e-6 at 50 °C, ~+0.43 %/°C; consistent with
-# benzene's well-known +0.368 %/°C, Wu 2010 Eq. 3). S&K assume the same
-# fractional coefficient at all wavelengths.
-_TOLUENE_RVV_TEMP_COEFFICIENT: float = 0.0043   # per °C  (relative, positive)
+# Rayleigh ratio rises with temperature. Value = Sivokhin & Kazantsev 2021 Eq. (9)
+# fitted coefficient (0.00421 /°C, referenced to 25 °C); consistent with their Table 2
+# (Rvv 8.00e-6 @10 °C -> 9.41e-6 @50 °C, ~+0.42 %/°C) and with benzene's +0.368 %/°C
+# (Wu 2010 Eq. 3). S&K assume the same fractional coefficient at all wavelengths.
+# (Was 0.0043, a rough endpoint estimate; corrected to S&K's own fitted 0.00421,
+# owner-approved 2026-07-22.)
+_TOLUENE_RVV_TEMP_COEFFICIENT: float = 0.00421   # per °C  (relative, positive; S&K Eq. 9)
 
 # Vertical depolarization ratio of toluene, rho_v = I_VH / I_VV.
 # Sivokhin & Kazantsev 2021, Table 1: 0.346 at 25 °C (measured at 660 nm),
@@ -308,13 +365,33 @@ _TOLUENE_DEPOL_V_25C: float = 0.346
 _TOLUENE_DEPOL_V_TEMP_COEFFICIENT: float = -0.00135   # per °C  (absolute)
 
 _TOLUENE_RAYLEIGH_REF_TEMP_C: float = 25.0
+
+# How far a declared laser wavelength may sit from a tabulated one (532 / 660 nm) and
+# still be served that table entry UNSCALED. A house convenience tolerance with no
+# literature source -- a flagged convenience simplification, not a canonical criterion:
+# it exists so a nominal "532" laser typed as 531.9 or 532.5 is not refused, and the
+# canonical alternative is a separately sourced R_VV at the actual wavelength (the
+# do-not-interpolate rule above). Its price is bounded by the wavelength exponent
+# below: at 2 nm from 532 nm the served value is ~1.6 % off (4.17 x 2/532), which is
+# why the substitution is DISCLOSED (`toluene_wavelength_extrapolation_reason`) rather
+# than silent -- a 534 nm laser was served R_VV(532) with nothing said, and since
+# Mw ~ R_std the whole bias landed on Mw and A2.
 _WAVELENGTH_MATCH_TOLERANCE_NM: float = 2.0
+
+# Toluene's Rayleigh-ratio wavelength exponent, R ~ lambda^-4.17 -- Wu, Chem. Phys.
+# 2010, Eq. (4), p. 45: the correlation is for the UNPOLARIZED ratio R_u over 420-700 nm
+# (the depolarization ratio is ~wavelength-independent there, so the same exponent
+# sizes R_VV's disclosure; benzene's raw power is 4.38, not this one). Used ONLY to
+# size the disclosure of a within-tolerance
+# substitution; the value served is never scaled by it (the correlation's own scatter is
+# up to 6 % at 532 nm, so a scaled value would not be a sourced one).
+_TOLUENE_RVV_WAVELENGTH_EXPONENT: float = -4.17
 
 # Temperature validity range for the R_VV(T), rho_v(T) corrections: the span of the
 # Sivokhin & Kazantsev 2021 tables (Rvv and rho_v tabulated 10-50 C). Outside this
 # the linear coefficients above are unvalidated extrapolation; we WARN (not raise --
 # owner 2026-07-11) so elevated-temperature calibrations still run, but the
-# extrapolation is never silent (audit F-04).
+# extrapolation is never silent.
 _TOLUENE_RAYLEIGH_TEMP_MIN_C: float = 10.0
 _TOLUENE_RAYLEIGH_TEMP_MAX_C: float = 50.0
 
@@ -326,7 +403,7 @@ def toluene_temperature_extrapolation_reason(temperature_C: float) -> Optional[s
 
     Single source of truth for the wording: `rayleigh_ratio_toluene` emits it via
     `warnings.warn` (headless/stderr + tests), and the GUI surfaces the same string as
-    a neutral note next to the calibration k_c (audit F-04-GUI). Glyph-less and
+    a neutral note next to the calibration k_c. Glyph-less and
     self-contained so either surface can lead it with its own preamble/marker.
 
     Returns None when `temperature_C` is inside the S&K 10-50 C table; otherwise a
@@ -347,6 +424,40 @@ def toluene_temperature_extrapolation_reason(temperature_C: float) -> Optional[s
     )
 
 
+def toluene_wavelength_extrapolation_reason(wavelength_nm: float) -> Optional[str]:
+    """The extrapolation note for a toluene-standard wavelength, or None.
+
+    The wavelength sibling of `toluene_temperature_extrapolation_reason` (rule 10: the
+    two axes of the same table are disclosed the same way). None when `wavelength_nm`
+    IS a tabulated wavelength, and also None when it is too far from every tabulated
+    one to be served at all -- `rayleigh_ratio_toluene` raises there, and the raise is
+    that case's surface. In between (within `_WAVELENGTH_MATCH_TOLERANCE_NM` of a table
+    entry but not on it) the nearest entry is served UNSCALED, and this names the
+    substitution and its approximate size on toluene's ~lambda^-4.17 dependence.
+    Single source of the wording: `rayleigh_ratio_toluene` emits it via `warnings.warn`
+    and the GUI shows the same string next to k_c.
+    """
+    if not math.isfinite(wavelength_nm):
+        return None
+    nearest = min(_TOLUENE_RVV_25C, key=lambda w: abs(wavelength_nm - w))
+    d = abs(wavelength_nm - nearest)
+    if math.isclose(wavelength_nm, nearest, abs_tol=1e-9) or d > _WAVELENGTH_MATCH_TOLERANCE_NM:
+        return None
+    # Within tolerance implies 530 <= lambda <= 662 nm, so the ratio below is in
+    # (0.99, 1.01) -- no tail of the power can under- or overflow here.
+    pct = abs((wavelength_nm / nearest) ** _TOLUENE_RVV_WAVELENGTH_EXPONENT - 1.0) * 100.0
+    supported = ', '.join(f'{w:g}' for w in sorted(_TOLUENE_RVV_25C))
+    # No author-year citation here for the same reason as the temperature note (this
+    # string renders on-screen); the exponent's source is on the module constant.
+    return (
+        f"Wavelength {wavelength_nm:g} nm is not in the toluene Rayleigh-ratio table "
+        f"({supported} nm); the {nearest:g} nm value was used unscaled, which is "
+        f"EXTRAPOLATED: on toluene's ~lambda^-4.17 wavelength dependence a {d:g} nm "
+        f"difference moves the Rayleigh ratio, and with it k_c, Mw and A2, by about "
+        f"{pct:.1f} %."
+    )
+
+
 def rayleigh_ratio_toluene(
     wavelength_nm: float,
     temperature_C: float,
@@ -363,7 +474,7 @@ def rayleigh_ratio_toluene(
 
     Geometry conversions (vertically polarized incident light):
         VV : R_VV                       (vertical analyzer)
-        VU : R_VV * (1 + rho_v)         (NO analyzer; e.g. the BI-200SM)
+        VU : R_VV * (1 + rho_v)         (NO analyzer)
         VH : R_VV * rho_v               (horizontal analyzer)
     The geometry MUST match the geometry in which the calibrant intensity was
     measured; otherwise the absolute scale is wrong by ~(1 + rho_v) ~ 1.35.
@@ -376,14 +487,16 @@ def rayleigh_ratio_toluene(
         Measurement temperature in degrees Celsius.
     geometry : str
         'VV', 'VU', or 'VH' -- REQUIRED (no default). Use 'VU' for an instrument
-        with a vertically polarized laser and no polarization analyzer (e.g. the
-        BI-200SM). Passing None (or omitting it) raises: the geometry must be
+        with a vertically polarized laser and no polarization analyzer.
+        Passing None (or omitting it) raises: the geometry must be
         explicit, since VV vs VU differ by (1 + rho_v) ~ 1.35 on the absolute
         scale and a wrong default would silently corrupt every calibrated Mw/A2.
     depolarization_ratio_v : float, optional
         rho_v = I_VH / I_VV for toluene. If omitted, the temperature-dependent
         value from Sivokhin & Kazantsev 2021 is used (0.346 at 25 C). Supply your
         own if you have measured it, especially at wavelengths far from 660 nm.
+        Must be in [0, 0.75], the physical range for vertically polarized
+        incident light (see _RHO_V_DEPOLARIZATION_LIMIT).
 
     Returns
     -------
@@ -393,30 +506,37 @@ def rayleigh_ratio_toluene(
     Raises
     ------
     ValueError
-        If the geometry is unspecified (None) or not VV/VU/VH, or if the wavelength
-        is unsupported.
+        If the geometry is unspecified (None) or not VV/VU/VH, if the wavelength
+        is unsupported, or if a user-supplied depolarization_ratio_v is outside
+        [0, 0.75].
 
     Warns
     -----
     UserWarning
         If the temperature is outside the 10-50 C table of the S&K correction (the
         value is extrapolated, not blocked -- so elevated-temperature calibrations
-        still work, but the extrapolation is flagged).
+        still work, but the extrapolation is flagged). Likewise if the wavelength is
+        within the +/- 2 nm match tolerance of a tabulated wavelength but not ON it:
+        the tabulated value is served unscaled and the substitution is named, with its
+        approximate size (`toluene_wavelength_extrapolation_reason`).
 
     Notes
     -----
-    R_VV(T) = R_VV(25) * (1 + alpha (T - 25)), alpha = +0.0043 /C (S&K Table 2;
+    R_VV(T) = R_VV(25) * (1 + alpha (T - 25)), alpha = +0.00421 /C (S&K 2021 Eq. 9;
     the coefficient is POSITIVE -- the Rayleigh ratio rises with temperature).
     rho_v(T) = 0.346 - 0.00135 (T - 25) (S&K Table 1) unless overridden.
-    Verified to reproduce the S&K Rv (VU) table at 10/25/50 C.
+    Implements S&K 2021 Eq. (9) (p. 9501) verbatim, anchored at their Table 2
+    value at 25 C; it reproduces Table 2 within 1 % over 10-50 C (the table is
+    slightly convex, so the linear form sits 0.9 % low at 10 C and 0.7 % low at
+    50 C -- the residual of S&K's own linear fit).
 
     For wavelengths not in the table, add a properly sourced R_VV to
-    _TOLUENE_RVV_25C; do not interpolate (R ~ lambda^-4.2).
+    _TOLUENE_RVV_25C; do not interpolate (R ~ lambda^-4.17 for toluene, Wu 2010 Eq. 4).
     """
     if geometry is None:
         raise ValueError(
             "geometry must be specified: one of 'VV', 'VU', or 'VH' (VU for a "
-            "vertically polarized laser with no analyzer, e.g. the BI-200SM). "
+            "vertically polarized laser with no analyzer). "
             "There is no default -- VV vs VU differ by (1 + rho_v) ~ 1.35 on the "
             "absolute scale, so a silent default would corrupt calibrated Mw/A2."
         )
@@ -429,9 +549,9 @@ def rayleigh_ratio_toluene(
     # The S&K temperature correction is tabulated only over 10-50 C; outside it the
     # linear R_VV(T)/rho_v(T) coefficients are EXTRAPOLATED. WARN (do not raise) so
     # elevated-temperature calibrations still work, but the extrapolation is never
-    # silent (audit F-04; owner 2026-07-11 -- warn, not raise, since reline SLS runs
+    # silent (owner 2026-07-11 -- warn, not raise, since reline SLS runs
     # hot). Keep-both: the same reason string is surfaced in the GUI as a neutral note
-    # next to the calibration k_c via the controller (audit F-04-GUI); this warning is
+    # next to the calibration k_c via the controller; this warning is
     # the headless/stderr + pytest.warns channel.
     reason = toluene_temperature_extrapolation_reason(temperature_C)
     if reason is not None:
@@ -451,6 +571,12 @@ def rayleigh_ratio_toluene(
             f"Supported: {supported}. Add a sourced R_VV to _TOLUENE_RVV_25C "
             f"to support a new wavelength."
         )
+    # Within tolerance but not on the table: served unscaled, never silently. The
+    # wavelength sibling of the temperature warning above (same keep-both shape: this
+    # warning is the headless/pytest channel, the GUI renders the same string).
+    wl_reason = toluene_wavelength_extrapolation_reason(wavelength_nm)
+    if wl_reason is not None:
+        warnings.warn(wl_reason, stacklevel=2)
 
     # Temperature-corrected polarized value R_VV(T).
     dT = temperature_C - _TOLUENE_RAYLEIGH_REF_TEMP_C
@@ -462,8 +588,21 @@ def rayleigh_ratio_toluene(
     # Depolarization ratio (temperature-dependent default, or user-supplied).
     if depolarization_ratio_v is None:
         rho_v = _TOLUENE_DEPOL_V_25C + _TOLUENE_DEPOL_V_TEMP_COEFFICIENT * dT
+        origin = (f"the tabulated rho_v(T) evaluated at {temperature_C!r} C -- its "
+                  f"linear form turns negative near 281 C, far past the 10-50 C table")
     else:
         rho_v = float(depolarization_ratio_v)
+        origin = 'the supplied value'
+    # Same physical-range guard as every other rho_v consumer in this module
+    # (depolarization_ratio_unpolarized, cabannes_isotropic_factor,
+    # optical_anisotropy_squared), on BOTH arms: a negative Rayleigh ratio is not an
+    # extrapolation the warn-not-raise rule for the table covers. The
+    # `not (0.0 <= x <= limit)` form also rejects NaN and inf.
+    if not (0.0 <= rho_v <= _RHO_V_DEPOLARIZATION_LIMIT):
+        raise ValueError(
+            f"rho_v must be in [0, {_RHO_V_DEPOLARIZATION_LIMIT}] for the toluene "
+            f"calibrant's depolarization ratio, got {rho_v!r} ({origin})."
+        )
 
     if geometry == 'VU':
         return r_vv * (1.0 + rho_v)
@@ -512,23 +651,33 @@ def refractive_index_correction(
     no correction is needed. The SLS analysis module applies this factor
     whenever solvent_refractive_index != standard_refractive_index.
 
-    The (n/n_std)^2 form is the standard correction for a cylindrical
-    scattering cell. Some instruments use a more elaborate form that also
-    accounts for the refractive index of the cell walls; this simpler
-    form is appropriate for most goniometer setups including the
-    Brookhaven instruments.
+    The fixed (n/n_std)^2 form is derived from cell-wall refraction of the
+    observed scattering volume and solid angle (Helmholtz-Lagrange), and
+    Coumou proves it holds regardless of cell shape -- rectangular and
+    cylindrical alike [@coumou1960, Eq. [2a], p. 413]. Chu gives a
+    generalized detection-optics form with an exponent between 1 and 2
+    (Eq. 8.4.19); this platform implements the fixed refraction-derived
+    exponent-2 form.
     """
-    if not (standard_refractive_index > 0):
+    if not _is_positive_finite(standard_refractive_index):
         raise ValueError(
-            f"standard_refractive_index must be positive, "
+            f"standard_refractive_index must be a positive finite number, "
             f"got {standard_refractive_index!r}."
         )
-    if not (solvent_refractive_index > 0):
+    if not _is_positive_finite(solvent_refractive_index):
         raise ValueError(
-            f"solvent_refractive_index must be positive, "
+            f"solvent_refractive_index must be a positive finite number, "
             f"got {solvent_refractive_index!r}."
         )
-    return (solvent_refractive_index / standard_refractive_index) ** 2
+    # `r * r`, not `r ** 2`: both indices are user-supplied and guarded only for
+    # positive-finiteness, so their RATIO can reach the edge where a Python float `**`
+    # raises OverflowError while `*` saturates to inf. The sibling square in
+    # `optical_constant_K` is spelled the same way and for the same reason; this one is
+    # reached from the same call in `compute_excess_rayleigh_ratio`, on the same
+    # user-supplied refractive index, so leaving it as `**` would just move the crash
+    # one function over.
+    ratio = solvent_refractive_index / standard_refractive_index
+    return ratio * ratio
 
 
 # ---------------------------------------------------------------------------
@@ -581,9 +730,30 @@ def optical_constant_K(
     default for most modern light scattering instruments. If your
     instrument uses a different polarization geometry, K must be modified.
     """
+    # Every square and fourth power is spelled as repeated MULTIPLICATION, never `**`.
+    # On a Python float `**` RAISES OverflowError where `*` saturates to inf
+    # (`1e300 ** 2` raises; `1e300 * 1e300` is inf), and a raise happens before any
+    # caller's guard can run -- so `**` here would make an out-of-range input a crash
+    # rather than a flaggable value. All three arguments are user-supplied and only
+    # range-checked for sign/finiteness, so all three can reach the edge: measured,
+    # `dn/dc = 1e200`, `n = 1e200` and `lambda = 1e200` each raised out of this
+    # function before this change. Callers guard the RESULT (see
+    # analysis.sls.compute_excess_rayleigh_ratio), which is the one quantity that
+    # actually has to be usable.
     wavelength_cm = wavelength_nm * 1.0e-7   # nm -> cm
-    numerator = 4.0 * math.pi ** 2 * solvent_refractive_index ** 2 * dn_dc_mL_per_g ** 2
-    denominator = AVOGADRO_NA * wavelength_cm ** 4
+    n2 = solvent_refractive_index * solvent_refractive_index
+    dn_dc2 = dn_dc_mL_per_g * dn_dc_mL_per_g
+    lambda2 = wavelength_cm * wavelength_cm
+    numerator = 4.0 * math.pi * math.pi * n2 * dn_dc2
+    denominator = AVOGADRO_NA * lambda2 * lambda2
+    if denominator == 0.0:
+        # lambda^4 underflowed to zero, so the quotient has no representable value.
+        # Saturate rather than raise, for the same reason the squares above use `*`:
+        # a ZeroDivisionError here kills the analysis before the caller's K guard can
+        # flag the run. Sign-free -- the numerator is a sum of squares, so it is never
+        # negative -- and NaN when both ends collapse, which the caller's
+        # `isfinite(K) and K > 0` test rejects exactly as it rejects inf.
+        return float('inf') if numerator > 0.0 else float('nan')
     return numerator / denominator
 
 
@@ -744,8 +914,14 @@ def cabannes_isotropic_factor(rho_v: float) -> float:
     -----
     This is the vertically-polarized-incident analog of the classical natural-
     light Cabannes factor (6 - 7 rho_u)/(6 + 6 rho_u); see
-    cabannes_isotropic_factor_natural(). For small rho_v the two agree to first
-    order. The anisotropic FRACTION removed is 1 - f = (4/3) rho_v.
+    cabannes_isotropic_factor_natural(). The two are NOT interchangeable, even
+    at small anisotropy: with rho_u = 2 rho_v/(1 + rho_v) the natural-light
+    factor removes (13/3) rho_v to first order against this function's
+    (4/3) rho_v (a ratio of 3.25), because the unpolarized total it corrects
+    already contains the horizontal component. Sources for the two forms:
+    Kerker 1969 Ch. 9 Sec. 9.1c (p. 498) states the natural-light factor; Chu
+    1991 Sec. 8.4.1.A the vertical-incident relations above. The anisotropic
+    FRACTION removed is 1 - f = (4/3) rho_v.
     """
     if not (0.0 <= rho_v <= _RHO_V_DEPOLARIZATION_LIMIT):
         raise ValueError(
@@ -848,7 +1024,7 @@ def optical_anisotropy_squared(rho_v: float) -> float:
 #
 # Rigid circular cylinder (length L, diameter d, axial ratio p = L/d):
 #   Tirado, Lopez Martinez & Garcia de la Torre, J. Chem. Phys. 81, 2047 (1984),
-#   Eqs. (1),(5),(9),(10). The end-effect correction polynomials are fitted for
+#   Eqs. (3),(5),(9),(10). The end-effect correction polynomials are fitted for
 #   2 < p < 30; outside that range the formulas are unsupported extrapolations.
 #
 # Sphere (radius R):
@@ -873,8 +1049,9 @@ def rod_end_corrections(aspect_ratio_p: float) -> tuple:
     as a pair so the rod diffusion functions and the inverse solver share one source.
     """
     p = aspect_ratio_p
-    if not (p > 0):
-        raise ValueError(f"aspect ratio p must be positive, got {p!r}.")
+    if not _is_positive_finite(p):
+        raise ValueError(
+            f"aspect ratio p must be a positive finite number, got {p!r}.")
     nu = 0.312 + 0.565 / p - 0.100 / p ** 2
     delta_perp = -0.662 + 0.917 / p - 0.050 / p ** 2
     return nu, delta_perp
@@ -884,7 +1061,7 @@ def rod_translational_diffusion(length_m: float, diameter_m: float,
                                 temperature_K: float, viscosity_Pa_s: float) -> float:
     """Translational diffusion coefficient D_t of a rigid cylinder, in m^2/s.
 
-        D_t = kT / (3 pi eta L) * (ln p + nu),   p = L/d   (Tirado 1984 Eqs. 1, 9)
+        D_t = kT / (3 pi eta L) * (ln p + nu),   p = L/d   (Tirado 1984 Eqs. 3, 9)
 
     Valid for 2 < p < 30 (rod_aspect_ratio_valid); evaluates outside but the
     correction is then an extrapolation.
@@ -923,11 +1100,13 @@ def rod_length_from_translational_diffusion(diffusion_coefficient_m2_per_s: floa
     The algebraic inverse of rod_translational_diffusion for fixed p. The depolarized
     rod inversion uses it to reduce the 2-D (L, d) solve to a 1-D root find in p.
     """
-    if not (diffusion_coefficient_m2_per_s > 0):
+    if not _is_positive_finite(diffusion_coefficient_m2_per_s):
         raise ValueError(
-            f"D_t must be positive, got {diffusion_coefficient_m2_per_s!r}.")
-    if not (temperature_K > 0 and viscosity_Pa_s > 0):
-        raise ValueError("temperature_K and viscosity_Pa_s must be positive.")
+            f"D_t must be a positive finite number, "
+            f"got {diffusion_coefficient_m2_per_s!r}.")
+    if not (_is_positive_finite(temperature_K) and _is_positive_finite(viscosity_Pa_s)):
+        raise ValueError("temperature_K and viscosity_Pa_s must be positive finite "
+                         "numbers.")
     nu, _ = rod_end_corrections(aspect_ratio_p)
     return (BOLTZMANN_K * temperature_K * (math.log(aspect_ratio_p) + nu)
             / (3.0 * math.pi * viscosity_Pa_s * diffusion_coefficient_m2_per_s))
@@ -948,10 +1127,11 @@ def sphere_rotational_diffusion(radius_m: float, temperature_K: float,
     the simple (single-unknown) shape model for an anisotropic NEAR-spherical
     particle (Balog et al. 2015).
     """
-    if not (radius_m > 0):
-        raise ValueError(f"radius_m must be positive, got {radius_m!r}.")
-    if not (temperature_K > 0 and viscosity_Pa_s > 0):
-        raise ValueError("temperature_K and viscosity_Pa_s must be positive.")
+    if not _is_positive_finite(radius_m):
+        raise ValueError(f"radius_m must be a positive finite number, got {radius_m!r}.")
+    if not (_is_positive_finite(temperature_K) and _is_positive_finite(viscosity_Pa_s)):
+        raise ValueError("temperature_K and viscosity_Pa_s must be positive finite "
+                         "numbers.")
     return BOLTZMANN_K * temperature_K / (8.0 * math.pi * viscosity_Pa_s * radius_m ** 3)
 
 
@@ -965,20 +1145,177 @@ def sphere_radius_from_rotational_diffusion(diffusion_coefficient_rad2_per_s: fl
     Inverse of sphere_rotational_diffusion. For a true sphere this equals the
     Stokes (translational) radius; comparing the two is a sphericity check.
     """
-    if not (diffusion_coefficient_rad2_per_s > 0):
+    if not _is_positive_finite(diffusion_coefficient_rad2_per_s):
         raise ValueError(
-            f"D_r must be positive, got {diffusion_coefficient_rad2_per_s!r}.")
-    if not (temperature_K > 0 and viscosity_Pa_s > 0):
-        raise ValueError("temperature_K and viscosity_Pa_s must be positive.")
+            f"D_r must be a positive finite number, "
+            f"got {diffusion_coefficient_rad2_per_s!r}.")
+    if not (_is_positive_finite(temperature_K) and _is_positive_finite(viscosity_Pa_s)):
+        raise ValueError("temperature_K and viscosity_Pa_s must be positive finite "
+                         "numbers.")
     return (BOLTZMANN_K * temperature_K
             / (8.0 * math.pi * viscosity_Pa_s
                * diffusion_coefficient_rad2_per_s)) ** (1.0 / 3.0)
 
 
 def _require_positive_lengths(length_m, diameter_m, temperature_K, viscosity_Pa_s):
-    if not (length_m > 0 and diameter_m > 0):
+    if not (_is_positive_finite(length_m) and _is_positive_finite(diameter_m)):
         raise ValueError(
-            f"length_m and diameter_m must be positive, got {length_m!r}, "
-            f"{diameter_m!r}.")
-    if not (temperature_K > 0 and viscosity_Pa_s > 0):
-        raise ValueError("temperature_K and viscosity_Pa_s must be positive.")
+            f"length_m and diameter_m must be positive finite numbers, got "
+            f"{length_m!r}, {diameter_m!r}.")
+    if not (_is_positive_finite(temperature_K) and _is_positive_finite(viscosity_Pa_s)):
+        raise ValueError("temperature_K and viscosity_Pa_s must be positive finite "
+                         "numbers.")
+
+
+# ---------------------------------------------------------------------------
+# Ellipsoid of revolution (prolate/oblate) -- Perrin friction factors.
+#
+# Semi-axes: a = polar (symmetry-axis) semi-axis, b = equatorial radius. Axial
+# ratio p = a/b (prolate p > 1, oblate p < 1, sphere p = 1). The Perrin
+# expressions are naturally written in rho = b/a = 1/p; the equal-volume sphere
+# radius is R0 = (a b^2)^(1/3). Callers work in p = a/b (parity with the rod);
+# this module converts to rho internally.
+#
+# Perrin's dimensionless elliptic factor (Koenig 1975 Eqs. 6/7 with S0 = 2/a,
+# aS = a*S; ln[(1+sqrt(1-rho^2))/rho] = artanh(sqrt(1-rho^2))):
+#     prolate (rho<1):  aS = 2 artanh(sqrt(1-rho^2)) / sqrt(1-rho^2)
+#     oblate  (rho>1):  aS = 2 atan (sqrt(rho^2-1)) / sqrt(rho^2-1)
+#   aS -> 2 as rho -> 1 (sphere). Shared by BOTH friction factors below.
+#
+# Translational (Tanford 1961, Physical Chemistry of Macromolecules, Eqs.
+#   19-14/19-15; Perrin 1936): f0 = 6 pi eta R0, f/f0 = 2/(rho^(2/3) aS), so
+#     D_t = kT/f = kT / (6 pi eta R0 . 2/(rho^(2/3) aS)).
+#   Reduces to Stokes-Einstein kT/(6 pi eta R) at a = b.
+#
+# Rotational -- end-over-end tumbling of the symmetry axis, the coefficient DDLS
+#   observes (the spin about the symmetry axis is invisible). Koenig 1975
+#   (Biopolymers 14, 2421, correcting Perrin 1934), friction about the equatorial
+#   axis (his Eq. 9):
+#     C2 = 4 C0 (1-rho^4) / {3 rho^2 [aS (2-rho^2) - 2]},  C0 = 8 pi eta a b^2
+#     D_perp = kT/C2.
+#   Koenig's sign correction is to the *equatorial-axis relaxation* tau_2, NOT to
+#   C2/tau_1 (the tumbling), which Perrin already had right; C2 is used here as
+#   Koenig restates it. Reduces to kT/(8 pi eta R^3) (Stokes-Einstein-Debye) at a=b.
+#
+# Validity band: Koenig tabulates/graphs 0.1 <= rho <= 10 (symmetric), i.e.
+# 0.1 <= p <= 10; callers flag results outside it (like the rod's 2 < p < 30).
+
+# Aspect-ratio (p = a/b) range over which Koenig (1975) tabulates the ellipsoid
+# friction factors. A documented validity bound, not a hard domain limit.
+ELLIPSOID_ASPECT_RATIO_MIN: float = 0.1
+ELLIPSOID_ASPECT_RATIO_MAX: float = 10.0
+
+
+def ellipsoid_aspect_ratio_valid(aspect_ratio_p: float) -> bool:
+    """True if p = a/b is in Koenig's (1975) tabulated range 0.1 < p < 10."""
+    return ELLIPSOID_ASPECT_RATIO_MIN < aspect_ratio_p < ELLIPSOID_ASPECT_RATIO_MAX
+
+
+def _perrin_elliptic_aS(rho: float) -> float:
+    """Perrin's dimensionless elliptic factor aS(rho) (= a*S; Koenig 1975 Eqs. 6/7).
+
+        prolate (rho<1):  aS = 2 artanh(sqrt(1-rho^2)) / sqrt(1-rho^2)
+        oblate  (rho>1):  aS = 2 atan (sqrt(rho^2-1)) / sqrt(rho^2-1)
+
+    rho = b/a (equatorial/polar). Shared by the ellipsoid translational and
+    rotational friction. Tends to 2 as rho -> 1 (sphere); the exact sphere is
+    guarded (the closed forms are 0/0 there).
+    """
+    if not _is_positive_finite(rho):
+        raise ValueError(
+            f"axial ratio rho = b/a must be a positive finite number, got {rho!r}.")
+    if abs(rho - 1.0) < 1e-9:
+        return 2.0
+    if rho < 1.0:                                   # prolate
+        s = math.sqrt(1.0 - rho * rho)
+        return 2.0 * math.atanh(s) / s
+    s = math.sqrt(rho * rho - 1.0)                  # oblate
+    return 2.0 * math.atan(s) / s
+
+
+def _ellipsoid_f_ratio(rho: float) -> float:
+    """Perrin translational friction ratio f/f0 = 2/(rho^(2/3) aS) of an ellipsoid of
+    revolution (rho = b/a); 1 at the sphere (rho = 1). Shared by the forward D_t
+    (ellipsoid_translational_diffusion) and its size inverse
+    (ellipsoid_semi_axes_from_translational_diffusion) so the two stay EXACT inverses --
+    a single edit to the friction form can never desynchronize them.
+    """
+    if abs(rho - 1.0) < 1e-9:
+        return 1.0                                  # sphere: f = f0
+    return 2.0 / (rho ** (2.0 / 3.0) * _perrin_elliptic_aS(rho))
+
+
+def ellipsoid_translational_diffusion(polar_semi_axis_m: float,
+                                      equatorial_radius_m: float,
+                                      temperature_K: float,
+                                      viscosity_Pa_s: float) -> float:
+    """Translational diffusion coefficient D_t of an ellipsoid of revolution, m^2/s.
+
+        D_t = kT / f,   f = 6 pi eta R0 . (f/f0),   R0 = (a b^2)^(1/3)
+        f/f0 = 2 / (rho^(2/3) aS),   rho = b/a       (Tanford 1961 Eqs. 19-14/19-15)
+
+    a = polar semi-axis, b = equatorial radius. Reduces to Stokes-Einstein
+    kT/(6 pi eta R) at a = b (sphere).
+    """
+    a, b = polar_semi_axis_m, equatorial_radius_m
+    _require_positive_lengths(a, b, temperature_K, viscosity_Pa_s)
+    rho = b / a
+    r0_m = (a * b * b) ** (1.0 / 3.0)
+    f0 = 6.0 * math.pi * viscosity_Pa_s * r0_m
+    return BOLTZMANN_K * temperature_K / (f0 * _ellipsoid_f_ratio(rho))
+
+
+def ellipsoid_rotational_diffusion(polar_semi_axis_m: float,
+                                   equatorial_radius_m: float,
+                                   temperature_K: float,
+                                   viscosity_Pa_s: float) -> float:
+    """End-over-end rotational diffusion coefficient D_perp of an ellipsoid, rad^2/s.
+
+        D_perp = kT / C2,   C0 = 8 pi eta a b^2,   rho = b/a
+        C2 = 4 C0 (1 - rho^4) / {3 rho^2 [aS (2 - rho^2) - 2]}
+        (Koenig 1975 Eq. 9, correcting Perrin 1934)
+
+    This is the tumbling of the symmetry axis -- the rotation DDLS observes (the
+    spin about the symmetry axis is not seen). Reduces to the sphere value
+    kT/(8 pi eta R^3) at a = b. Near rho = 1 the closed form is 0/0 (both the
+    numerator 1-rho^4 and the bracket vanish); the sphere value is used there.
+    """
+    a, b = polar_semi_axis_m, equatorial_radius_m
+    _require_positive_lengths(a, b, temperature_K, viscosity_Pa_s)
+    rho = b / a
+    c0 = 8.0 * math.pi * viscosity_Pa_s * a * b * b
+    if abs(rho - 1.0) < 1e-4:
+        c2 = c0                                     # sphere limit (avoids the 0/0)
+    else:
+        a_s = _perrin_elliptic_aS(rho)
+        c2 = (4.0 * c0 * (1.0 - rho ** 4)
+              / (3.0 * rho * rho * (a_s * (2.0 - rho * rho) - 2.0)))
+    return BOLTZMANN_K * temperature_K / c2
+
+
+def ellipsoid_semi_axes_from_translational_diffusion(
+        diffusion_coefficient_m2_per_s: float, aspect_ratio_p: float,
+        temperature_K: float, viscosity_Pa_s: float) -> tuple:
+    """Semi-axes (a, b) in m from D_t at a KNOWN axial ratio p = a/b.
+
+    Inverse of ellipsoid_translational_diffusion for fixed p: D_t fixes the total
+    friction f = kT/D_t, hence the equal-volume-sphere radius R0 = f/(6 pi eta .
+    f/f0); then a = R0 p^(2/3), b = R0 p^(-1/3) (so a/b = p, a b^2 = R0^3). The
+    depolarized ellipsoid inversion uses it to reduce the 2-D (a, b) solve to a
+    1-D root find in p.
+    """
+    if not _is_positive_finite(diffusion_coefficient_m2_per_s):
+        raise ValueError(
+            f"D_t must be a positive finite number, "
+            f"got {diffusion_coefficient_m2_per_s!r}.")
+    if not _is_positive_finite(aspect_ratio_p):
+        raise ValueError(
+            f"aspect ratio p must be a positive finite number, got {aspect_ratio_p!r}.")
+    if not (_is_positive_finite(temperature_K) and _is_positive_finite(viscosity_Pa_s)):
+        raise ValueError("temperature_K and viscosity_Pa_s must be positive finite "
+                         "numbers.")
+    rho = 1.0 / aspect_ratio_p
+    f = BOLTZMANN_K * temperature_K / diffusion_coefficient_m2_per_s
+    r0_m = f / (6.0 * math.pi * viscosity_Pa_s * _ellipsoid_f_ratio(rho))
+    return (r0_m * aspect_ratio_p ** (2.0 / 3.0),
+            r0_m * aspect_ratio_p ** (-1.0 / 3.0))

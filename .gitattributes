@@ -6,6 +6,14 @@
 *.sh      text eol=lf
 *.bat     text eol=crlf
 
+# Pin the source and doc formats as text so their line endings are decided by the
+# REPO, not by each machine's core.autocrlf. Without this, a second editor (or a PC
+# with autocrlf unset) can rewrite whole-file line endings and bury a real diff.
+# LF in the index, native in the working tree — which is already what every tracked
+# .py/.md holds, so adding this normalizes nothing and changes no content.
+*.py      text
+*.md      text
+
 # PDFs are binary — never apply line-ending normalization (autocrlf would corrupt
 # the byte stream on checkout). Covers the committed docs/*.pdf and the generated
 # illustrated guide. `-text` keeps the system `diff: astextplain` textconv intact.

@@ -97,7 +97,7 @@ class DepolarizationResult:
     """Static depolarization analysis from one VV/VH intensity pair.
 
     All quantities assume VERTICALLY polarized incident light (the modern default).
-    `physically_valid` is False when rho_v falls outside [0, 3/4]; in that case the
+    `physically_valid` is False when rho_v falls outside [0, 3/4); in that case the
     derived quantities are clamped/NaN and `note` explains why, rather than the
     analysis raising -- a slightly-out-of-range rho_v is usually instrumental
     (stray depolarized light from polarizer/analyzer leakage, reflections, or an
@@ -115,7 +115,7 @@ class DepolarizationResult:
     i_vh: float                        # VH intensity used (after dark-count subtraction)
     dark_count: float                  # dark count subtracted from each
     # quality
-    physically_valid: bool             # 0 <= rho_v <= 3/4
+    physically_valid: bool             # 0 <= rho_v < 3/4
     note: str = ''
     # uncertainty (None unless replicate SEs were supplied)
     rho_v_se: Optional[float] = None
@@ -152,9 +152,12 @@ def depolarization_ratio(i_vv: float, i_vh: float, dark_count: float = 0.0) -> f
     """
     vv = i_vv - dark_count
     vh = i_vh - dark_count
-    if not (vv > 0):
+    # Finite as well as positive: an infinite I_VV passes a bare `> 0` and gives
+    # rho_v = vh/inf = 0.0 -- which reads as a perfectly isotropic scatterer, and drives
+    # the Cabannes factor to exactly 1 (no anisotropy correction) with no flag anywhere.
+    if not (math.isfinite(vv) and vv > 0):
         raise ValueError(
-            f"dark-subtracted I_VV must be positive, got {vv!r} "
+            f"dark-subtracted I_VV must be a positive finite number, got {vv!r} "
             f"(I_VV={i_vv!r}, dark_count={dark_count!r})."
         )
     return vh / vv
@@ -192,18 +195,23 @@ def analyze_depolarization(
 
     Notes
     -----
-    rho_v outside [0, 3/4] does not raise: it sets physically_valid=False, records
+    rho_v outside [0, 3/4) does not raise: it sets physically_valid=False, records
     why in `note`, and leaves delta^2 = nan (and the Cabannes factor still computed
     from the linear form, which stays finite). rho_v <= 0 means no resolvable
-    depolarization; rho_v > 3/4 is unphysical for an anisotropic scatterer and
-    signals instrumental stray depolarized light.
+    depolarization; rho_v >= 3/4 is unphysical for an anisotropic scatterer -- at
+    the limit itself the isotropic Rayleigh contribution vanishes (Cabannes factor
+    f = 0) and delta^2 is undefined, and above it it signals instrumental stray
+    depolarized light.
     """
     rho_v = depolarization_ratio(i_vv, i_vh, dark_count=dark_count)
     vv = i_vv - dark_count
     vh = i_vh - dark_count
 
-    # Validity against the physical range [0, 3/4] for vertical incident light.
-    physically_valid = (0.0 <= rho_v <= _RHO_V_DEPOLARIZATION_LIMIT)
+    # Validity against the physical range [0, 3/4) for vertical incident light. The
+    # limit itself is excluded: at rho_v = 3/4 the Cabannes factor is exactly 0
+    # (R_iso vanishes) and delta^2 is undefined, so the limit is not a value the
+    # method can meaningfully produce -- it takes the same branch as rho_v > 3/4.
+    physically_valid = (0.0 <= rho_v < _RHO_V_DEPOLARIZATION_LIMIT)
     notes = []
 
     # Natural-light equivalent and optical anisotropy. Guard the closed forms,
@@ -294,34 +302,12 @@ def isotropic_rayleigh_ratio(r_vv: float, rho_v: float) -> float:
 # ===========================================================================
 # Dynamic DDLS -- rotational diffusion from the VV/VH correlogram decay rates
 # ===========================================================================
-#
-# For an optically anisotropic scatterer in the small-qL regime the FIELD (g1)
-# correlation decay rates are (Zero & Pecora 1982, Eqs. III.1/III.2; the
-# rotational 6*Theta term from Pecora 1964):
-#
-#     Gamma_VV = q^2 D_t                 (polarized; translation only)
-#     Gamma_VH = q^2 D_t + 6 D_r         (depolarized; + rotational diffusion)
-#
-# so the rotational diffusion coefficient is D_r = (Gamma_VH - Gamma_VV) / 6, and
-# a multi-angle plot of Gamma_VV vs q^2 gives D_t (slope, through the origin).
-#
-# IMPORTANT: Gamma here is the FIELD decay rate (the g1 rate). A homodyne intensity
-# correlogram g2(tau)-1 = beta exp(-2 Gamma tau) decays at 2*Gamma; the cumulant
-# fitter (analysis.dls.fit_cumulants) already returns the field rate Gamma, so feed
-# THAT in -- do not pass an intensity (2*Gamma) rate, or D_r and D_t come out 2x.
-#
-# Recovery strategy (see test-data/Synthetic/DPLS/parameters.txt): take D_t from
-# the VV channel (Gamma_VV = q^2 D_t is the whole VV signal, cleanly measured), and
-# D_r from the per-angle difference (Gamma_VH - Gamma_VV)/6. Fitting D_t as the
-# SLOPE of Gamma_VH vs q^2 is ill-conditioned when rotation dominates (the slope is
-# tiny next to the 6 D_r intercept), so it is avoided here.
-#
-# Uncertainty (CLAUDE.md invariant 8): a SINGLE angle (one VV + one VH correlogram)
-# gives NO standard error -- each Gamma is from a single correlogram (Schaetzel
-# 1990). Across MULTIPLE angles the points are independent measurements, so the
-# through-origin regression SE on D_t and the spread (SD/sqrt(n)) of the per-angle
-# D_r are legitimate ensemble uncertainties (the same basis as the multi-angle
-# Zimm SE and the ISO 22412 replicate SE), and are reported with that label.
+
+# In the small-qL regime the FIELD (g1) decay rates are Gamma_VV = q^2 D_t and
+# Gamma_VH = q^2 D_t + 6 D_r, so D_r = (Gamma_VH - Gamma_VV) / 6 and a multi-angle plot of
+# Gamma_VV vs q^2 gives D_t. Sources, recovery strategy and uncertainty are on
+# `analyze_ddls`. IMPORTANT: Gamma is the FIELD rate; a homodyne intensity correlogram
+# decays at 2*Gamma.
 
 # qL above which the single-exponential VH form starts to break (higher rotational
 # modes / intramolecular interference appear). Zero & Pecora 1982: clean below ~3,
@@ -364,7 +350,7 @@ class DDLSResult:
     d_t_m2_s: float                    # slope of Gamma_VV vs q^2 (through origin)
     d_t_se: Optional[float]
     d_r_rad2_s: float                  # mean of d_r_per_angle
-    d_r_se: Optional[float]            # SD/sqrt(n) across angles; None for n < 2
+    d_r_se: Optional[float]            # SD/sqrt(n) across angles; None for n < 2 or zero spread
     rh_t_nm: float                     # Stokes-Einstein radius from D_t
     # Rh_t ∝ D_t^-1: the fractional error carries over exactly (sigma_Rh/Rh = sigma_D/D),
     # so this is the already-validated reciprocal pass-through of d_t_se (power_law_se,
@@ -377,8 +363,21 @@ class DDLSResult:
     method: str                        # 'multi-angle' | 'single-angle'
     single_exponential_valid: Optional[bool]
     notes: str = ''
+    # The D_r verdict as a FLAG plus its own sentence, alongside the joined `notes`
+    # prose. Consumers that ACT on the verdict (the export Comments cell, the GUI warning
+    # tier) read the flag; only the human-facing surfaces read the sentence, so a reword
+    # cannot disarm them and no consumer re-derives the condition for itself.
+    d_r_reliable: bool = True
+    reliability_note: str = ''
     se_estimator: str = 'hc3'          # covariance estimator behind d_t_se (the only
     #                                    regression SE here; d_r_se is a replicate SEM)
+    # The (T, eta) THIS result was computed with. Carried rather than looked up again,
+    # because the shape models (below) need the same pair: rh_t_nm here and the models'
+    # radii are both kT / 6 pi eta D, so two independent lookups can disagree and report
+    # a particle as non-spherical purely because they picked different viscosities.
+    # Optional only so an older cached/hand-built result still constructs.
+    temperature_K: Optional[float] = None
+    viscosity_Pa_s: Optional[float] = None
 
 
 def rotational_diffusion_from_rates(gamma_vv_s_inv: float,
@@ -387,8 +386,11 @@ def rotational_diffusion_from_rates(gamma_vv_s_inv: float,
 
         D_r = (Gamma_VH - Gamma_VV) / 6
 
-    Both inputs are FIELD (g1) decay rates in s^-1 (Pecora 1964; Zero & Pecora
-    1982). The result is in rad^2/s. A non-positive result (Gamma_VH <= Gamma_VV)
+    Both inputs are FIELD (g1) decay rates in s^-1. The combined VV/VH pair is Berne &
+    Pecora 2000, Eqs. 7.3.17-7.3.18 p.122; Zero & Pecora 1982, Eqs. III.1/III.2 is the
+    rod-specific restatement. (NB Pecora 1964 gives the translational and rotational
+    broadening only as SEPARATE limits, not this combined pair.) The result is in rad^2/s. A
+    non-positive result (Gamma_VH <= Gamma_VV)
     is unphysical for an anisotropic scatterer and signals noise, a mis-paired
     VV/VH, or an isotropic particle; it is returned as-is (possibly <= 0) so the
     caller can flag it rather than having it silently clamped.
@@ -425,8 +427,26 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
     -----
     D_t is the slope of Gamma_VV vs q^2 through the origin (robust; the VV signal
     is clean). D_r is the mean of the per-angle (Gamma_VH - Gamma_VV)/6 (each angle
-    an independent estimate of the q-independent rotational rate). See the module
-    notes for the uncertainty rationale.
+    an independent estimate of the q-independent rotational rate). Fitting D_t as the
+    SLOPE of Gamma_VH vs q^2 instead is ill-conditioned when rotation dominates -- the
+    slope is tiny next to the 6 D_r intercept -- so it is avoided.
+
+    Uncertainty (invariant 8): a SINGLE angle (one VV + one VH correlogram) gives NO
+    standard error, each Gamma coming from a single correlogram (Schaetzel 1990). Across
+    MULTIPLE angles the points are independent measurements, so the through-origin
+    regression SE on D_t and the spread (SD/sqrt(n)) of the per-angle D_r are legitimate
+    ensemble uncertainties -- the same basis as the multi-angle Zimm SE and the ISO 22412
+    replicate SE -- and are reported with that label.
+
+    Reliability of D_r (invariant 4): `d_r_reliable` is False, with `reliability_note`
+    naming each cause independently, when a per-angle rate is unphysical
+    (Gamma_VH <= Gamma_VV) OR when an angle had no VH rate at all (a NaN Gamma_VH from a
+    failed per-angle VH fit). The second cause matters because the mean tolerates it --
+    `replicate_mean_se` averages the angles that remain -- so a flag that could not see
+    the drop once let an all-NaN VH set ship D_r = NaN as reliable with an empty note.
+    The guard is sized to the operation it protects: whatever the mean silently drops,
+    the flag names. Flag-not-refuse: D_r stays the mean over the surviving angles, and
+    the note says how many contributed.
     """
     pts = sorted(points, key=lambda p: p.angle_deg)
     if len(pts) == 0:
@@ -434,17 +454,41 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
     # T and eta are needed ONLY for the Stokes-Einstein radius Rh_t; D_t, D_r and
     # the rotational time do not use them, so they are optional (Rh_t -> nan if
     # either is missing or non-positive).
+    # Every argument Stokes-Einstein will receive is gated here, not only D:
+    # `stokes_einstein_rh` refuses a non-finite D, T *or* eta, so an infinite T or eta
+    # reaching it raises -- the same escape the d_t gate below prevents, one argument over.
     have_t_and_eta = (temperature_K is not None and viscosity_Pa_s is not None
-                      and temperature_K > 0 and viscosity_Pa_s > 0)
+                      and math.isfinite(temperature_K) and temperature_K > 0
+                      and math.isfinite(viscosity_Pa_s) and viscosity_Pa_s > 0)
 
     angles = np.array([p.angle_deg for p in pts], dtype=float)
     q = np.array([p.q_m_inv for p in pts], dtype=float)
     g_vv = np.array([p.gamma_vv_s_inv for p in pts], dtype=float)
     g_vh = np.array([p.gamma_vh_s_inv for p in pts], dtype=float)
-    if np.any(q <= 0):
-        raise ValueError("every q_m_inv must be positive.")
-    if np.any(g_vv <= 0) or np.any(g_vh <= 0):
-        raise ValueError("every decay rate must be positive.")
+    # NaN and +inf are NOT equivalent on the decay rates, and the difference is
+    # load-bearing. NaN is TOLERATED: a failed VH cumulant fit at one angle yields a NaN
+    # Gamma, and D_r is a `replicate_mean_se` over the per-angle rates, which drops
+    # non-finite members -- so the remaining angles still give an honest D_r rather than
+    # the whole multi-angle run being refused. +inf must NOT pass: nothing downstream drops
+    # it, so it survives the mean, poisons the through-origin D_t fit, and Stokes-Einstein
+    # turns it into a plausible R_h = 0.0 nm. (q is different: computed from validated
+    # optics, never fitted, so it takes the full finite check.)
+    if not np.all(np.isfinite(q) & (q > 0)):
+        raise ValueError("every q_m_inv must be a positive finite number.")
+    # ...and the tolerance is stated PER CHANNEL, because the survival argument only holds
+    # for one of them. D_r is a replicate_mean_se over the per-angle (Gamma_VH - Gamma_VV),
+    # which drops non-finite members -- so a NaN VH rate costs that angle and no more.
+    # D_t is a through-origin fit of Gamma_VV vs q^2, which drops NOTHING: one NaN VV rate
+    # NaNs the whole D_t and R_h,t. Tolerating NaN there would be silent withholding, so
+    # VV takes the full finite check and VH does not.
+    if not np.all(np.isfinite(g_vv) & (g_vv > 0)):
+        raise ValueError(
+            "every Gamma_VV must be a positive finite number (the D_t fit drops no "
+            "points, so one bad angle would withhold D_t and R_h,t silently).")
+    if np.any((g_vh <= 0) | np.isinf(g_vh)):
+        raise ValueError(
+            "every Gamma_VH must be positive and finite; NaN from a failed per-angle VH "
+            "fit is tolerated and that angle is dropped from D_r.")
     q2 = q * q
     d_r_per_angle = (g_vh - g_vv) / 6.0
     n = len(pts)
@@ -463,23 +507,53 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
     # D_r from the per-angle differences (independent estimates of one rate).
     d_r_stats = unc.replicate_mean_se(list(d_r_per_angle))
     d_r = d_r_stats.mean
-    d_r_se = d_r_stats.sem                   # None for n < 2
+    d_r_se = d_r_stats.sem                   # None for n < 2 or a zero spread
 
-    if np.any(d_r_per_angle <= 0):
-        notes.append(
+    # Two INDEPENDENT preconditions on D_r, each stated on its own: the per-angle rate
+    # must be physical (Gamma_VH > Gamma_VV), and it must exist at all (a NaN is the
+    # angle `replicate_mean_se` silently drops -- see the Notes above for why the flag
+    # must see it). The NaN-vs-inf split of the guard above is kept: the unphysical
+    # sentence is about Gamma_VH <= Gamma_VV, so a dropped angle must not fire it, and
+    # +inf must. Consumers read the FLAG; the controller's shape-model entry guard
+    # deliberately re-checks positivity on the AGGREGATE D_r instead (coarser: a flagged
+    # mean keeps computing, caveat in Comments -- owner-ruled 2026-08-10).
+    unphysical = bool(np.any((d_r_per_angle <= 0) | np.isinf(d_r_per_angle)))
+    n_dropped = int(np.count_nonzero(np.isnan(d_r_per_angle)))
+    d_r_reliable = (not unphysical) and n_dropped == 0
+    # The word "unphysical" is pinned by test_pathology_surfaces_at_the_export_layer.
+    d_r_reasons: List[str] = []
+    if unphysical:
+        d_r_reasons.append(
             "at least one angle has Gamma_VH <= Gamma_VV (D_r <= 0), which is "
             "unphysical for an anisotropic scatterer -- check the VV/VH pairing, "
             "the signal-to-noise, or whether the particle is optically isotropic.")
+    if n_dropped == n:
+        d_r_reasons.append(
+            f"no angle has a VH decay rate (the VH cumulant fit failed at all {n} "
+            f"angle{'s' if n != 1 else ''}), so there is no D_r -- refit the VH "
+            f"correlograms or check the VH channel's signal.")
+    elif n_dropped:
+        d_r_reasons.append(
+            f"{n_dropped} of {n} angles had no VH decay rate (the VH cumulant fit "
+            f"failed there) and were dropped, so D_r and its SE are the mean over the "
+            f"remaining {n - n_dropped} angle{'s' if n - n_dropped != 1 else ''}.")
+    d_r_note = ' '.join(d_r_reasons)
+    if d_r_note:
+        notes.append(d_r_note)
 
     # Stokes-Einstein radius from D_t (translational), and the VH relaxation time.
+    # isfinite as well as > 0: +inf passes a bare `> 0` and Stokes-Einstein would return a
+    # finite, plausible Rh = 0.0 nm (2026-07-31 spec-01). The physics function now refuses
+    # a non-finite D, so without this gate the refusal would escape as a ValueError.
     rh_t_nm = (stokes_einstein_rh(d_t, temperature_K, viscosity_Pa_s) * 1e9
-               if (have_t_and_eta and d_t > 0) else float('nan'))
+               if (have_t_and_eta and math.isfinite(d_t) and d_t > 0) else float('nan'))
     # Rh_t inherits d_t_se by the exact fractional relation (Rh_t ∝ D_t^-1), the same
     # already-validated reciprocal pass-through used for GammaQ2Result.rh_se (invariant 8;
     # no separate MC gate needed -- see power_law_se's carve-out note). None when d_t_se is.
     rh_t_se = (unc.power_law_se(rh_t_nm, d_t, d_t_se, -1)
                if math.isfinite(rh_t_nm) else None)
-    rotational_time_s = (1.0 / (6.0 * d_r)) if d_r > 0 else float('nan')
+    rotational_time_s = (1.0 / (6.0 * d_r) if (math.isfinite(d_r) and d_r > 0)
+                         else float('nan'))
 
     # qL single-exponential guard (only if a rod length is known).
     qL = None
@@ -507,32 +581,19 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
         d_r_rad2_s=d_r, d_r_se=d_r_se,
         rh_t_nm=rh_t_nm, rh_t_se=rh_t_se, rotational_time_s=rotational_time_s,
         n_angles=n, method=method, single_exponential_valid=single_exp_valid,
-        notes=' '.join(notes), se_estimator=estimator)
+        notes=' '.join(notes), d_r_reliable=d_r_reliable, reliability_note=d_r_note,
+        se_estimator=estimator,
+        temperature_K=temperature_K, viscosity_Pa_s=viscosity_Pa_s)
 
 
 # ===========================================================================
 # Shape models (DPLS Phase 3) -- particle dimensions from D_t and D_r
 # ===========================================================================
 #
-# This is the model-DEPENDENT inverse: D_t and D_r are shape-free observables, but
-# turning them into dimensions assumes a geometry. Two models are offered:
-#
-#   * sphere (1 unknown): R from D_r via Stokes-Einstein-Debye; for a TRUE sphere
-#     it equals the translational (Stokes) radius Rh, so their ratio is a sphericity
-#     check. Appropriate for near-spherical anisotropic particles (Balog et al. 2015).
-#   * rigid rod (2 unknowns): length L and diameter d from (D_t, D_r) by inverting
-#     the Tirado (1984) cylinder relations. Exactly determined; solved numerically.
-#
-# Outputs are dimensions of an ASSUMED shape, NOT measurements: the result objects
-# carry that caveat and a goodness/validity flag so the GUI never presents an L as
-# if it were observed. The two models read together diagnose the shape -- a sphere
-# consistency far from 1 says "not a sphere; use the rod", and vice versa.
-#
-# Uncertainty: SEs on D_t / D_r propagate to the dimensions. The sphere radius is a
-# closed-form power law (delta method). The rod inverse is nonlinear with no closed
-# form, so its SEs are propagated by MONTE CARLO (sample D_t, D_r from their SEs,
-# invert each, take the spread) -- which is the sampling SD directly, so there is no
-# linearization to validate separately (CLAUDE.md invariant 8).
+# The model-DEPENDENT inverse: D_t and D_r are shape-free observables, but turning them into
+# dimensions assumes a geometry. Outputs are dimensions of an ASSUMED shape, NOT measurements
+# -- each result object carries that caveat and a validity flag so the GUI never presents an
+# L as if it were observed. Read together the models diagnose the shape.
 
 
 @dataclass
@@ -545,6 +606,11 @@ class SphereShapeResult:
     sphericity_ratio: float         # radius_rot / radius_trans (1 for a true sphere)
     is_consistent: bool             # |ratio - 1| within tolerance -> sphere plausible
     note: str = ''
+    # The covariance estimator behind `radius_trans_se` -- a strict pass-through of the
+    # DDLS `d_t_se`, which is HC3 or the classical-OLS opt-in at the user's choice. The
+    # tag travels with the ± onto every surface that prints it (invariant 8 clause A);
+    # `radius_rot_se` is a replicate SEM and has no estimator.
+    se_estimator: str = 'hc3'
 
 
 @dataclass
@@ -559,6 +625,48 @@ class RodShapeResult:
     in_valid_range: bool            # 2 < p < 30 (Tirado fitted range)
     converged: bool                 # a rod reproduces both D_t and D_r
     note: str = ''
+    # The covariance estimator behind the DDLS `d_t_se` the Monte Carlo draws from
+    # (invariant 8 clause A: the ± travels with the estimator that produced it).
+    se_estimator: str = 'hc3'
+    # The Monte-Carlo census behind the three ± -- how many (D_t, D_r) draws were
+    # taken, how many a rigid rod actually reproduced, and the seed. The ± is the SD
+    # over the draws that solved, so the count is part of what the ± means: a draw
+    # fails only when the pair lies outside the rod model (a negative rate, or a D_r
+    # faster than any rod with that D_t admits). Zero draws when no SEs were given.
+    mc_n_draws: int = 0
+    mc_n_used: int = 0
+    mc_seed: Optional[int] = None
+
+
+@dataclass
+class EllipsoidShapeResult:
+    """Ellipsoid-of-revolution dimensions from D_t and D_r (model-dependent).
+
+    Perrin friction: translation Tanford 1961 (Eqs. 19-14/19-15), rotation Koenig
+    1975 (Eq. 9, correcting Perrin 1934). One solution per fitting branch -- a
+    given (D_t, D_r) admits up to THREE ellipsoids (1 prolate + 2 oblate; the
+    oblate D_perp is non-monotonic), so ellipsoid_dimensions_from_diffusion
+    returns a LIST of these and `degenerate` is set when more than one fits.
+    """
+    semi_axis_polar_nm: float           # a (polar / symmetry-axis semi-axis)
+    semi_axis_polar_se: Optional[float]
+    equatorial_radius_nm: float         # b (equatorial radius)
+    equatorial_radius_se: Optional[float]
+    axial_ratio_p: float                # p = a/b (>1 prolate, <1 oblate)
+    axial_ratio_se: Optional[float]
+    is_prolate: bool
+    in_valid_range: bool                # 0.1 < p < 10 (Koenig tabulated range)
+    converged: bool                     # an ellipsoid reproduces both D_t and D_r
+    degenerate: bool                    # >1 ellipsoid fits this (D_t, D_r)
+    note: str = ''
+    # As on RodShapeResult: the estimator behind the DDLS `d_t_se` the draws come from,
+    # and the Monte-Carlo census PER SOLUTION (a draw counts for this branch only when
+    # its re-solve has a root nearest this branch's p -- see the matching rule in
+    # `ellipsoid_dimensions_from_diffusion`).
+    se_estimator: str = 'hc3'
+    mc_n_draws: int = 0
+    mc_n_used: int = 0
+    mc_seed: Optional[int] = None
 
 
 def sphere_dimensions_from_diffusion(
@@ -566,24 +674,38 @@ def sphere_dimensions_from_diffusion(
         temperature_K: float, viscosity_Pa_s: float,
         d_t_se: Optional[float] = None,
         d_r_se: Optional[float] = None,
-        sphericity_tol: float = 0.15) -> SphereShapeResult:
+        sphericity_tol: float = 0.15,
+        se_estimator: str = 'hc3') -> SphereShapeResult:
     """Sphere-model radii from D_t and D_r, with a sphericity consistency check.
 
     R_rot comes from D_r (Stokes-Einstein-Debye, R = (kT/8 pi eta D_r)^1/3); R_trans
     is the ordinary Stokes radius from D_t (= Rh). For a true sphere they are equal,
     so `sphericity_ratio` = R_rot/R_trans should be ~1; a ratio outside
     1 +/- `sphericity_tol` flags that the particle is not spherical (e.g. a rod,
-    where R_rot > R_trans). R_rot's SE propagates from D_r by the delta method
+    where R_rot > R_trans). One unknown, and appropriate for near-spherical anisotropic
+    particles (Balog et al. 2015). R_rot's SE propagates from D_r by the delta method
     (R ∝ D_r^(-1/3) -> SE(R)/R = (1/3) SE(D_r)/D_r); R_trans's SE propagates from D_t as
     the reciprocal Stokes radius (R_trans ∝ D_t^-1 -> SE(R)/R = SE(D_t)/D_t), the same
     already-validated pass-through as the DLS-angular Rh_se / DDLS rh_t_se (invariant 8).
+    `se_estimator` names the covariance estimator behind `d_t_se` (the DDLS result's
+    own tag) and is recorded on the result so R_trans's ± never travels unlabelled.
     """
     r_rot_nm = phys.sphere_radius_from_rotational_diffusion(
         d_r_rad2_s, temperature_K, viscosity_Pa_s) * 1e9
     r_trans_nm = stokes_einstein_rh(d_t_m2_s, temperature_K, viscosity_Pa_s) * 1e9
-    ratio = r_rot_nm / r_trans_nm if r_trans_nm > 0 else float('nan')
-    r_rot_se = (r_rot_nm * (1.0 / 3.0) * (d_r_se / d_r_rad2_s)
-                if (d_r_se is not None and d_r_rad2_s > 0) else None)
+    # isfinite: an infinite R_trans gives sphericity_ratio = 0.0, and the
+    # 'outside 1 +/- tol -> not spherical' verdict is then issued on that 0.0.
+    ratio = (r_rot_nm / r_trans_nm
+             if (math.isfinite(r_trans_nm) and r_trans_nm > 0) else float('nan'))
+    # Both ± legs gate on the finiteness of the VALUE they qualify, not on their input
+    # rate: gating on the rate admits +inf, and an infinite D_r would give
+    # radius_rot = 0.00 nm ± 0.00 -- a ± of zero on a size of zero, from a rate that is not
+    # a number. Both go through the SAME shared helper with the same gate, so they are
+    # identical bar the exponent (R_rot ∝ D_r^(-1/3), R_trans ∝ D_t^-1), and `power_law_se`
+    # carries the x == 0 and non-finite-SE handling a hand-rolled form would not
+    # (invariant 8: a ± comes from the shared toolkit).
+    r_rot_se = (unc.power_law_se(r_rot_nm, d_r_rad2_s, d_r_se, -1.0 / 3.0)
+                if math.isfinite(r_rot_nm) else None)
     r_trans_se = (unc.power_law_se(r_trans_nm, d_t_m2_s, d_t_se, -1)
                   if math.isfinite(r_trans_nm) else None)
     consistent = math.isfinite(ratio) and abs(ratio - 1.0) <= sphericity_tol
@@ -595,7 +717,52 @@ def sphere_dimensions_from_diffusion(
     return SphereShapeResult(
         radius_rot_nm=r_rot_nm, radius_rot_se=unc.se_or_none(r_rot_se),
         radius_trans_nm=r_trans_nm, radius_trans_se=unc.se_or_none(r_trans_se),
-        sphericity_ratio=ratio, is_consistent=consistent, note=note)
+        sphericity_ratio=ratio, is_consistent=consistent, note=note,
+        se_estimator=se_estimator)
+
+
+def _same_sign(a: float, b: float) -> bool:
+    """Do two finite residuals share a sign, so that NO root is bracketed between them?
+
+    A residual of exactly ZERO means the root is AT that endpoint, so the bracket is
+    valid and this must answer False. `math.copysign` alone cannot say that: it reports
+    +1 for `0.0` and -1 for `-0.0`, so this function's FIRST version bailed on `(0.0, 5.0)`
+    while proceeding on `(0.0, -5.0)` -- the same bracket, opposite answers, decided by the
+    sign bit of a zero. `brentq` accepts `f(a) == 0` and returns that endpoint, so bailing
+    there throws away an exact solution and reports "the rod model does not fit". A zero is
+    also reachable by UNDERFLOW.
+
+    Written as a sign comparison, NOT as ``a * b > 0``. The product form is the sheet's
+    own model defect: it UNDERFLOWS to exactly 0.0 for same-signed values around 1e-200
+    (at 1e-160 the product is 1e-320 -- subnormal but non-zero, so still ``> 0``; the
+    magnitude that reaches bitwise zero is two decades further down, which is what the
+    companion test drives), so ``a * b > 0`` reads False, the "no sign change, bail out"
+    branch does not fire, and
+    `brentq` is called on a bracket it rejects -- raising ``ValueError`` from OUTSIDE the
+    ``try`` that wraps the residual evaluations. (It overflows to ``inf`` at the other
+    tail, which happens to read True, so only one end was broken -- the usual asymmetry.)
+
+    The question the guard is asking is about SIGNS, and signs are exact at every
+    magnitude: expressing the predicate on the raw inputs removes both tails instead of
+    guarding one (CLAUDE.md rule 12).
+    Shared by the rod and ellipsoid solvers so the two cannot drift apart (rule 10).
+    """
+    if a == 0.0 or b == 0.0:
+        return False                       # the root is at an endpoint: bracket is valid
+    return math.copysign(1.0, a) == math.copysign(1.0, b)
+
+
+# The rod inverse's fallback bracket in p = L/d. p > 1 is the cylinder domain (L > d);
+# the upper end is a float-range ceiling, not a physical one -- the Tirado forms are
+# monotone in ln p out to any p a float holds, and the Monte-Carlo tail below needs the
+# whole domain open (see `_solve_rod_pld`). The same shape as the ellipsoid pair below.
+_ROD_P_BRACKET_LO: float = 1.0 + 1e-4
+_ROD_P_BRACKET_HI: float = 1e9
+# The ellipsoid inverse's outer brackets in p = a/b, prolate (> 1) and oblate (< 1). The
+# Perrin factors are defined on all of p > 0; the old [0.01, 100] window clipped the
+# same Monte-Carlo tail the rod window did.
+_ELLIPSOID_P_PROLATE_HI: float = 1e4
+_ELLIPSOID_P_OBLATE_LO: float = 1e-4
 
 
 def _solve_rod_pld(d_t_m2_s: float, d_r_rad2_s: float,
@@ -605,8 +772,19 @@ def _solve_rod_pld(d_t_m2_s: float, d_r_rad2_s: float,
     Reduces the 2-D (L, d) system to a 1-D root find in the aspect ratio p: at any
     p, D_t fixes L (rod_length_from_translational_diffusion), then the predicted D_r
     is monotonic decreasing in p, so D_r(p) - D_r_measured has at most one root. Try
-    the Tirado-valid window first, then a wider range (flagged out-of-range).
-    Returns (L_nm, d_nm, p, in_valid_range) or None if no rod fits.
+    the Tirado-valid window first, then the whole range a cylinder admits (flagged
+    out-of-range). Returns (L_nm, d_nm, p, in_valid_range) or None if no rod fits.
+
+    The fallback bracket is the full domain of the Tirado forms (p > 1, where L > d;
+    the end corrections are defined for every positive p), not a convenient window.
+    It used to be [1.05, 200], and that clip fell exactly on the Monte-Carlo tail of
+    `rod_dimensions_from_diffusion`: a (D_t, D_r) draw with a slightly slow D_r has a
+    very large p, and dropping those draws made the reported ± the SD of a censored
+    sample -- it stopped tracking the input ± and could shrink as the input ± grew.
+    With the bracket open, a draw fails only when NO cylinder reproduces it (D_r faster
+    than the p -> 1 limit for that D_t) -- the model's own boundary. The remaining end is
+    a FLOAT ceiling, not a physical one: a D_r slow enough to need p > 1e9 is still lost,
+    which is far outside any rod light scattering sizes.
     """
     def dr_residual(p):
         length_m = phys.rod_length_from_translational_diffusion(
@@ -620,14 +798,14 @@ def _solve_rod_pld(d_t_m2_s: float, d_r_rad2_s: float,
             f_lo, f_hi = dr_residual(lo), dr_residual(hi)
         except (ValueError, ZeroDivisionError):
             return None
-        if not (math.isfinite(f_lo) and math.isfinite(f_hi)) or f_lo * f_hi > 0:
+        if not (math.isfinite(f_lo) and math.isfinite(f_hi)) or _same_sign(f_lo, f_hi):
             return None
         return optimize.brentq(dr_residual, lo, hi, xtol=1e-9, rtol=1e-12)
 
     p = solve_in(phys.ROD_ASPECT_RATIO_MIN, phys.ROD_ASPECT_RATIO_MAX)
     in_range = p is not None
-    if p is None:                                   # try a wider, flagged range
-        p = solve_in(1.05, 200.0)
+    if p is None:                                   # the whole cylinder domain, flagged
+        p = solve_in(_ROD_P_BRACKET_LO, _ROD_P_BRACKET_HI)
     if p is None:
         return None
     length_m = phys.rod_length_from_translational_diffusion(
@@ -639,15 +817,26 @@ def rod_dimensions_from_diffusion(
         d_t_m2_s: float, d_r_rad2_s: float, *,
         temperature_K: float, viscosity_Pa_s: float,
         d_t_se: Optional[float] = None, d_r_se: Optional[float] = None,
-        n_mc: int = 2000, seed: int = 12345) -> RodShapeResult:
+        n_mc: int = 2000, seed: int = 12345,
+        se_estimator: str = 'hc3') -> RodShapeResult:
     """Rigid-cylinder length and diameter from D_t and D_r (Tirado 1984 inverse).
 
     Solves the 2-D problem via the 1-D reduction in `_solve_rod_pld`. When both SEs
     are given, the dimension SEs are propagated by Monte Carlo: sample D_t, D_r from
     independent normals, invert each, and take the spread (the sampling SD -- no
-    linearization). `in_valid_range` is False when the recovered p falls outside the
-    Tirado-fitted 2 < p < 30 (the dimensions are then extrapolated); `converged` is
-    False when no rod reproduces both coefficients (the rod model does not fit).
+    linearization) over the draws a rigid rod reproduces. That census is recorded on
+    the result (`mc_n_draws`, `mc_n_used`, `mc_seed`) because it is part of what the
+    ± means: a draw is lost only where the pair leaves the rod model altogether (a
+    negative rate, or a D_r faster than any cylinder with that D_t admits -- the p -> 1
+    limit), not to the old aspect-ratio window; the surviving bracket end is a float
+    ceiling far outside any physical rod (see `_solve_rod_pld`). The aspect ratio's
+    distribution is heavy-tailed at large input SEs (a slow D_r draw means a very long
+    thin rod), so `aspect_ratio_se` can be large next to the point estimate -- that is
+    the honest spread, not a defect; L and d stay well behaved. `se_estimator` is the
+    DDLS result's tag for the `d_t_se` fed in, carried so the ± travels labelled.
+    `in_valid_range` is False when the recovered p falls outside the Tirado-fitted
+    2 < p < 30 (the dimensions are then extrapolated); `converged` is False when no
+    rod reproduces both coefficients (the rod model does not fit).
     """
     solved = _solve_rod_pld(d_t_m2_s, d_r_rad2_s, temperature_K, viscosity_Pa_s)
     if solved is None:
@@ -656,14 +845,18 @@ def rod_dimensions_from_diffusion(
             diameter_se=None, aspect_ratio_p=float('nan'), aspect_ratio_se=None,
             in_valid_range=False, converged=False,
             note='No rigid rod reproduces both D_t and D_r -- the rod model does not '
-                 'fit (the particle may be flexible, branched, or non-rod-like).')
+                 'fit (the particle may be flexible, branched, or non-rod-like).',
+            se_estimator=se_estimator)
     length_nm, diameter_nm, p, in_range = solved
 
     length_se = diameter_se = p_se = None
+    n_draws = n_used = 0
+    mc_seed: Optional[int] = None
     if d_t_se is not None and d_r_se is not None and d_t_se > 0 and d_r_se > 0:
         rng = np.random.default_rng(seed)
+        n_draws, mc_seed = int(n_mc), int(seed)
         Ls, ds, ps = [], [], []
-        for _ in range(int(n_mc)):
+        for _ in range(n_draws):
             dt = float(rng.normal(d_t_m2_s, d_t_se))
             dr = float(rng.normal(d_r_rad2_s, d_r_se))
             if dt <= 0 or dr <= 0:
@@ -671,7 +864,8 @@ def rod_dimensions_from_diffusion(
             s = _solve_rod_pld(dt, dr, temperature_K, viscosity_Pa_s)
             if s is not None:
                 Ls.append(s[0]); ds.append(s[1]); ps.append(s[2])
-        if len(Ls) >= 2:
+        n_used = len(Ls)
+        if n_used >= 2:
             length_se = unc.se_or_none(float(np.std(Ls, ddof=1)))
             diameter_se = unc.se_or_none(float(np.std(ds, ddof=1)))
             p_se = unc.se_or_none(float(np.std(ps, ddof=1)))
@@ -685,4 +879,186 @@ def rod_dimensions_from_diffusion(
         length_nm=length_nm, length_se=length_se,
         diameter_nm=diameter_nm, diameter_se=diameter_se,
         aspect_ratio_p=p, aspect_ratio_se=p_se,
-        in_valid_range=in_range, converged=True, note=note)
+        in_valid_range=in_range, converged=True, note=note,
+        se_estimator=se_estimator,
+        mc_n_draws=n_draws, mc_n_used=n_used, mc_seed=mc_seed)
+
+
+def _ellipsoid_oblate_peak_p() -> float:
+    """p* where the oblate branch's D_perp(p) at fixed D_t peaks (~0.722).
+
+    D_perp|_{D_t} is a pure shape function of the axial ratio (proportional to
+    (f/f0)^3/(C2/C0), independent of D_t, T, eta), so p* is a universal constant of
+    the Perrin factors. Computed once here (not transcribed) so the oblate-solve split
+    is exactly on the peak -- a slightly-off split could fail to bracket a root sitting
+    right at the maximum. Any fixed (D_t, T, eta) gives the same p*.
+    """
+    def neg_dperp(p):
+        a_m, b_m = phys.ellipsoid_semi_axes_from_translational_diffusion(
+            1e-11, p, 298.15, 1e-3)
+        return -phys.ellipsoid_rotational_diffusion(a_m, b_m, 298.15, 1e-3)
+    return float(optimize.minimize_scalar(
+        neg_dperp, bounds=(0.15, 0.999), method='bounded').x)
+
+
+# The oblate branch is non-monotonic; it is split at its (D_t-independent) peak into
+# two monotonic sub-intervals so each brackets at most one root.
+_ELLIPSOID_OBLATE_PEAK_P: float = _ellipsoid_oblate_peak_p()
+
+
+def _solve_ellipsoid_axes(d_t_m2_s: float, d_r_rad2_s: float,
+                          temperature_K: float, viscosity_Pa_s: float):
+    """Every ellipsoid of revolution reproducing D_t and D_r (0-3 of them).
+
+    At fixed D_t each axial ratio p fixes the size (ellipsoid_semi_axes_from_
+    translational_diffusion); the predicted D_perp is then matched to the measured
+    value. The prolate branch (p>1) is monotonic in p (<=1 root); the oblate branch
+    (p<1) has an interior maximum at _ELLIPSOID_OBLATE_PEAK_P, so it is split there
+    into two monotonic pieces and can yield up to two roots. Returns a list of
+    (a_nm, b_nm, p, is_prolate, in_valid_range) sorted by p, near-p duplicates
+    (the shared sphere limit) merged.
+    """
+    def residual(p):
+        a_m, b_m = phys.ellipsoid_semi_axes_from_translational_diffusion(
+            d_t_m2_s, p, temperature_K, viscosity_Pa_s)
+        return phys.ellipsoid_rotational_diffusion(
+            a_m, b_m, temperature_K, viscosity_Pa_s) - d_r_rad2_s
+
+    def root_in(lo, hi):
+        # Each interval is monotonic in D_perp(p), so an endpoint sign change
+        # brackets the single root.
+        try:
+            f_lo, f_hi = residual(lo), residual(hi)
+        except (ValueError, ZeroDivisionError):
+            return None
+        if not (math.isfinite(f_lo) and math.isfinite(f_hi)) or _same_sign(f_lo, f_hi):
+            return None
+        return optimize.brentq(residual, lo, hi, xtol=1e-12, rtol=1e-12)
+
+    ps = []
+    r = root_in(1.0 + 1e-4, _ELLIPSOID_P_PROLATE_HI)     # prolate (monotonic)
+    if r is not None:
+        ps.append(r)
+    for lo, hi in ((_ELLIPSOID_OBLATE_PEAK_P, 1.0 - 1e-4),   # oblate, near-sphere side
+                   (_ELLIPSOID_P_OBLATE_LO, _ELLIPSOID_OBLATE_PEAK_P)):  # oblate, far side
+        r = root_in(lo, hi)
+        if r is not None:
+            ps.append(r)
+
+    out = []
+    for p in sorted(ps):
+        a_m, b_m = phys.ellipsoid_semi_axes_from_translational_diffusion(
+            d_t_m2_s, p, temperature_K, viscosity_Pa_s)
+        out.append((a_m * 1e9, b_m * 1e9, p, p > 1.0,
+                    phys.ellipsoid_aspect_ratio_valid(p)))
+    merged = []
+    for sol in out:                                     # drop the shared p~1 duplicate
+        if merged and abs(sol[2] - merged[-1][2]) < 1e-3:
+            continue
+        merged.append(sol)
+    return merged
+
+
+def ellipsoid_dimensions_from_diffusion(
+        d_t_m2_s: float, d_r_rad2_s: float, *,
+        temperature_K: float, viscosity_Pa_s: float,
+        d_t_se: Optional[float] = None, d_r_se: Optional[float] = None,
+        n_mc: int = 2000, seed: int = 12345,
+        se_estimator: str = 'hc3') -> List[EllipsoidShapeResult]:
+    """Ellipsoid-of-revolution semi-axes from D_t and D_r (Perrin inverse).
+
+    Returns a LIST of EllipsoidShapeResult -- one per ellipsoid that reproduces
+    both coefficients (Tanford 1961 translation + Koenig 1975 rotation via
+    `_solve_ellipsoid_axes`). A given (D_t, D_r) admits up to three (1 prolate +
+    2 oblate); every fitting solution is returned, `degenerate` is set when more
+    than one does, and none is silently preferred. No ellipsoid fitting -> a single
+    `converged=False` NaN sentinel (never an empty list). When both SEs are given,
+    each solution's dimension SEs are Monte-Carlo-propagated (sample D_t, D_r from
+    independent normals, re-solve, match each draw's roots to the nearest base
+    solution by p, take the spread) -- the same MC pattern as the rod, locked per
+    solution so the branches do not cross-contaminate. Each solution records its own
+    census (`mc_n_draws`, `mc_n_used`, `mc_seed`): a draw counts for a branch only
+    when its re-solve has a root nearest that branch, so a branch that exists for a
+    minority of draws reports a ± over that minority and says so. The brackets are
+    the full p > 0 domain of the Perrin factors, so a draw is lost to the model's own
+    boundary rather than to a shape window (the same censoring the rod inverse had); the
+    surviving bracket ends are float limits far outside any physical particle.
+    `se_estimator` is the DDLS result's tag for the `d_t_se` fed in. `in_valid_range`
+    is False outside Koenig's tabulated 0.1 < p < 10 (dimensions then extrapolated).
+    """
+    solved = _solve_ellipsoid_axes(d_t_m2_s, d_r_rad2_s,
+                                   temperature_K, viscosity_Pa_s)
+    if not solved:
+        return [EllipsoidShapeResult(
+            semi_axis_polar_nm=float('nan'), semi_axis_polar_se=None,
+            equatorial_radius_nm=float('nan'), equatorial_radius_se=None,
+            axial_ratio_p=float('nan'), axial_ratio_se=None,
+            is_prolate=False, in_valid_range=False, converged=False,
+            degenerate=False,
+            note='No ellipsoid of revolution reproduces both D_t and D_r -- the '
+                 'ellipsoid model does not fit (try the rod or sphere models).',
+            se_estimator=se_estimator)]
+
+    degenerate = len(solved) > 1
+    base_ps = [s[2] for s in solved]
+    ses = [(None, None, None) for _ in solved]
+    n_used = [0 for _ in solved]
+    n_draws = 0
+    mc_seed: Optional[int] = None
+    if d_t_se is not None and d_r_se is not None and d_t_se > 0 and d_r_se > 0:
+        rng = np.random.default_rng(seed)
+        n_draws, mc_seed = int(n_mc), int(seed)
+        samples = [[] for _ in solved]
+        log_base = [math.log(bp) for bp in base_ps]
+        for _ in range(n_draws):
+            dt = float(rng.normal(d_t_m2_s, d_t_se))
+            dr = float(rng.normal(d_r_rad2_s, d_r_se))
+            if dt <= 0 or dr <= 0:
+                continue
+            # Assign each draw's roots to their nearest base solution by log(p), but keep
+            # only the CLOSEST root per base. Near an existence fold a draw can gain a
+            # branch the base set lacks (e.g. an oblate root when the base is a lone
+            # prolate); absorbing that far root into an unrelated base would grossly
+            # inflate its dimension SE (invariant 8, non-conservative over-report). The
+            # closest-per-base rule drops those spurious extra roots.
+            best = {}                               # base index -> (log-dist, (a,b,p))
+            for a_nm, b_nm, p, _is_pro, _in in _solve_ellipsoid_axes(
+                    dt, dr, temperature_K, viscosity_Pa_s):
+                lp = math.log(p)
+                j = min(range(len(log_base)), key=lambda k: abs(lp - log_base[k]))
+                dist = abs(lp - log_base[j])
+                if j not in best or dist < best[j][0]:
+                    best[j] = (dist, (a_nm, b_nm, p))
+            for j, (_dist, sol) in best.items():
+                samples[j].append(sol)
+        for j, s in enumerate(samples):
+            n_used[j] = len(s)
+            if len(s) >= 2:
+                arr = np.asarray(s)
+                ses[j] = (unc.se_or_none(float(np.std(arr[:, 0], ddof=1))),
+                          unc.se_or_none(float(np.std(arr[:, 1], ddof=1))),
+                          unc.se_or_none(float(np.std(arr[:, 2], ddof=1))))
+
+    results = []
+    for (a_nm, b_nm, p, is_pro, in_range), (a_se, b_se, p_se), used in zip(
+            solved, ses, n_used, strict=True):
+        note = ''
+        if not in_range:
+            note = (f'axial ratio p = {p:.2f} is outside Koenig (1975) tabulated '
+                    f'range 0.1 < p < 10; the dimensions are extrapolated and '
+                    f'should be treated with caution.')
+        if degenerate:
+            kind = 'prolate' if is_pro else 'oblate'
+            note = ((note + ' ' if note else '')
+                    + f'this (D_t, D_r) is also consistent with '
+                      f'{len(solved) - 1} other ellipsoid'
+                      f'{"s" if len(solved) > 2 else ""} '
+                      f'({kind} solution shown).')
+        results.append(EllipsoidShapeResult(
+            semi_axis_polar_nm=a_nm, semi_axis_polar_se=a_se,
+            equatorial_radius_nm=b_nm, equatorial_radius_se=b_se,
+            axial_ratio_p=p, axial_ratio_se=p_se,
+            is_prolate=is_pro, in_valid_range=in_range, converged=True,
+            degenerate=degenerate, note=note, se_estimator=se_estimator,
+            mc_n_draws=n_draws, mc_n_used=used, mc_seed=mc_seed))
+    return results

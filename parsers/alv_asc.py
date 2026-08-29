@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -64,6 +65,7 @@ from parsers.base_parser import (
     BaseTraceParser,
     DLSFilePreview,
     TraceFilePreview,
+    MalformedDataError,
     ParseError,
     convert_delay_times,
     convert_viscosity,
@@ -74,6 +76,7 @@ _KHZ_TO_CPS = 1000.0                 # 1 kHz of photon counts = 1000 counts/s
 _SECTION_CORRELATION = '"Correlation"'
 _SECTION_COUNT_RATE = '"Count Rate"'
 _ANGLE_KEY_RE = re.compile(r'^Angle\((\d+)\)')
+_MEANCR_KEY_RE = re.compile(r'^MeanCR(\d+)\b')
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +90,10 @@ class _ALVChannel:
     angle_deg: float
     correlogram: np.ndarray          # g2(tau) - 1
     count_rates_cps: np.ndarray      # count-rate trace, converted to cps
+    # The file's OWN mean count rate for this channel (its MeanCR scalar), in cps.
+    # None when the file did not record a usable one. A record of what the vendor
+    # reported, never a substitute for the trace's own mean.
+    mean_count_rate_cps: Optional[float] = None
 
 
 @dataclass
@@ -102,19 +109,34 @@ class _ALVData:
     trace_times_s: np.ndarray        # count-rate trace time (s)
     channels: List[_ALVChannel]
     source_file: str
+    # The run's NOMINAL length from the header, in seconds. Not the trace's own
+    # span: a file reporting 10 s carries a Count Rate section covering 9.88 s.
+    duration_s: Optional[float] = None
+    # Passive load-time notices (a data block cut short by a bad row), carried onto
+    # every preview built from this file.
+    notes: tuple = ()
 
 
 def _read_lines(file_path: str) -> List[str]:
-    """Read the file as latin-1 (FileNotFoundError propagates, per the contract)."""
-    with open(file_path, encoding=_ENCODING, newline='') as fh:
-        return fh.read().splitlines()
+    """Read the file as latin-1. A missing file is FileNotFoundError (the contract);
+    any other OS refusal -- a file the acquisition software still holds open, a share
+    the user can list but not read -- is a plain ParseError, the one class `autodetect`
+    skips past. This parser is first in the DLS list, so a bare OSError here escaped
+    the whole load, for every format."""
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File not found: {file_path!r}")
+    try:
+        with open(file_path, encoding=_ENCODING, newline='') as fh:
+            return fh.read().splitlines()
+    except OSError as exc:
+        raise ParseError(f"Could not read {file_path!r}: {exc}") from exc
 
 
 def _find_section(lines: List[str], marker: str, start: int = 0) -> int:
     for i in range(start, len(lines)):
         if lines[i].strip() == marker:
             return i
-    raise ParseError(f"ALV file is missing its {marker} section.")
+    raise MalformedDataError(f"ALV file is missing its {marker} section.")
 
 
 def _parse_header_block(header_lines: List[str]) -> Dict[str, str]:
@@ -140,6 +162,35 @@ def _get(header: Dict[str, str], prefix: str) -> Optional[str]:
     return None
 
 
+def _mean_count_rates_cps(header: Dict[str, str]) -> List[Optional[float]]:
+    """The file's own per-channel mean count rates, in cps, in COLUMN order.
+
+    The MeanCR keys are POSITIONAL, not detector-numbered: the k-th key (sorted by
+    its integer suffix) describes Count Rate column k, whatever that suffix happens
+    to be. Measured 2026-08-14 against all three real ALV families -- the ALV-7012
+    multi-angle files number them `MeanCR1..12` while both ALV-7004 families start
+    at `MeanCR0`, so reading `MeanCR<detector index>` picks the neighbouring
+    detector on a 7004 file and lands 30 % off its own trace.
+
+    A zero, negative or non-finite entry reads as ABSENT rather than as a count
+    rate of zero: 7004 files write `MeanCR2/3 = 0.000` for detectors they do not
+    use. Matching is by regex, never by _get's prefix rule -- 'MeanCR1' is a prefix
+    of 'MeanCR12'.
+    """
+    indexed: List[Tuple[int, Optional[float]]] = []
+    for key, text in header.items():
+        m = _MEANCR_KEY_RE.match(key)
+        if m:
+            indexed.append((int(m.group(1)), _to_float(text)))
+    out: List[Optional[float]] = []
+    for _, khz in sorted(indexed, key=lambda pair: pair[0]):
+        if khz is None or not np.isfinite(khz) or khz <= 0.0:
+            out.append(None)
+        else:
+            out.append(khz * _KHZ_TO_CPS)
+    return out
+
+
 def _to_float(text: Optional[str]) -> Optional[float]:
     if text is None:
         return None
@@ -149,16 +200,20 @@ def _to_float(text: Optional[str]) -> Optional[float]:
         return None
 
 
-def _read_numeric_block(lines: List[str], start: int) -> Tuple[np.ndarray, int]:
+def _read_numeric_block(lines: List[str], start: int) -> Tuple[np.ndarray, int, bool]:
     """Read a contiguous block of whitespace-separated numeric rows from `start`.
 
     Stops at the first blank line, a quoted section header, or a non-numeric line.
-    Returns (rows array, index of the stopping line). Rows must share a column
-    count; a ragged row ends the block.
+    Returns (rows array, index of the stopping line, cut_short). Rows must share a
+    column count; a ragged row ends the block. `cut_short` is True when the stop was
+    a non-numeric or ragged ROW rather than the block's natural end (blank line,
+    header, end of file) -- the one case where measured data after the stop is
+    silently left unread, which the caller discloses.
     """
     rows: List[List[float]] = []
     ncols: Optional[int] = None
     i = start
+    cut_short = False
     while i < len(lines):
         stripped = lines[i].strip()
         if not stripped or stripped.startswith('"'):
@@ -167,18 +222,20 @@ def _read_numeric_block(lines: List[str], start: int) -> Tuple[np.ndarray, int]:
         try:
             values = [float(p) for p in parts]
         except ValueError:
+            cut_short = True
             break
         if ncols is None:
             ncols = len(values)
         elif len(values) != ncols:
+            cut_short = True
             break
         rows.append(values)
         i += 1
     if not rows:
-        raise ParseError(
+        raise MalformedDataError(
             f"ALV file: expected numeric data starting at line {start + 1}, "
             f"found none.")
-    return np.asarray(rows, dtype=float), i
+    return np.asarray(rows, dtype=float), i, cut_short
 
 
 def _parse_alv_file(file_path: str) -> _ALVData:
@@ -190,6 +247,12 @@ def _parse_alv_file(file_path: str) -> _ALVData:
         first = lines[0] if lines else '<empty file>'
         raise ParseError(
             f"{file_path!r} is not an ALV .ASC file (first line: {first!r}).")
+
+    # --- format commit point ---------------------------------------------------
+    # Above this line a failure means "not my format" and stays a plain ParseError,
+    # so autodetect can hand the file to the next parser. Below it the file has
+    # proved it IS this format, so a failure is malformed DATA and raises
+    # MalformedDataError, whose message is meant for the user.
     instrument = lines[0].split(' Data')[0].strip() or 'ALV'
 
     idx_corr = _find_section(lines, _SECTION_CORRELATION)
@@ -213,33 +276,60 @@ def _parse_alv_file(file_path: str) -> _ALVData:
             angles[1] = a
     active = sorted(i for i, a in angles.items() if a != 0.0)
     if not active:
-        raise ParseError(
+        raise MalformedDataError(
             f"{file_path!r}: no active detection angles "
             f"(no non-zero Angle(i) or bare Angle key).")
 
     # correlation block: lag (ms) + one g2-1 column per detector
-    corr, after_corr = _read_numeric_block(lines, idx_corr + 1)
+    corr, after_corr, corr_cut = _read_numeric_block(lines, idx_corr + 1)
     idx_cr = _find_section(lines, _SECTION_COUNT_RATE, after_corr)
-    cr, _ = _read_numeric_block(lines, idx_cr + 1)
+    cr, after_cr, cr_cut = _read_numeric_block(lines, idx_cr + 1)
+
+    # A block that ended on a bad row (not its blank-line / header end) has rows
+    # after the stop that were never read: a truncated correlogram or trace, which
+    # every fit would take at face value. Disclosed keep-both -- on `notes` for the
+    # GUI's passive box and as a UserWarning for a headless caller.
+    found_notes = []
+    for name, cut, block, stop in (('Correlation', corr_cut, corr, after_corr),
+                                   ('Count Rate', cr_cut, cr, after_cr)):
+        if cut:
+            found_notes.append(
+                f"the {name} block ended at line {stop + 1} on a row that is not "
+                f"numeric or has a different number of columns; {block.shape[0]} row(s) "
+                f"were read before it and the rest of the block was not loaded. If the "
+                f"file was not edited by hand, re-export it."
+            )
+    notes = tuple(found_notes)
+    for note in notes:
+        warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
 
     need_cols = max(active) + 1          # column 0 is lag/time, channel i is column i
     for name, block in (('Correlation', corr), ('Count Rate', cr)):
         if block.shape[1] < need_cols:
-            raise ParseError(
+            raise MalformedDataError(
                 f"{file_path!r}: the {name} block has {block.shape[1]} columns "
                 f"but detector {max(active)} needs at least {need_cols}.")
 
     delay_times_s = convert_delay_times(corr[:, 0], 'ms')   # ms -> s (the gotcha)
     trace_times_s = cr[:, 0].astype(float)                  # already seconds
 
+    # Channel i reads Count Rate column i, so it takes the i-th positional MeanCR.
+    # A list too short to reach it yields None rather than a guess: a short list
+    # means the pairing is unknown, and a wrong mean count rate is worse than none.
+    mean_crs = _mean_count_rates_cps(header)
     channels = [
         _ALVChannel(
             index=i, angle_deg=angles[i],
             correlogram=corr[:, i].astype(float),
             count_rates_cps=cr[:, i].astype(float) * _KHZ_TO_CPS,
+            mean_count_rate_cps=(mean_crs[i - 1] if i <= len(mean_crs) else None),
         )
         for i in active
     ]
+
+    duration_s = _to_float(_get(header, 'Duration'))
+    if duration_s is not None and (not np.isfinite(duration_s) or duration_s <= 0):
+        duration_s = None
 
     visc = _to_float(_get(header, 'Viscosity'))
     label = _get(header, 'Samplename')
@@ -252,7 +342,7 @@ def _parse_alv_file(file_path: str) -> _ALVData:
     try:
         viscosity_Pa_s = convert_viscosity(visc, 'cp') if visc is not None else None
     except ValueError as exc:
-        raise ParseError(
+        raise MalformedDataError(
             f"{file_path!r}: invalid viscosity {visc!r} cP in the ALV header ({exc})."
         ) from exc
 
@@ -267,6 +357,26 @@ def _parse_alv_file(file_path: str) -> _ALVData:
         trace_times_s=trace_times_s,
         channels=channels,
         source_file=os.path.abspath(file_path),
+        duration_s=duration_s,
+        notes=notes,
+    )
+
+
+def _trace_preview_for(data: _ALVData, ch: _ALVChannel) -> TraceFilePreview:
+    """The count-rate trace of one channel, labelled with its angle.
+
+    One builder for both parsers, so a trace ingested through the DLS load and the
+    same trace loaded on its own can never end up with different labels or units.
+    """
+    tag = f'{ch.angle_deg:g}°'
+    label = f'{data.sample_label} @ {tag}' if data.sample_label else tag
+    return TraceFilePreview(
+        source_file=data.source_file,
+        instrument_name=data.instrument,
+        times_s=data.trace_times_s.copy(),
+        count_rates_cps=ch.count_rates_cps.copy(),
+        sample_label=label,
+        notes=data.notes,
     )
 
 
@@ -280,6 +390,13 @@ class ALVCorrelatorParser(BaseDLSParser):
     Sample identity (polymer/solvent/concentration) is not in the file and is left
     for the confirmation step. The several angles of one file share temperature,
     viscosity, wavelength, and refractive index, and group into a single sample.
+
+    An ALV file carries the count-rate trace beside the correlogram, so each
+    preview also carries ITS OWN channel's trace (``trace_preview``) and the
+    vendor's mean count rate and nominal duration. The loader links that trace to
+    the measurement it creates. Pairing is structural rather than positional --
+    both halves come off one ``_ALVChannel``, so no zip across two independently
+    filtered channel lists can attach one angle's trace to another angle's curve.
     """
 
     def parse(self, file_path: str) -> List[DLSFilePreview]:
@@ -296,6 +413,10 @@ class ALVCorrelatorParser(BaseDLSParser):
                 solvent_refractive_index=data.refractive_index,
                 temperature_K=data.temperature_K,
                 viscosity_Pa_s=data.viscosity_Pa_s,
+                vendor_mean_count_rate_cps=ch.mean_count_rate_cps,
+                vendor_duration_s=data.duration_s,
+                trace_preview=_trace_preview_for(data, ch),
+                notes=data.notes,
             )
             for ch in data.channels
         ]
@@ -305,24 +426,13 @@ class ALVCorrelatorParser(BaseDLSParser):
 class ALVTraceParser(BaseTraceParser):
     """ALV ``.ASC`` -> one ``TraceFilePreview`` per active angle (count-rate trace).
 
-    Each trace is labeled with its angle so the user can pair it with the matching
-    correlogram (the ``measurement_id`` back-reference is left for the confirmation
-    step). Count rates are converted kHz -> cps.
+    Each trace is labeled with its angle. This is the surface for loading an ALV
+    file's traces ON THEIR OWN; loading the same file as a correlogram links each
+    trace to the measurement it belongs to instead (the confirmation step this
+    parser leaves the ``measurement_id`` back-reference for). Count rates are
+    converted kHz -> cps.
     """
 
     def parse(self, file_path: str) -> List[TraceFilePreview]:
         data = _parse_alv_file(file_path)
-        previews = []
-        for ch in data.channels:
-            tag = f'{ch.angle_deg:g}°'
-            label = f'{data.sample_label} @ {tag}' if data.sample_label else tag
-            previews.append(
-                TraceFilePreview(
-                    source_file=data.source_file,
-                    instrument_name=data.instrument,
-                    times_s=data.trace_times_s.copy(),
-                    count_rates_cps=ch.count_rates_cps.copy(),
-                    sample_label=label,
-                )
-            )
-        return previews
+        return [_trace_preview_for(data, ch) for ch in data.channels]

@@ -1,0 +1,44 @@
+Mode-Resolved synthetic set -- ground truth and how it was established
+======================================================================
+
+One linked truth, three faces: two-mode correlograms whose per-angle
+amplitude fractions ARE the static partition fractions; count-rate
+traces whose means ARE the static intensities (exact-mean matched);
+and the per-mode excess Rayleigh ratios below. Load both .ASC files,
+commit, run the mode map, pick the two families, record the mode set,
+derive the static series from the traces, and the partition must
+reproduce the table (the amplitude-Guinier recovers the slow Rg).
+
+Deliberately NO pre-derived SLS file: derive the static points in-app
+from the traces, so the check is against this truth, not against a
+stored copy of the derivation arithmetic.
+
+Recipe (build_mode_resolved_tuple): defaults, seed=23 (slow_rg_nm=120, a_fast_q0=0.3, rh_fast_nm=5, crossing at 82 deg)
+
+Scalar truth
+------------
+slow-mode Guinier size Rg_s     : 120 nm (what the amplitude-Guinier fit recovers)
+fast fraction at q -> 0         : 0.3
+fast-mode Rh                    : 5 nm (D_f = 4.90746e-11 m^2/s)
+slow-mode dynamics              : q_independent, crossing the fast branch at 82 deg
+concentration                   : 5 mg/mL
+wavelength / n / T / viscosity  : 532 nm / 1.33 / 298.15 K / 0.00089 Pa*s
+dn/dc (enter by hand)           : 0.135 mL/g
+calibrant intensity (toluene)   : 100000 cps (k_c = 3.14964e-10; geometry VU, 532 nm, 25 C)
+
+Per-angle truth (fractions are domain-free; dR in cm^-1, I in cps)
+--------------------------------------------------------------------
+angle   A_fast   A_slow   dR_fast      dR_slow      dR_total     I_sample     I_solvent
+ 35.0   0.3797   0.6203   3.52976e-05  5.76606e-05  9.29582e-05  661483   10460.7
+ 50.0   0.4417   0.5583   3.52976e-05  4.46128e-05  7.99104e-05  426865   7832.44
+ 65.0   0.5036   0.4964   3.52976e-05  3.47860e-05  7.00836e-05  317248   6620.27
+ 80.0   0.5590   0.4410   3.52976e-05  2.78493e-05  6.31469e-05  263665   6092.56
+ 95.0   0.6051   0.3949   3.52976e-05  2.30371e-05  5.83347e-05  241247   6022.92
+110.0   0.6417   0.3583   3.52976e-05  1.97090e-05  5.50066e-05  241526   6385.07
+125.0   0.6695   0.3305   3.52976e-05  1.74223e-05  5.27199e-05  265853   7324.65
+140.0   0.6896   0.3104   3.52976e-05  1.58899e-05  5.11875e-05  329220   9334.34
+
+Gamma_fast per angle (1/s): 35: 4379.7, 50: 8650.7, 65: 13983, 80: 20012, 95: 26328, 110: 32500, 125: 38108, 140: 42769
+Gamma_slow per angle (1/s): 35: 20847, 50: 20847, 65: 20847, 80: 20847, 95: 20847, 110: 20847, 125: 20847, 140: 20847
+
+exact_mean = True; trace_cv = 0.03; max count rate = 661483 cps

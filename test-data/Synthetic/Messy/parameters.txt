@@ -22,8 +22,14 @@ Notes:
   - DLS files are ALV .ASC: all angles + a count-rate trace are in one file.
     Enter polymer name, solvent (water), and the concentration (in the file
     name) for each. Temperature/viscosity/n/wavelength are read from the file.
-  - SLS files are Brookhaven .csv (a full Zimm set: solvent reference at c=0
-    plus 5 concentrations x 12 angles). Enter polymer name + temperature.
+  - SLS Zimm files are Brookhaven .csv (a full Zimm set: solvent reference at
+    c=0 plus 5 concentrations x 12 angles). Enter polymer name + temperature.
+  - The SLS Guinier file is the SAME data in Brookhaven's other .csv layout:
+    one angular scan plus the solvent blank measured beside it. It loads as TWO
+    measurements. That layout records no concentration and no dn/dc, so enter
+    polymer name + temperature AND:
+        concentration = 0.6 mg/mL   (for the sample, not the blank)
+        dn/dc         = 0.135 mL/g
   - To pair rho = Rg/Rh for a sample, give its DLS and SLS files the SAME
     polymer name + solvent + temperature so they group into one sample.
   - The two-column trace loads via the Utilities > Traces tab (time = s,
@@ -45,7 +51,9 @@ GROUND TRUTH (what the analyses should recover):
   Bimodal DLS sample: two populations at Rh = 20 nm and 200 nm
     (intensity weights ~1 : 2). Use CONTIN or NNLS to resolve them.
 
-  rho = Rg/Rh ~ 1.5 for every series sample (good-solvent coil).
+  rho = Rg/Rh ~ 1.5 for every series sample (the THETA-solvent linear-coil
+    value; a good-solvent coil sits nearer 1.78 -- the series pairs this rho
+    with a good-solvent size exponent, and the two are not made consistent).
   Rg-Mw scaling exponent nu ~ 0.585; A2-Mw exponent ~ -0.2.
   DLS shows a mild concentration dependence (kD ~ +30 mL/g), so the
   D-vs-c extrapolation has a small positive slope (PEG 1M has 3 concs).

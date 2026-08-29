@@ -1,0 +1,31 @@
+Date/Time,8/12/2026 11:00:26 AM
+Sample ID,Water W1
+Operator ID,Esam A
+Sample Liquid,Water
+Refractive Index of Sample Liquid,1.334
+Refractive Index of Sample Cell,1.5
+Refractive Index of Vat Liquid,1.4691
+Polarization Analyzer Position,Vertical
+Wavelength (nm),532
+'A' Dark Count Rate,2370
+'B' Dark Count Rate,0
+Pinhole Size (mm),1
+Interference Filter,Out
+Reflective Corrections Applied,Yes
+Number of Angles Measured,8
+Angle 1 (degrees),30
+Angle 2 (degrees),45
+Angle 3 (degrees),60
+Angle 4 (degrees),75
+Angle 5 (degrees),90
+Angle 6 (degrees),105
+Angle 7 (degrees),120
+Angle 8 (degrees),135
+Sample Intensity - Angle 1,9584.229
+Sample Intensity - Angle 2,6616.239
+Sample Intensity - Angle 3,5236.497
+Sample Intensity - Angle 4,5202.181
+Sample Intensity - Angle 5,4367.545
+Sample Intensity - Angle 6,4470.592
+Sample Intensity - Angle 7,4946.471
+Sample Intensity - Angle 8,6149.588

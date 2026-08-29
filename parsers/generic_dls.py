@@ -68,6 +68,7 @@ Change history
 from __future__ import annotations
 
 import os
+import warnings
 from typing import List, Optional
 
 import numpy as np
@@ -77,11 +78,9 @@ from parsers.base_parser import (
     BaseDLSParser,
     DLSFilePreview,
     ParseError,
+    apply_data_form,
     convert_delay_times,
 )
-
-# Accepted data form strings
-_VALID_DATA_FORMS = ('g2m1', 'g2', 'g1')
 
 # Minimum number of data rows to accept
 _MIN_ROWS = 2
@@ -110,76 +109,11 @@ def _detect_delimiter(first_line: str) -> str:
     )
 
 
-def _apply_data_form(
-    raw_col2: np.ndarray,
-    data_form: str,
-    baseline_B: Optional[float],
-    beta: Optional[float],
-    file_path: str,
-) -> np.ndarray:
-    """Convert raw column-2 values to g²(τ)-1 according to data_form.
-
-    Parameters
-    ----------
-    raw_col2 : np.ndarray
-        Values as read from the file.
-    data_form : str
-        One of 'g2m1', 'g2', 'g1'.
-    baseline_B : float or None
-        Required if data_form == 'g2'. The baseline value B such that
-        g²(τ)-1 = (G(τ) - B) / B.
-    beta : float or None
-        Required if data_form == 'g1'. The coherence factor β such that
-        g²(τ)-1 = β · |g¹(τ)|².
-    file_path : str
-        Used only in error messages.
-
-    Returns
-    -------
-    np.ndarray
-        g²(τ)-1 values.
-
-    Raises
-    ------
-    ParseError
-        If a required parameter (B or β) is missing or physically invalid.
-    """
-    if data_form == 'g2m1':
-        return raw_col2.copy()
-
-    if data_form == 'g2':
-        if baseline_B is None:
-            raise ParseError(
-                f"data_form='g2' requires baseline_B to be supplied, "
-                f"but it is None. Set preview.baseline_B before calling "
-                f"preview.build() for {file_path!r}."
-            )
-        if not (baseline_B > 0):
-            raise ParseError(
-                f"baseline_B must be a positive number, got {baseline_B!r}."
-            )
-        return (raw_col2 - baseline_B) / baseline_B
-
-    if data_form == 'g1':
-        if beta is None:
-            raise ParseError(
-                f"data_form='g1' requires beta (coherence factor) to be "
-                f"supplied, but it is None. Set preview.beta before calling "
-                f"preview.build() for {file_path!r}."
-            )
-        if not (0 < beta <= 1.0):
-            raise ParseError(
-                f"beta must be in the range (0, 1], got {beta!r}. "
-                f"The coherence factor is an instrument property, typically "
-                f"between 0.01 and 1.0."
-            )
-        # Siegert relation: g²(τ)-1 = β · |g¹(τ)|²
-        return beta * np.abs(raw_col2) ** 2
-
-    raise ParseError(
-        f"Unknown data_form {data_form!r}. "
-        f"Accepted values: {_VALID_DATA_FORMS}."
-    )
+# The conversion itself now lives in base_parser.py, because the Brookhaven
+# TurboCorr .dat parser needs the same 'g2' branch (its channel contents are
+# raw correlator counts). Kept under the old private name so the call sites
+# below and the tests that name it read unchanged.
+_apply_data_form = apply_data_form
 
 
 class GenericDLSFilePreview(DLSFilePreview):
@@ -265,13 +199,16 @@ class GenericDLSFilePreview(DLSFilePreview):
         fields (polymer, solvent, ...). This lets a loader convert the arrays at
         load time and then hand the measurement to the standard confirmation flow,
         where the identity is filled in. Raises if the unit / data form is unset."""
-        from parsers.base_parser import ParseError as _PE
+        # ParseError is imported at module scope and these raises name it LITERALLY: an
+        # alias makes them invisible to `test_parser_error_taxonomy`'s AST gate, which
+        # matches the class by name. The gate resolves aliases too, but a literal name
+        # needs no resolving, so the two halves close the hole from both sides.
         if self.delay_time_unit is None or self.data_form is None:
-            raise _PE('delay_time_unit and data_form must be set before conversion.')
+            raise ParseError('delay_time_unit and data_form must be set before conversion.')
         if self.data_form == 'g2' and self.baseline_B is None:
-            raise _PE("data_form 'g2' requires baseline_B.")
+            raise ParseError("data_form 'g2' requires baseline_B.")
         if self.data_form == 'g1' and self.beta is None:
-            raise _PE("data_form 'g1' requires beta.")
+            raise ParseError("data_form 'g1' requires beta.")
         self.delay_times_s = convert_delay_times(self._raw_delay_times, self.delay_time_unit)
         self.correlogram = _apply_data_form(self._raw_col2, self.data_form,
                                             self.baseline_B, self.beta,
@@ -287,8 +224,7 @@ class GenericDLSFilePreview(DLSFilePreview):
         """
         missing = self.missing_required_fields()
         if missing:
-            from parsers.base_parser import ParseError as _PE
-            raise _PE(
+            raise ParseError(
                 f"Cannot build DLSMeasurement: required fields not yet "
                 f"supplied: {missing}.",
                 missing_fields=missing,
@@ -381,12 +317,17 @@ class GenericDLSParser(BaseDLSParser):
             raise FileNotFoundError(f"File not found: {file_path!r}")
 
         try:
-            with open(file_path, encoding='utf-8', newline='') as fh:
-                raw_lines = [line.rstrip('\r\n') for line in fh]
-        except UnicodeDecodeError:
-            # Fall back to latin-1 for files with non-UTF-8 characters
-            with open(file_path, encoding='latin-1', newline='') as fh:
-                raw_lines = [line.rstrip('\r\n') for line in fh]
+            try:
+                with open(file_path, encoding='utf-8', newline='') as fh:
+                    raw_lines = [line.rstrip('\r\n') for line in fh]
+            except UnicodeDecodeError:
+                # Fall back to latin-1 for files with non-UTF-8 characters
+                with open(file_path, encoding='latin-1', newline='') as fh:
+                    raw_lines = [line.rstrip('\r\n') for line in fh]
+        except OSError as exc:
+            # A file the OS refuses to read (locked, permission denied) is a plain
+            # ParseError, like the instrument parsers' read sites -- not an escape.
+            raise ParseError(f"Could not read {file_path!r}: {exc}") from exc
 
         # Remove blank lines
         lines = [l for l in raw_lines if l.strip()]
@@ -408,12 +349,18 @@ class GenericDLSParser(BaseDLSParser):
             if len(parts) != 2:
                 n_bad += 1
                 continue
+            # Both cells are parsed BEFORE either is appended (the generic_sls shape).
+            # Appending column 1 first left the two columns out of step whenever a
+            # row's second cell was blank or non-numeric: every later correlation value
+            # was attributed to the previous row's delay, and the file still loaded.
             try:
-                col1.append(float(parts[0].strip()))
-                col2.append(float(parts[1].strip()))
+                t = float(parts[0].strip())
+                y = float(parts[1].strip())
             except ValueError:
                 n_bad += 1
                 continue
+            col1.append(t)
+            col2.append(y)
 
         total = len(lines)
         if n_bad / total > _MAX_BAD_ROW_FRACTION:
@@ -432,10 +379,23 @@ class GenericDLSParser(BaseDLSParser):
                 f"At least {_MIN_ROWS} are required."
             )
 
+        # Under the ceiling a bad row is tolerated, not hidden: it is disclosed on the
+        # preview (the GUI's passive box) and as a UserWarning (headless), keep-both.
+        notes: tuple = ()
+        if n_bad:
+            note = (
+                f"{n_bad} of {total} row(s) could not be read as two numbers and were "
+                f"skipped; {len(col1)} loaded. If a skipped row was meant to carry data, fix it "
+                f"in the file and re-load."
+            )
+            notes = (note,)
+            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+
         preview = GenericDLSFilePreview(
             source_file=os.path.abspath(file_path),
             instrument_name='Generic (plain-text)',
             _raw_delay_times=np.array(col1, dtype=float),
             _raw_col2=np.array(col2, dtype=float),
+            notes=notes,
         )
         return [preview]

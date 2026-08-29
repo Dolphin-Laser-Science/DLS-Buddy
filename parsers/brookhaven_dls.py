@@ -66,6 +66,7 @@ Change history
 from __future__ import annotations
 
 import os
+import warnings
 from typing import List
 
 import numpy as np
@@ -74,8 +75,10 @@ from parsers.base_parser import (
     BaseDLSParser,
     BaseTraceParser,
     DLSFilePreview,
+    MalformedDataError,
     ParseError,
     TraceFilePreview,
+    convert_delay_times,
 )
 
 # ---------------------------------------------------------------------------
@@ -106,8 +109,9 @@ _TRACE_LABEL_ROW = 0
 _TRACE_HEADER_ROW = 1
 _TRACE_DATA_START_ROW = 2
 
-# Conversion factors applied by these parsers before storing
-_MICROSECONDS_TO_SECONDS = 1.0e-6   # delay times: µs -> s
+# Conversion factors applied by these parsers before storing. The delay axis goes
+# through the shared table in base_parser instead: it feeds Gamma, D and Rh, so its
+# factor lives in one place.
 _KCPS_TO_CPS = 1000.0               # count rates: kcps -> cps
 
 
@@ -264,10 +268,16 @@ class BrookhavenDLSParser(BaseDLSParser):
         #     not a Brookhaven DLS file -- reject so the loader can try another
         #     parser (otherwise a plain two-column table would be silently and
         #     wrongly accepted, with its first two rows eaten as label/header).
-        if 'c(t)' not in lines[_CORR_DATA_START_ROW - 1].lower():
+        if 'c(t)' not in lines[_CORR_HEADER_ROW].lower():
             raise ParseError(
                 f"{file_path!r} is not a Brookhaven DLS correlogram: its second "
                 f"row is not the expected 't(...),C(t),...' column header.")
+
+        # --- format commit point ---------------------------------------------------
+        # Above this line a failure means "not my format" and stays a plain ParseError,
+        # so autodetect can hand the file to the next parser. Below it the file has
+        # proved it IS this format, so a failure is malformed DATA and raises
+        # MalformedDataError, whose message is meant for the user.
 
         # --- row 1: sample label ---
         sample_label = _extract_label(lines[_CORR_LABEL_ROW])
@@ -306,15 +316,31 @@ class BrookhavenDLSParser(BaseDLSParser):
             g2m1_values.append(ct)
 
         if len(delay_times_us) == 0:
-            raise ParseError(
+            raise MalformedDataError(
                 f"No valid data rows found in {file_path!r} after stripping "
                 f"padding rows (found {n_padding} padding rows, "
                 f"{n_bad} malformed rows)."
             )
 
         # Convert delay times from µs to seconds (canonical internal unit)
-        delay_times_s = np.array(delay_times_us, dtype=float) * _MICROSECONDS_TO_SECONDS
+        delay_times_s = convert_delay_times(
+            np.array(delay_times_us, dtype=float), 'us')
         correlogram = np.array(g2m1_values, dtype=float)
+
+        # A skipped row is measured data the user never sees again, and it shortens the
+        # correlogram every fit reads -- so it is disclosed on BOTH channels (the
+        # keep-both convention: `notes` for the GUI's passive box, a UserWarning for a
+        # headless caller). Padding rows are the format's own and are not reported.
+        notes: tuple = ()
+        if n_bad:
+            note = (
+                f"{n_bad} data row(s) could not be read as a delay-time / C(t) pair and "
+                f"were skipped; {len(delay_times_us)} channel(s) loaded. A skipped row "
+                f"shortens the correlogram -- if the file was not edited by hand, "
+                f"re-export it."
+            )
+            notes = (note,)
+            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
 
         # Build the preview. Physical parameters are left as None.
         preview = DLSFilePreview(
@@ -323,6 +349,7 @@ class BrookhavenDLSParser(BaseDLSParser):
             delay_times_s=delay_times_s,
             correlogram=correlogram,
             sample_label=sample_label if sample_label else None,
+            notes=notes,
         )
 
         return [preview]
@@ -407,11 +434,17 @@ class BrookhavenTraceParser(BaseTraceParser):
         #     parser (otherwise a plain two-column table -- e.g. an HH:MM:SS timestamp
         #     with a bare cps column -- would be silently accepted and its cps values
         #     wrongly rescaled x1000 as if they were kcps, corrupting every trace
-        #     diagnostic). Mirrors the correlogram sibling's C(t) sniff (hardened S36).
+        #     diagnostic). Mirrors the correlogram sibling's C(t) sniff.
         if 'count rate' not in lines[_TRACE_HEADER_ROW].lower():
             raise ParseError(
                 f"{file_path!r} is not a Brookhaven count-rate trace: its second "
                 f"row is not the expected 'Time (seconds),Count Rate (kcps)' header.")
+
+        # --- format commit point ---------------------------------------------------
+        # Above this line a failure means "not my format" and stays a plain ParseError,
+        # so autodetect can hand the file to the next parser. Below it the file has
+        # proved it IS this format, so a failure is malformed DATA and raises
+        # MalformedDataError, whose message is meant for the user.
 
         # --- row 1: sample label ---
         sample_label = _extract_label(lines[_TRACE_LABEL_ROW])
@@ -442,10 +475,22 @@ class BrookhavenTraceParser(BaseTraceParser):
             count_rates_cps.append(rate_kcps * _KCPS_TO_CPS)   # kcps -> cps
 
         if len(times_s) == 0:
-            raise ParseError(
+            raise MalformedDataError(
                 f"No valid data rows found in {file_path!r} "
                 f"({n_bad} malformed rows encountered)."
             )
+
+        # Same disclosure as the correlogram route above: a skipped row is a gap in
+        # the trace the diagnostics will read as a real interval.
+        notes: tuple = ()
+        if n_bad:
+            note = (
+                f"{n_bad} data row(s) could not be read as a time / count-rate pair and "
+                f"were skipped; {len(times_s)} point(s) loaded. If the file was not "
+                f"edited by hand, re-export it."
+            )
+            notes = (note,)
+            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
 
         preview = TraceFilePreview(
             source_file=os.path.abspath(file_path),
@@ -453,6 +498,7 @@ class BrookhavenTraceParser(BaseTraceParser):
             times_s=np.array(times_s, dtype=float),
             count_rates_cps=np.array(count_rates_cps, dtype=float),
             sample_label=sample_label if sample_label else None,
+            notes=notes,
         )
 
         return [preview]

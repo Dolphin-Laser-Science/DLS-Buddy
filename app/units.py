@@ -100,6 +100,35 @@ def to_canonical(quantity: str, value: float, unit: str) -> float:
         raise ValueError(f"Unknown unit {unit!r} for quantity {quantity!r}.") from None
 
 
+def convert(quantity: str, value: float, from_unit: str, to_unit: str) -> float:
+    """Convert `value` between any two listed units of a linear quantity.
+
+    Exists for values stored in a *declared non-canonical* unit — the SLS
+    result fields carry q² in nm⁻² by decision (spec engineering-04 stage 2),
+    so the display layer converts from that declared source unit rather than
+    from the canonical one.
+
+    Guarantee (load-bearing for the plotting byte-identity harness): when
+    ``from_unit == to_unit`` the factor is exactly ``1.0`` (x/x == 1.0 for any
+    finite nonzero factor), so the value passes through bit-identical.
+
+    Temperature is affine (offset, not a factor), so it is not supported here;
+    use `to_canonical`/`from_canonical` for temperature.
+    """
+    if quantity == 'temperature':
+        raise ValueError("convert() handles linear quantities only; use "
+                         "to_canonical/from_canonical for temperature.")
+    try:
+        factors = _LINEAR[quantity]
+    except KeyError:
+        raise ValueError(f"Unknown quantity {quantity!r}.") from None
+    try:
+        return value * (factors[from_unit] / factors[to_unit])
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown unit {exc.args[0]!r} for quantity {quantity!r}.") from None
+
+
 def from_canonical(quantity: str, value: float, unit: str) -> float:
     """Convert a canonical `value` to `unit` for display/editing."""
     if quantity == 'temperature':

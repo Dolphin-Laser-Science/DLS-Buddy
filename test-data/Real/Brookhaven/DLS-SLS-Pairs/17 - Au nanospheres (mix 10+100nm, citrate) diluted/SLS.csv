@@ -1,0 +1,39 @@
+Date/Time,7/24/2026 4:22:58 PM
+Sample ID,"22. Gold Nanosphere (Mix 10+100nm, Citrate) - Diluted"
+Operator ID,Esam A
+Sample Liquid,Water
+Refractive Index of Sample Liquid,1.334
+Refractive Index of Sample Cell,1.5
+Refractive Index of Vat Liquid,1.4691
+Polarization Analyzer Position,Vertical
+Wavelength (nm),532
+'A' Dark Count Rate,2320
+'B' Dark Count Rate,0
+Pinhole Size (mm),1
+Interference Filter,Out
+Reflective Corrections Applied,Yes
+Number of Angles Measured,8
+Angle 1 (degrees),30
+Angle 2 (degrees),45
+Angle 3 (degrees),60
+Angle 4 (degrees),75
+Angle 5 (degrees),90
+Angle 6 (degrees),105
+Angle 7 (degrees),120
+Angle 8 (degrees),135
+Liquid Intensity - Angle 1,4727.499
+Liquid Intensity - Angle 2,3867.524
+Liquid Intensity - Angle 3,3477.231
+Liquid Intensity - Angle 4,3401.47
+Liquid Intensity - Angle 5,3190.083
+Liquid Intensity - Angle 6,3250.135
+Liquid Intensity - Angle 7,3346.067
+Liquid Intensity - Angle 8,3602.185
+Sample Intensity - Angle 1,414100.1
+Sample Intensity - Angle 2,293507.2
+Sample Intensity - Angle 3,240454.6
+Sample Intensity - Angle 4,223295.5
+Sample Intensity - Angle 5,191402.7
+Sample Intensity - Angle 6,191175.9
+Sample Intensity - Angle 7,203295.1
+Sample Intensity - Angle 8,254561.4

@@ -47,6 +47,10 @@ Unit conversion helpers
     convert_count_rate      convert a count rate from kcps/Mcps/Hz to cps
     convert_trace_times     convert trace elapsed times from ms/min/h to s
 
+Correlogram form conversion
+    apply_data_form         convert a raw second column (g1 / un-normalized g2 /
+                            already-subtracted g2m1) to the canonical g2(tau)-1
+
 Preview dataclasses
     DLSFilePreview          one DLS measurement's extracted + pending fields
     SLSFilePreview          one SLS measurement's extracted + pending fields
@@ -68,13 +72,22 @@ Change history
             field (now 9 required fields each). TraceFilePreview unchanged
             (intensity traces carry no solvent). build() passes solvent_name
             through to the measurement constructors.
+2026-08-03  apply_data_form moved here from generic_dls.py, where it was the
+            module-private _apply_data_form. Two parsers now need the 'g2'
+            branch -- the generic plain-text parser and the Brookhaven
+            TurboCorr .dat parser, whose channel contents are raw correlator
+            counts. Keeping one copy keeps the positive-finite baseline guard
+            in one place instead of two. generic_dls.py keeps a private alias
+            so its call sites and tests are unchanged.
 """
 
 from __future__ import annotations
 
+import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import numpy as np
 
@@ -178,6 +191,9 @@ def convert_delay_times(
             f"Unrecognized delay time unit {from_unit!r}. "
             f"Accepted: {sorted(_DELAY_TIME_FACTORS)}."
         )
+    # The generic previews hold their raw columns and convert on build(), so this is the
+    # only point at which their delay axis passes through shared code.
+    require_finite_data(values, 'delay times')
     return np.asarray(values, dtype=float) * _DELAY_TIME_FACTORS[key]
 
 
@@ -216,10 +232,10 @@ def convert_temperature(
             f"Unrecognized temperature unit {from_unit!r}. "
             f"Use 'C' for Celsius or 'K' for kelvin."
         )
-    if not (temp_K > 0):
+    if not (math.isfinite(temp_K) and temp_K > 0):
         raise ValueError(
-            f"Converted temperature is {temp_K} K, which is non-positive. "
-            f"Check the input value ({value!r} {from_unit})."
+            f"Converted temperature is {temp_K} K, which is not a positive finite "
+            f"number. Check the input value ({value!r} {from_unit})."
         )
     return temp_K
 
@@ -261,9 +277,10 @@ def convert_concentration(
             f"Accepted: {list(_CONCENTRATION_FACTORS)}."
         )
     result = float(value) * _CONCENTRATION_FACTORS[matched]
-    if result < 0:
+    if not (math.isfinite(result) and result >= 0):
         raise ValueError(
-            f"Concentration must be zero or positive, got {value!r} {from_unit}."
+            f"Concentration must be a finite number, zero or positive, "
+            f"got {value!r} {from_unit}."
         )
     return result
 
@@ -299,9 +316,9 @@ def convert_viscosity(
             f"Accepted: {sorted(_VISCOSITY_FACTORS)}."
         )
     result = float(value) * _VISCOSITY_FACTORS[key]
-    if not (result > 0):
+    if not (math.isfinite(result) and result > 0):
         raise ValueError(
-            f"Viscosity must be positive, got {value!r} {from_unit}."
+            f"Viscosity must be a positive finite number, got {value!r} {from_unit}."
         )
     return result
 
@@ -336,6 +353,7 @@ def convert_count_rate(
             f"Unrecognized count-rate unit {from_unit!r}. "
             f"Accepted: {sorted(_COUNT_RATE_FACTORS)}."
         )
+    require_finite_data(values, 'count rates')
     return np.asarray(values, dtype=float) * _COUNT_RATE_FACTORS[key]
 
 
@@ -370,25 +388,20 @@ def convert_trace_times(
             f"Unrecognized trace-time unit {from_unit!r}. "
             f"Accepted: {sorted(_TRACE_TIME_FACTORS)}."
         )
+    require_finite_data(values, 'trace times')
     return np.asarray(values, dtype=float) * _TRACE_TIME_FACTORS[key]
 
 
 # ---------------------------------------------------------------------------
 # ParsedFilePreview dataclasses
 # ---------------------------------------------------------------------------
-#
-# A ParsedFilePreview is what a parser produces. Every field is Optional:
-# the parser fills in what it can find in the file; the rest are left as None
-# to be filled in by the user at the confirmation step.
-#
-# The .build() method on each preview validates that all required fields
-# are present, applies any remaining unit conversions, and constructs the
-# final data model object. Calling .build() before all required fields are
-# filled in raises a ParseError with a list of which fields are still missing.
-#
-# Design note: ParsedFilePreview objects are transient. They live only during
-# the load-and-confirm workflow and are discarded after .build() succeeds.
-# They are not stored, exported, or passed to analysis functions.
+
+# A ParsedFilePreview is what a parser produces. Every field is Optional: the parser fills
+# in what it can find and the rest stay None, for the user to supply at the confirmation
+# step. `.build()` validates that all required fields are present, applies any remaining
+# unit conversions, and constructs the final data model object; called too early it raises a
+# ParseError listing what is missing. Previews are transient -- they live only during the
+# load-and-confirm workflow and are never stored, exported, or passed to analysis.
 
 
 class ParseError(ValueError):
@@ -401,6 +414,275 @@ class ParseError(ValueError):
     def __init__(self, message: str, missing_fields: Optional[List[str]] = None):
         super().__init__(message)
         self.missing_fields: List[str] = missing_fields or []
+
+
+class MalformedDataError(ParseError):
+    """This IS my format, and its data is unusable -- as opposed to "not my format".
+
+    Both are ParseErrors, because both mean the parser produced nothing. The distinction
+    is who the message is for. A plain ParseError from a sniff is the parser declining a
+    file that belongs to someone else, and the loader is right to swallow it and try the
+    next parser. A MalformedDataError is a diagnosis of a file the parser understood
+    perfectly well -- naming the row, the channel and the reason -- and swallowing that
+    leaves the user with a bare "could not read 1 file(s)", which is a WORSE outcome than
+    before the diagnosis existed.
+
+    A parser raises this for any failure AFTER its format-commit point: the line at which
+    every earlier statement has established that no other parser can claim the file (e.g.
+    Brookhaven's `C(t)` header row -- once that is seen, a bad data row is malformed data,
+    not "not mine"). Each parser marks that line with a `--- format commit point ---`
+    comment. `tests/test_parser_error_taxonomy.py` holds the classification.
+
+    Subclassing rather than a flag on ParseError so that `except ParseError` at the
+    boundaries that genuinely want both -- `.build()`, the Settings-driven baseline
+    re-normalization -- keeps working untouched. The cost is that arm ORDER matters: a
+    handler for this must precede `except ParseError`, or it is dead code. That is not
+    hypothetical; it is exactly how the reverted round's version of this failed.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Shared data-column validation
+# ---------------------------------------------------------------------------
+
+def require_finite_data(
+    values: Optional[np.ndarray],
+    field_name: str,
+    file_path: Optional[str] = None,
+) -> None:
+    """Reject a data column containing nan or +/-inf, naming where it came from.
+
+    The single finiteness guard for every parser. `float()` accepts the literal tokens
+    'nan', 'inf' and '1e400', and a blank cell filled with np.nan outright would let a
+    non-finite value reach the workspace intact.
+    `DLSMeasurement` does reject it -- but at *Run*, with a bare ValueError naming
+    neither the file nor the channel, long after the file that caused it is out of view.
+    Rejecting here converts that into a ParseError at load, which is what the parser
+    boundary is for.
+
+    Deliberately shared rather than repeated per parser: with nine parsers, N hand-added
+    predicates is the shape that lets the tenth silently opt out (rule 10). Callers are
+    the preview dataclasses' ``__post_init__`` and the shared converters, which together
+    cover every route a numeric column takes into a preview.
+
+    ``None`` and empty arrays pass: absence is the required-field layer's business, not
+    this one's.
+    """
+    if values is None:
+        return
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return
+    bad = ~np.isfinite(arr)
+    if not bad.any():
+        return
+    where = np.flatnonzero(bad)
+    source = f'{file_path!r}: ' if file_path else ''
+    shown = ', '.join(f'[{i}]={arr[i]!r}' for i in where[:3])
+    if where.size > 3:
+        shown += f', ... ({where.size} in total)'
+    raise MalformedDataError(
+        f"{source}{field_name} must contain only finite numbers, but "
+        f"{where.size} of {arr.size} value(s) are nan or inf: {shown}. "
+        f"The file is malformed at those positions -- a blank or non-numeric cell, "
+        f"or a value too large to represent."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Correlogram form conversion
+# ---------------------------------------------------------------------------
+
+VALID_DATA_FORMS = ('g2m1', 'g2', 'g1')
+
+# How far the g2 baseline B may sit from the raw data's own scale before it is rejected, as
+# a factor either side.
+
+# SIZED FROM THE RELATION THE DATA OBEYS, not picked as a round number. Here the raw column
+# IS un-subtracted g2, so raw = B(1 + beta|g1|^2) with beta|g1|^2 in [0, 1]. That puts raw/B
+# in [1, 2] and B/median(|raw|) in [0.5, 1] by construction, so two decades either side is
+# already ~100x more slack than the quantity can take. A wider band leaves the silent
+# failure reachable: B at 1e5 x scale returns a uniform -0.99999 correlogram, finite, smooth
+# and shaped like data. Scale-RELATIVE because the raw column may be counts, kHz or
+# already-normalized values, and no absolute bound serves all three.
+BASELINE_SCALE_TOLERANCE = 1.0e2
+
+# The band a g1 column's PEAK must lie in.
+#
+# SIZED FROM THE RELATION THE DATA OBEYS, like the baseline band above. Here the column IS
+# the normalized field autocorrelation, so |g1(tau)| <= 1 with |g1| -> 1 as tau -> 0; a
+# legitimate column peaks just under 1 for every input, fixing both edges of ONE band on
+# max|raw|. The PEAK, not the median: the relation pins |g1| at tau -> 0, while a median sits
+# at an arbitrary point on the decay, obeying nothing. A quantile would be more robust to one
+# outlying channel -- and would hide the single out-of-range channel this exists to catch.
+
+# CEILING: the |g1| <= 1 ceiling plus an allowance for an instrument that normalizes
+# against a measured rather than a computed baseline and can report a first channel a per
+# cent or two above 1.
+G1_PEAK_CEILING = 1.05
+# FLOOR: two decades below full correlation. There is no PHYSICAL floor -- a column whose
+# decay ran out before the first lag peaks low -- but such a column carries no measurable
+# correlation, and this is the SILENT tail: 1e-200 squares to exactly 0.0 and returns an
+# all-zero correlogram that is finite, flat and shaped like a dead channel (measured).
+# Sizing the floor to the ARITHMETIC instead (|x|^2 underflows only below ~2.2e-162) is the
+# mistake BASELINE_SCALE_TOLERANCE's own comment names: it rejects the absurd tail and
+# leaves a peak of 1e-100 -- an equally dead channel -- accepted.
+G1_PEAK_FLOOR = 1.0e-2
+# WHAT THIS BAND DOES NOT DECIDE. A raw g2 column mis-declared as g1 peaks at 1 + beta. For
+# any working instrument (beta > 0.05) that is above the ceiling and rejected; as beta -> 0
+# it converges on 1 and becomes indistinguishable from a legitimate g1 by ANY magnitude
+# test. So the message below states the measured peak and offers 'g2' as one possibility in
+# a list, never as a diagnosis: an earlier attempt asserted the diagnosis while its bound
+# let through the exact low-coherence case the assertion was wrong about. The remedy for the
+# undecidable case is PREVENTION -- the tooltip on the load dialog's "Column 2 is" control.
+
+
+def apply_data_form(
+    raw_col2: np.ndarray,
+    data_form: str,
+    baseline_B: Optional[float],
+    beta: Optional[float],
+    file_path: str,
+) -> np.ndarray:
+    """Convert raw column-2 values to g²(τ)-1 according to data_form.
+
+    Shared by every parser whose file does not already store the canonical
+    g²(τ)-1: the generic plain-text parser (where the user declares the form)
+    and the Brookhaven TurboCorr .dat parser (whose channel contents are raw
+    correlator counts, i.e. data_form 'g2' with the baseline read from the
+    file header).
+
+    Parameters
+    ----------
+    raw_col2 : np.ndarray
+        Values as read from the file.
+    data_form : str
+        One of 'g2m1', 'g2', 'g1'.
+    baseline_B : float or None
+        Required if data_form == 'g2'. The baseline value B such that
+        g²(τ)-1 = (G(τ) - B) / B.
+    beta : float or None
+        Required if data_form == 'g1'. The coherence factor β such that
+        g²(τ)-1 = β · |g¹(τ)|².
+    file_path : str
+        Used only in error messages.
+
+    Returns
+    -------
+    np.ndarray
+        g²(τ)-1 values.
+
+    Raises
+    ------
+    ParseError
+        If a required parameter (B or β) is missing or physically invalid.
+    """
+    # The generic and .dat paths assign the correlogram AFTER their preview is built, so
+    # the preview's own __post_init__ guard never sees it. This is the funnel both go
+    # through, so the same check belongs here. Note this is NOT the magnitude guard below
+    # -- a finite-input check cannot substitute for it,
+    # since B = 1e+300 is perfectly finite and still ruins the quotient.
+    require_finite_data(raw_col2, 'the raw data column', file_path)
+
+    if data_form == 'g2m1':
+        # No magnitude band here, deliberately: this branch performs no arithmetic, so
+        # there is no operation to size a guard to. A |g2-1| plausibility ceiling would be
+        # a statement about the CANONICAL
+        # correlogram, which every parser produces directly -- guarding it here would cover
+        # one of six producers, which is rule 10's asymmetry in reverse. Its home is
+        # DLSFilePreview/DLSMeasurement, and it opens its own thread at N = 0.
+        return raw_col2.copy()
+
+    if data_form == 'g2':
+        if baseline_B is None:
+            raise ParseError(
+                f"data_form='g2' requires baseline_B to be supplied, "
+                f"but it is None. Set preview.baseline_B before calling "
+                f"preview.build() for {file_path!r}."
+            )
+        if not (math.isfinite(baseline_B) and baseline_B > 0):
+            raise ParseError(
+                f"baseline_B must be a positive finite number, got {baseline_B!r}."
+            )
+        # The check above bounds B's SIGN; `(raw - B)/B` is sensitive to its MAGNITUDE.
+        # Closing that gap needs a bound on both tails, because they fail differently and
+        # only one announces itself: B = 5e-324 overflows the quotient to inf, while
+        # B = 1e+300 returns a uniform -1.0 that is finite, smooth and shaped like data. A
+        # guard on non-finite OUTPUT would catch only the loud tail, so the bound is on the
+        # input, relative to the data's own scale.
+        scale = float(np.median(np.abs(raw_col2)))
+        if not (math.isfinite(scale) and scale > 0.0):
+            raise MalformedDataError(
+                f"{file_path!r}: cannot judge baseline_B={baseline_B!r} because the raw "
+                f"data column has no usable scale (its median magnitude is {scale!r}). "
+                f"More than half the column is zero or non-finite, which is itself a "
+                f"dead correlogram: every such channel converts to exactly -1.0."
+            )
+        # ONE computation, so there is no second predicate that could be mis-sized
+        # against the operation it protects (rule 12's "prefer removing the gap").
+        # Both saturation tails land OUTSIDE the band, which is what makes the single
+        # ratio sufficient: B=1e300 over scale=1e-300 saturates to inf, and B=1e-300
+        # over scale=1e300 underflows to 0.0 -- each rejected by the bound it exceeds.
+        ratio = baseline_B / scale
+        if not (1.0 / BASELINE_SCALE_TOLERANCE <= ratio <= BASELINE_SCALE_TOLERANCE):
+            raise ParseError(
+                f"{file_path!r}: baseline_B={baseline_B!r} is {ratio:.3g} times the raw "
+                f"data's own scale (median magnitude {scale:.6g}), beyond the "
+                f"{BASELINE_SCALE_TOLERANCE:.0e}x tolerance either side. B is the "
+                f"long-time limit of that column, so a baseline this far from it is "
+                f"wrong by construction -- check the value and the column's units."
+            )
+        return (raw_col2 - baseline_B) / baseline_B
+
+    if data_form == 'g1':
+        if beta is None:
+            raise ParseError(
+                f"data_form='g1' requires beta (coherence factor) to be "
+                f"supplied, but it is None. Set preview.beta before calling "
+                f"preview.build() for {file_path!r}."
+            )
+        if not (0 < beta <= 1.0):
+            raise ParseError(
+                f"beta must be in the range (0, 1], got {beta!r}. "
+                f"The coherence factor is an instrument property, typically "
+                f"between 0.01 and 1.0."
+            )
+        # The two guards above bound BETA; the operation below is equally sensitive to the
+        # COLUMN's magnitude, whose two tails fail differently and only one of which
+        # announces itself. 1e+200 squares to inf, escaping to *Run* as an unnamed
+        # "correlogram must contain only finite numbers"; 1e-200 squares to exactly 0.0, and
+        # an all-zero correlogram is finite, flat and shaped like a dead channel, accepted
+        # in silence. Hence ONE band on ONE quantity with both edges anchored to the same
+        # relation. `initial=0.0` keeps an empty column inside the same predicate (peak
+        # 0.0 -> rejected) instead of numpy's bare zero-size-reduction ValueError.
+        peak = float(np.max(np.abs(raw_col2), initial=0.0))
+        # A PLAIN ParseError, i.e. the DIALOG's channel rather than the batched
+        # malformed-file box. This band fires because the COLUMN does not match the
+        # DECLARED form, a setting the user picked in that dialog -- so it belongs with
+        # every other way of getting the g1 choice wrong (a missing or unparseable beta),
+        # all of which come back inline through `_try_generic_dls`'s ParseError arm. In the
+        # batched box it would tell the user to change a setting inside a box telling them
+        # to fix the file. The load is NOT thereby retryable: the user re-loads to try
+        # another data form. Only `generic_dls` reaches here; `brookhaven_dat` passes 'g2'.
+        if not (G1_PEAK_FLOOR <= peak <= G1_PEAK_CEILING):
+            raise ParseError(
+                f"{file_path!r}: data_form='g1' but the raw data column peaks at "
+                f"{peak:.6g}, outside the [{G1_PEAK_FLOOR:g}, {G1_PEAK_CEILING:g}] range a "
+                f"normalized g1 can take. g1 is the NORMALIZED field autocorrelation, so "
+                f"|g1| <= 1 and its first channel sits just under 1. Too large usually "
+                f"means raw correlator counts or kHz, an un-normalized or un-subtracted g2 "
+                f"(choose the 'g2(t)' data form and give its baseline B), or a column in "
+                f"per cent; too small means the column carries no measurable correlation, "
+                f"or the two columns are the wrong way round. Check the 'Column 2 is' "
+                f"setting."
+            )
+        # Siegert relation: g²(τ)-1 = β · |g¹(τ)|²
+        return beta * np.abs(raw_col2) ** 2
+
+    raise ParseError(
+        f"Unknown data_form {data_form!r}. "
+        f"Accepted values: {VALID_DATA_FORMS}."
+    )
 
 
 @dataclass
@@ -428,6 +710,16 @@ class DLSFilePreview:
     # (correlogram is always g2(tau)-1 by the time it reaches the preview;
     #  any g1 / un-subtracted g2 conversion happens inside the parser.)
 
+    # The numeric columns require_finite_data() guards at construction. Declared as a
+    # roster rather than checked inline so a generic scan can assert every preview
+    # publishes one (rule 11) -- a preview that grows a third column and forgets to list
+    # it here turns the drift guard red instead of quietly opting out.
+    _DATA_ARRAY_FIELDS = ('delay_times_s', 'correlogram')
+
+    def __post_init__(self) -> None:
+        for name in self._DATA_ARRAY_FIELDS:
+            require_finite_data(getattr(self, name), name, self.source_file)
+
     # --- sample identity ---
     sample_label: Optional[str] = None
     polymer_name: Optional[str] = None                  # REQUIRED
@@ -442,6 +734,25 @@ class DLSFilePreview:
 
     # --- optional physical parameters ---
     viscosity_Pa_s: Optional[float] = None              # optional in DLSMeasurement
+
+    # --- what the instrument file itself recorded (records, not knobs) ---
+    # The vendor's own mean count rate for this measurement (cps) and the nominal
+    # run length (s), where the format carries them. Offered to the user like any
+    # other header value the parser proposes; they never reach DLSMeasurement.
+    vendor_mean_count_rate_cps: Optional[float] = None
+    vendor_duration_s: Optional[float] = None
+    # The count-rate trace this file recorded BESIDE this correlogram, for the
+    # formats that ship both in one file (currently ALV .ASC). The loader stores it
+    # in the workspace's trace collection with a link back to the measurement it
+    # creates. Deliberately not carried onto DLSMeasurement: traces live in one
+    # place, so that a standalone solvent or calibrant trace is representable too.
+    trace_preview: Optional['TraceFilePreview'] = None
+
+    # --- passive load-time notices ---
+    # Glyph-less, human-readable notes the parser attaches (e.g. a record column that had
+    # a header but no data and was not loaded). The load flow surfaces these as a passive
+    # ⓘ message; the parser also emits the same text via warnings.warn (keep-both).
+    notes: tuple = ()
 
     def missing_required_fields(self) -> List[str]:
         """Return a list of required field names that are still None."""
@@ -537,6 +848,20 @@ class TraceFilePreview:
     sample_label: Optional[str] = None
     measurement_id: Optional[str] = None                # optional back-reference
 
+    # --- passive load-time notices ---
+    # See DLSFilePreview.notes. Carried here for the same reason the finiteness roster is:
+    # the three preview types are one family with three loaders, and wiring two of three is
+    # the shape that leaves the third silently opted out (rule 10) -- which is exactly what
+    # the reverted round did with the autodetect loops one file over.
+    notes: tuple = ()
+
+    # See DLSFilePreview._DATA_ARRAY_FIELDS for why this roster is declared, not inline.
+    _DATA_ARRAY_FIELDS = ('times_s', 'count_rates_cps')
+
+    def __post_init__(self) -> None:
+        for name in self._DATA_ARRAY_FIELDS:
+            require_finite_data(getattr(self, name), name, self.source_file)
+
     def missing_required_fields(self) -> List[str]:
         required = {
             'times_s': self.times_s,
@@ -596,7 +921,12 @@ class SLSFilePreview:
     # --- optics ---
     wavelength_nm: Optional[float] = None               # REQUIRED
     solvent_refractive_index: Optional[float] = None    # REQUIRED
-    dn_dc_mL_per_g: Optional[float] = None              # REQUIRED
+    # NOT required: dn/dc enters only the optical constant K, which cancels in every
+    # coefficient ratio, so the scale-free analyses (every Rg, the form-factor sizes,
+    # the calibration-free 2*A2*Mw) run without it. Absent -> the run is flagged and
+    # noted, exactly as an absent calibration constant is. See SLSMeasurement's
+    # "Optional optics". Still never proposed or defaulted (invariant 3).
+    dn_dc_mL_per_g: Optional[float] = None
 
     # --- calibration reference (informational; parser fills from file) ---
     calibration_constant: Optional[float] = None
@@ -610,6 +940,13 @@ class SLSFilePreview:
     # message; the parser also emits the same text via warnings.warn (keep-both).
     notes: tuple = ()
 
+    # See DLSFilePreview._DATA_ARRAY_FIELDS for why this roster is declared, not inline.
+    _DATA_ARRAY_FIELDS = ('angles_deg', 'intensities')
+
+    def __post_init__(self) -> None:
+        for name in self._DATA_ARRAY_FIELDS:
+            require_finite_data(getattr(self, name), name, self.source_file)
+
     def missing_required_fields(self) -> List[str]:
         required = {
             'angles_deg': self.angles_deg,
@@ -620,7 +957,6 @@ class SLSFilePreview:
             'temperature_K': self.temperature_K,
             'wavelength_nm': self.wavelength_nm,
             'solvent_refractive_index': self.solvent_refractive_index,
-            'dn_dc_mL_per_g': self.dn_dc_mL_per_g,
         }
         return [name for name, value in required.items() if value is None]
 
@@ -660,29 +996,48 @@ class SLSFilePreview:
                 self.angles_deg, self.intensities, self.polymer_name,
                 self.solvent_name, self.concentration_g_per_mL, self.temperature_K,
                 self.wavelength_nm, self.solvent_refractive_index,
-                self.dn_dc_mL_per_g,
             ] if v is not None
         )
         return (
             f"SLSFilePreview(source={self.source_file!r}, "
             f"c={self.concentration_g_per_mL!r} g/mL, "
-            f"required_fields_filled={filled}/9, "
+            f"required_fields_filled={filled}/8, "
             f"ready={self.is_ready()})"
         )
+
+
+def collect_parse_notes(previews, file_path: str, into: list) -> None:
+    """Append each preview's passive notes to `into` as file-prefixed lines, ONCE each.
+
+    The load flow renders `into` as a single passive ⓘ box, so this is the point where the
+    three loaders (DLS, SLS, trace) share one behaviour instead of three copies -- the same
+    rule-10 reasoning as `require_finite_data`.
+
+    De-duplication is not cosmetic. A note describes the FILE, and a multi-record parser
+    hands the same note to every preview it returns (a preview must not disagree with its
+    own file's parse), so a twenty-record clipboard paste would otherwise render the same
+    sentence nineteen times.
+
+    `getattr(p, 'notes', ())` rather than `p.notes`: a hand-built preview in a test, or a
+    future preview type that has not been enrolled, degrades to "no notes" instead of
+    raising inside a loader.
+    """
+    base = os.path.basename(file_path)
+    for p in previews:
+        for note in getattr(p, 'notes', ()):
+            line = f'{base}: {note}'
+            if line not in into:
+                into.append(line)
 
 
 # ---------------------------------------------------------------------------
 # Abstract base classes
 # ---------------------------------------------------------------------------
 #
-# Each base class defines one abstract method: parse(). Subclasses must
-# implement it. Attempting to instantiate a subclass that hasn't implemented
-# parse() raises a TypeError immediately, which is much better than a
-# mysterious AttributeError later.
-#
-# The base classes are intentionally thin. They do not enforce file extension
-# checks, encoding, or any format-specific logic -- that is the subclass's
-# responsibility.
+# Each base class defines one abstract method, parse(); a subclass that has not implemented
+# it raises TypeError on instantiation rather than a mysterious AttributeError later. The
+# base classes are intentionally thin: they do not enforce file extension checks, encoding,
+# or any format-specific logic -- that is the subclass's responsibility.
 
 class BaseDLSParser(ABC):
     """Abstract base class for all DLS file parsers.
@@ -695,14 +1050,14 @@ class BaseDLSParser(ABC):
     Usage example (in a subclass)::
 
         class BrookhavenDLSParser(BaseDLSParser):
-            def parse(self, file_path: str) -> List[DLSFilePreview]:
+            def parse(self, file_path: str) -> Sequence[DLSFilePreview]:
                 preview = DLSFilePreview(source_file=file_path)
                 # ... read file, populate preview fields ...
                 return [preview]
     """
 
     @abstractmethod
-    def parse(self, file_path: str) -> List[DLSFilePreview]:
+    def parse(self, file_path: str) -> Sequence[DLSFilePreview]:
         """Parse a DLS data file and return a list of previews.
 
         Parameters
@@ -740,7 +1095,7 @@ class BaseTraceParser(ABC):
     """Abstract base class for all intensity trace file parsers."""
 
     @abstractmethod
-    def parse(self, file_path: str) -> List[TraceFilePreview]:
+    def parse(self, file_path: str) -> Sequence[TraceFilePreview]:
         """Parse a count rate history file and return a list of previews.
 
         Parameters
@@ -774,7 +1129,7 @@ class BaseSLSParser(ABC):
     """Abstract base class for all SLS file parsers."""
 
     @abstractmethod
-    def parse(self, file_path: str) -> List[SLSFilePreview]:
+    def parse(self, file_path: str) -> Sequence[SLSFilePreview]:
         """Parse an SLS data file and return a list of previews.
 
         Parameters

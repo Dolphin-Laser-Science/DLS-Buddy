@@ -1,0 +1,78 @@
+DLS Buddy -- Synthetic MULTI-TAU test data
+==========================================
+
+Why this set exists
+-------------------
+Every OTHER committed synthetic correlogram in this repo has a UNIFORMLY log-spaced lag
+axis. No real correlator emits one. A real instrument emits a multi-tau STAIRCASE: blocks
+of constant spacing that double at each block boundary, so the channel spacing -- and the
+per-channel noise with it -- changes along the axis.
+
+Measured on the two files here, at 90 deg:
+
+  uniform-log twin   200 channels   tau ratio 1.0844 .. 1.0844
+  multi-tau          183 channels   tau ratio 1.0667 .. 2.0000
+
+For comparison, every real correlogram family in this repo, measured over all of them
+rather than over the one that surfaced the question:
+
+  ALV .ASC                              103 previews   1.0667 .. 2.0000
+  Brookhaven .dat, DLS-SLS-Pairs        190 previews   1.0182 .. 2.0833
+  Brookhaven .dat, mode-resolved         58 previews   1.0231 .. 2.0833
+  Brookhaven "- Corr Fnctn.csv"          90 previews   1.0001 .. 9.9965
+
+The synthetic file above matches the ALV family exactly. It does NOT span the last row:
+those long-lag exports carry a x10 block step (0.1 s -> 1.0 s) that no multi-tau
+parameter set here reproduces, so a correlogram from that family is harder still.
+
+The pair is built from the SAME populations and the SAME seed, differing only in the lag
+axis and the noise model, so any difference in a recovered value is attributable to those
+two and nothing else.
+
+
+GLOBAL PARAMETERS (enter at the Data-tab confirmation step)
+-----------------------------------------------------------
+  Solvent                 : water
+  Solvent refractive index: 1.33
+  Viscosity               : 0.89 cP
+  Temperature             : 25.0 C (298.15 K)
+  Wavelength              : 532 nm
+
+
+GROUND TRUTH
+------------
+  Rh                  45.0 nm at every angle (single population, monodisperse)
+  Angles              30, 45, 60, 75, 90, 105, 120, 135 deg
+  beta                0.85
+  noise_level         0.01
+
+  `noise_level` means different things in the two files, deliberately:
+    uniform-log  constant per-channel SD of 0.01
+    multi-tau    the FIRST channel's SD is 0.01; later channels follow the Schaetzel
+                 (1990) classical-limit form, so the far tail is quieter per channel
+                 while carrying fewer independent samples
+
+
+WHAT THE PAIR ALREADY SHOWS (measured 2026-08-21, on these exact files)
+----------------------------------------------------------------------
+The two files are the same physics. They do NOT fit the same way.
+
+  fit_cumulants at the default cutoff 0.1
+    uniform-log   Rh = 43.5 - 46.0 nm at all eight angles
+    multi-tau     Rh = 44.0 - 45.5 nm at five angles, and 7934 / 13502 / 42422 nm
+                  at 75 / 120 / 135 deg
+
+  fit_cumulants at cutoff 0.3
+    multi-tau     Rh = 43.7 - 47.9 nm at all eight angles
+
+So the blow-up is the CUTOFF meeting a realistic lag axis, not the data. The multi-tau
+axis runs to 0.79 s with densely-spaced channels in a tail where g2-1 has decayed into
+noise; an amplitude cutoff of 0.1 admits that tail, and at the fast-decaying back angles
+the fit window becomes mostly noise. The uniform-log axis has far fewer channels out
+there and never exposes it.
+
+The program is honest about all three: `rh_reliable` is False on each, with a note that
+the radius is beyond what the lag window can support. Nothing here is a defect. The point
+is that this sensitivity was **unreachable from committed synthetic data** until now,
+because every other file in the corpus has the easy axis -- which is what makes any fit
+quality figure measured on that corpus optimistic.

@@ -27,8 +27,9 @@ The confidence band is the engine's **per-condition conservative bound**:
 conditions, growing toward the validity-box edges, honestly FLAT where a source
 supplies no shape (bulk-grade viscosities). Every part of it derives from real
 quantities (stated source accuracy, fit-residual envelopes, dn/dT-slope
-propagation) — never a fabricated model. It is **shown, never
-propagated** into any analysis SE. All physics lives in the controller/engine; this
+propagation, and a measured inter-laboratory reproducibility floor —
+critically-evaluated viscosity correlations exempt) — never a fabricated model.
+It is **shown, never propagated** into any analysis SE. All physics lives in the controller/engine; this
 widget only drives the controller and draws the bare arrays it returns.
 
 Global by design even though it lives under the sample-scoped Utilities tab: it
@@ -50,7 +51,9 @@ from analysis.uncertainty import format_pm
 from app import units as U
 from physics import solvents as solvents_lib
 from gui.help import section_header
-from gui.plot_controls import AxisControlBar, make_canvas_expanding, themed_navtoolbar
+from gui.plot_controls import (
+    AxisControlBar, make_canvas_expanding, set_plot_export_name, themed_navtoolbar)
+from gui.solvent_picker import index_of_solvent, populate_solvent_combo
 from gui.theme import ThemedLabel, token as theme_token
 from gui.widgets import value_unit_row as _value_unit_row
 
@@ -79,13 +82,15 @@ class SolventExplorerModule(QtWidgets.QWidget):
             'Solvent Explorer — look up n and η for a solvent + temperature + wavelength',
             'A display-only calculator over the solvent-property library:',
             bullets=[
-                'All library solvents appear here (primary + estimate). '
-                '“(estimate)” marks a lower-confidence solvent.',
+                'All library solvents appear here, split into <b>Measured properties</b> '
+                'and <b>Estimated properties</b> — the second section is the '
+                'lower-confidence data, which the Data tab offers but never auto-fills.',
                 'Values never enter an analysis — this view only shows them '
                 '(use the Data tab to auto-fill a measurement).',
                 'Each curve is drawn only across the range the library covers; '
-                'the shaded band is a conservative bound at each condition '
-                '(narrowest where the sources are strongest).',
+                'the shaded band is a conservative bound at each condition, '
+                'including an allowance for disagreement between published '
+                'sources (narrowest where the sources are strongest).',
                 'The band is <b>shown, never propagated</b> into any reported ± '
                 '(see Theory-and-Equations-Guide §5).',
             ]))
@@ -144,7 +149,8 @@ class SolventExplorerModule(QtWidgets.QWidget):
         pv.setContentsMargins(0, 0, 0, 0)
         self.figure = Figure(figsize=(9.6, 3.4), constrained_layout=True)
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
-        pv.addWidget(themed_navtoolbar(self.canvas, plots))
+        pv.addWidget(themed_navtoolbar(self.canvas, plots, self.controller))
+        set_plot_export_name(self.canvas, 'solvent_properties')
         pv.addWidget(self.canvas, 1)
         # One axis-control bar per y-axis, all on the one canvas (the T-cell's twin
         # axes share x, so editing x on either is consistent, not conflicting). The η
@@ -164,8 +170,9 @@ class SolventExplorerModule(QtWidgets.QWidget):
         outer.addWidget(plots, 1)
 
         self.band_note = ThemedLabel(
-            'Shaded band = conservative bound at each condition '
-            '(Theory-and-Equations-Guide §5) — shown, never propagated into an analysis SE. '
+            'Shaded band = conservative bound at each condition, including an '
+            'inter-laboratory allowance (Theory-and-Equations-Guide §5) — shown, '
+            'never propagated into an analysis SE. '
             'Curves stop where the library’s validity ends.',
             role='hint', size=11)
         self.band_note.setWordWrap(True)
@@ -181,14 +188,11 @@ class SolventExplorerModule(QtWidgets.QWidget):
         return w
 
     def _populate_solvent_combo(self) -> None:
-        """Fill the combo from all library solvents; estimate-tier rows are labeled
-        '(estimate)'. The canonical name rides itemData so the label is cosmetic."""
+        """Fill the combo from all library solvents, grouped into measured/estimated
+        sections by the shared picker helper (the Data tab and Settings show the same
+        roster the same way)."""
         self.solvent_combo.blockSignals(True)
-        self.solvent_combo.clear()
-        for name in solvents_lib.available_solvents(None):
-            tier = solvents_lib.solvent_tier(name)
-            label = name if tier == 'primary' else f'{name} (estimate)'
-            self.solvent_combo.addItem(label, name)
+        populate_solvent_combo(self.solvent_combo)
         self.solvent_combo.blockSignals(False)
 
     def reseed_from_settings(self) -> None:
@@ -198,8 +202,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
         Utilities' reseed path cascades here."""
         default = getattr(self.controller.settings, 'default_solvent', None)
         if default:
-            i = self.solvent_combo.findData(
-                solvents_lib.normalize_solvent_name(default))
+            i = index_of_solvent(self.solvent_combo, default)
             if i >= 0:
                 self.solvent_combo.blockSignals(True)
                 self.solvent_combo.setCurrentIndex(i)

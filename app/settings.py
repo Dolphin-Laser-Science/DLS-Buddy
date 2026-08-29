@@ -44,13 +44,22 @@ class SettingsState:
     rh_grid_min_nm: float = 1.0             # CONTIN/NNLS Rh grid lower bound
     rh_grid_max_nm: float = 1000.0          # CONTIN/NNLS Rh grid upper bound
     rh_grid_points: int = 100               # CONTIN/NNLS Rh grid resolution
-    lcurve_alpha_min: float = 1.0e-6        # CONTIN L-curve alpha sweep lower bound
+    lcurve_alpha_min: float = 1.0e-4        # CONTIN alpha sweep floor; derivation on fit_contin
     lcurve_alpha_max: float = 1.0e2         # CONTIN L-curve alpha sweep upper bound
     contin_alpha_method: str = 'gcv'        # CONTIN alpha selection: 'gcv' (Golub 1979,
     #                                         default), 'lcurve' (Hansen max-curvature
     #                                         corner), or 'ftest' (Provencher F-test)
     contin_ftest_prob_reject: float = 0.5   # F-test probability-to-reject level
     #                                         (Provencher default 0.5); higher -> smoother
+
+    # --- file loading ---
+    brookhaven_dat_baseline: str = 'calculated'   # which baseline normalizes a Brookhaven
+    #                                               raw ASCII .dat correlogram: 'calculated'
+    #                                               (total_A*total_B/n_samples, a whole-run
+    #                                               statistic) or 'measured' (the mean of the
+    #                                               file's baseline channels). Consulted ONLY
+    #                                               when the file's own header does not name
+    #                                               one; an explicit in-file choice wins.
 
     # --- SLS defaults ---
     standard_geometry: str = 'VU'           # toluene Rayleigh geometry: VU / VV / VH
@@ -93,10 +102,21 @@ class SettingsState:
     plot_units: Dict[str, str] = field(default_factory=dict)
 
     # --- session (interface) ---
+    confirm_run_replaces_pick: bool = False  # ask before an explicit Run replaces an
+    #                                          explicitly picked value (off: the run's
+    #                                          summary/status still disclose it -- the
+    #                                          disclosure is not a setting and never
+    #                                          turns off). Pure interaction behaviour,
+    #                                          global like show_tooltips; no number is
+    #                                          touched, so it is not per-run seeded.
     reopen_last_session: bool = False       # auto-save the workspace on exit and reopen
     #                                         it on the next launch (off by default)
     last_session_path: str = ''             # app-managed autosave file (set by the GUI;
     #                                         resolved beside settings.json, never CWD)
+    last_export_dir: str = ''               # app-managed: folder of the last successful
+    #                                         CSV/plot save (seeds the save dialogs)
+    last_open_dir: str = ''                 # app-managed: folder of the last successful
+    #                                         data-file open (seeds the open dialogs)
 
     # ---- serialization ----
     def to_dict(self) -> Dict[str, Any]:
@@ -169,14 +189,12 @@ class SettingsState:
 
         if hint is str:
             # Every string setting (free-form paths/solvent names AND the method/appearance
-            # enums) is accepted on a type check alone -- we deliberately do NOT validate an
-            # enum value against a hard-coded allow-list. An unknown-but-string value (a typo,
-            # or a choice from a newer build) passes through to its consumer, which is already
-            # safe: the analysis SE falls back to HC3, an unknown Rayleigh geometry raises
-            # loudly at calibration, and the method selectors fall back to their defaults -- so
-            # a bad enum can never produce a silently-wrong result. This keeps forward-compat
-            # ("a newer build's settings.json still loads") and avoids a drift-prone hand list
-            # (owner decision, 2026-07-12, after the audit-04 review found both costs).
+            # enums) is accepted on a type check alone -- deliberately NOT validated against a
+            # hard-coded allow-list. An unknown-but-string value (a typo, or a choice from a
+            # newer build) passes to its consumer, which is already safe: the analysis SE
+            # falls back to HC3, an unknown Rayleigh geometry raises loudly at calibration,
+            # and the method selectors fall back to their defaults. This keeps forward
+            # compatibility and avoids a drift-prone hand list.
             if isinstance(value, str):
                 return value, True, None
             return bad("text")

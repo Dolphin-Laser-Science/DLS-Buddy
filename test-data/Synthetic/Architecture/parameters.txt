@@ -1,0 +1,44 @@
+DLS Buddy — Synthetic Architecture (branching contraction factor g) test data
+============================================================================
+
+A homologous LINEAR Rg-Mw series (Rg = 0.05 * Mw^0.5), two REGULAR STARS, and two
+RANDOMLY-BRANCHED FRACTIONS (tri- and tetra-functional), built to exercise the
+Cross-Sample Architecture tab: tag the linear samples Linear and a branched sample
+Branched (Chain type, Data tab), and g = (Rg_branched / Rg_linear)^2 is recovered.
+Its reading depends on the selected branching model:
+  * regular star            -> f_eff  (arm number, from g = (3f-2)/f^2)
+  * random tri / tetra      -> n      (branch units/molecule, from Eqs. 47a/47b)
+
+GLOBAL PARAMETERS (enter at the Data-tab confirmation step):
+  Solvent                 : water
+  Solvent refractive index: 1.33
+  Viscosity               : 0.89 cP
+  Temperature             : 25.0 C (298.15 K)
+  Wavelength              : 532 nm
+  dn/dc                   : 0.135 mL/g
+
+SLS CALIBRATION (SLS tab calibration panel):
+  Standard toluene (VU); calibrant intensity 100000 at 90 deg
+  (the program computes k_c = 3.1496e-10)
+
+GROUND TRUTH (Role -> tag on the Architecture tab):
+  sample            role      Mw          Rg (nm)   Rh (nm)   model         f   n   g       
+  PS linear 100k    linear    1e+05       15.811    10.541                                  
+  PS linear 400k    linear    4e+05       31.623    21.082                                  
+  PS linear 900k    linear    9e+05       47.434    31.623                                  
+  PS star 3-arm     branched  2e+05       19.720    14.086    regular star  3       0.7778  
+  PS star 4-arm     branched  6e+05       30.619    22.680    regular star  4       0.6250  
+  PS random tri     branched  3e+05       22.457    15.815    random tri    3   6   0.6724  
+  PS random tetra   branched  7e+05       31.816    23.055    random tetra  4   4   0.5784  
+
+Expected on the Architecture tab (linear series tagged Linear, one Branched):
+  PS star 3-arm    -> g ≈ 0.778;  regular star  -> f_eff ≈ 3
+  PS star 4-arm    -> g ≈ 0.625;  regular star  -> f_eff ≈ 4
+  PS random tri    -> g ≈ 0.672;  random tri    -> n ≈ 6 branch units/molecule
+  PS random tetra  -> g ≈ 0.578;  random tetra  -> n ≈ 4 branch units/molecule
+  (all four branched Mw sit inside the linear reference span 1e5-9e5)
+
+MODEL-DEPENDENCE (the headline caveat): the SAME g inverts to a DIFFERENT n
+under a different model. E.g. PS random tri (g ≈ 0.672) reads as n ≈ 6 under the
+tri model but n ≈ 2.4 under the tetra model, and f_eff ≈ 3.6 as a regular star —
+so the readout must always name the assumed model.

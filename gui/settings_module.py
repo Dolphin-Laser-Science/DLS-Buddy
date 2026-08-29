@@ -21,10 +21,25 @@ from PySide6 import QtCore, QtWidgets
 
 from app import units as U
 from app.settings import SettingsState
-from physics import solvents as solvents_lib
 from gui.help import HelpBadge
+from gui.solvent_picker import index_of_solvent, populate_solvent_combo
+from gui.widgets import first_selectable_index
 from gui.theme import ThemedLabel
 from gui.worker import busy_notice, runner
+
+# Calculation-nuance tooltips for the unit choices whose reach is easy to
+# misjudge (spec 04 stage 2 extended both to the SLS axes).
+_PLOT_UNIT_TIPS = {
+    'scattering_q2':
+        'Applies to every q² axis: the DLS Γ-vs-q² and DDLS plots AND the SLS '
+        'plots (Rayleigh ratio, Debye, Guinier, form factors, Zimm — whose '
+        'printed spacing constant k follows this unit). Fitted results are '
+        'unaffected; only axes rescale.',
+    'concentration':
+        'Applies to the concentration axes: the DLS D-vs-c plot and the SLS '
+        'calibration-free A₂ plot. Legend concentration labels always read '
+        'mg/mL, whatever the axis unit.',
+}
 
 # Plot-axis display-unit choices surfaced in Settings:
 # (quantity, label). The combo for each offers U.unit_options(quantity).
@@ -35,17 +50,37 @@ _PLOT_UNIT_ROWS = [
     ('diffusion', 'Diffusion coeff. D'),
     ('decay_rate', 'Decay rate Γ'),
     ('concentration', 'Concentration'),
-    ('radius', 'Radius (Rh / Rg)'),
-    ('molar_mass', 'Molar mass Mw'),
+    ('radius', 'Radius (R<sub>h</sub> / R<sub>g</sub>)'),
+    ('molar_mass', 'Molar mass M<sub>w</sub>'),
 ]
 
 
-def _seed_combo(combo: QtWidgets.QComboBox, value, *, use_data: bool) -> None:
+def _seed_combo(combo: QtWidgets.QComboBox, value, *, use_data: bool,
+                find=None) -> None:
     """Select ``value`` in ``combo`` (by data or text). If it isn't a current item —
     e.g. a hand-edited settings.json, or a solvent later dropped from the library —
     insert it as an extra entry rather than silently falling back to a different one,
-    so an untouched Apply writes the same value back instead of replacing it."""
-    idx = combo.findData(value) if use_data else combo.findText(value)
+    so an untouched Apply writes the same value back instead of replacing it.
+
+    ``find`` overrides how a row is located, for a field whose own matching rule is not
+    exact equality. The solvent field passes ``index_of_solvent`` so a hand-edited
+    ``"Water"`` snaps to the ``water`` row instead of adding a near-duplicate beside it —
+    one kind of value must not have two matching rules in one program.
+
+    The append below is only sound because the appended row is findable BY THE SAME RULE
+    on the next call. If it were not, every reload would append again: this runs on init,
+    on Restore defaults, and on a cancelled Apply's revert, so the list would grow without
+    bound. ``index_of_solvent`` casefolds both sides for exactly this reason.
+    """
+    if not value:
+        # Nothing to seed. Appending here would add a literal 'None'/'' row -- and, since
+        # no lookup would ever match it, one more on every reload.
+        combo.setCurrentIndex(max(0, first_selectable_index(combo)))
+        return
+    if find is not None:
+        idx = find(combo, value)
+    else:
+        idx = combo.findData(value) if use_data else combo.findText(value)
     if idx < 0:
         combo.addItem(str(value), value if use_data else None)
         idx = combo.count() - 1
@@ -69,8 +104,11 @@ class SettingsModule(QtWidgets.QWidget):
         note = ThemedLabel(
             'These are starting defaults that seed each module’s per-run controls. '
             'You can still change a value per run, and that per-run value (not the '
-            'setting) is what is used and recorded. Saved to settings.json at the '
-            'program root.', role='muted')
+            'setting) is what is used and recorded — except where a setting says '
+            'otherwise in its own tooltip: the file-loading, appearance, display-unit '
+            'and result-formatting choices are global, and the Brookhaven .dat '
+            'baseline is read once, when the file loads. Saved to settings.json at '
+            'the program root.', role='muted')
         note.setWordWrap(True)
         outer.addWidget(note)
 
@@ -104,12 +142,46 @@ class SettingsModule(QtWidgets.QWidget):
             'small-particle mode is not erased. See the Theory-and-Equations-Guide.')
         form.addRow('Skip initial lag channels:', self.skip_channels)
 
+        form.addRow(self._header('File Loading'))
+        self.bh_dat_baseline = QtWidgets.QComboBox()
+        self.bh_dat_baseline.addItem('Calculated', 'calculated')
+        self.bh_dat_baseline.addItem('Measured', 'measured')
+        self.bh_dat_baseline.setToolTip(
+            'Baseline used to normalize a Brookhaven raw ASCII .dat correlogram, '
+            'whose channels hold raw counts: g₂−1 = counts/B − 1. Applies only when '
+            'the file itself does not name a baseline. See the '
+            'Theory-and-Equations-Guide.')
+        dat_help = HelpBadge(
+            'Brookhaven .dat files store raw correlator counts plus two baselines, '
+            'so one of them has to be chosen before the correlogram exists.',
+            bullets=[
+                '<b>Calculated</b> — the default. Formed from the run totals '
+                '(counts A × counts B, over the number of samples), so it uses '
+                'the whole measurement.',
+                '<b>Measured</b> — the average of the baseline channels the acquiring '
+                'software set aside. Matches what Particle Explorer reports, but '
+                'depends on those channels lying past the decay.',
+                'A file that names its own baseline overrides this setting.',
+                'The two typically differ by a few tenths of a percent. That makes '
+                'no difference to the default fits, which float or estimate a '
+                'baseline of their own and absorb it; it shifts the size by a few '
+                'percent for the linear cumulant method, which assumes none.',
+                'A large difference between the two baselines is itself a dust or '
+                'slow-drift warning, whichever you pick.',
+            ])
+        dat_row = QtWidgets.QWidget()
+        dat_lay = QtWidgets.QHBoxLayout(dat_row)
+        dat_lay.setContentsMargins(0, 0, 0, 0)
+        dat_lay.addWidget(self.bh_dat_baseline, 1)   # stretch like a badge-less row
+        dat_lay.addWidget(dat_help)
+        form.addRow('Brookhaven .dat baseline:', dat_row)
+
         form.addRow(self._header('SLS Defaults'))
         self.geometry = QtWidgets.QComboBox()
         self.geometry.addItems(['VU', 'VV', 'VH'])
         self.geometry.setToolTip(
             'Scattering geometry of the calibration standard: VV = polarized, '
-            'VH = depolarized, VU = no analyzer (e.g. the BI-200SM). '
+            'VH = depolarized, VU = no analyzer (a vertical laser with no analyzer). '
             'See the Theory-and-Equations-Guide.')
         form.addRow('Standard geometry:', self.geometry)
         self.qrg_max = QtWidgets.QDoubleSpinBox()
@@ -122,7 +194,7 @@ class SettingsModule(QtWidgets.QWidget):
 
         form.addRow(self._header('Solvent Library'))
         self.default_solvent = QtWidgets.QComboBox()
-        self.default_solvent.addItems(solvents_lib.available_solvents('primary'))
+        populate_solvent_combo(self.default_solvent)
         self.default_solvent.setToolTip(
             'The solvent the Solvent Explorer (a Utilities sub-tab) starts on. A '
             'convenience default only — it never sets a value in any analysis.')
@@ -156,9 +228,8 @@ class SettingsModule(QtWidgets.QWidget):
         est_row = QtWidgets.QWidget()
         est_lay = QtWidgets.QHBoxLayout(est_row)
         est_lay.setContentsMargins(0, 0, 0, 0)
-        est_lay.addWidget(self.se_estimator)
+        est_lay.addWidget(self.se_estimator, 1)      # stretch like a badge-less row
         est_lay.addWidget(est_help)
-        est_lay.addStretch(1)
         form.addRow('Regression SE estimator:', est_row)
 
         # NB: the synthetic-generator (β/noise/points) and intensity-trace (outlier
@@ -179,6 +250,8 @@ class SettingsModule(QtWidgets.QWidget):
         for q, label in _PLOT_UNIT_ROWS:
             combo = QtWidgets.QComboBox()
             combo.addItems(U.unit_options(q))
+            if q in _PLOT_UNIT_TIPS:
+                combo.setToolTip(_PLOT_UNIT_TIPS[q])
             self.plot_unit_combos[q] = combo
             form.addRow(f'{label}:', combo)
 
@@ -250,8 +323,40 @@ class SettingsModule(QtWidgets.QWidget):
         self.reopen_last_session.setToolTip(
             'When on, the current workspace is auto-saved when you close the program '
             'and reopened the next time you launch it. If the saved session is missing '
-            'or cannot be read, the program starts empty. Off by default.')
+            'or damaged, the program starts empty. If it was saved by a different '
+            'version it cannot be opened, and you are asked at startup whether to keep '
+            'that file (nothing is auto-saved over it) or let this version replace it. '
+            'Off by default.')
         form.addRow('Session:', self.reopen_last_session)
+        self.confirm_run_replaces_pick = QtWidgets.QCheckBox(
+            'Ask before a Run replaces a picked value')
+        self.confirm_run_replaces_pick.setToolTip(
+            'An explicit Run replaces a value you picked in Cross-Sample, and the '
+            'run always reports the replacement afterwards. Turn this on to be '
+            'asked first instead; Cancel keeps the pick and runs nothing.')
+        confirm_help = HelpBadge(
+            'Whether pressing Run asks before replacing a value you explicitly '
+            'picked in Cross-Sample.',
+            bullets=[
+                'A <b>picked</b> value is replaced by the two runs that write '
+                'sample values — a Zimm/Berry run (picked Rg/Mw/A₂) and replicate '
+                'averaging (picked Rh); pressing Run is a deliberate act. Other '
+                'runs, and every passive refresh, leave picks alone.',
+                '<b>Off</b> (default) — the run proceeds, and its summary / status '
+                'line reports what it replaced. That report always appears; it is '
+                'not part of this setting.',
+                '<b>On</b> — a confirm names the picked value(s) first; Cancel '
+                'keeps the pick and runs nothing.',
+                'Hand-entered values are never replaced by any run, with or '
+                'without this setting.',
+            ])
+        confirm_row = QtWidgets.QWidget()
+        confirm_lay = QtWidgets.QHBoxLayout(confirm_row)
+        confirm_lay.setContentsMargins(0, 0, 0, 0)
+        confirm_lay.addWidget(self.confirm_run_replaces_pick)
+        confirm_lay.addWidget(confirm_help)
+        confirm_lay.addStretch(1)
+        form.addRow('Runs:', confirm_row)
 
         outer.addWidget(host)
 
@@ -282,25 +387,41 @@ class SettingsModule(QtWidgets.QWidget):
             cumulant_order=s.cumulant_order,
             rh_grid_min_nm=s.rh_grid_min_nm, rh_grid_max_nm=s.rh_grid_max_nm,
             rh_grid_points=s.rh_grid_points,
-            lcurve_alpha_min=s.lcurve_alpha_min, lcurve_alpha_max=s.lcurve_alpha_max)
+            lcurve_alpha_min=s.lcurve_alpha_min, lcurve_alpha_max=s.lcurve_alpha_max,
+            contin_alpha_method=s.contin_alpha_method,
+            contin_ftest_prob_reject=s.contin_ftest_prob_reject)
         _seed_combo(self.cumulant_method, s.cumulant_method, use_data=True)
         self.skip_channels.setValue(s.skip_initial_channels)
-        self.geometry.setCurrentText(s.standard_geometry)
+        _seed_combo(self.bh_dat_baseline, s.brookhaven_dat_baseline, use_data=True)
+        _seed_combo(self.geometry, s.standard_geometry, use_data=False)
         self.qrg_max.setValue(s.guinier_qrg_max)
-        _seed_combo(self.default_solvent, s.default_solvent, use_data=False)
+        # use_data: the picker puts the canonical name on itemData and treats the label
+        # as cosmetic, and its section headers carry no data — so matching on data can
+        # never land on one. find: the same caseless rule the Data tab and the Explorer
+        # use, so this field does not become a second way to match a solvent name.
+        _seed_combo(self.default_solvent, s.default_solvent, use_data=True,
+                    find=index_of_solvent)
         _seed_combo(self.se_estimator, s.se_estimator, use_data=True)
+        # _seed_combo, not setCurrentText: a stored value the list no longer offers
+        # (a hand-edited settings.json, a unit later dropped -- app/units.py records
+        # viscosity's 'cP') must round-trip through an untouched Apply, not be
+        # silently replaced by the combo's first row. The plot layer already falls
+        # back to its default for a unit it does not know (`plots.set_plot_units`).
         for q, combo in self.plot_unit_combos.items():
-            combo.setCurrentText(s.plot_units.get(q, U.default_unit(q)))
+            _seed_combo(combo, s.plot_units.get(q, U.default_unit(q)), use_data=False)
         self.no_unc_sig_figs.setValue(s.no_uncertainty_sig_figs)
-        # last_session_path is managed by the shell (autosave on exit), not edited here;
-        # retain it so Apply round-trips it instead of blanking the stored path.
-        self._retained_last_session_path = s.last_session_path
-        self.theme.setCurrentText(s.theme)
-        self.palette.setCurrentText(s.plot_palette)
+        # last_session_path / last_export_dir / last_open_dir are managed by the shell
+        # (autosave on exit; the file dialogs), not edited here. _collect() reads them
+        # LIVE from controller.settings rather than retaining a snapshot here: the file
+        # dialogs mutate the settings object mid-session, and an Apply collecting a
+        # construction-time snapshot would silently revert them (review finding).
+        _seed_combo(self.theme, s.theme, use_data=False)
+        _seed_combo(self.palette, s.plot_palette, use_data=False)
         self.plot_match_theme.setChecked(s.plot_match_theme)
         _seed_combo(self.ui_density, s.ui_density, use_data=True)
         self.show_tooltips.setChecked(s.show_tooltips)
         self.reopen_last_session.setChecked(s.reopen_last_session)
+        self.confirm_run_replaces_pick.setChecked(s.confirm_run_replaces_pick)
 
     def _collect(self) -> SettingsState:
         return SettingsState(
@@ -309,9 +430,13 @@ class SettingsModule(QtWidgets.QWidget):
             **self._retained_dls,
             cumulant_method=self.cumulant_method.currentData(),
             skip_initial_channels=self.skip_channels.value(),
+            brookhaven_dat_baseline=self.bh_dat_baseline.currentData(),
             standard_geometry=self.geometry.currentText(),
             guinier_qrg_max=self.qrg_max.value(),
-            default_solvent=self.default_solvent.currentText(),
+            # `or ''` because the field is typed `str`: currentData() is None on a blank
+            # or header row, and writing None into a str field puts a value in
+            # settings.json that no reader is prepared for.
+            default_solvent=self.default_solvent.currentData() or '',
             se_estimator=self.se_estimator.currentData(),
             plot_units={q: combo.currentText()
                         for q, combo in self.plot_unit_combos.items()},
@@ -322,21 +447,44 @@ class SettingsModule(QtWidgets.QWidget):
             plot_match_theme=self.plot_match_theme.isChecked(),
             show_tooltips=self.show_tooltips.isChecked(),
             reopen_last_session=self.reopen_last_session.isChecked(),
-            last_session_path=self._retained_last_session_path,
+            confirm_run_replaces_pick=self.confirm_run_replaces_pick.isChecked(),
+            last_session_path=self.controller.settings.last_session_path,
+            last_export_dir=self.controller.settings.last_export_dir,
+            last_open_dir=self.controller.settings.last_open_dir,
         )
 
     # ----------------------------------------------------------- actions ---
     @QtCore.Slot()
-    def _apply(self) -> bool:
+    def _apply(self, *, force: bool = False) -> bool:
         """Apply the edited settings. Returns True if applied, False if it was
         aborted (busy, or a stale-guard prompt canceled) — `_restore` uses this to
-        fully revert the widgets on cancel."""
+        fully revert the widgets on cancel.
+
+        A no-change Apply is a no-op (no persist, no `applied` cascade) unless
+        `force` is set: `_restore` forces it, because the shell's reseed of the DLS
+        per-run controls rides the `applied` signal and those controls are not part of
+        the compared `SettingsState` — equality of the object is not equality of the
+        effect (owner-ruled 2026-08-28; the constraint's home is CLAUDE.md's locked
+        decision "Settings seed, never override").
+
+        `force` is KEYWORD-ONLY on purpose: this method is a slot on the Update
+        button's `clicked(bool checked)`, and a positional first parameter takes that
+        payload — measured on PySide6 6.11.1, `@QtCore.Slot()` does not suppress it, so
+        a checkable button would deliver `force=True` on every click. Keyword-only
+        removes the gap instead of policing it: Qt cannot fill it."""
         # Settings values seed the analysis defaults a background run reads
         # mid-flight — applying under it could change its numbers.
         if runner().is_busy:
             busy_notice(self)
             return False
         new = self._collect()
+        if not force and new == self.controller.settings:
+            # Nothing changed: no persist, no `applied` cascade (the shell's re-theme,
+            # re-seed and every-tab redraw). Same shape as Controller.is_dirty(): the
+            # collected state against the applied one. A fresh state's first Apply
+            # still goes through: its `plot_units` is `{}` until _collect fills the
+            # eight axis units, a real change to persist once.
+            return True
         # Two independent switches (cumulant method, SE estimator) each make some
         # existing results stale and offer a clear-and-warn. Collect BOTH confirmations
         # up front and only mutate after every prompt is confirmed — otherwise canceling
@@ -350,13 +498,22 @@ class SettingsModule(QtWidgets.QWidget):
 
         if new.cumulant_method != old_method:
             n = self.controller.cumulant_dependent_result_count()
-            if n > 0:
+            # The picked count gates the prompt too: a dangling pick can exist while
+            # the row/cache counts are zero (its row removed by a declined re-run, or
+            # the cache emptied by a reload), and a clear that destroys a pick must
+            # never run unconfirmed (SampleResult docstring: proceed or back out).
+            p = self.controller.cumulant_dependent_picked_count()
+            if n > 0 or p > 0:
+                picked_clause = (f", plus {p} explicitly picked Rh value(s) that "
+                                 f"came from them" if p else "")
                 resp = QtWidgets.QMessageBox.question(
                     self, 'Switch cumulant method?',
                     f"Switching the cumulant method will clear {n} existing "
-                    f"cumulant-based result(s) — cumulant fits, Γ vs q², and "
-                    f"replicate averages. Distributions, SLS, and any hand-entered "
-                    f"Rh are kept.\n\nContinue?",
+                    f"cumulant-based result(s) (cumulant fits, Γ vs q², D vs c, and "
+                    f"replicate averages){picked_clause}. A sample Rh taken from a "
+                    f"cleared result goes with it, so ρ = Rg/Rh is blank until you "
+                    f"re-run. Distributions, SLS, and any hand-entered Rh are "
+                    f"kept.\n\nContinue?",
                     QtWidgets.QMessageBox.StandardButton.Yes
                     | QtWidgets.QMessageBox.StandardButton.Cancel,
                     QtWidgets.QMessageBox.StandardButton.Cancel)
@@ -367,16 +524,20 @@ class SettingsModule(QtWidgets.QWidget):
 
         if new.se_estimator != old_estimator:
             n = self.controller.se_dependent_result_count()
-            if n > 0:
+            p = self.controller.se_dependent_picked_count()   # gates like the cumulant arm
+            if n > 0 or p > 0:
                 label = 'classical OLS' if new.se_estimator == 'ols' else 'HC3 (robust)'
+                picked_clause = (f", plus {p} explicitly picked value(s) whose ± "
+                                 f"is estimator-routed (a pick cannot refresh "
+                                 f"its ±)" if p else "")
                 resp = QtWidgets.QMessageBox.question(
                     self, 'Switch uncertainty estimator?',
                     f"Switching to {label} will clear {n} existing result(s) that "
-                    f"report a regression ± — Zimm/Berry, Debye, Guinier, "
-                    f"calibration-free A₂, Γ vs q², and D vs c — so they recompute "
-                    f"under the new estimator. Point estimates (Mw, Rg, D, Rh) are "
-                    f"unaffected; distributions, cumulants, and any hand-entered "
-                    f"values are kept.\n\nContinue?",
+                    f"report a regression ± (Zimm/Berry, Debye, Guinier, "
+                    f"calibration-free A₂, Γ vs q², and D vs c){picked_clause}, so "
+                    f"they recompute under the new estimator. Computed point "
+                    f"estimates (Mw, Rg, D, Rh) are unaffected; distributions, "
+                    f"cumulants, and any hand-entered values are kept.\n\nContinue?",
                     QtWidgets.QMessageBox.StandardButton.Yes
                     | QtWidgets.QMessageBox.StandardButton.Cancel,
                     QtWidgets.QMessageBox.StandardButton.Cancel)
@@ -412,5 +573,5 @@ class SettingsModule(QtWidgets.QWidget):
         # the factory values just loaded — fully reload them from the (unchanged)
         # applied settings, not just the two guarded dropdowns, so the UI can't be
         # left displaying defaults that were never applied.
-        if not self._apply():
+        if not self._apply(force=True):      # force: the reseed rides `applied`
             self._load_from(self.controller.settings)

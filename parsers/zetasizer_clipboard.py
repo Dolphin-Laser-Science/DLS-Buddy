@@ -45,11 +45,18 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 from typing import List
 
 import numpy as np
 
-from parsers.base_parser import BaseDLSParser, DLSFilePreview, ParseError
+from parsers.base_parser import (
+    BaseDLSParser,
+    DLSFilePreview,
+    MalformedDataError,
+    ParseError,
+    convert_delay_times,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -66,8 +73,6 @@ _DATA_START_ROW = 1
 
 _COL_LAG_TIME = 0
 _FIRST_RECORD_COL = 1    # every column from here on is one record's correlogram
-
-_MICROSECONDS_TO_SECONDS = 1.0e-6   # lag times: µs -> s
 
 # Header column-1 text used to recognize the format (case-insensitive). The full
 # phrase 'lag time' (not a bare 'lag' substring) so an unrelated tab file that
@@ -194,6 +199,15 @@ class ZetasizerClipboardParser(BaseDLSParser):
                 f"its header row intact?)"
             )
 
+        # --- format commit point ---------------------------------------------------
+        # Above this line a failure means "not my format" and stays a plain ParseError,
+        # so autodetect can hand the file to the next parser. Below it the file has
+        # proved it IS this format, so a failure is malformed DATA and raises
+        # MalformedDataError, whose message is meant for the user. TWO pre-commit checks
+        # still live BELOW this line, both deliberate: the bad-lag-row fraction and the
+        # foreign-file record sniff. Both say "this is not Zetasizer clipboard data" about a
+        # file that happens to have a Lag Time header, so both must read as a format verdict.
+
         # --- record columns: every non-empty header cell after the lag column ---
         # (the trailing empty cell from the final tab is skipped.)
         record_cols = [
@@ -221,14 +235,17 @@ class ZetasizerClipboardParser(BaseDLSParser):
                 n_bad += 1
                 continue
             lag_us.append(t)
-            # A missing/blank/non-numeric cell becomes NaN for that record only,
-            # keeping every record on the shared lag axis (ragged rows tolerated).
+            # A missing/blank/non-numeric cell is recorded as None for that record only,
+            # keeping every record on the shared lag axis (ragged rows tolerated). Which
+            # of those Nones is padding and which is malformed cannot be decided here --
+            # it depends on whether anything follows in the same record -- so the
+            # decision is deferred to the per-record pass below.
             for i in record_cols:
                 cell = parts[i].strip() if i < len(parts) else ''
                 try:
                     values[i].append(float(cell))
                 except ValueError:
-                    values[i].append(np.nan)
+                    values[i].append(None)
 
         total = len(data_lines)
         if total and n_bad / total > _MAX_BAD_ROW_FRACTION:
@@ -240,41 +257,113 @@ class ZetasizerClipboardParser(BaseDLSParser):
             )
 
         if len(lag_us) == 0:
-            raise ParseError(
+            raise MalformedDataError(
                 f"No valid data rows found in {file_path!r} "
                 f"({n_bad} malformed rows)."
             )
 
         # The n_bad guard above only inspects the LAG cell, so a foreign file with a
         # numeric first column but non-numeric record columns would slip through and store
-        # a meaningless all-NaN correlogram (F-24). Reject the FOREIGN-file case up front:
-        # a numeric lag axis with NO record column carrying any numeric value is not
-        # Zetasizer clipboard data with its record columns intact.
-        #
-        # A MIXED file (some valid columns, one header-present-but-all-NaN column) is NOT
-        # silently dropped: every record column is emitted, and an all-NaN one then fails
-        # LOUDLY at build via the correlogram finite guard (naming its series) -- exactly as
-        # a partially-NaN record already does. Fail-loud, never a silent partial load
-        # (invariant 2 / this cluster's theme). Arrays are built once here and reused below.
-        corr = {i: np.array(values[i], dtype=float) for i in record_cols}
-        if not any(np.any(np.isfinite(a)) for a in corr.values()):
+        # a meaningless all-NaN correlogram. Reject the FOREIGN-file case FIRST: a numeric
+        # lag axis with NO record column carrying any numeric value is not Zetasizer
+        # clipboard data with its record columns intact. Order matters -- run after the
+        # per-record strictness below, a foreign file would be reported as a malformed
+        # Zetasizer row rather than as the wrong format. It ALSO guarantees the per-record
+        # drop below can never empty the file: at least one column is numeric here.
+        if not any(any(v is not None for v in values[i]) for i in record_cols):
             raise ParseError(
                 f"{file_path!r} has a numeric lag axis but no record column with any "
                 f"numeric value (every 'Record N' column is non-numeric). This does not "
                 f"look like Zetasizer clipboard data with its record columns intact."
             )
 
-        delay_times_s = np.array(lag_us, dtype=float) * _MICROSECONDS_TO_SECONDS
+        # Per-record pass. A blank cell is PADDING only where it is part of the trailing
+        # run -- a clipboard paste can genuinely hold records of different lengths on one
+        # lag axis. Anywhere else it is a hole in the middle of a series, i.e. a malformed
+        # file, and it is named HERE rather than deferred to DLSMeasurement's "correlogram
+        # must contain only finite numbers" at *Run*, which names neither the file, the
+        # record, nor the row.
+        corr = {}
+        dropped = []
+        for i in record_cols:
+            vals = values[i]
+            n = len(vals)
+            while n > 0 and vals[n - 1] is None:
+                n -= 1                              # strip the trailing padding run
+            holes = [r for r in range(n) if vals[r] is None]
+            label = labels[i] or f'column {i + 1}'
+            if n == 0:
+                # A header with no numeric value ANYWHERE carries no data, so dropping it
+                # loses nothing, where raising would cost the paste's other good records.
+                # It is never dropped silently: see the note built below, which reaches the
+                # GUI. The asymmetry with `holes` just below is deliberate -- an empty
+                # column has nothing to lose, while a HOLED column carries real pasted
+                # values, so naming the row and lag beats discarding them.
+                dropped.append(label)
+                continue
+            if holes:
+                first = holes[0]
+                raise MalformedDataError(
+                    f"{file_path!r}: record {label!r} is blank or non-numeric at data "
+                    f"row {first + 1} (lag {lag_us[first]!r} us), with {n - first - 1} "
+                    f"further value(s) after it. A gap inside a record is a malformed "
+                    f"paste; only blanks at the END of a record are padding."
+                )
+            corr[i] = np.array(vals[:n], dtype=float)
+
+        # ONE note string, both channels (the keep-both convention `generic_sls.py` set):
+        # `notes` reaches the GUI as a passive info box, and the UserWarning keeps the
+        # scripted/headless caller informed. The GUI half is the load-bearing one --
+        # `tests/test_notes_bridge.py` exists to establish that stderr is invisible in the
+        # packaged app, which is exactly why a previous stderr-only attempt at this drop
+        # was rejected.
+        found_notes = []
+        # A data row whose lag cell is not a number is skipped for EVERY record (the
+        # 5 % ceiling above tolerates a few); that is a lag channel the user never
+        # sees, so it is disclosed like the empty-column drop below.
+        if n_bad:
+            found_notes.append(
+                f"{n_bad} of {total} data row(s) have a non-numeric lag-time cell and "
+                f"were skipped for every record; {len(lag_us)} lag channel(s) loaded. If "
+                f"a skipped row was meant to carry data, fix it and re-paste."
+            )
+        if dropped:
+            shown = ', '.join(repr(d) for d in dropped[:3])
+            if len(dropped) > 3:
+                shown += f', ... ({len(dropped)} in total)'
+            found_notes.append(
+                f"{len(dropped)} of {len(record_cols)} record column(s) have a header but "
+                f"no numeric value in any row, so they were not loaded: {shown}. The other "
+                f"{len(corr)} record(s) loaded normally. An empty record column usually "
+                f"means the paste was cut short -- re-copy the correlation data if those "
+                f"records were meant to be included."
+            )
+        notes = tuple(found_notes)
+        for note in notes:
+            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+
+        # µs -> s through the shared table: the lag axis feeds Gamma, D and Rh, so
+        # its factor lives in one place rather than in a copy per format.
+        delay_times_s = convert_delay_times(np.array(lag_us, dtype=float), 'us')
         abs_path = os.path.abspath(file_path)
 
+        # A record whose trailing padding was stripped is shorter than the shared lag
+        # axis, so each preview takes the leading slice matching its own length. For the
+        # rectangular case -- what the instrument actually writes -- this is the whole
+        # axis, unchanged.
+        #
+        # Every surviving preview carries the same note: it describes the FILE, and a
+        # preview must not disagree with its own file's parse. The load flow de-duplicates
+        # (see base_parser.collect_parse_notes), so a 20-record paste still renders one line.
         previews = [
             DLSFilePreview(
                 source_file=abs_path,
                 instrument_name='Malvern Zetasizer',
-                delay_times_s=delay_times_s.copy(),
+                delay_times_s=delay_times_s[:corr[i].size].copy(),
                 correlogram=corr[i],
                 sample_label=labels[i] if labels[i] else None,
+                notes=notes,
             )
-            for i in record_cols
+            for i in record_cols if i in corr
         ]
         return previews

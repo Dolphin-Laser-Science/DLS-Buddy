@@ -21,7 +21,9 @@ CASES (ground truth — what the distribution methods should recover):
   Close bimodal             : 40 + 90 nm (~2x separation, near the resolution
                               limit) — the hard inversion case.
   Wide bimodal (x3)         : 30 + 200 nm at noise 0.001 / 0.003 / 0.010.
-                              A good selector keeps TWO peaks even at 0.010;
+                              A good selector keeps TWO peaks at 0.001 and
+                              0.003; 0.010 is the margin (GCV resolves both
+                              at some angles and merges them at others);
                               an over-smoothing one merges them into a single
                               intermediate peak.
 

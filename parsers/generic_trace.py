@@ -48,6 +48,7 @@ Change history
 from __future__ import annotations
 
 import os
+import warnings
 from typing import List, Optional
 
 import numpy as np
@@ -168,11 +169,15 @@ class GenericTraceParser(BaseTraceParser):
             raise FileNotFoundError(f"File not found: {file_path!r}")
 
         try:
-            with open(file_path, encoding='utf-8', newline='') as fh:
-                raw_lines = [line.rstrip('\r\n') for line in fh]
-        except UnicodeDecodeError:
-            with open(file_path, encoding='latin-1', newline='') as fh:
-                raw_lines = [line.rstrip('\r\n') for line in fh]
+            try:
+                with open(file_path, encoding='utf-8', newline='') as fh:
+                    raw_lines = [line.rstrip('\r\n') for line in fh]
+            except UnicodeDecodeError:
+                with open(file_path, encoding='latin-1', newline='') as fh:
+                    raw_lines = [line.rstrip('\r\n') for line in fh]
+        except OSError as exc:
+            # A file the OS refuses to read is a plain ParseError (see generic_dls.py).
+            raise ParseError(f"Could not read {file_path!r}: {exc}") from exc
 
         lines = [l for l in raw_lines if l.strip()]
         if len(lines) < _MIN_ROWS:
@@ -191,12 +196,16 @@ class GenericTraceParser(BaseTraceParser):
             if len(parts) != 2:
                 n_bad += 1
                 continue
+            # Both cells are parsed BEFORE either is appended (the generic_sls shape);
+            # see generic_dls.py for the column shift the other order produced.
             try:
-                times.append(float(parts[0].strip()))
-                rates.append(float(parts[1].strip()))
+                t = float(parts[0].strip())
+                r = float(parts[1].strip())
             except ValueError:
                 n_bad += 1
                 continue
+            times.append(t)
+            rates.append(r)
 
         total = len(lines)
         if n_bad / total > _MAX_BAD_ROW_FRACTION:
@@ -213,10 +222,22 @@ class GenericTraceParser(BaseTraceParser):
                 f"are required."
             )
 
+        # Tolerated, not hidden -- see generic_dls.py (keep-both disclosure).
+        notes: tuple = ()
+        if n_bad:
+            note = (
+                f"{n_bad} of {total} row(s) could not be read as two numbers and were "
+                f"skipped; {len(times)} loaded. If a skipped row was meant to carry data, fix it "
+                f"in the file and re-load."
+            )
+            notes = (note,)
+            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+
         preview = GenericTraceFilePreview(
             source_file=os.path.abspath(file_path),
             instrument_name='Generic (plain-text)',
             _raw_times=np.array(times, dtype=float),
             _raw_count_rates=np.array(rates, dtype=float),
+            notes=notes,
         )
         return [preview]

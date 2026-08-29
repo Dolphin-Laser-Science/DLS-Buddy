@@ -35,9 +35,17 @@ residual by the delta-method inverse-variance of the recovered g1: propagating a
 g1^2), so the per-lag weight is w(tau) proportional to g1(tau)^2 -- long-lag /
 clipped channels get ~0 weight, which suppresses the pedestal AND keeps the
 Provencher F-test residual (Provencher 1982a Eq. 3.9 is the weighted V) honest.
-The unknown noise scale cancels in the argmin and in the F-test's (V-V0)/V0 ratio,
-so the RELATIVE weight is parameter-free (no new inputs, no per-run tuning). The
-weight is a precision map that improves the FIT only; no statistical +/- is ever
+The weight's overall scale cancels in the NNLS argmin and at any FIXED alpha, so
+the relative weight needs no new inputs. It does NOT cancel in the alpha
+selection: rescaling w by c reparametrizes the Tikhonov objective as
+alpha -> alpha/sqrt(c), so the selected alpha slides by sqrt(c) across the fixed
+[alpha_min, alpha_max] sweep -- and w = |g2-1-baseline|/beta makes the per-run
+beta exactly such a rescale (measured: one 1.60x sweep step per beta-halving,
+recovered peak unchanged). The automatic selectors re-minimize and track the
+shift, so the recovered distribution is near-invariant until the tracked optimum
+reaches a sweep bound (flagged at either end: alpha_at_ceiling / alpha_at_floor);
+a USER-FIXED alpha does not compensate at all. Any substituted weight must be scale-anchored for the same
+reason. The weight is a precision map that improves the FIT only; no statistical +/- is ever
 reported from a single correlogram (invariant 8) -- Schätzel 1990 (the correlated,
 non-uniform correlator noise this approximates) is exactly why a single-shot ± is
 still deferred to replicate averaging.
@@ -110,6 +118,11 @@ class DistributionResult:
     residual_norm: float              # weighted ||M^.5 (A x - y)||^2 (g1-space residual)
     solution_norm: float              # ||x||^2
     n_skipped: int = 0                # leading channels dropped (skip_initial_channels)
+    # False only when a nonlinear fit (lognormal) failed to converge and the curve is
+    # the seed estimate, not a fit. The linear solvers (NNLS/CONTIN) always deliver
+    # their solution, so they leave the default. Consumers must never present the
+    # summary values, peaks, or a rho source from a success=False result as fitted.
+    success: bool = True
 
 
 @dataclass
@@ -143,7 +156,23 @@ class ContinResult:
     `alpha_at_ceiling` flags that the selected alpha landed on the HIGH-alpha end of
     the sweep. For GCV this is the documented flat-minimum failure mode (Hansen 1998
     p.185) and signals possible over-regularization (widen the range or inspect the
-    L-curve); a low-alpha (floor) pick is legitimate on clean data and is NOT flagged.
+    L-curve). `alpha_at_floor` is its twin for the LOW end: the selector wanted a
+    smaller alpha than the range allows -- at a low floor (the default 1e-4) that is
+    essentially unregularized NNLS, whose peak structure may be inversion noise rather
+    than populations (the "extra peaks" of an unregularized fit, CONTIN Users Manual
+    §3.2.3); at a user-raised floor it is only the least-smoothed answer the range
+    permitted. Both are set from the same selected sweep index, so they are exclusive
+    whenever the sweep has two or more points (a one-point sweep is both edges); a
+    user-supplied alpha sets neither (there is no sweep). Both flag, neither
+    withholds: the distribution is always returned (CLAUDE.md invariant 4,
+    flag-not-refuse).
+
+    `alpha_reliable` / `reliability_note` are the family pair every parametric result
+    carries (CumulantResult's shape): `alpha_reliable` is False iff either edge flag is
+    set, and `reliability_note` is the ONE sentence every surface shows for it --
+    ALPHA_FLOOR_NOTE / ALPHA_CEILING_NOTE, both joined with '; ' on a one-point sweep,
+    '' when interior or user-fixed. Every surface reads this string (pinned by
+    tests/test_workspace.py::test_contin_edge_note_is_one_string_on_every_surface).
     """
     distribution: DistributionResult
     lcurve: LCurveResult
@@ -151,11 +180,42 @@ class ContinResult:
     alpha_selection_method: str = 'lcurve'    # 'gcv' | 'lcurve' | 'ftest' | 'user'
     ftest_prob_reject: Optional[float] = None
     alpha_at_ceiling: bool = False
+    alpha_at_floor: bool = False
+    alpha_reliable: bool = True
+    reliability_note: str = ''
+
+
+# The sweep-edge wording, in its one home. The floor phrase is sized to the predicate:
+# the index says only that the selector wanted past the bound; what the solution then IS
+# depends on where the user put the range (unregularized at the default floor, not at
+# alpha = 30), so the floor's consequence lives in the how-to help, conditioned on the
+# floor's value. The ceiling phrase keeps its hedged consequence ("possible
+# over-regularization"), which holds at any ceiling.
+ALPHA_FLOOR_NOTE = ('CONTIN α at the sweep floor — the selector wanted a smaller α than '
+                    'the range allows')
+ALPHA_CEILING_NOTE = 'CONTIN α at the sweep ceiling — possible over-regularization'
+
+
+def _edge_note_for(at_floor: bool, at_ceiling: bool) -> str:
+    """The reliability note for a selected-alpha position: '' when interior, one phrase
+    at an edge, both (floor first) on a one-point sweep, which is both edges."""
+    parts = ([ALPHA_FLOOR_NOTE] if at_floor else []) + ([ALPHA_CEILING_NOTE] if at_ceiling else [])
+    return '; '.join(parts)
 
 
 # ---------------------------------------------------------------------------
 # Solver internals
 # ---------------------------------------------------------------------------
+
+# Iteration budget for scipy.optimize.nnls, as a multiple of the number of unknowns.
+# scipy's own default is 3n, which one committed real correlogram exceeds at one alpha of
+# its 40-point sweep (a 298x100 augmented system: 300 raises, 1000 converges, 10000 gives
+# the identical vector) -- and an uncaught raise there cost the user the whole
+# distribution. A budget, not a tolerance (invariant 4: no physics threshold hides here):
+# nnls stops on optimality, so raising the cap never changes a solve that already
+# converged. Serves every _solve_distribution caller (fit_contin's sweep and fit_nnls).
+NNLS_MAXITER_FACTOR = 10
+
 
 def _second_difference_operator(n: int) -> np.ndarray:
     """The (n-2) x n second-difference matrix L (rows [.. 1 -2 1 ..])."""
@@ -199,7 +259,10 @@ def _solve_distribution(
         y_aug = np.concatenate([yw, np.zeros(L.shape[0])])
     else:
         A_aug, y_aug = Aw, yw
-    x, _ = optimize.nnls(A_aug, y_aug)
+    # NNLS_MAXITER_FACTOR is an iteration BUDGET, not a tolerance: nnls terminates on
+    # optimality, so any converged solve is unchanged by a larger cap, and the cap only
+    # decides whether a slow solve finishes or raises. See the constant's comment.
+    x, _ = optimize.nnls(A_aug, y_aug, maxiter=NNLS_MAXITER_FACTOR * A_aug.shape[1])
     return x
 
 
@@ -220,14 +283,27 @@ def _distribution_summary(
     beta_estimated: bool,
     baseline_estimated: bool,
     n_skipped: int = 0,
+    success: bool = True,
 ) -> DistributionResult:
     """Assemble a DistributionResult from a raw solver solution x."""
     total = x.sum()
-    weights = x / total if total > 0 else x
+    # When the solution cannot be normalized, WITHHOLD the whole summary rather than
+    # returning the unnormalized vector. Three reasons it has to be NaN and not `x`:
+    # `weights` is documented as "normalized intensity weights (sum = 1)", so handing back
+    # an unnormalized vector breaks that contract silently; `mean_rh` computed from it is
+    # meaningless; and -- the one that actually bit -- `peak_rh = rh_grid[argmax(weights)]`
+    # is UNCHANGED by any guard on the mean, so an all-equal degenerate vector still
+    # reports the smallest grid point as "the peak", a perfectly plausible small size.
+    # Guarding the divisor alone fixed the mean and left the peak lying (spec-03 review).
+    if math.isfinite(total) and total > 0:
+        weights = x / total
+    else:
+        weights = np.full_like(np.asarray(x, dtype=float), np.nan)
     # intensity-weighted means over the distribution
     mean_gamma = float(np.sum(weights * gamma_grid))
     mean_rh = float(np.sum(weights * rh_grid_nm))
-    peak_rh = float(rh_grid_nm[int(np.argmax(weights))]) if weights.size else float('nan')
+    peak_rh = (float(rh_grid_nm[int(np.nanargmax(weights))])
+               if weights.size and np.any(np.isfinite(weights)) else float('nan'))
     # A x is the recovered field ACF g1; map back to measured space via the Siegert
     # relation g2 - 1 = beta |g1|^2 (+ residual baseline).
     g1_fit = A @ x
@@ -248,6 +324,7 @@ def _distribution_summary(
         residuals=residuals, rms_error=_rms_error(residuals),
         residual_norm=residual_norm, solution_norm=solution_norm,
         n_skipped=int(n_skipped or 0),
+        success=success,
     )
 
 
@@ -267,8 +344,13 @@ def _prepare_distribution_inputs(
     beta_estimated = beta is None
     if beta is None:
         beta = _estimate_beta(tau, g2m1, baseline)
-    if beta <= 0:
-        raise ValueError(f"beta must be positive, got {beta!r}.")
+    # isfinite as well as > 0: `beta <= 0` admits nan AND +inf, and every line below
+    # divides by beta -- an infinite one silently yields a signal of zeros, a NaN one a
+    # signal of NaNs, and neither reaches the user as an error. `_estimate_beta` now
+    # guarantees a positive finite value, but a USER-supplied beta arrives unchecked
+    # (2026-07-31 spec-01).
+    if not (math.isfinite(beta) and beta > 0):
+        raise ValueError(f"beta must be a positive finite number, got {beta!r}.")
 
     q = _measurement_q_m(measurement)
     eta = _require_viscosity(measurement)   # distributions are reported in Rh
@@ -283,17 +365,18 @@ def _prepare_distribution_inputs(
     # SIGN-PRESERVING recovery: in the long-lag noise floor u is zero-mean and dips
     # negative; a hard clip-at-0 would keep only the positive excursions and rectify
     # that noise into a POSITIVE g1 pedestal, which a non-negative fit absorbs as
-    # spurious large-Rh weight (the noisy-unimodal mean-Rh regression, S158). Taking
+    # spurious large-Rh weight (the noisy-unimodal mean-Rh regression). Taking
     # the signed square root keeps the noise zero-mean, so no pedestal forms; the
     # fitted model A x (a true non-negative g1) still only chases the real signal.
     y = np.sign(u) * np.sqrt(np.abs(u))
-    # delta-method inverse-variance weight of the recovered g1: propagating a
-    # (locally uniform) g2-1 noise through the sqrt gives Var(g1) prop 1/|u|, so
-    # w prop |u| = y^2. The overall scale cancels in the argmin / F-test ratio, so the
-    # relative weight is parameter-free; noise-floor channels (|u| -> 0) get ~0 weight.
-    # (Note sqrt(w) y = u exactly, so the weighted fit targets the same unbiased
-    # (g2-1)/beta as the legacy diagonal kernel, but through a cross-term-preserving
-    # g1 design -- noise-robust AND phantom-free.)
+    # Delta-method inverse-variance weight of the recovered g1: a (locally uniform)
+    # g2-1 noise through the sqrt gives Var(g1) prop 1/|u|, so w prop |u| = y^2. The
+    # overall scale cancels at any FIXED alpha (and for NNLS) but NOT in the alpha
+    # selection: w carries 1/beta, and rescaling w by c slides the selected alpha by
+    # sqrt(c) across the fixed sweep (module docstring); noise-floor channels
+    # (|u| -> 0) get ~0 weight. (Note sqrt(w) y = u exactly, so the weighted fit
+    # targets the same unbiased (g2-1)/beta as the legacy diagonal kernel, but
+    # through a cross-term-preserving g1 design -- noise-robust AND phantom-free.)
     w = y ** 2
     return (tau, g2m1, baseline, baseline_estimated, beta, beta_estimated,
             q, rh_grid, gamma_grid, A, y, w)
@@ -397,7 +480,7 @@ def fit_lognormal(
     def _weights(mu: float, sigma: float) -> np.ndarray:
         w = np.exp(-0.5 * ((ln_rh - mu) / sigma) ** 2)
         s = w.sum()
-        return w / s if s > 0 else w
+        return w / s if (math.isfinite(s) and s > 0) else w
 
     def model(_x, amp, mu, sigma):
         return amp * (A @ _weights(mu, sigma))
@@ -413,6 +496,7 @@ def fit_lognormal(
     except Exception:
         pass
 
+    converged = True
     p0 = [1.0, mu0, 0.3]
     bounds = ([1e-6, ln_rh[0], 1e-2], [np.inf, ln_rh[-1], 3.0])
     # weight the fit by the same delta-method w: curve_fit minimizes
@@ -424,15 +508,19 @@ def fit_lognormal(
             model, np.arange(tau.size), y, p0=p0, bounds=bounds, maxfev=10000,
             sigma=sigma_w, absolute_sigma=False)
         amp, mu, sigma = float(popt[0]), float(popt[1]), float(popt[2])
-    except (RuntimeError, ValueError):
+    except (RuntimeError, ValueError, TypeError):
+        # Same exception family the exponential fitters catch around curve_fit. The
+        # seed shape stands in as a "roughly here, unconverged" hint; the flag
+        # keeps it from ever reading as a fit downstream.
         amp, mu, sigma = 1.0, mu0, 0.3
+        converged = False
 
     x = amp * _weights(mu, sigma)
     return _distribution_summary(
         x, A, y, w, rh_grid, gamma_grid, beta, baseline, g2m1, tau, q,
         method='lognormal', alpha=None,
         beta_estimated=beta_est, baseline_estimated=baseline_est,
-        n_skipped=skip_initial_channels)
+        n_skipped=skip_initial_channels, success=converged)
 
 
 # ---------------------------------------------------------------------------
@@ -482,11 +570,14 @@ def _lcurve_corner(alphas, residual_norms, solution_norms) -> int:
     zeta = 0.5 * np.log10(res)
     eta = 0.5 * np.log10(sol)
     t = np.log10(a)
-    # A cubic spline needs >= 4 STRICTLY INCREASING abscissae. A single- or few-point
-    # sweep, or equal/near-duplicate bounds (alpha_min == alpha_max makes t constant),
-    # would make CubicSpline raise -- fall back to the discrete curvature instead of
-    # crashing the whole CONTIN fit.
-    if a.size < 4 or not np.all(np.diff(t) > 0):
+    # A cubic spline needs >= 4 STRICTLY INCREASING, FINITE abscissae. A single- or
+    # few-point sweep, or equal/near-duplicate bounds (alpha_min == alpha_max makes t
+    # constant), would make CubicSpline raise -- fall back to the discrete curvature
+    # instead of crashing the whole CONTIN fit. Finiteness is checked on t ITSELF, not
+    # on its diffs: an alpha of 0 or +inf puts a -inf/+inf in t, whose diff is +inf,
+    # which passes a bare "strictly increasing" test and then poisons the whole spline
+    # to NaN (a corner silently pinned to the least-regularized end).
+    if a.size < 4 or not (np.all(np.isfinite(t)) and np.all(np.diff(t) > 0)):
         return _discrete_curvature_argmax(zeta, eta)
     # NATURAL boundary conditions (second derivative = 0 at the sweep ends): the L-curve
     # corner is an INTERIOR feature, and a free (not-a-knot) spline overshoots at the
@@ -501,9 +592,11 @@ def _lcurve_corner(alphas, residual_norms, solution_norms) -> int:
     ep, epp = spline_e(td, 1), spline_e(td, 2)
     grad2 = zp ** 2 + ep ** 2                 # squared tangent magnitude
     gmax = float(grad2.max())
-    if gmax <= 0.0:
+    if not (math.isfinite(gmax) and gmax > 0.0):
         # a perfectly flat L-curve (every solve returned the same norms) carries no
         # corner information; pick the least-regularized end rather than divide by zero.
+        # A non-finite gmax (a NaN/inf norm anywhere on the curve) carries none either,
+        # and the bare `gmax <= 0.0` form let it through -- NaN compares False.
         return 0
     # Guard the L-curve's flat plateaus. For our ill-conditioned kernel the solution
     # has already converged at small alpha (residual and solution norm both plateau),
@@ -533,12 +626,34 @@ def _discrete_curvature_argmax(zeta, eta) -> int:
     zp, ep = np.gradient(zeta), np.gradient(eta)
     zpp, epp = np.gradient(zp), np.gradient(ep)
     grad2 = zp ** 2 + ep ** 2
-    if not np.any(grad2 > 0.0):
+    # Usable points are those with a FINITE, non-zero tangent: a bare `grad2 > 0.0`
+    # compares False for NaN (fine) but True for +inf, and an infinite lane makes the
+    # curvature NaN, which np.argmax would then select as the corner.
+    usable = np.isfinite(grad2) & (grad2 > 0.0)
+    if not np.any(usable):
         return 0
-    kappa = np.where(grad2 > 0.0,
+    kappa = np.where(usable,
                      (zp * epp - zpp * ep) / np.power(np.clip(grad2, 1e-300, None), 1.5),
                      -np.inf)
     return int(np.argmax(kappa))
+
+
+def _masked(a: np.ndarray) -> np.ndarray:
+    """A copy of `a` with every non-finite entry replaced by +inf, so it can never win an
+    `argmin`.
+
+    `np.argmin` returns the INDEX OF A NaN when one is present, so an alpha whose criterion
+    could not be computed is exactly the alpha a bare `argmin` selects -- a silent wrong
+    selection, strictly worse than the withhold it came from. `np.clip` does not help:
+    it passes NaN straight through.
+
+    One helper shared by both alpha selectors AND by both of their fallback branches --
+    masking a selector's main objective while leaving its last-resort `argmin` bare is the
+    same defect one branch down. `_discrete_curvature_argmax` uses the same
+    never-wins-sentinel idea with `-inf`, since it maximizes.
+    """
+    a = np.asarray(a, dtype=float)
+    return np.where(np.isfinite(a), a, np.inf)
 
 
 def _gcv_corner(residual_norms, dof_eff, n_data: int):
@@ -563,7 +678,21 @@ def _gcv_corner(residual_norms, dof_eff, n_data: int):
     v = np.asarray(residual_norms, dtype=float)
     dof = np.clip(np.asarray(dof_eff, dtype=float), 1e-6, n_data - 1e-6)
     gcv = n_data * v / (n_data - dof) ** 2
-    return int(np.argmin(gcv)), gcv
+    # An unanswerable alpha must not WIN the selection. `np.argmin` returns the index of a
+    # NaN, and `np.clip` passes NaN straight through, so an alpha whose hat-trace could
+    # not be computed was exactly the alpha this returned -- a silent wrong selection,
+    # strictly worse than the withhold it came from. Masked to a never-wins +inf, the same
+    # form `_discrete_curvature_argmax` uses.
+    if not np.any(np.isfinite(gcv)):
+        # No alpha in the sweep has a usable GCV value, so the criterion did not answer.
+        # Fall back to the minimum finite RESIDUAL -- the same reference the F-test uses --
+        # rather than to index 0 by accident. (Index 0 IS the smallest alpha for the
+        # ascending geomspace the caller builds, but that is a property of the caller, not
+        # of this function, and the two must not agree only by coincidence.) If even the
+        # residuals are all non-finite the masked argmin ties at index 0, which is the one
+        # case where there is genuinely no basis to prefer any alpha.
+        return int(np.argmin(_masked(v))), gcv
+    return int(np.argmin(_masked(gcv))), gcv
 
 
 def _tikhonov_effective_dof(A: np.ndarray, L: np.ndarray, alpha: float,
@@ -579,10 +708,22 @@ def _tikhonov_effective_dof(A: np.ndarray, L: np.ndarray, alpha: float,
     ill-conditioned Laplace-inversion kernel A this stays well below the data count,
     so the F-test degrees of freedom are always well defined. The non-negativity
     constraint can only lower it further, so this is a mild upper bound.
+
+    Returns NaN when the normal matrix is not finite. `np.linalg.solve` is an LU
+    factorization, not an SVD, so a non-finite entry does NOT make it raise -- it returns
+    entries that are not a solution (measured: a mix of NaN and zeros, matrix-dependent),
+    the `except LinAlgError` never fires, and the garbage trace was clipped into a
+    plausible-looking number. Both `A.T @ A` and `alpha**2` can saturate here on finite
+    input, since neither the design nor the alpha sweep has a magnitude bound.
     """
     if AtA is None:
         AtA = A.T @ A
-    M = AtA + (alpha ** 2) * (L.T @ L)
+    # `alpha * alpha`, not `alpha ** 2`: the sweep passes numpy floats (which saturate),
+    # but the signature accepts a PYTHON float, and there `**` RAISES OverflowError --
+    # before any guard below can run. See analysis/dls/_common.py::_d_from_gamma.
+    M = AtA + (alpha * alpha) * (L.T @ L)
+    if not (np.all(np.isfinite(M)) and np.all(np.isfinite(AtA))):
+        return float('nan')
     try:
         sol = np.linalg.solve(M, AtA)
     except np.linalg.LinAlgError:
@@ -634,15 +775,37 @@ def _ftest_corner(residual_norms, dof_eff, n_data: int,
     ny = float(n_data)
     # Reference alpha_0 = the solution with the MINIMUM residual (least-squares end;
     # normally the smallest alpha, but argmin also covers Provencher's note that a
-    # numerical instability can push it to a slightly larger alpha).
-    ref = int(np.argmin(v))
+    # numerical instability can push it to a slightly larger alpha), chosen among alphas
+    # whose effective dof is USABLE. NDF0 is taken from the reference and appears in both
+    # the scaling factor and the F-distribution, so a reference whose hat-trace could not be
+    # computed makes every fc NaN -- and since `np.argmin` returns the index of a NaN, the
+    # criterion would then select that same failed alpha. Masking the objective alone cannot
+    # fix it: the poison enters through the reference.
+    dof_usable = np.isfinite(dof)
+    ref_pool = np.where(np.isfinite(v) & dof_usable, v, np.inf)
+    # The last-resort branch is masked too: `np.argmin` returns the index of a NaN, so a
+    # bare `argmin(v)` here would select an alpha whose RESIDUAL is NaN.
+    ref = int(np.argmin(ref_pool if np.any(np.isfinite(ref_pool)) else _masked(v)))
     v0 = float(v[ref])
     ndf0 = float(np.clip(dof[ref], 1e-6, ny - 1e-6))   # NDF(alpha_0), fixed
-    frac_increase = np.clip((v - v0) / v0 if v0 > 0 else np.zeros_like(v), 0.0, None)
+    # An unusable reference residual yields NaN, NOT zeros. Substituting zeros turns the
+    # poison into a perfectly finite F-statistic of 0 for every alpha, so `fc` becomes a
+    # fabricated flat curve, `objective` is 0.5 everywhere, the "criterion did not answer"
+    # branch below never fires, and the tie resolves to index 0 -- the "index 0 by
+    # accident" the sibling selector explicitly disowns -- and the fabricated curve would
+    # also be stored on `LCurveResult.ftest_fc` and plotted as a real PROB1.
+    frac_increase = np.clip((v - v0) / v0 if (math.isfinite(v0) and v0 > 0)
+                            else np.full_like(v, np.nan), 0.0, None)
     f_stat = frac_increase * (ny - ndf0) / ndf0
     fc = special.fdtr(ndf0, ny - ndf0, f_stat)         # F CDF, dof (NDF0, Ny-NDF0)
-    idx = int(np.argmin(np.abs(fc - prob_reject)))
-    return idx, fc
+    # As in `_gcv_corner`: a NaN would WIN this argmin, so an alpha whose effective dof
+    # could not be computed would be the one selected. Masked to a never-wins +inf. If
+    # NDF0 itself is unanswerable every fc is NaN, and the fallback is the reference alpha
+    # (the least-squares end this criterion is defined against), not index 0 by accident.
+    objective = np.abs(fc - prob_reject)
+    if not np.any(np.isfinite(objective)):
+        return ref, fc
+    return int(np.argmin(_masked(objective))), fc
 
 
 def fit_contin(
@@ -651,7 +814,7 @@ def fit_contin(
     rh_max_nm: float = 1000.0,
     n_grid: int = 100,
     alpha: Optional[float] = None,
-    alpha_min: float = 1e-6,
+    alpha_min: float = 1e-4,
     alpha_max: float = 1e2,
     n_alpha: int = 40,
     beta: Optional[float] = None,
@@ -665,7 +828,8 @@ def fit_contin(
     """Recover a smoothed decay-rate distribution by regularized inversion.
 
     Solves min ||A x - y||^2 + alpha^2 ||L x||^2 subject to x >= 0, with L the
-    second-difference operator (Provencher 1982). The regularization parameter
+    second-difference operator (Provencher 1982a Eq. 3.10; implemented as the CONTIN
+    program of Provencher 1982). The regularization parameter
     alpha trades fit quality against distribution smoothness.
 
     If alpha is None (default), a sweep over [alpha_min, alpha_max] is run and alpha
@@ -691,9 +855,21 @@ def fit_contin(
     alpha : float, optional
         Fixed regularization parameter. If omitted, chosen by `alpha_method`.
     alpha_min, alpha_max, n_alpha :
-        Log-spaced alpha sweep (default 1e-6 to 1e2, 40 points). The 40-point sweep
+        Log-spaced alpha sweep (default 1e-4 to 1e2, 40 points). The 40-point sweep
         gives the L-curve spline a stable curvature and lets GCV resolve its interior
-        minimum; the range is unchanged from earlier versions.
+        minimum. The floor is a documented default (CLAUDE.md invariant 4), derived
+        rather than picked: CONTIN's own sweep is scale-relative, from machine
+        precision times the largest singular value up to that value (CONTIN Users
+        Manual §4.1.3), and its "alpha small enough" test is that the smallest-alpha
+        solution's residual agrees with the unregularized one in the first few figures
+        (§3.6.5 point 1). 1e-4 is the highest floor at which that still holds on the
+        committed reference correlograms (measured 2026-08-24 over n_grid 15-1000: the
+        residual at 1e-4 exceeds the unregularized one by <= 1e-5 relative on every
+        cell, while at 1e-3 regularization is already acting), so a floor pick is the
+        unregularized reference by construction and is flagged as such. A finer Rh grid
+        (n_grid) is what drives the F-test and GCV onto the floor; the flag says when
+        it happened. Pinned by tests/test_dls.py::test_alpha_floor_is_the_unregularized_reference
+        and the floor-flag tests beside it.
     beta, baseline : float, optional
         Coherence factor and baseline; estimated from the data if omitted.
     tau_min_s, tau_max_s : float, optional
@@ -708,11 +884,21 @@ def fit_contin(
     ContinResult
         .distribution is the chosen DistributionResult; .lcurve holds the sweep;
         .alpha_selection_method records which selector chose alpha;
-        .alpha_at_ceiling flags a high-alpha-end pick (GCV over-regularization guard).
+        .alpha_at_ceiling flags a high-alpha-end pick (GCV over-regularization guard);
+        .alpha_at_floor flags a low-alpha-end pick (the selector wanted a smaller
+        alpha than the range allows); .alpha_reliable is False at either edge and
+        .reliability_note carries the one sentence every surface shows for it.
     """
     if alpha_method not in ('gcv', 'lcurve', 'ftest'):
         raise ValueError(
             f"alpha_method must be 'gcv', 'lcurve', or 'ftest', got {alpha_method!r}.")
+    # Both tails (rule 12): a bare `alpha > 0` admits +inf (an infinite regularizer)
+    # and lets NaN through, so the guard names finiteness as the siblings do.
+    if alpha is not None and not (math.isfinite(alpha) and alpha > 0):
+        raise ValueError(
+            f"alpha must be a finite number > 0, got {alpha!r}. A non-positive alpha "
+            f"disables the Tikhonov regularization entirely (see fit_nnls for that "
+            f"unregularized case).")
     (tau, g2m1, baseline, baseline_est, beta, beta_est,
      q, rh_grid, gamma_grid, A, y, w) = _prepare_distribution_inputs(
         measurement, tau_min_s, tau_max_s, beta, baseline,
@@ -739,6 +925,16 @@ def fit_contin(
                             alpha_selection_method='user')
 
     # Sweep (shared by all three selectors -- only the selection function differs).
+    # The bounds are the fixed alpha's family -- and the two the GUI exposes as free
+    # text -- so they take the same finite-and-positive guard: a NaN or negative bound
+    # would otherwise ride np.geomspace onto the result as the recorded alpha, under
+    # the sweep-edge note (a proxy, not the failed precondition). An inverted pair is
+    # not refused: it sweeps descending, a shape the edge-note surfaces are pinned on.
+    if not (math.isfinite(alpha_min) and math.isfinite(alpha_max)
+            and alpha_min > 0 and alpha_max > 0):
+        raise ValueError(
+            f"alpha_min / alpha_max must be finite and > 0, got ({alpha_min!r}, "
+            f"{alpha_max!r}): the alpha sweep cannot be built from them.")
     alphas = np.geomspace(alpha_min, alpha_max, n_alpha)
     residual_norms = np.empty(n_alpha)
     solution_norms = np.empty(n_alpha)
@@ -767,10 +963,15 @@ def fit_contin(
         opt_idx = _lcurve_corner(alphas, residual_norms, solution_norms)
     opt_alpha = float(alphas[opt_idx])
     x_opt = solutions[opt_idx]
-    # High-alpha-end pick: over-regularization signal (GCV flat-minimum failure mode,
-    # Hansen 1998 p.185). A floor (low-alpha) pick is legitimate on clean data and is
-    # deliberately NOT flagged. Generic over selectors (cheap, correct for all three).
+    # Sweep-edge picks, one predicate each on the SAME selected index (so the two can
+    # never both fire and no second threshold exists). Ceiling: over-regularization
+    # signal (GCV flat-minimum failure mode, Hansen 1998 p.185). Floor: essentially
+    # unregularized NNLS at the default floor (see the fit_contin docstring on
+    # alpha_min for what reaches it), whose extra peaks are inversion noise. Generic
+    # over selectors.
     alpha_at_ceiling = bool(opt_idx == n_alpha - 1)
+    alpha_at_floor = bool(opt_idx == 0)
+    reliability_note = _edge_note_for(alpha_at_floor, alpha_at_ceiling)
 
     dist = _distribution_summary(
         x_opt, A, y, w, rh_grid, gamma_grid, beta, baseline, g2m1, tau, q,
@@ -786,7 +987,10 @@ def fit_contin(
                         alpha_selection_method=alpha_method,
                         ftest_prob_reject=(ftest_prob_reject
                                            if alpha_method == 'ftest' else None),
-                        alpha_at_ceiling=alpha_at_ceiling)
+                        alpha_at_ceiling=alpha_at_ceiling,
+                        alpha_at_floor=alpha_at_floor,
+                        alpha_reliable=not reliability_note,
+                        reliability_note=reliability_note)
 
 
 # ---------------------------------------------------------------------------
@@ -835,39 +1039,45 @@ class DistributionPeak:
     that peak's lobe -- so the peaks of a distribution sum to ~1. It is an
     intensity fraction, not a number or mass fraction (large particles scatter far
     more). `is_dominant` marks the largest-area peak.
+
+    `rh_lo_nm` / `rh_hi_nm` are the Rh values at the first and last grid points of
+    the peak's lobe (the integration bounds the fraction was summed over --
+    inclusive on both ends). NaN when the producing path predates the bounds
+    (additive fields, defaulted).
     """
     rh_nm: float                      # Rh at the peak maximum
     gamma_s_inv: float                # decay rate at the peak maximum
     weight_fraction: float            # intensity-weighted area of the peak's lobe
     is_dominant: bool
+    rh_lo_nm: float = float('nan')    # Rh at the lobe's first grid point
+    rh_hi_nm: float = float('nan')    # Rh at the lobe's last grid point
 
 
-def find_distribution_peaks(
-    distribution: DistributionResult,
-    min_weight_fraction: float = 0.05,
-) -> List[DistributionPeak]:
-    """Resolve the distinct populations (peaks) in a size distribution.
+def scan_distribution_peaks(rh_grid_nm, weights, min_weight_fraction: float = 0.05):
+    """Resolve the peaks of a weight-vs-Rh distribution, weighting-agnostic.
 
-    Local maxima of the (intensity-weighted) distribution are found on the Rh grid;
-    each peak's lobe runs to the local minima on either side, and the lobe's summed
-    weight is its intensity fraction. Peaks contributing less than
-    `min_weight_fraction` of the total are dropped as noise. The returned peaks are
-    sorted by Rh ascending; exactly one is flagged `is_dominant` (the largest area).
+    Returns a list of ``(peak_index, weight_fraction, lo_idx, hi_idx)`` on the Rh-SORTED
+    grid, so the caller can build peak objects in whatever weighting the ``weights`` carry
+    (the same scan serves the intensity distribution AND its reweighted volume/surface/
+    number views — one definition, per the fix-the-family rule). ``peak_index`` indexes
+    the Rh-ascending arrays returned in ``rh_sorted``; ``lo_idx``/``hi_idx`` are the
+    peak's lobe bounds as a half-open slice ``[lo_idx, hi_idx)`` of those arrays — the
+    exact range the fraction was summed over (mode-resolved scattering integrates a
+    lobe between these bounds, so they are returned rather than discarded).
 
-    A monomodal distribution returns a single peak. This is the basis for offering a
-    CONTIN/NNLS peak Rh as a rho source and for letting the user pick a peak when a
-    sample is multi-population.
+    Returns ``(peaks, rh_sorted, w_sorted)``: peaks is ``[(idx, frac, lo, hi), ...]``
+    (empty if the distribution is degenerate), rh_sorted / w_sorted the ascending-Rh
+    arrays the indices refer to.
     """
-    rh = np.asarray(distribution.rh_grid_nm, dtype=float)
-    w = np.asarray(distribution.weights, dtype=float)
-    gamma = np.asarray(distribution.gamma_grid_s_inv, dtype=float)
+    rh = np.asarray(rh_grid_nm, dtype=float)
+    w = np.asarray(weights, dtype=float)
     if rh.size == 0:
-        return []
+        return [], rh, w
     order = np.argsort(rh)
-    rh, w, gamma = rh[order], w[order], gamma[order]
+    rh, w = rh[order], w[order]
     total = float(w.sum())
-    if not (total > 0):
-        return []
+    if not (math.isfinite(total) and total > 0):
+        return [], rh, w
 
     n = w.size
     # Local maxima, including the endpoints if they rise above their neighbor. A
@@ -877,7 +1087,7 @@ def find_distribution_peaks(
     maxima: List[int] = []
     i = 0
     while i < n:
-        if not (w[i] > 0):
+        if not (math.isfinite(w[i]) and w[i] > 0):
             i += 1
             continue
         j = i
@@ -898,15 +1108,135 @@ def find_distribution_peaks(
         bounds.append(a + int(np.argmin(w[a:b + 1])))
     bounds.append(n)
 
-    peaks: List[DistributionPeak] = []
+    peaks = []
     for k, peak_i in enumerate(maxima):
         lo, hi = bounds[k], bounds[k + 1]
         frac = float(w[lo:hi].sum() / total)
         if frac < min_weight_fraction:
             continue
+        peaks.append((peak_i, frac, lo, hi))
+    return peaks, rh, w
+
+
+def validate_integration_bounds(bounds_nm):
+    """Validate manual integration intervals; returns them as float pairs.
+
+    THE one predicate home (rule 12: one boundary, not two to keep aligned):
+    both `integrate_between` (at use) and the controller's `set_mode_bounds`
+    (at user-input time) call this, so what the store accepts and what the
+    integration refuses cannot drift apart. Raises ValueError on a non-finite
+    or inverted interval, and on overlap -- including TOUCHING intervals
+    (hi_a == lo_b), because bounds are inclusive both ends, so even touching
+    would count a shared grid point twice.
+    """
+    pairs = [(float(lo), float(hi)) for lo, hi in bounds_nm]
+    for lo, hi in pairs:
+        if not (math.isfinite(lo) and math.isfinite(hi) and lo < hi):
+            raise ValueError(
+                f'integration bounds must be finite with lo < hi, got ({lo}, {hi}).')
+    for (lo_a, hi_a), (lo_b, hi_b) in zip(sorted(pairs), sorted(pairs)[1:], strict=False):
+        if hi_a >= lo_b:
+            raise ValueError(
+                f'integration bounds overlap: ({lo_a}, {hi_a}) and ({lo_b}, {hi_b}) — '
+                'overlapping intervals would count the shared weight twice.')
+    return pairs
+
+
+def integrate_between(rh_grid_nm, weights, bounds_nm):
+    """Integrate a weight-vs-Rh distribution over user-set Rh intervals, weighting-agnostic.
+
+    The manual-bounds counterpart of `scan_distribution_peaks`' automatic lobes: when
+    overlapping populations defeat the local-minimum split, the user supplies explicit
+    ``bounds_nm = [(lo_nm, hi_nm), ...]`` and each interval's summed weight becomes that
+    mode's fraction of the total. Works on any weighting (intensity or reweighted views),
+    exactly like the scan — one definition for the whole distribution family.
+
+    Interval semantics: grid points with ``lo_nm <= rh <= hi_nm`` belong to the interval
+    (inclusive both ends — the values are user-facing Rh, not slice indices). Intervals
+    must be well-formed (``lo < hi``) and must not overlap each other: a split that counts
+    a grid point twice writes fractions that sum past 1 — a false record, refused with a
+    ``ValueError``. An interval that captures NO weight is a *noted* result (fraction 0.0,
+    ``rh_at_max_nm`` NaN), not an error: an empty window is honest information about where
+    the user cut.
+
+    Returns a list of ``(rh_at_max_nm, weight_fraction, lo_idx, hi_idx)`` in the order of
+    ``bounds_nm``, on the Rh-ascending grid — the same tuple shape as the scan, with the
+    peak position taken as the weight maximum inside the interval. ``lo_idx``/``hi_idx``
+    are the half-open slice of the sorted arrays. Fractions are relative to the FULL
+    distribution total (not the covered subset), so a partial cover discloses itself as
+    fractions summing below 1. Returns ``(intervals, rh_sorted, w_sorted)``; empty
+    ``intervals`` if the distribution is degenerate (empty grid or non-positive total).
+    """
+    rh = np.asarray(rh_grid_nm, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    pairs = validate_integration_bounds(bounds_nm)
+    order = np.argsort(rh)
+    rh, w = rh[order], w[order]
+    if rh.size == 0:
+        return [], rh, w
+    total = float(w.sum())
+    if not (math.isfinite(total) and total > 0):
+        return [], rh, w
+    intervals = []
+    for lo_nm, hi_nm in pairs:
+        inside = np.nonzero((rh >= lo_nm) & (rh <= hi_nm))[0]
+        if inside.size == 0:
+            intervals.append((float('nan'), 0.0, 0, 0))
+            continue
+        lo_idx, hi_idx = int(inside[0]), int(inside[-1]) + 1
+        seg = w[lo_idx:hi_idx]      # NaN weights never reach here: a NaN total is degenerate above
+        frac = float(seg.sum() / total)
+        if frac <= 0.0:             # grid points but no weight — noted, not an error
+            intervals.append((float('nan'), 0.0, lo_idx, hi_idx))
+            continue
+        peak_i = lo_idx + int(np.argmax(seg))
+        intervals.append((float(rh[peak_i]), frac, lo_idx, hi_idx))
+    return intervals, rh, w
+
+
+def find_distribution_peaks(
+    distribution: DistributionResult,
+    min_weight_fraction: float = 0.05,
+) -> List[DistributionPeak]:
+    """Resolve the distinct populations (peaks) in a size distribution.
+
+    Local maxima of the (intensity-weighted) distribution are found on the Rh grid;
+    each peak's lobe runs to the local minima on either side, and the lobe's summed
+    weight is its intensity fraction. Peaks contributing less than
+    `min_weight_fraction` of the total are dropped as noise. The returned peaks are
+    sorted by Rh ascending; exactly one is flagged `is_dominant` (the largest area).
+
+    A monomodal distribution returns a single peak. This is the basis for offering a
+    CONTIN/NNLS peak Rh as a rho source and for letting the user pick a peak when a
+    sample is multi-population.
+
+    A success=False result has NO peaks: its curve is the seed estimate, and a peak
+    of a failed fit is a fit-like number no caller may present. The refusal lives
+    here, in the one scan every consumer routes through, so no call site needs its
+    own gate.
+    """
+    if getattr(distribution, 'success', True) is False:
+        return []
+    gamma = np.asarray(distribution.gamma_grid_s_inv, dtype=float)
+    rh_in = np.asarray(distribution.rh_grid_nm, dtype=float)
+    # A gamma grid whose length disagrees with the Rh grid is a malformed/degenerate result;
+    # the pre-refactor code co-sorted the two and raised IndexError there (caught upstream as
+    # "no peaks"). Preserve that: return [] rather than emitting NaN-gamma peaks that could
+    # surface a NaN-decay-rate population in the table or as a rho source.
+    if gamma.size != rh_in.size:
+        return []
+    scanned, rh, _w = scan_distribution_peaks(
+        rh_in, distribution.weights, min_weight_fraction)
+    if not scanned:
+        return []
+    # Re-sort gamma to match the Rh-ascending arrays the scan returned.
+    gamma = gamma[np.argsort(rh_in)]
+    peaks: List[DistributionPeak] = []
+    for peak_i, frac, lo, hi in scanned:
         peaks.append(DistributionPeak(
             rh_nm=float(rh[peak_i]), gamma_s_inv=float(gamma[peak_i]),
-            weight_fraction=frac, is_dominant=False))
+            weight_fraction=frac, is_dominant=False,
+            rh_lo_nm=float(rh[lo]), rh_hi_nm=float(rh[hi - 1])))
     if not peaks:
         return []
     dominant = max(range(len(peaks)), key=lambda j: peaks[j].weight_fraction)

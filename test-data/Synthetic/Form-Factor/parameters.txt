@@ -1,0 +1,56 @@
+DLS Buddy — Synthetic Form-factor SETS (SLS P(q) + paired DLS) test data
+============================================================================
+
+Each sample is an SLS form-factor set PLUS a paired multi-angle DLS whose Rh is
+set from a textbook rho = Rg/Rh for that shape. Load a pair, fit the Form factor
+P(q) for Rg (SLS tab) and a cumulant / Gamma-q^2 for Rh (DLS tab), pick the
+form-factor Rg on the Cross-Sample tab, and rho = Rg/Rh reproduces the shape
+verdict below. The panel exercises the cross-sample tagging / validation axes:
+  * rho shape verdict          -> sphere / soft-sphere / coil / rod
+  * model-dependent flag        -> a form-factor Rg is flagged (neutral i) everywhere
+  * degenerate selection        -> ellipsoid (Rg-divergent) + core-shell (Rg-agree)
+  * model-dependent scaling     -> the FF sphere ladder fits nu ~ 1/3 (tag Linear)
+  * apparent vs thermodynamic   -> FF sphere apparent is single-concentration
+  * uncalibrated                -> FF sphere uncal (Mw arbitrary scale; Rg/rho survive)
+
+GLOBAL PARAMETERS (enter at the Data-tab confirmation step):
+  Solvent                 : water
+  Solvent refractive index: 1.33
+  Viscosity               : 0.89 cP
+  Temperature             : 25.0 C (298.15 K)
+  Wavelength              : 532 nm
+  dn/dc                   : 0.135 mL/g
+
+SLS CALIBRATION (SLS tab calibration panel; the calibrated samples carry it):
+  Standard toluene (VU); calibrant intensity 100000 at 90 deg
+  (the program computes k_c = 3.1496e-10)
+
+GROUND TRUTH:
+  sample              model       Mw         Rg (nm)  Rh (nm)  rho   verdict                   degenerate          cal  shape params
+  FF coil             debye       8e+05      55       36.7     1.50  random (Gaussian) coil    no                  yes  
+  FF ellipsoid        ellipsoid   3e+06      120      48       2.50  rod / extended            yes (Rg-divergent)  yes  eps=3
+  FF core-shell       core_shell  4e+06      65.1     65.1     1.00  dendrimer / soft sphere   yes (Rg-agree)      yes  Rc=35 Ro=90 m1=1.2 m2=1.05
+  FF sphere 0.5M      sphere      5e+05      31.7     41       0.78  hard sphere               no                  yes  
+  FF sphere 1M        sphere      1e+06      40       51.6     0.78  hard sphere               no                  yes  
+  FF sphere 2M        sphere      2e+06      50.4     65       0.78  hard sphere               no                  yes  
+  FF sphere apparent  sphere      1e+06      40       51.6     0.78  hard sphere               no                  yes  
+  FF sphere uncal     sphere      1e+06      40       51.6     0.78  hard sphere               no                  NO   
+  FF Mie latex        mie         6e+05      250      323      0.78  hard sphere               no                  yes  m=1.19173
+
+WHAT TO EXPECT ON THE CROSS-SAMPLE TAB:
+  * FF coil        -> rho ~ 1.5  -> "random (Gaussian) coil"
+  * FF ellipsoid   -> rho ~ 2.5  -> "rod / extended"; the ellipsoid fit is DEGENERATE
+      and Rg-divergent, so each admissible solution is an explicit pick (no consensus).
+  * FF core-shell  -> rho ~ 1.0  -> "dendrimer / soft sphere"; DEGENERATE but the
+      solutions AGREE on Rg, so a "size determined, shape ambiguous" consensus is offered.
+  * FF Mie latex   -> rho ~ 0.78 "hard sphere" (a solid latex sphere); qRg ~ 7.5 sits
+      past the first Mie minimum, so Rg recovers while Mw/A2 carry the deep-minimum
+      ill-conditioning flag -- expected physics, not a defect.
+  * FF sphere 0.5M/1M/2M -> rho ~ 0.78 "hard sphere"; tagged Linear, the scaling plot
+      fits nu ~ 1/3 (Rg-Mw and Rh-Mw), carrying the MODEL-DEPENDENT flag.
+  * FF sphere apparent -> a single-concentration form-factor Rg -> flagged APPARENT.
+  * FF sphere uncal    -> load in its OWN session (or clear the SLS calibration): Mw and
+      A2 go arbitrary-scale (uncalibrated warning), but Rg and rho survive.
+
+NOTE: SLS calibration is session-global, so do not load "FF sphere uncal" in the
+same session as the calibrated samples if you want to see its uncalibrated behaviour.
