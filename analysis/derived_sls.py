@@ -6,18 +6,27 @@ Turn a set of DLS runs' mean count rates into ONE static (SLS) angular series.
 
 This is the engine half of "trace-derived static points": a DLS run's average
 scattered intensity is the static observable, so a goniometer that recorded only
-correlograms can still yield a full static analysis. Sedlak and Amis (1992,
-J. Chem. Phys. 96:817) did exactly this on a Brookhaven BI-200SM -- "Measurements
-of integrated intensities (static light scattering) were done using the same setup
-by counting the total number of counts per a defined time interval" (p. 819) --
-so the practice is standard, not a house invention.
+correlograms can still yield a full static analysis. Schaertl 2007 states the
+identity outright, in the Fig. 1.12 discussion (printed p. 18): "For static light
+scattering experiments, the average scattered intensity <I(q,t)>_T, as indicated
+by the dotted line, is measured." And Sedlak and Amis (1992, J. Chem. Phys.
+96:817) did exactly this on a Brookhaven BI-200SM -- "Measurements of integrated
+intensities (static light scattering) were done using the same setup by counting
+the total number of counts per a defined time interval" (p. 819) -- so the
+practice is standard, not a house invention.
+
+(The Schaertl locus was recorded, then dropped as unconfirmed, then restored on
+the owner's word once the page was re-opened: the check that rejected it had read
+the book's PDF index 18, which is printed p. 7, because the reference index
+carried one page offset for a book whose offset is piecewise. Printed p. 18 is
+PDF index 29 and prints the sentence above.)
 
 What this module does NOT do
 ----------------------------
 It never reads a trace, a workspace or a file, and it never decides WHICH mean
 count rate a run carries. It is handed the number the user committed, together
 with the tag saying where that number came from ('trace:mean',
-'trace:sigma_clipped', 'vendor', 'user'), and it collates. Choosing the source is
+'trace:sigma_clipped', 'vendor', 'generator', 'user'), and it collates. Choosing the source is
 the user's, through the Data tab (invariant 3); recording the choice is this
 module's, because a derived number must travel with its provenance.
 
@@ -57,8 +66,9 @@ import numpy as np
 from core.data_models import (DLSMeasurement, casefold_identity_name,
                               polarization_state, round_angle_for_identity,
                               round_concentration_for_identity,
-                              round_temperature_for_identity)
+                              round_temperature_for_identity, usable_rate)
 from analysis.dls.replicate import check_replicate_identity
+from analysis.uncertainty import replicate_mean_se
 
 __all__ = ['DerivedIntensityInput', 'DerivedPoint', 'DerivedStaticSeries',
            'derive_static_series', 'require_one_polarization_state']
@@ -71,20 +81,43 @@ class DerivedIntensityInput:
     ``mean_count_rate_cps`` is the value COMMITTED on that run, and ``source`` is
     its committed provenance tag. Both are passed in rather than derived here so
     that this module cannot disagree with the Data tab about either.
+
+    ``display_name`` is the run's name as the rest of the program shows it, supplied
+    by the CALLER for the same reason: a pure analysis function may not look anything
+    up (invariant 1), and a note naming runs by internal id -- this module's own
+    count-rate-disagreement note reaches the Derived sub-tab and the exported Comments
+    cell, outliving the session -- names them by something no reader can resolve. It
+    defaults to the id, so a caller that has no name still gets a well-formed note.
     """
     item_id: str
     measurement: DLSMeasurement
     mean_count_rate_cps: float
     source: str
+    display_name: str = ''
+
+    @property
+    def name(self) -> str:
+        """The name to PRINT for this run: the caller's, else its internal id."""
+        return self.display_name or self.item_id
 
 
 @dataclass(frozen=True)
 class DerivedPoint:
-    """One angle of the derived series, with the runs that produced it."""
+    """One angle of the derived series, with the runs that produced it.
+
+    ``intensity_se_cps`` is the standard error of the mean over the runs averaged
+    into this point, from their spread (the ISO 22412 repeat-measurement
+    uncertainty, :func:`analysis.uncertainty.replicate_mean_se` -- the platform's
+    one licensed single-sample DLS-side +/-). It is ``None`` for a single run,
+    where no spread exists and none is invented (invariant 8), and ``None`` for a
+    zero spread, by that function's own rule. It is a RECORD of the point's
+    precision: nothing downstream weights a fit by it.
+    """
     angle_deg: float
     intensity_cps: float
     source_item_ids: Tuple[str, ...]
     source_tags: Tuple[str, ...]
+    intensity_se_cps: Optional[float] = None
 
     @property
     def is_replicate_mean(self) -> bool:
@@ -164,25 +197,27 @@ def require_one_polarization_state(measurements) -> None:
 def _require_usable_rate(entry: DerivedIntensityInput) -> float:
     """The entry's mean count rate as a usable float, or raise.
 
-    Checked on the VALUE rather than on whatever produced it: a photon rate can be
-    neither negative nor non-finite, and both float tails arrive here the same way
-    (a saturated product reads inf, an underflowed one reads 0.0 -- the second is
-    representable but cannot carry a scattering series, so it is refused too).
+    Checked on the VALUE rather than on whatever produced it, by the one predicate
+    every reader of the count rate shares (`core.data_models.usable_rate`): a photon
+    rate can be neither negative nor non-finite, and both float tails arrive here the
+    same way (a saturated product reads inf, an underflowed one reads 0.0 -- the
+    second is representable but cannot carry a scattering series, so it is refused
+    too); a typed string or a bool is refused by type.
     """
-    value = float(entry.mean_count_rate_cps)
-    if not np.isfinite(value) or value <= 0.0:
+    value = usable_rate(entry.mean_count_rate_cps)
+    if value is None:
         raise ValueError(
-            "Run {0!r} has a mean count rate of {1!r} cps, which cannot be a "
+            "Measurement {0!r} has a mean count rate of {1!r} cps, which cannot be a "
             "scattered intensity. Commit a positive mean count rate on the Data "
             "tab, or leave this run out of the derivation.".format(
-                entry.item_id, value)
+                entry.name, entry.mean_count_rate_cps)
         )
     return value
 
 
 def derive_static_series(
     entries: Sequence[DerivedIntensityInput],
-    *, rtol: float = 1e-6,
+    *, rtol: float = 1e-6, rate_rel_tol: float = 0.05,
 ) -> DerivedStaticSeries:
     """Collate DLS runs' committed mean count rates into one static series.
 
@@ -195,6 +230,18 @@ def derive_static_series(
         Relative tolerance handed to :func:`check_replicate_identity` for the
         same-angle averaging. Documented and overridable rather than a magic
         number (invariant 4).
+    rate_rel_tol
+        How far apart a same-angle group's mean count rates may lie -- the highest
+        against the lowest, (max - min) / min, the pairwise relative difference
+        `mean_count_rate_status` computes between a committed rate and its trace --
+        before the averaged point is DISCLOSED as built from runs that disagree.
+        The identity check compares the runs' parameters,
+        not their intensities; this is the sibling comparison the Data tab's
+        `mean_count_rate_status` already makes between a committed rate and its
+        trace, at the same default and with the same rationale -- repeats at one
+        setting agree to about 0.5 %, and the failures worth catching are gross
+        (a changed pinhole or attenuator is a factor of several; a kHz/cps slip a
+        factor of 1000). A disclosure, never a refusal; the value is unchanged.
 
     Raises
     ------
@@ -261,6 +308,9 @@ def derive_static_series(
     points: List[DerivedPoint] = []
     for angle in sorted(by_angle):
         group = by_angle[angle]
+        values = [rates[e.item_id] for e in group]
+        intensity = float(np.mean(values))
+        se: Optional[float] = None
         if len(group) > 1:
             # Averaging, not collating -- so the strict shared check governs, and a
             # non-replicate set raises rather than being silently meaned. Recording
@@ -269,15 +319,44 @@ def derive_static_series(
             # shape a first-loaded solvent blank has been measured to produce
             # elsewhere in the program.
             check_replicate_identity([e.measurement for e in group], rtol=rtol)
+            # The point's precision from the replicate spread (n >= 2; None on a
+            # zero spread by replicate_mean_se's rule). A single run gets None: no
+            # spread exists and none is invented (invariant 8). Surfaced on the
+            # averaging note -- which reaches the tab, the provenance and the export
+            # -- so the record the guides describe is one the user can read.
+            se = replicate_mean_se(values).sem
             notes.append(
-                '{0} runs at {1:g} deg were averaged into one point.'.format(
-                    len(group), angle))
-        intensity = float(np.mean([rates[e.item_id] for e in group]))
+                '{0} runs at {1:g} deg were averaged into one point{2}.'.format(
+                    len(group), angle,
+                    '' if se is None else
+                    ' (standard error of the mean from their spread: \u00b1 {0:.3g} '
+                    'cps)'.format(se)))
+            # The identity check passed on the PARAMETERS; now the INTENSITIES: two
+            # runs that share angle, temperature and fraction but not a pinhole or
+            # attenuator pass every identity field and are not on one scale
+            # (measured 5.6x apart on one real pair), and nothing else in the chain
+            # compares the numbers being meaned. The pairwise form the Data tab uses,
+            # so the shared default keeps the sensitivity it was calibrated on (a
+            # half-range about the mean is about half as sensitive); every rate is
+            # positive (`_require_usable_rate`), so the minimum is a valid divisor.
+            lo, hi = min(values), max(values)
+            spread = (hi - lo) / lo
+            if spread > rate_rel_tol:
+                notes.append(
+                    'The {0} runs at {1:g} deg do not agree: their mean count rates '
+                    'run from {2:.4g} to {3:.4g} cps, {4:.0f} % apart (runs {5}). '
+                    'Repeats at one setting agree to well within {6:.0f} %, so a '
+                    'spread this large usually means a different pinhole, attenuator '
+                    'or laser power; the averaged point is used as is.'.format(
+                        len(group), angle, lo, hi, 100.0 * spread,
+                        ', '.join(e.name for e in group),
+                        100.0 * rate_rel_tol))
         points.append(DerivedPoint(
             angle_deg=float(angle),
             intensity_cps=intensity,
             source_item_ids=tuple(e.item_id for e in group),
             source_tags=tuple(e.source for e in group),
+            intensity_se_cps=se,
         ))
 
     # --- disclosure: the unit, on every series (doctrine rule 2) ---

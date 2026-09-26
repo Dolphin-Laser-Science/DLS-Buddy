@@ -18,29 +18,33 @@ its own controls, so switching method or measurement never wipes another view:
 
 All analysis goes through the controller (`run_*`); soft flags (PDI > 0.3,
 non-diffusive, the reliability notes) are GUI overlays, never drawn on the figure.
-Exception, owner-ruled: a failed distribution fit's "(failed)" legend suffix IS drawn
--- it states what the curve is (a seed estimate, not a fit), the same
+Exception, owner-ruled: a failed distribution fit's "failed" note IS drawn on the
+legend -- it states what the curve is (a seed estimate, not a fit), the same
 analysis-determined tier as plotting's dropped-point and ceiling-halo markers, so a
-saved image cannot present a seed curve as fitted. Each
+saved image cannot present a seed curve as fitted. It names the METHOD that failed,
+since a legend entry stands for a measurement and may cover several of its curves. Each
 sub-tab caches its last result per measurement/sample (within-session) and restores
 it on reselection (no recompute).
 """
 
 from __future__ import annotations
 
+import html
 import math
+import itertools
 import re
 from collections import namedtuple
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 
 from plotting.plots import (
-    plot_correlogram_scaled, plot_distribution, plot_lcurve,
+    plot_correlogram_fit_line, plot_correlogram_scaled, plot_distribution, plot_lcurve,
     plot_weighted_distribution,
     plot_gamma_q2, plot_concentration_extrapolation, plot_ddls,
     plot_mode_map, plot_mode_family_fit, plot_amplitude_vs_q,
@@ -54,28 +58,36 @@ from analysis.optical_model import (
     INTENSITY, RDG, MIE, OpticalModelError,
 )
 from app import units as U
-from app.controller import FIT_ELIGIBLE_QUALITIES
+from app.analysis_region import RegionState, region_summary
+from app.controller import _DLS_DETAIL_SPECS, FIT_ELIGIBLE_QUALITIES
 from core.data_models import IDENTITY_FORM_BY_FIELD
+from core.naming import (UNCONFIRMED_SAMPLE, measurement_display_name,
+                         measurement_hover_card, sample_display_name)
 from gui.plot_controls import (
     AxisControlBar, make_split_panels, make_canvas_expanding,
-    make_vertical_plot_stack, attach_residual_resizer, set_plot_export_name,
+    make_vertical_plot_stack, pin_under_column, scrolling_notes, COLUMN_STACK_STRETCH,
+    attach_residual_resizer, set_plot_export_dressing, set_plot_export_name,
     themed_navtoolbar,
 )
 from gui.export_helper import (
-    confirm_overwrite, export_to_csv, sample_suggested_name, suggested_name)
+    confirm_overwrite, export_to_csv, measurement_export_names,
+    sample_suggested_name)
 from exporting.export import alpha_selection_note
 from gui.field_labels import humanize_field_names
 from gui.help import add_help_to_groupbox, section_header, HelpBadge
 from gui.plot_overlays import (draw_excluded_markers, reissue_legend_preserving_title,
                                show_plot_placeholder, PLACEHOLDER_GRAY)
+from gui.settings_module import DistributionFitFields
 from gui.theme import ThemedLabel, color as theme_color, set_flag
 from gui.widgets import (roomy_tabs, SelectionModel, MeasurementPicker, GroupTickBar,
-                         RichTextDelegate, RichTextHeaderView)
+                         marker_swatch, NAME_COL_MAX_W, RichTextDelegate,
+                         RichTextHeaderView, sidebar_measurement_order)
 from gui.worker import BACKGROUND_RUN_TOOLTIP, BUSY_NOTICE, run_when_idle, runner
 from analysis.uncertainty import (format_fixed_sig, format_pm, pdg_erases_value,
                                   format_value_at_uncertainty)
-from analysis import dls as dls_engine
 from analysis.dls import CUMULANT_PDI_VALIDITY_LIMIT
+from analysis.dls.distributions import (ALPHA_NO_CORNER_NOTE, FTEST_BAND_NOTE_TEMPLATE,
+                                        FTEST_REFERENCE_NOTE)
 
 
 # Scale modes for the four correlogram views, named Yscale-Xscale -> (xscale, yscale).
@@ -130,17 +142,32 @@ def _decay_frame(curves) -> Optional['_DecayFrame']:
 
 class _AnalysisRegion:
     """The shared DLS analysis region (all in seconds), edited on the Correlogram
-    tab (numeric fields + draggable markers) and used by every per-measurement DLS
-    run: parametric fits use the fit WINDOW [tau_min, tau_max]; distribution fits
-    use the window plus a BASELINE measured over [base_lo, base_hi].
+    tab (numeric fields + draggable markers): the fit WINDOW [tau_min, tau_max] plus a
+    BASELINE span [base_lo, base_hi]. This object holds the handles and whether the
+    user has moved each kind; what a fit reads from them is decided in ONE place,
+    `app/analysis_region.py::region_fit_kwargs` (through `Controller.
+    analysis_region_kwargs`), which the Correlogram and Distribution sub-tabs and every
+    checked "use the Correlogram tab's delay window and baseline" path all call. That
+    module's docstring states the rule; `state()` is the snapshot handed to it.
 
-    It deliberately does NOT carry the two engine inputs Settings seeds (the skipped
-    channels, the cumulant method). Making them per-run controls here was tried and
-    reverted: the Cross-Sample candidate builders re-derive the same fit from
+    NOTHING IS APPLIED UNTIL THE USER SETS IT (owner-ruled 2026-09-03 for the span,
+    2026-09-22 for the window). `window_touched` / `baseline_touched` are False while the
+    handles still hold the values `init_from_data` proposed from the ticked data, and an
+    untouched part reaches no fit: each run keeps its own full lag range and its fit's
+    own baseline estimate. The moment a handle of a kind is dragged or its field edited,
+    that part applies, and `Reset window + baseline` clears both flags again. This is NOT
+    policing: a region the user set is never refused, second-guessed or overridden
+    (invariant 4 clause 2); only a region the user never set stops being applied. The
+    measured hazard it closes is a region seeded from one run -- a baseline span, or a
+    window on one lag axis -- reaching a run it was never placed on.
+
+    It deliberately does NOT carry the engine inputs Settings seeds (the skipped
+    channels, the cumulant method and order). Making them per-run controls here was tried
+    and reverted: the Cross-Sample candidate builders re-derive the same fit from
     `controller.settings`, so a panel-local value promoted a DIFFERENT Rh than the
-    panel showed (30.0 nm shown, 23.73 nm promoted, measured). One source of truth the
-    candidate builders read too is the real fix, and it must also settle the cumulant
-    ORDER, which diverges the same way today (tier 1 hardcodes `order=2`).
+    panel showed (30.0 nm shown, 23.73 nm promoted, measured). The controller's seed
+    homes are that one source of truth; the Correlogram tab's order box is the one
+    per-run value, and the tier-1 candidate promotes the tab's own fit while it is fresh.
     """
 
     def __init__(self) -> None:
@@ -148,44 +175,170 @@ class _AnalysisRegion:
         self.tau_max_s: Optional[float] = None
         self.base_lo_s: Optional[float] = None
         self.base_hi_s: Optional[float] = None
-        self._initialized = False
+        # Has the USER placed each part, as opposed to `init_from_data` proposing it? The
+        # Data tab's changed-since-commit highlight is the house pattern: a value the
+        # program proposed and a value the user asserted are different states, and only
+        # the second may steer a number.
+        self.window_touched = False
+        self.baseline_touched = False
 
     def init_from_data(self, tau: np.ndarray) -> None:
-        """Seed sensible defaults once: window = full range, baseline = last 25 %
-        (matching the engine's default tail estimate)."""
-        if self._initialized or tau.size == 0:
+        """Propose the defaults from the ticked data: window = full range, baseline =
+        last 25 % of the lags. An UNTOUCHED part follows the data on every call, so its
+        handles draw the current selection's range; a part the user moved is theirs and
+        stays put. Neither proposal reaches a fit (see the class docstring)."""
+        if tau.size == 0:
             return
         lo, hi = float(tau.min()), float(tau.max())
-        self.tau_min_s, self.tau_max_s = lo, hi
-        self.base_lo_s = float(np.quantile(tau, 0.75))
-        self.base_hi_s = hi
-        self._initialized = True
+        proposal = {'tau_min_s': lo, 'tau_max_s': hi,
+                    'base_lo_s': float(np.quantile(tau, 0.75)), 'base_hi_s': hi}
+        for attrs, touched in ((self._WINDOW_ATTRS, self.window_touched),
+                               (self._BASELINE_ATTRS, self.baseline_touched)):
+            for attr in attrs:
+                # A part the user placed keeps its values even when typed before any data
+                # was ticked (the flag, not the first call, decides); an end still empty
+                # takes the proposal.
+                if not touched or getattr(self, attr) is None:
+                    setattr(self, attr, proposal[attr])
 
     def force_reseed(self) -> None:
-        """Drop the seeded defaults so the next init_from_data re-seeds from data
-        (used by the Correlogram tab's 'Reset window + baseline')."""
-        self._initialized = False
+        """Drop the placed values so the next init_from_data re-proposes both parts from
+        the data (the Correlogram tab's 'Reset window + baseline'), and forget that the
+        user ever moved either -- Reset is the one control that undoes a placement, so it
+        is the one that clears the flags."""
+        self.window_touched = False
+        self.baseline_touched = False
 
-    def window_kwargs(self) -> Dict[str, float]:
-        kw: Dict[str, float] = {}
-        if self.tau_min_s is not None:
-            kw['tau_min_s'] = self.tau_min_s
-        if self.tau_max_s is not None:
-            kw['tau_max_s'] = self.tau_max_s
-        return kw
+    _WINDOW_ATTRS = ('tau_min_s', 'tau_max_s')
+    _BASELINE_ATTRS = ('base_lo_s', 'base_hi_s')
 
-    def baseline_value(self, tau: np.ndarray, g2m1: np.ndarray) -> Optional[float]:
-        """The baseline the engine measures over this region's window.
+    def set_handle(self, attr: str, value) -> None:
+        """Move one handle, marking its kind touched when the handle actually moves.
 
-        The arithmetic belongs to the engine (invariant 5): this widget owns the
-        handles, `dls_engine.baseline_over_window` owns the number. It used to be
-        spelled again here, which made a physics-affecting value a second definition
-        that could drift from the engine's.
+        The one write path for both editors (drag and numeric field), so the two cannot
+        disagree about what counts as a placement. The value comparison matters: the
+        numeric-field editor rewrites all four handles on every edit, so a plain
+        `setattr` there would mark the baseline touched when the user typed a
+        delay-window bound and never went near the purple span -- and the window touched
+        when they only moved the span.
         """
-        if self.base_lo_s is None or self.base_hi_s is None:
-            return None
-        return dls_engine.baseline_over_window(tau, g2m1,
-                                               self.base_lo_s, self.base_hi_s)
+        if value != getattr(self, attr):
+            if attr in self._WINDOW_ATTRS:
+                self.window_touched = True
+            elif attr in self._BASELINE_ATTRS:
+                self.baseline_touched = True
+        setattr(self, attr, value)
+
+    def state(self) -> RegionState:
+        """The Qt-free snapshot the one reading helper takes -- read on the main thread
+        at dispatch, so a background fit never sees a handle move under it."""
+        return RegionState(self.tau_min_s, self.tau_max_s, self.base_lo_s,
+                           self.base_hi_s, window_touched=self.window_touched,
+                           baseline_touched=self.baseline_touched)
+
+
+def _region_fit_kwargs(controller, region: _AnalysisRegion, iid: str, method: str) -> Dict:
+    """The GUI's thin call into the one reading (`Controller.analysis_region_kwargs`):
+    what a `method` fit of measurement `iid` reads from the shared region. Every tab
+    that fits under the region builds its Run and its staleness key from this, so a
+    region cannot mean one thing on one tab and another elsewhere."""
+    return controller.analysis_region_kwargs(iid, method, region.state())
+
+
+class RegionCheckBox(QtWidgets.QWidget):
+    """The opt-in "use the Correlogram tab's delay window and baseline" box -- ONE
+    widget, one behaviour, on every surface that re-runs a fit behind the scenes: the
+    Γ vs q², D vs c, Mode Map and DDLS sub-tabs and the "Average derived results…"
+    prompt.
+
+    - its label line says what the region holds now, or that nothing is set;
+    - unticked (the default, held per (sample, fraction) by each tab and never saved)
+      the run uses each measurement's own defaults, as the paths did before the box;
+    - ticked, the run reads the region through the one reading every tab shares
+      (`Controller.analysis_region_kwargs`), and the result's notes say so;
+    - its `key()` joins the owning tab's staleness key, so toggling it -- or moving a
+      handle while it is ticked -- flags a shown result stale, and leaves an unticked
+      one alone.
+
+    Opt-in, never automatic, because the region is ONE per DLS tab, not one per sample:
+    a span placed while looking at one sample would otherwise reach another sample's
+    runs unasked. A LIVE link to the other tab's region while ticked, unlike the Mode
+    Map's one-time copy of the Distribution tab's fields (`ui_style_guide.md` §4 states
+    the difference)."""
+
+    toggled = QtCore.Signal(bool)
+
+    LABEL = "Use the Correlogram tab's delay window and baseline"
+
+    def __init__(self, region: _AnalysisRegion, parent=None) -> None:
+        super().__init__(parent)
+        self._region = region
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        self.box = QtWidgets.QCheckBox(self.LABEL)
+        self.box.setToolTip(
+            'Ticked, each run is fitted as the Correlogram tab fits it: over the delay '
+            'window set there, with a baseline measured over the part of the purple span '
+            'inside that window. A window or span never moved there is not applied, so '
+            'ticking changes nothing until you set one. Unticked, each run keeps its own '
+            'full lag range and its fit\'s own baseline estimate. The result\'s notes say '
+            'which it used.')
+        self.box.toggled.connect(self.toggled)
+        row.addWidget(self.box)
+        row.addWidget(HelpBadge(
+            'Fit these runs over the region set on the Correlogram tab.', bullets=[
+                'Set the delay window or the purple baseline span on the '
+                '<b>Correlogram</b> sub-tab, then tick this box and press <b>Run</b>.',
+                'Only a window or span you have moved is used; the line under the box '
+                'says what is set now.',
+                'The baseline is measured over the part of the span inside the delay '
+                'window; the greyed part outside it is not used.',
+                'Held per sample and not saved with the session; each new sample starts '
+                'unticked.',
+                'Ticking it, or moving the region while it is ticked, marks a shown '
+                'result out of date — press <b>Run</b> again.',
+                'The result’s notes, its export and any Summary row it writes say it '
+                'used the Correlogram tab’s region.',
+            ]))
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.summary = ThemedLabel('', role='hint', size=10)
+        self.summary.setWordWrap(True)
+        lay.addWidget(self.summary)
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Re-read the region into the label line (the owning module calls this when the
+        Correlogram tab reports a move)."""
+        self.summary.setText(region_summary(self._region.state()))
+
+    def isChecked(self) -> bool:
+        return self.box.isChecked()
+
+    def set_checked_silently(self, on: bool) -> None:
+        """Show a held per-(sample, fraction) state without firing `toggled`."""
+        was = self.box.blockSignals(True)
+        try:
+            self.box.setChecked(bool(on))
+        finally:
+            self.box.blockSignals(was)
+
+    # The tabs hold the choice per (sample, fraction) -- the box shows only the one on
+    # screen -- so both readers take the held choice rather than the box's own state; a
+    # deferred Run of another (sample, fraction) reads its own.
+    def region_for_run(self, checked: bool) -> Optional[RegionState]:
+        """The snapshot a Run hands the controller: the region when `checked`, else None.
+        Read on the main thread at dispatch."""
+        return self._region.state() if checked else None
+
+    def key(self, checked: bool) -> tuple:
+        """The choice's part of a staleness key: the choice and, when `checked`, the
+        region's APPLIED parts (`RegionState.applied`), so re-seeding an untouched handle
+        never flags a result stale and every move of a set one does."""
+        return (True, self._region.state().applied()) if checked else (False,)
 
 
 _CORR_METHODS: List[Tuple[str, str]] = [
@@ -200,20 +353,213 @@ _DIST_METHODS: List[Tuple[str, str]] = [
     ('CONTIN', 'contin'),
 ]
 
+# Every fit that can be drawn over a correlogram, in the order the Correlogram tab's
+# "Fits to show" list presents them: the four that tab runs, then the three the
+# Distribution tab runs. DERIVED from the two rosters rather than typed again, so a
+# method added to either is offered here without a second edit and cannot be half-added
+# (rule 11: drive a family from a scan, never a hand list). The gate that keeps the
+# maps below total over it is
+# `tests/test_gui_smoke.py::test_every_drawable_fit_method_has_a_distinct_line_style_and_a_short_name`.
+_FIT_METHODS: List[Tuple[str, str]] = _CORR_METHODS + _DIST_METHODS
+_CORR_METHOD_KEYS = frozenset(key for _label, key in _CORR_METHODS)
+
+# Short names for the "Fits to show" list and the plot legend. The roster's own labels
+# are form-row labels ('Stretched Exponential (KWW)') and do not fit a two-column
+# checkbox grid in a 360 px control column, nor a legend entry beside a full
+# `sample . axes . name`.
+_FIT_SHORT_LABELS: Dict[str, str] = {
+    'cumulant': 'Cumulant', 'single': 'Single exp', 'double': 'Double exp',
+    'kww': 'KWW', 'lognormal': 'Lognormal', 'nnls': 'NNLS', 'contin': 'CONTIN',
+}
+
+# LINE STYLE IS THE METHOD, on both DLS co-plotting tabs and in both of their residual
+# panels, so a dash pattern means the same thing wherever it is drawn. Fixed per method
+# -- never an index-keyed cycle, which would re-assign a style as the ticked set moved.
+# It retires line style as the Distribution tab's per-MEASUREMENT channel; the marker
+# takes that channel there (see `_DistributionTab._draw`). Spacings separate WITHIN each
+# family: one parametric against one distribution fit here, NNLS against CONTIN there.
+_METHOD_LINESTYLE: Dict[str, object] = {
+    'cumulant':  '-',                        # solid
+    'single':    (0, (6, 2)),                # long dash
+    'double':    (0, (2, 2)),                # short dash
+    'kww':       (0, (6, 2, 1, 2)),          # dash-dot
+    'lognormal': (0, (1, 2)),                # dotted
+    'nnls':      (0, (4, 1, 1, 1, 1, 1)),    # dash-dot-dot
+    'contin':    (0, (8, 2, 2, 2)),          # long dash + dash
+}
+
+
+def _fit_label(key: str) -> str:
+    """The short name of a fit method, for the layers list, the legend and the residual
+    panel. Falls back to the roster's own form-row label so a method added to
+    `_CORR_METHODS` / `_DIST_METHODS` and not to `_FIT_SHORT_LABELS` still names
+    itself -- the map is a shortening, not the roster."""
+    if key in _FIT_SHORT_LABELS:
+        return _FIT_SHORT_LABELS[key]
+    return next((lbl for lbl, k in _FIT_METHODS if k == key), key)
+
+
+def _neutral_ink() -> str:
+    """The figure's own text colour, for chrome that must not read as a data series.
+
+    Taken from the live rcParams rather than hard-coded, so it follows the on-screen
+    plot theme (`plotting.plots.set_onscreen_plot_theme`) into dark mode and back --
+    a hard-coded grey is unreadable on one of the two."""
+    import matplotlib
+    return matplotlib.rcParams.get('text.color', '0.25')
+
+
+def draw_fit_residuals(ax, entries, *, xscale: str = 'log') -> None:
+    """Draw ONE residual panel: the residuals of exactly the fits drawn above it, each
+    in its measurement's colour and its method's line style, with the methods on
+    display named on the panel.
+
+    `entries` is ``[(colour, method_key, result), ...]`` in draw order; each result
+    carries `fit_tau_s` and `residuals`. BOTH DLS residual panels -- the Correlogram
+    tab's and the Distribution tab's -- go through this one body, so the two cannot
+    disagree about what a residual panel shows or how it is coded, and the drawing
+    exists once.
+
+    All seven methods define `residuals` identically -- (g2-1) data minus fitted,
+    unweighted, on `fit_tau_s` (`analysis/dls/cumulants.py`, `exponentials.py`,
+    `distributions.py`) -- which is what lets them share one axis honestly. A method
+    added later whose residual is a different quantity does not join a panel until it
+    is.
+
+    The caller owns the axes and passes it CLEARED; no axes is created or recreated here
+    (the serial gui tier's heap-fault history -- reuse a persistent cleared axis).
+    """
+    tfac = _disp_factor('time')
+    for color, key, res in entries:
+        ax.plot(np.asarray(res.fit_tau_s, dtype=float) * tfac,
+                np.asarray(res.residuals, dtype=float),
+                color=color, ls=_METHOD_LINESTYLE.get(key, '-'), lw=1.0)
+    ax.axhline(0.0, color='#444', lw=0.6, ls=':')
+    ax.set_xscale(xscale)
+    ax.set_xlabel(rf'Delay time $\tau$ ({_disp_unit("time")})')
+    ax.set_ylabel('resid.')
+    # The panel names what it is showing, in the GAP above it rather than inside it or
+    # in the y-label: the label is rotated into a gutter too narrow for a method list,
+    # a title would take height from a panel that is only 22 % of the column, and text
+    # placed inside overlapped the residuals as soon as the panel got short (measured
+    # 2026-09-18 on the nine-run harness frame, where it sat across the data). The gap
+    # is already widened for the resizer grip and carries the main axis's centred
+    # x-label, which a LEFT-aligned note sits beside rather than over. No colour is
+    # passed, so the text inherits the figure's own (themed) text colour.
+    shown = list(dict.fromkeys(key for _c, key, _r in entries))
+    if shown:
+        ax.text(0.0, 1.06, 'Residuals: ' + ', '.join(_fit_label(k) for k in shown),
+                transform=ax.transAxes, ha='left', va='bottom', fontsize=7, zorder=5)
+
 
 # Shown when a displayed fit was computed from inputs that have since changed: a
 # committed parameter, a tab-owned input (the delay window / baseline / cumulant
 # order, the ticked set) or a settings-seeded one (skip_initial_channels, the cumulant
-# method, the SE estimator). Each tab's `_run_signature` names the inputs its fit
-# reads and is stored with the cached fit; a redisplay compares the two -- the SLS
-# tab's `sls_run_signature` shape. Complements the pre-commit '(ran on last
-# committed values)' note: this covers the post-commit window, where `is_dirty()` has
-# already gone false but the plot still reflects the old inputs.
+# method, the cumulant fit cutoff, the SE estimator). Each tab's `_run_signature` names
+# the inputs its fit reads and is stored with the cached fit; a redisplay compares the
+# two -- the SLS tab's `sls_run_signature` shape. Complements the pre-commit '(ran on
+# last committed values)' note: this covers the post-commit window, where `is_dirty()`
+# has already gone false but the plot still reflects the old inputs.
 _STALE_HINT = 'Inputs changed since this fit — press Run to refresh.'
 
 #: `_recompute(sid, fraction=_FOCUSED)`: fit the focused fraction, unless a deferred
 #: Run re-enters with the (sample, fraction) it was pressed on.
 _FOCUSED = object()
+
+
+# Every numeral in a status message, for grouping several measurements' copies of one
+# message into a single sentence (item 7). Matches an optionally signed integer or
+# decimal with an optional exponent -- the forms `format_fixed_sig` emits.
+_STATUS_NUMERAL = re.compile(r'-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?')
+
+# What a masked numeral becomes while grouping. It must be a string no MESSAGE can
+# contain, because the grouping rests on "same mask => same numeral count in the same
+# positions": a subject carrying the mask token literally decomposes differently from
+# its group-mates, and indexing one member's numerals by another's range raises
+# IndexError in a Qt slot. NUL cannot appear in a Qt label, and `chr(0)` is built
+# rather than typed -- a literal NUL in a source file makes the file binary to grep
+# and to every byte-level tool.
+_STATUS_MASK = chr(0)
+
+
+# How many runs a VALUE-BEARING grouped message names before it says "and N more".
+# Names are long and this label sits under the scrolled control column, where an
+# uncapped listing of nine wraps to three lines and takes the height out of the
+# results tables above it.
+
+# A per-call argument, not a rule, because the cap is only honest where the elided runs
+# are recoverable: a value-bearing flag is also on its own glance cell. A passive note
+# is rendered nowhere else, and a message with no varying numeral degenerates to a bare
+# name list -- both are passed no cap.
+_STATUS_LIST_MAX = 4
+
+
+def _elide_listing(items, cap) -> str:
+    """Join a grouped message's run list, capped at `cap` (None = name them all)."""
+    if cap is None or len(items) <= cap:
+        return '   '.join(items)
+    return '   '.join(items[:cap]) + f'   … and {len(items) - cap} more'
+
+
+def group_status_lines(entries, *, value_cap=None):
+    """Render [(measurement_name, message)] so one KIND of message is explained once.
+
+    The commonest DLS warning carries its own value ("PDI = 0.328 is above the 0.3
+    validity limit ..."), so no two rendered lines were ever identical and a
+    three-replicate run printed the same paragraph three times -- the collaborator's
+    "errors and warnings spam the bottom of the column".
+
+    A message's KIND is its text with every numeral masked, which needs no cooperation
+    from the engine: the notes keep their wording and nothing about them is
+    restructured for this. Two messages of one kind then differ only in their numbers.
+
+    Within a kind, a numeral position that DIFFERS across the measurements is a value
+    and a position that agrees is part of the sentence -- a printed threshold, a limit,
+    an order. So the shared sentence keeps its constants and blanks only what varies,
+    and each measurement is named beside its own value beneath it. A kind with one
+    member renders exactly as before, prefixed with its measurement.
+
+    Pure: no Qt, no widgets, so the grouping is unit-testable on strings alone.
+    """
+    order, groups = [], {}
+    for name, line in entries:
+        key = _STATUS_NUMERAL.sub(_STATUS_MASK, line)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append((name, line))
+
+    out = []
+    for key in order:
+        members = groups[key]
+        if len(members) == 1:
+            name, line = members[0]
+            out.append(f'{name}: {line}')
+            continue
+        # Same mask => same numeral count in the same positions, so these line up.
+        numerals = [_STATUS_NUMERAL.findall(line) for _n, line in members]
+        varying = [i for i in range(len(numerals[0]))
+                   if len({nums[i] for nums in numerals}) > 1]
+        counter = itertools.count()
+        blank = set(varying)
+
+        def _mask(m, _c=counter, _b=blank):
+            # Bound as defaults: the lambda is consumed by this one `sub` call, but a
+            # closure over the loop variables is the shape that bites the NEXT edit.
+            return '…' if next(_c) in _b else m.group(0)
+
+        out.append(_STATUS_NUMERAL.sub(_mask, members[0][1]))
+        if varying:
+            listed = [f'{name}: {" / ".join(nums[i] for i in varying)}'
+                      for (name, _l), nums in zip(members, numerals, strict=True)]
+            cap = value_cap
+        else:
+            # Identical messages with nothing to distinguish: name the measurements,
+            # all of them -- there is no per-run value and so no cell carrying it.
+            listed = [name for name, _l in members]
+            cap = None
+        out.append('    ' + _elide_listing(listed, cap))
+    return out
 
 
 def _ordinal_peak(i: int) -> str:
@@ -233,7 +579,7 @@ def _widen_row_gap(figure, hspace: float = 0.06) -> None:
         engine = figure.get_layout_engine()
         if engine is not None and hasattr(engine, 'set'):
             engine.set(hspace=hspace)
-    except Exception:
+    except Exception:  # noqa: BLE001 — layout-engine API differences
         pass
 
 
@@ -283,6 +629,31 @@ def _fill_vtable(table, values) -> None:
             it.setText(v)
 
 
+def _repoint_vtable(table, rows) -> None:
+    """Re-point an existing `_vtable` at a different row set, in place.
+
+    `_vtable` BUILDS a table; this reuses one when the method box changes the rows it
+    should show. In place rather than swapping a fresh widget into the layout, so the
+    pane's splitter share, its scroll position and every connection survive a method
+    change. Re-applies the row-label tooltips and the content height cap exactly as
+    `_vtable` does, because both are keyed to the row set that just changed.
+    """
+    table.setRowCount(len(rows))
+    for r, name in enumerate(rows):
+        label = QtWidgets.QTableWidgetItem(name)
+        # The μ₃/μ₄ rows carry the in-program caution against over-reading a bare higher
+        # moment; every other row's tooltip is its own label, for narrow-column elision.
+        label.setToolTip(_RESULT_ROW_TOOLTIPS.get(name, name))
+        table.setItem(r, 0, label)
+        table.setItem(r, 1, QtWidgets.QTableWidgetItem('—'))
+    row_h = table.verticalHeader().defaultSectionSize()
+    table.setMaximumHeight(row_h * max(len(rows), 1) + 2 * table.frameWidth() + 2)
+    # It may also SHRINK to three rows and scroll. A `_vtable` otherwise reports its
+    # whole row count as its minimum, which in a short section is taken out of whatever
+    # shares the space with it.
+    table.setMinimumHeight(row_h * min(max(len(rows), 1), 3) + 2 * table.frameWidth() + 2)
+
+
 def _reset_vtable(table) -> None:
     """Reset a `_vtable`'s value column to '—'."""
     for r in range(table.rowCount()):
@@ -295,61 +666,66 @@ def _reset_vtable(table) -> None:
 # Multi-measurement co-plotting (shared by the Correlogram & Distribution tabs)
 # ===========================================================================
 
-def _selection_scoped_name(controller, iids, analysis: str, ext: str = 'csv') -> str:
-    """Suggested export name for a ticked-measurement view: carries the sample
-    token when every measurement belongs to ONE sample, bare otherwise. The
-    Correlogram/Distribution tick set can span samples, where a token would be
-    ill-defined — but the common single-sample case must not propose the same
-    filename for every sample (review finding)."""
+def _selection_sample_id(controller, iids):
+    """The one sample every ticked id belongs to, or None when the set spans samples.
+
+    ONE definition of "does this selection span samples?", shared by the export-name
+    helper below and by the legends' sample prefix (`_sample_prefixes`).
+    """
     sids = {controller.sample_id_of(iid) for iid in iids}
-    sid = next(iter(sids)) if len(sids) == 1 else None
-    if sid is None:
-        return suggested_name(None, analysis, ext)
-    return sample_suggested_name(controller, sid, analysis, ext)
+    return next(iter(sids)) if len(sids) == 1 else None
 
 
-def _meas_label(lm) -> str:
-    """A short label for a DLS measurement in the selection list / legend / table."""
-    p = lm.committed_params
-    user_label = p.get('label') or ''
-    name = user_label if user_label else lm.item_id
-    parts = [] if user_label else [f'{p.get("polymer_name") or "?"}/{p.get("solvent_name") or "?"}']
-    ang = p.get('angle_deg')
-    if ang is not None:
-        parts.append(f'{ang:g}°')
-    conc = p.get('concentration_g_per_mL')
-    if conc:
-        parts.append(f'{conc * 1000:.3g} mg/mL')
-    frac = p.get('mw_fraction')
-    if frac:
-        parts.append(f'[{frac}]')
-    if getattr(lm, 'derived_kind', None) == 'replicate_average':
-        parts.append(f'(avg of {len(lm.derived_from or [])})')
-    suffix = ' '.join(parts)
-    return f'{name}: {suffix}' if suffix else name
+def _selection_export_names(controller, items, analysis: str, ext: str = 'csv'):
+    """`(dialog name, per-file suffixes)` for a ticked-measurement export.
+
+    `items` is `(item_id, method-or-None)` in fan-out order. The sample token rides
+    the name when every ticked measurement belongs to ONE sample and is dropped
+    otherwise, where a token would be ill-defined — but the common single-sample
+    case must not propose the same filename for every sample (review finding).
+    The suffixes are what the fan-out appends to whatever stem the user types; the
+    dialog shows the whole name when exactly one measurement is ticked.
+    """
+    return measurement_export_names(
+        controller, _selection_sample_id(controller, [iid for iid, _m in items]),
+        items, analysis, ext)
 
 
-def _sample_header(sample) -> str:
-    """Bold group header text for a sample in the DLS selection list."""
-    poly = sample.polymer_name or '?'
-    solv = sample.solvent_name or '?'
-    T = sample.temperature_K
-    if T and T == T:   # not NaN
-        return f'{poly} / {solv} @ {T:g} K'
-    return f'{poly} / {solv}'
+def _sample_label_of(controller, iid) -> str:
+    """This measurement's sample name, or `(unconfirmed sample)` when it is in none.
+
+    `Controller.sample_id_of` is declared `Optional[str]` and a measurement in no
+    sample is a listable, tickable state -- `MeasurementPicker.refresh` puts one under
+    exactly that header. Both DLS legend builders subscripted `workspace.samples[...]`
+    with its result, which is `samples[None]` -> KeyError inside a draw, swallowed by
+    Qt at the slot boundary and leaving a half-drawn figure. `_sample_prefixes` two
+    functions down already guards the same lookup; this is that guard, shared, so the
+    two consumers cannot drift from it again.
+    """
+    sid = controller.sample_id_of(iid)
+    sample = controller.workspace.samples.get(sid) if sid else None
+    return sample_display_name(sample) if sample is not None else UNCONFIRMED_SAMPLE
 
 
-def _meas_short(lm) -> str:
-    """A very short label for a table column header (item id + angle/fraction)."""
-    p = lm.committed_params
-    bits = [lm.item_id]
-    ang = p.get('angle_deg')
-    if ang is not None:
-        bits.append(f'{ang:g}°')
-    frac = p.get('mw_fraction')
-    if frac:
-        bits.append(f'[{frac}]')
-    return ' '.join(bits)
+def _sample_prefixes(controller, iids) -> dict:
+    """Per-id sample prefix for a co-plotted set: the sample's name when the set SPANS
+    samples, None when it does not.
+
+    Builds no name of its own -- it decides ONE thing, whether the set spans samples,
+    and hands `core.naming` the answer. The predicate is the one
+    `_selection_export_names` uses for export names, so a legend and a filename can
+    never disagree about it. A single-sample view names its sample once, above.
+    """
+    iids = list(iids)
+    if _selection_sample_id(controller, iids) is not None:
+        return {iid: None for iid in iids}
+    samples = controller.workspace.samples
+    out = {}
+    for iid in iids:
+        sid = controller.sample_id_of(iid)
+        s = samples.get(sid) if sid else None
+        out[iid] = sample_display_name(s) if s is not None else None
+    return out
 
 
 # ===========================================================================
@@ -369,24 +745,127 @@ _AVERAGE_METHODS = [
 ]
 
 
-def ask_average_method(parent) -> Optional[str]:
-    """Ask which dynamic fit to run on each replicate. Returns the method key, or
-    None if the user canceled. Cumulant is the default (the ISO 22412 z-average
-    sizing basis)."""
-    labels = [lbl for lbl, _ in _AVERAGE_METHODS]
-    choice, ok = QtWidgets.QInputDialog.getItem(
-        parent, 'Average derived results',
-        'Fit each replicate with which method?\n'
-        '(the mean ± SD/√N of its parameters is reported).\n'
-        'Distribution methods report per-peak averages in Rh order; CONTIN over '
-        'many replicates is slow.',
-        labels, 0, False)
-    if not ok:
+#: What the averaging prompt can read or copy from the DLS tab, handed in by the module
+#: that owns the tabs: the shared region, and zero-argument / per-method accessors for the
+#: Correlogram tab's order box and the Distribution tab's fields, read at confirmation.
+AverageSources = namedtuple('AverageSources',
+                            'region cumulant_order distribution_kwargs')
+
+
+class AverageRequest(namedtuple('AverageRequest',
+                                'method region cumulant_order distribution_kwargs',
+                                defaults=(None, None, None))):
+    """What the averaging prompt asked for: the method, the region when its box was
+    ticked, and the one-time copy of the Correlogram tab's order or the Distribution
+    tab's fields when the copy box was ticked (None: the Settings values)."""
+
+    def run_kwargs(self) -> dict:
+        """The keyword arguments `Controller.average_dls_results` takes for them."""
+        return dict(region=self.region, cumulant_order=self.cumulant_order,
+                    distribution_kwargs=self.distribution_kwargs)
+
+
+class AverageDialog(QtWidgets.QDialog):
+    """The "Average derived results…" prompt: which fit each replicate gets, whether it
+    reads the Correlogram tab's region (the shared `RegionCheckBox`), and whether it
+    copies the matching DLS sub-tab's per-run settings -- the Correlogram tab's cumulant
+    order for a cumulant average, the Distribution tab's fields for CONTIN, NNLS or
+    lognormal. The Settings values an unticked copy runs on are shown either way, from
+    the same controller computation that writes the summary's note, so what the prompt
+    showed and what the average recorded cannot disagree. Averaging runs once, so a copy
+    taken here is one-time by construction -- the Mode Map's copy button, in the one
+    place averaging is started."""
+
+    def __init__(self, parent, controller, sources: Optional[AverageSources] = None) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self._sources = sources
+        self.setWindowTitle('Average derived results')
+        lay = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            'Fit each replicate with which method? The mean ± SD/√N of its parameters is '
+            'reported. Distribution methods report per-peak averages in Rh order; CONTIN '
+            'over many replicates is slow.')
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        self.method_combo = QtWidgets.QComboBox()
+        for label, key in _AVERAGE_METHODS:
+            self.method_combo.addItem(label, key)
+        lay.addWidget(self.method_combo)
+        self.region_box = RegionCheckBox(
+            sources.region if sources is not None else _AnalysisRegion())
+        lay.addWidget(self.region_box)
+        self.copy_box = QtWidgets.QCheckBox()
+        self.copy_box.setToolTip(
+            'A one-time copy of that sub-tab\'s current per-run value(s), taken when you '
+            'press OK; unticked, the average runs on the Settings values shown below. '
+            'The average\'s summary records which, and a written Summary row names the '
+            'cumulant order it ran at.')
+        lay.addWidget(self.copy_box)
+        self.settings_label = ThemedLabel('', role='hint', size=10)
+        self.settings_label.setWordWrap(True)
+        lay.addWidget(self.settings_label)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        self.method_combo.currentIndexChanged.connect(self._sync_method)
+        self._sync_method()
+
+    def method(self) -> str:
+        return self.method_combo.currentData()
+
+    def _sync_method(self, *_args) -> None:
+        """Show the copy choice the method has -- the order for a cumulant average, the
+        Distribution tab's fields for an inversion, none for the other fits -- and the
+        Settings values it would otherwise run on."""
+        method = self.method()
+        s = self._sources
+        if method == 'cumulant':
+            now = f' (now {s.cumulant_order()})' if s is not None else ''
+            self.copy_box.setText(f"Use the Correlogram tab's cumulant order{now}")
+        else:
+            self.copy_box.setText("Use the Distribution tab's settings")
+        copyable = method == 'cumulant' or method in ('contin', 'nnls', 'lognormal')
+        self.copy_box.setVisible(copyable and s is not None)
+        try:
+            text = self.controller.average_inputs_text(method)
+            text = f'Unticked: {text}' if text else ''
+        except ValueError as exc:
+            # A hand-edited Settings token the seed home refuses: say so here, where the
+            # average would otherwise fail on every replicate with the same refusal.
+            text = f'Settings cannot seed this fit: {exc}'
+        self.settings_label.setText(text)
+        self.settings_label.setVisible(bool(text))
+
+    def request(self) -> AverageRequest:
+        """The request for what the dialog shows now. The copy is taken HERE, once."""
+        method = self.method()
+        s = self._sources
+        copy = (not self.copy_box.isHidden()) and self.copy_box.isChecked() and s is not None
+        order = s.cumulant_order() if copy and method == 'cumulant' else None
+        dist = (s.distribution_kwargs(method)
+                if copy and method in ('contin', 'nnls', 'lognormal') else None)
+        return AverageRequest(method, self.region_box.region_for_run(
+            self.region_box.isChecked()), order, dist)
+
+
+def ask_average_method(parent, controller,
+                       sources: Optional[AverageSources] = None) -> Optional[AverageRequest]:
+    """Ask which dynamic fit to run on each replicate, and whether it reads the
+    Correlogram tab's region and copies the matching sub-tab's per-run settings.
+    Returns the request, or None if the user canceled. Cumulant is the default (ISO
+    22412's sizing basis, whose size is the scattered-intensity-weighted harmonic mean)."""
+    dlg = AverageDialog(parent, controller, sources)
+    if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
         return None
-    for lbl, key in _AVERAGE_METHODS:
-        if lbl == choice:
-            return key
-    return None
+    try:
+        return dlg.request()
+    except ValueError as exc:       # a copied CONTIN α range the engine would refuse
+        QtWidgets.QMessageBox.warning(parent, 'Average derived results', str(exc))
+        return None
 
 
 def format_average_summary(summary: dict) -> str:
@@ -399,7 +878,12 @@ def format_average_summary(summary: dict) -> str:
     n_ok = summary.get('n_fit_ok', 0)
     n_rep = summary.get('n_replicates', 0)
     lines = [f'DLS replicate average — {method}',
-             f'{n_ok} of {n_rep} replicate(s) fit successfully.', '']
+             f'{n_ok} of {n_rep} replicate(s) fit successfully.']
+    # What the fits read -- the settings (Settings or a copied tab's) and, when its box was
+    # ticked, the Correlogram tab's region -- in the controller's own words, one sentence
+    # each (`Controller.average_inputs_text` / `region_note`).
+    lines += [f'ⓘ {note}' for note in summary.get('notes') or ()]
+    lines.append('')
 
     peaks = summary.get('peaks')
     if peaks is not None:                          # distribution method
@@ -456,7 +940,8 @@ def show_average_summary(parent, summary: dict) -> None:
 # tab now, with real checkboxes and one visual idiom). `DLSModule` builds one shared
 # `SelectionModel(color_cycle=cycle)` so overlay colors stay stable, and the
 # Correlogram / Distribution / Summary tabs each embed a `MeasurementPicker` bound to it.
-# `_meas_label` / `_sample_header` (above) are injected as the picker's label callables.
+# `core.naming`'s `measurement_display_name` / `sample_display_name` are injected as the
+# picker's label callables -- the one builder every surface in the program shares.
 
 # Help shown on the "?" badge of the DLS measurement pickers (how-to-use).
 _PICKER_HELP = 'Tick the measurements to analyze and overlay.'
@@ -471,6 +956,12 @@ _SUMMARY_PICKER_BULLETS = [
     'Ticks pick which measurements the table shows when '
     '<b>“Ticked only”</b> is on.',
     'With “Ticked only” off, the table lists every DLS result.',
+    '<b>“Show fit details”</b> adds every other quantity each parametric fit reports '
+    '(decay rate, moments, fitted order and baseline, fractions, stretch, convergence). '
+    'Only the methods you actually ran add columns, each column names its fit, and the '
+    'table scrolls sideways when they do not fit.',
+    'ⓘ on a cell marks a note about how that number was obtained — hover to read it. '
+    'It is a remark, not a warning; ⚠ is the warning.',
 ]
 
 # Bulk "tick all at X" group fields for the DLS measurement pickers:
@@ -501,28 +992,277 @@ _GROUP_PICKER_BULLETS = _PICKER_BULLETS + [
 # always-visible Cumulant + KWW tables and the single/double-into-status line.
 #
 # Every Rh row names its kind in the label: one angle at one concentration is APPARENT
-# (invariant 7), and the cumulant Rh is additionally a z-average -- the Distribution tab
-# says "distribution-weighted, not z-average" of its peaks, so this table must say the
-# other half where the number is read (ui_style_guide R5.3: never hidden).
+# (invariant 7), said where the number is read (ui_style_guide R5.3), and it is the whole
+# qualifier -- WHICH average a cumulant fit reports (the scattered-intensity-weighted
+# harmonic mean) is the Theory-and-Equations Guide's to define (CLAUDE.md invariant 7).
+
+# Passive (nuance) tooltips for the cumulant order control and the μ₃ / μ₄ result rows.
+# They carry the WHOLE caution: the higher moments ship bare, with no per-value validity
+# glyph, because their unreliability is a constant property of the method rather than a
+# per-run precondition (owner-ruled 2026-09-05; the ruling's home, its literature basis and
+# the measured magnitudes are on `CumulantResult`). No citation in the text (ui_style_guide
+# R6.1) -- the guide section is the pointer. Module constants so the GUI tier can assert them.
+_CUMULANT_ORDER_TOOLTIP = (
+    'Degree of the cumulant expansion: 1 = size (D) only, 2 adds PDI (polydispersity), '
+    '3 adds μ₃ (the decay-rate distribution\'s asymmetry), 4 adds μ₄; cumulant method '
+    'only, greyed out for the others. Orders '
+    '3–4 need broad distributions — on this program\'s synthetic benchmarks order 4 '
+    'improves on order 2 in Γ at PDI ≈ 0.6, and in both Γ and the PDI only on clean data '
+    'at PDI ≈ 0.2–0.3; everywhere else — lower PDIs, noisier data up to PDI ≈ 0.3, and '
+    'the PDI at PDI ≈ 0.6 — order 2 is at least as precise. Order 3 is offered for its '
+    'diagnostic μ₃: the literature does not recommend it, and on those benchmarks it is the '
+    'one order that can report a badly wrong PDI as reliable on a broad sample — read the '
+    'size at order 2 and broad distributions at order 4; see the '
+    'Theory-and-Equations-Guide §3.2.6.')
+_HIGHER_MOMENT_TOOLTIP = (
+    'Fitted parameter, not a measured moment: at best (nonlinear method, broad sample) its '
+    'uncertainty is comparable to its own value, and on the linear method or below '
+    'PDI ≈ 0.3 it is noise — a 0 is the fit\'s bound, not a measurement. Use it to compare '
+    'fits, not to characterize the sample; see the Theory-and-Equations-Guide §3.2.6.')
+# Row-LABEL tooltips of the results table, keyed by the row's label so a reordering of
+# `_RESULT_ROWS` cannot move a caution onto the wrong quantity. On the label cell, not the
+# value cell: a value cell's tooltip carries that value's own reliability REASON (or, with
+# nothing to explain, its full text for the elided-column case), and the two must not
+# fight. Applied where the labels are BUILT (`_repoint_vtable`, which runs on every method
+# change and would otherwise overwrite them); a row not listed here keeps its own label as
+# the tooltip, the elided-header convention.
+_RESULT_ROW_TOOLTIPS = {'μ₃ (s⁻³)': _HIGHER_MOMENT_TOOLTIP, 'μ₄ (s⁻⁴)': _HIGHER_MOMENT_TOOLTIP}
+
 _RESULT_ROWS = {
-    'cumulant': ['Γ (s⁻¹)', 'R<sub>h</sub> (nm, z-average, apparent)', 'PDI', 'μ₂ (s⁻²)',
-                 'order', 'method', 'baseline B'],
-    'single':   ['Γ (s⁻¹)', 'R<sub>h</sub> (nm, apparent)', 'β', 'converged'],
+    'cumulant': ['Γ (s⁻¹)', 'R<sub>h</sub> (nm, apparent)', 'PDI', 'μ₂ (s⁻²)',
+                 'μ₃ (s⁻³)', 'μ₄ (s⁻⁴)', 'order', 'method', 'baseline B'],
+    'single':   ['Γ (s⁻¹)', 'R<sub>h</sub> (nm, apparent)', 'β', 'baseline', 'converged'],
     'double':   ['fast R<sub>h</sub> (nm, apparent)', 'fast frac',
-                 'slow R<sub>h</sub> (nm, apparent)', 'slow frac', 'converged'],
+                 'slow R<sub>h</sub> (nm, apparent)', 'slow frac', 'baseline', 'converged'],
     'kww':      ['stretch s', 'τ<sub>c</sub> (s)', '⟨τ⟩ (s)',
                  'R<sub>h</sub>(τ<sub>c</sub>) (nm, apparent)',
-                 'R<sub>h</sub>(⟨τ⟩) (nm, apparent)', 'converged'],
+                 'R<sub>h</sub>(⟨τ⟩) (nm, apparent)', 'baseline', 'converged'],
+}
+
+# The HEADLINE quantities of each method -- what the glance table shows, one row per
+# ticked run. Every other quantity stays in the focused-run panel (`_RESULT_ROWS`).
+#
+# A glance column is named by the `_RESULT_ROWS` row it SHOWS, never by an index, for
+# the reason `_RESULT_ROW_TOOLTIPS` is keyed by label. The header is the short form;
+# "apparent" is said once on the table's title line.
+
+# That resolution proves the LABEL exists and nothing more -- the index then subscripts
+# `_result_values`, an independent hand-written list, and `_result_notes` hard-codes the
+# same integers a third time. What forbids a drift between them is a pair of tests, not
+# this resolution: `test_every_result_row_renders_the_quantity_its_label_names` and
+# `test_a_reliability_note_lands_on_the_size_it_judges`. An earlier version of this
+# comment claimed their safety before they existed.
+_GLANCE_ROWS = {
+    'cumulant': [('R<sub>h</sub> (nm)', 'R<sub>h</sub> (nm, apparent)'),
+                 ('PDI', 'PDI')],
+    'single':   [('R<sub>h</sub> (nm)', 'R<sub>h</sub> (nm, apparent)')],
+    'double':   [('fast R<sub>h</sub> (nm)', 'fast R<sub>h</sub> (nm, apparent)'),
+                 ('slow R<sub>h</sub> (nm)', 'slow R<sub>h</sub> (nm, apparent)')],
+    'kww':      [('R<sub>h</sub>(τ<sub>c</sub>) (nm)',
+                  'R<sub>h</sub>(τ<sub>c</sub>) (nm, apparent)'),
+                 ('R<sub>h</sub>(⟨τ⟩) (nm)',
+                  'R<sub>h</sub>(⟨τ⟩) (nm, apparent)')],
+}
+
+# Resolved to (header, index-into-`_result_values`) at import, so a headline naming a
+# row that does not exist is an ImportError here and not a wrong number on screen.
+# `.index` rather than `assert`: an assert disappears under -O, this cannot.
+# How many glance rows are visible before the table scrolls. Six, because that is the
+# replicate-set size the readability criterion is written against -- six ticked runs
+# must be readable without scrolling, and a seventh must not cost the panel below.
+_GLANCE_VISIBLE_ROWS = 6
+
+# ... and the fewest it keeps when the section is squeezed. Three is enough to read a
+# value, see that a second run differs, and know to scroll; below that the table stops
+# being a summary at all.
+_GLANCE_FLOOR_ROWS = 3
+
+# THE LEGEND IS SPLIT BY DESTINATION (ui_style_guide R10.6). The SCREEN gets a
+# compact key -- one entry per METHOD drawn plus the window/baseline markers, constant
+# in the selection size -- and the SAVED file gets that plus one entry per MEASUREMENT,
+# grouped under its sample, in a figure grown to hold it. `_draw_key` and
+# `export_legend_dressing` carry the measurements behind each half.
+
+#: Point size of the on-screen key, and of the export legend.
+_KEY_FONT_PT = 7.0
+_EXPORT_FONT_PT = 7.0
+
+#: Legend `labelspacing`, in units of the font size.
+_LEGEND_LABELSPACING = 0.3
+
+# The on-screen key shortens two marker labels. `tau window (fit range)` and
+# `baseline region` render 229 px wide together in the 160 px corner cell the key
+# lives in (measured); at these they measure 93 px and fit with room. The full
+# wording goes to the export legend, which has the width.
+_KEY_SHORT_LABELS = {'τ window (fit range)': 'τ window',
+                     'baseline region': 'baseline'}
+
+#: A saved figure grows by its legend's own height, capped so a large selection
+#: cannot emit a strip. 2.0 in is about 40 rows at 7 pt -- past any real selection,
+#: and short of an image whose legend dwarfs its plot.
+_EXPORT_GROW_CAP_IN = 2.0
+
+#: The residual panel's floor, in pixels of drawn axes. Below this the panel stops
+#: showing a residual at all. It does NOT fire at the shipped window size once the
+#: legend is a key (measured: 59.8 px); it is insurance for a smaller window, where
+#: the fraction-of-the-stack split under-serves a panel whose own chrome is fixed.
+_RESID_FLOOR_PX = 45.0
+
+
+#: The labels `_draw_markers` puts on the correlogram's own chrome artists -- DERIVED
+#: from the shortening map above rather than typed again, so the two cannot drift.
+#: Matched EXACTLY: a substring test on 'window'/'baseline' also caught any
+#: measurement whose name contains either word -- `baseline run`, `baseline_90.asc`
+#: -- pulling its data scatter into a key that is supposed to be constant in the
+#: selection size, and into the exported legend a second time.
+_MARKER_LABELS = tuple(_KEY_SHORT_LABELS)
+
+
+def _marker_legend_entries(ax):
+    """The window/baseline marker entries a correlogram axes has labelled itself."""
+    handles, labels = ax.get_legend_handles_labels()
+    return [(h, lab) for h, lab in zip(handles, labels, strict=True)
+            if lab in _MARKER_LABELS]
+
+
+def _method_legend_entries(methods):
+    """One neutral-ink entry per method drawn, carrying that method's line style."""
+    ink = _neutral_ink()
+    return [(Line2D([], [], color=ink, lw=1.4, ls=_METHOD_LINESTYLE.get(k, '-')),
+             _fit_label(k)) for k in methods]
+
+
+def _measurement_legend_entries(selection, names_by_sample):
+    """One entry per measurement, grouped under a bold sample row.
+
+    `names_by_sample` is `{sample label: [(iid, unprefixed name)]}` in draw order.
+    The sample is a GROUP ROW rather than a prefix on every entry -- the shape the
+    measurement picker and the DLS Summary table already use, and what takes the
+    longest entry from 76 characters to 44. Returns `(entries, group_labels)`; the
+    caller bolds the group rows.
+    """
+    out, groups = [], []
+    for sample, rows in names_by_sample.items():
+        out.append((Line2D([], [], ls='none'), sample))
+        groups.append(sample)
+        for iid, name in rows:
+            out.append((Line2D([], [], color=selection.color_for(iid),
+                               marker=selection.marker_for(iid) or 'o',
+                               markerfacecolor='none', ls='none'),
+                        '   ' + name))
+    return out, groups
+
+
+def _draw_key(figure, entries, *, bbox=None, ncol=None):
+    """Draw the on-screen KEY and return it, or None when there is nothing to show.
+
+    `bbox` places it inside a region of the figure (the Correlogram tab's empty
+    bottom-right gridspec cell); without one it sits below the panel, which is what
+    the Distribution tab does -- that figure is a plain stack with no free cell.
+    Clears any previous legend first: a figure legend outlives `ax.clear()`.
+    """
+    figure.legends.clear()
+    if not entries:
+        return None
+    handles = [h for h, _lab in entries]
+    labels = [_KEY_SHORT_LABELS.get(lab, lab) for _h, lab in entries]
+    if bbox is not None:
+        # BOTTOM-aligned inside the cell: the cell is empty by construction, but the
+        # side view above spills its x tick labels down into it, so a top-aligned key
+        # prints over them (measured).
+        return figure.legend(handles, labels, loc='lower left',
+                             bbox_to_anchor=(bbox.x0, bbox.y0, bbox.width,
+                                             bbox.height),
+                             frameon=False, fontsize=_KEY_FONT_PT, handlelength=2.0,
+                             handletextpad=0.5, borderaxespad=0.0,
+                             labelspacing=_LEGEND_LABELSPACING)
+    return figure.legend(handles, labels, loc='outside lower center', frameon=False,
+                         fontsize=_KEY_FONT_PT, handlelength=2.0,
+                         ncol=ncol or len(labels), columnspacing=1.6,
+                         labelspacing=_LEGEND_LABELSPACING)
+
+
+def export_legend_dressing(figure, entries, groups):
+    """A `save_figure_via` dressing: put the FULL legend on the written figure.
+
+    Returns the zero-argument callable that hook wants, which itself returns an undo.
+    The figure grows by the legend's own height (capped at `_EXPORT_GROW_CAP_IN`) so
+    nothing is taken from either panel -- the saved plot is LARGER than the on-screen
+    one, not rationed against its legend.
+
+    ONE column, deliberately: matplotlib fills columns top-to-bottom, so a sample
+    group splits across a column boundary and the right column clips the margin
+    (both measured). One column needs no straddling rule at all.
+    """
+    def dress():
+        keep = list(figure.legends)
+        figure.legends.clear()
+        size_in = figure.get_size_inches().copy()
+        grow = min(len(entries) * _EXPORT_FONT_PT * 1.45 / figure.dpi + 0.12,
+                   _EXPORT_GROW_CAP_IN)
+        figure.set_size_inches(size_in[0], size_in[1] + grow)
+        leg = figure.legend([h for h, _lab in entries],
+                            [lab for _h, lab in entries],
+                            loc='outside lower center', frameon=False,
+                            fontsize=_EXPORT_FONT_PT, handlelength=2.0,
+                            handletextpad=0.6, ncol=1,
+                            labelspacing=_LEGEND_LABELSPACING)
+        for text in leg.get_texts():
+            if text.get_text() in groups:
+                text.set_fontweight('bold')
+
+        def undo():
+            leg.remove()
+            figure.legends.extend(keep)
+            figure.set_size_inches(*size_in)
+        return undo
+    return dress
+
+
+def _hide_shared_x(upper_ax):
+    """Drop the x tick labels and x label from the UPPER axes of a fit+residual
+    stack: the two share an x range and the residual carries the only axis, which is
+    the standard convention. Both were printed twice until this (measured: removing
+    the duplicate gives the residual ~6 px and the fit ~20 px).
+
+    ONLY where the two panels genuinely share x. Applied to the DLS Distribution tab,
+    whose panels are Rh (or Γ) over delay time τ, it strips the distribution's own
+    axis and leaves it above an axis for a different quantity -- which is what it did
+    until round `8fb4` caught it. The caller asserts the shared range; this helper
+    cannot check it, since an axes carries no record of what its neighbour plots.
+    """
+    upper_ax.set_xlabel('')
+    upper_ax.tick_params(labelbottom=False)
+
+
+# Columns in the "Fits to show" grid -- see the measurement at its construction.
+_LAYER_COLS = 4
+
+_GLANCE_COLS = {
+    key: [(header, _RESULT_ROWS[key].index(row)) for header, row in pairs]
+    for key, pairs in _GLANCE_ROWS.items()
 }
 
 
 class _CorrelogramTab(QtWidgets.QWidget):
     """Parametric-fit view: four correlogram scales + residuals + result tables,
     over ONE or MANY co-plotted measurements (ticked in the checklist). All share
-    one τ-window / baseline; each measurement gets a stable color and a results
-    column."""
+    one τ-window / baseline; each measurement gets a stable colour and a glance row.
 
-    def __init__(self, controller, region, selection, parent=None) -> None:
+    ANY stored fit can be drawn over the data, not only the one the Method box is
+    showing: the "Fits to show" list offers all seven -- the four parametric fits this
+    tab runs and the three distribution fits the Distribution tab runs -- so a cumulant
+    and a CONTIN reconstruction can be compared on one correlogram. Colour and marker
+    are the MEASUREMENT, line style is the METHOD, and the residual panel beneath shows
+    the residuals of exactly the fits drawn above it, in the same coding."""
+
+    #: The user moved the shared region -- a drag released, a field edited, or Reset.
+    #: The owning `DLSModule` routes it to every "use the Correlogram tab's delay window
+    #: and baseline" checkbox, which relabels itself and flags a checked result stale.
+    regionChanged = QtCore.Signal()
+
+    def __init__(self, controller, region, selection, parent=None, *,
+                 distribution_fits=None) -> None:
         super().__init__(parent)
         self.controller = controller
         self.region = region                    # shared _AnalysisRegion (seconds)
@@ -531,13 +1271,29 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self._runnable = False
         self._raw: Dict[str, Tuple] = {}        # iid -> (tau, g2m1) for checked DLS
         self._union_tau: Optional[Tuple[float, float]] = None
-        self._cache: Dict[str, Dict] = {}       # iid -> {'key','result','sig'}
-        self._run_failures: Dict[str, str] = {} # iid -> reason (last run)
+        # (iid, method) -> {'result','sig'}. Keyed by the PAIR since B8: a
+        # correlogram can carry several fits at once, so storing one fit per
+        # measurement made comparing two impossible and dropped the previous method's
+        # result on every Run. The Distribution tab's results already had this shape.
+        self._cache: Dict[Tuple[str, str], Dict] = {}
+        # Zero-arg accessor for the fits the DISTRIBUTION tab owns, injected by the
+        # owning DLSModule -- `{(iid, method): {'result','stale'}}`. A default that
+        # answers nothing keeps this tab constructible on its own (its unit tests do),
+        # and the indirection is why no widget here reaches into its sibling.
+        self._distribution_fits = distribution_fits or (lambda: {})
+        # (iid, method) -> reason, the SAME key as `_cache`, and cleared with each Run.
+        # Keyed by iid alone it was READ against whatever method the box happened to
+        # show, so one method's Run failure printed "skipped" beside another method's
+        # displayed numbers AND suppressed that number's own reliability note
+        # (invariant 4 inverted). It became a sibling of `_cache` the moment the cache
+        # took the pair key, and did not move with it.
+        self._run_failures: Dict[Tuple[str, str], str] = {}
         self._scales = list(_SCALE_MODES)       # [main, side0, side1, side2]
         self._markers: Dict[str, object] = {}   # handle name -> Line2D on main_ax
         self._handle_glyphs: Dict[str, object] = {}  # handle name -> caret Line2D
         self._placeholder = None                # empty-state Text artist (nothing ticked)
-        self._base_span = None                  # baseline shaded region (Polygon)
+        self._base_span = None                  # baseline shaded region inside the window
+        self._base_span_outside: list = []      # ... and its greyed parts outside it
         self._drag: Optional[str] = None        # handle being dragged, or None
         self._suppress_fields = False
         self._build_ui()
@@ -548,7 +1304,8 @@ class _CorrelogramTab(QtWidgets.QWidget):
 
         self.checklist = MeasurementPicker(
             self.controller, self.selection, kinds=('dls',),
-            label_fn=_meas_label, header_fn=_sample_header,
+            label_fn=measurement_display_name, header_fn=sample_display_name,
+            tooltip_fn=measurement_hover_card,
             help_text=_PICKER_HELP, help_bullets=_GROUP_PICKER_BULLETS,
             group_fields=(_GROUP_FIELD_CONC, _GROUP_FIELD_ANGLE))
         self.checklist.selectionChanged.connect(self._on_selection_changed)
@@ -562,11 +1319,44 @@ class _CorrelogramTab(QtWidgets.QWidget):
             '<b>window</b> handles (green carets) sit at the <b>top</b>; the '
             '<b>baseline</b> handles (purple carets) at the <b>bottom</b> — so grab '
             'the top or bottom half to pick one when they overlap.',
-            'Moving the window or baseline, or changing the method or cumulant '
-            'order, after a Run flags the shown fit stale — press <b>Run</b> again to '
-            'refresh it.',
-            'The <b>baseline region</b> sets where g₂−1 → 0 is estimated (used by the '
-            'distribution methods).',
+            'Moving the window or baseline, or changing the method, cumulant order '
+            'or fit cutoff, after a Run flags the shown fit stale — press <b>Run</b> '
+            'again to refresh it.',
+            '<b>Cumulant order</b>: 2 suits most samples. Order 4 helps mainly on broad '
+            'distributions (PDI around 0.6), and there in Γ rather than in the PDI; below '
+            'PDI ≈ 0.3, order 2 is at least as precise except on clean data from about '
+            'PDI 0.2. μ₃ '
+            'and μ₄ are diagnostics for comparing fits, not measurements of the sample.',
+            'The <b>baseline region</b> sets where g₂−1 → 0 is measured, and each '
+            'method reads it its own way: the single/double/KWW fits and the '
+            '<i>linear</i> cumulant <b>subtract</b> it (shown in the <b>baseline</b> '
+            'row), the <i>nonlinear</i> cumulant measures its own floating baseline '
+            '<b>over</b> it, and the distribution methods <b>normalize</b> by it.',
+            'The window and the baseline region are each applied only <b>once you move '
+            'them</b>. Until then each run keeps its own full lag range, and each fit '
+            'runs as if no baseline had been given: the single/double/KWW fits and the '
+            'linear cumulant subtract <b>nothing</b>, the nonlinear cumulant measures its '
+            'floating baseline over the last quarter of the lags that collected '
+            'coincidence, and the distribution methods estimate their own. So a region '
+            'left over from another measurement cannot quietly change a number. '
+            '<b>Reset window + baseline</b> returns to that state.',
+            'Only the part of the baseline region <b>inside the delay window</b> is read; '
+            'the part outside it is drawn grey and not used.',
+            'The <i>linear</i> cumulant regresses only the run of points around the peak '
+            'that stays above a fraction of it — a tenth by default, set in '
+            '<b>Settings ▸ Cumulant fit cutoff</b> — so its drawn <b>fit</b> line and the '
+            'residual panel under it stop where that run does. Every method regresses '
+            'only the channels in the delay window that collected any coincidence — a '
+            'channel at g₂ = 0 is dropped by every fit and counted in a note — and the '
+            'other methods\' line spans the window.',
+            'A <i>linear</i> cumulant fit that bends back <b>upward</b> at its right-hand '
+            'end is telling you the sample is too polydisperse for the method — the same '
+            'thing the PDI warning says. Prefer a distribution method (NNLS / CONTIN) '
+            'when you see it.',
+            'The Γ vs q², D vs c, Mode Map and DDLS sub-tabs and <b>Average derived '
+            'results…</b> read this region only when you tick their <b>Use the '
+            'Correlogram tab\'s delay window and baseline</b> box; otherwise each run '
+            'uses its own defaults.',
         ])
         form = QtWidgets.QFormLayout(box)
         self.method_combo = QtWidgets.QComboBox()
@@ -585,25 +1375,52 @@ class _CorrelogramTab(QtWidgets.QWidget):
             'Single/Double exponential ask it of each mode\'s rate, '
             'so the flag lands on THAT mode only; Cumulant and KWW ask it of the '
             'correlogram itself.\n'
+            'The linear cumulant fits a quadratic in the exponent, so its curve has a '
+            'minimum at τ = Γ/μ₂ = 1/(PDI·Γ) and rises after it. At a high PDI that '
+            'point falls inside the measured lags and the drawn fit visibly turns back '
+            'up — the expansion past its range of validity, not a fitting failure. The '
+            'nonlinear form can only do this above PDI 2. See the '
+            'Theory-and-Equations-Guide.\n'
             'Every method also flags an Rh outside the range DLS can establish — above '
             '~5 µm (10 µm diameter) sedimentation outweighs Brownian motion, below 0.2 nm '
             'the fit chased a short-lag artifact — and the cumulant flags a PDI above '
-            '0.3. See the Theory-and-Equations-Guide §3.1.')
+            '0.3.\n'
+            'Once you move the purple baseline region, the baseline measured over its part '
+            'inside the delay window is subtracted before the fit as a pinned offset '
+            '(Single/Double/KWW, linear cumulant), and the nonlinear cumulant measures its '
+            'floating baseline over that part instead of the last quarter of the live lags. '
+            'Until you move it, the first four subtract nothing and the nonlinear cumulant '
+            'measures its own baseline over the last quarter of the lags that collected '
+            'coincidence. An offset left in the data is otherwise absorbed as a spurious '
+            'slow mode.\n'
+            'A nonlinear cumulant whose µ₂ comes to rest on its zero bound adds a passive '
+            'note: the PDI shown is that bound, not a measurement. At order 4 a µ₄ resting '
+            'on its bound gets its own note. The Theory-and-Equations-Guide §3.2.7 explains '
+            'what can cause either. '
+            'Which residual weighting built the fit, chosen in Settings, is recorded on the '
+            'result; the export '
+            'names it only when it is not the program\'s default, the sourced '
+            'Biganzoli–Ferri variance (with the run\'s committed mean count rate when one '
+            'exists, its classical limit when none does). That variance is evaluated on '
+            'the correlator\'s own per-channel sample times when the file states them; '
+            'otherwise on a stand-in derived from the delay axis, which the export names. '
+            'It also uses the run\'s duration where the file states it, and a long-run '
+            'form where it does not. See the Theory-and-Equations-Guide §3.2.9.')
         self.method_combo.currentIndexChanged.connect(self._on_method_changed)
         form.addRow('Method:', self.method_combo)
         self.order_spin = QtWidgets.QSpinBox()
-        self.order_spin.setRange(1, 3)
+        # 1-4, the engine's own range (`fit_cumulants`): order 4 is where the literature
+        # stops, and the regime/noise caveats on orders 3-4 are this tooltip's job, since
+        # the higher moments ship with no per-value flag (`CumulantResult.mu4_s_inv4`).
+        self.order_spin.setRange(1, 4)
         self.order_spin.setValue(self.controller.settings.cumulant_order)
-        self.order_spin.setToolTip(
-            'Degree of the cumulant polynomial fit of ln(g₂−1): 1 = size (D) only, '
-            '2 adds PDI (polydispersity), 3 adds skew. Applies to the cumulant method '
-            'only — greyed out for the other methods.')
+        self.order_spin.setToolTip(_CUMULANT_ORDER_TOOLTIP)
         form.addRow('Cumulant order:', self.order_spin)
         # The order is a fit input: changing it beside a shown fit flags that fit stale.
-        self.order_spin.valueChanged.connect(lambda _v: self._update_status())
+        self.order_spin.valueChanged.connect(lambda _v: self._on_fit_input_moved())
         win, self.tau_min, self.tau_max, self.tau_unit = _delay_window_row()
         form.addRow('Delay window:', win)
-        # Baseline region (used by distribution fits): mean g2-1 over this τ range.
+        # Baseline region (every DLS fit reads it): mean g2-1 over this τ range.
         brow = QtWidgets.QHBoxLayout(); brow.setContentsMargins(0, 0, 0, 0)
         self.base_lo = QtWidgets.QLineEdit(); self.base_lo.setPlaceholderText('low')
         self.base_hi = QtWidgets.QLineEdit(); self.base_hi.setPlaceholderText('high')
@@ -611,8 +1428,16 @@ class _CorrelogramTab(QtWidgets.QWidget):
         bwidget = QtWidgets.QWidget(); bwidget.setLayout(brow)
         form.addRow('Baseline region:', bwidget)
         # Reset the window + baseline back to the defaults (full lag range; baseline
-        # = last 25 %) — handy after dragging/zooming.
+        # = last 25 %) — handy after dragging/zooming, and the one control that clears
+        # both touched flags, so the fits go back to their own per-file estimates.
         self.reset_region_button = QtWidgets.QPushButton('Reset window + baseline')
+        self.reset_region_button.setToolTip(
+            'Put the delay window back to the full lag range and the baseline region '
+            'back to the last quarter of the lags, and stop applying either: until you '
+            'move a handle again each run keeps its own full lag range, the '
+            'single/double/KWW and linear-cumulant fits subtract nothing, the nonlinear '
+            'cumulant measures its own baseline over the last quarter of the lags that '
+            'collected coincidence, and the distribution methods estimate their own.')
         self.reset_region_button.clicked.connect(self._on_reset_region)
         form.addRow(self.reset_region_button)
         # Two-way sync: editing a field moves its marker.
@@ -621,7 +1446,67 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self.tau_unit.currentTextChanged.connect(lambda _t: self._fields_from_region())
         self.run_button = QtWidgets.QPushButton('Run')
         self.run_button.clicked.connect(self._on_run)
-        form.addRow(self.run_button)
+        # NOT added to the form: it is pinned below the scroll area instead -- see
+        # `fit_pane`. In the form it sat at content y=182 against a viewport measured
+        # at 120/155/172 px (1280x760 / 1600x1020 / 1920x1080), i.e. below the fold at
+        # every shipped window size, so the tab's primary action had to be scrolled to.
+
+        # ---- "Fits to show": this tab's first LAYERS list (the locked GUI decision's
+        # checkbox-layers pattern; the Distribution tab's `method_checks` is the nearest
+        # existing one). One entry per method that can reconstruct a correlogram,
+        # enabled once that fit exists for a ticked run.
+        # It rides with the PLOT, not the left control column, and that is MEASURED: at
+        # 1280x760 that column's three panes all sit at their floors (picker 200 px, its
+        # own minimum; fit 120; results 300; of 636), so a fourth would overlap its
+        # children (R3.2), and in the scrolled fit pane the box sat below the fold.
+        layers_box = QtWidgets.QGroupBox('Fits to show')
+        add_help_to_groupbox(
+            layers_box,
+            'Draw any stored fit over the data — not just the one in the Method box.',
+            bullets=[
+                'An entry turns on once that fit <b>exists</b> for a ticked '
+                'measurement. The four parametric fits come from this tab’s <b>Run</b>; '
+                '<b>Lognormal / NNLS / CONTIN</b> come from the '
+                '<b>Distribution</b> sub-tab’s own Run.',
+                'The <b>colour and point shape</b> are the measurement; the '
+                '<b>line style</b> is the method, and means the same thing on the '
+                'Distribution sub-tab.',
+                'The <b>residual panel</b> beneath the plot shows the residuals of '
+                'exactly the fits ticked here, in the same colours and line styles.',
+                'A fit whose inputs have changed since it ran is marked '
+                '<b>(stale)</b> and is not drawn — press <b>Run</b> on the tab that '
+                'owns it to refresh it.',
+                'The <b>results table</b> follows the <b>Method</b> box, not '
+                'this list: it shows one method’s numbers at a time.',
+                'The <b>key</b> in the plot’s corner names the methods drawn. The '
+                '<b>measurements</b> are named in the figure <b>Save</b> writes — '
+                'the checklist and results table beside the plot already name them '
+                'here, and a saved image has neither.',
+            ])
+        # Two columns: seven checkboxes in one column take ~140 px of a control column
+        # whose results section is already floored at 300 px.
+        # Two rows of FOUR: measured on the real platform, the widest row is 434 px
+        # against a 550 px canvas with every entry carrying its "(stale)" suffix, where
+        # one row of seven needs 742 px and would be cut.
+        lgrid = QtWidgets.QGridLayout(layers_box)
+        lgrid.setContentsMargins(8, 2, 8, 2)
+        lgrid.setVerticalSpacing(1)
+        self.layer_checks: Dict[str, QtWidgets.QCheckBox] = {}
+        for i, (label, key) in enumerate(_FIT_METHODS):
+            cb = QtWidgets.QCheckBox(_fit_label(key))
+            cb.setToolTip(
+                f'Draw the stored {label} fit of every ticked measurement over the '
+                'data, and its residuals in the panel beneath. Enabled once that fit '
+                'exists; the line style shown is this method’s, on both DLS '
+                'plot sub-tabs.')
+            cb.setEnabled(False)               # until a fit of this method exists
+            cb.stateChanged.connect(self._on_layer_toggled)
+            self.layer_checks[key] = cb
+            lgrid.addWidget(cb, i // _LAYER_COLS, i % _LAYER_COLS)
+        lgrid.setColumnStretch(_LAYER_COLS, 1)     # keep the row left-packed
+        # Guards the programmatic tick/enable pass below against re-entering `_redraw`
+        # through `stateChanged` -- a sync that redraws that syncs.
+        self._syncing_layers = False
 
         # One results area for the selected method: a single
         # table rebuilt with that method's rows, with Export directly beneath it.
@@ -630,40 +1515,99 @@ class _CorrelogramTab(QtWidgets.QWidget):
         rlay.setContentsMargins(0, 0, 0, 0)
         self.results_label = QtWidgets.QLabel('Results')
         rlay.addWidget(self.results_label)
+        # GLANCE table -- one ROW per ticked run: its plot swatch, its name, and the
+        # method's headline values (`_GLANCE_COLS`). One row per run rather than one
+        # COLUMN per run, which is what this table used to be and why it failed by
+        # construction: the control column is 360 px wide, so three ticked runs left
+        # each value 70-80 px and every cell painted as '0…'. Measured once the one
+        # name builder landed: a one-column-per-measurement header overran its column by
+        # 228 px, i.e. a name cannot be held at any width in that shape.
+        self.glance_table = QtWidgets.QTableWidget(0, 1)
+        self.glance_table.setHorizontalHeader(RichTextHeaderView(self.glance_table))
+        self.glance_table.verticalHeader().setVisible(False)
+        self.glance_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        # Left-elided like the derived-run table: a file stem's TAIL is what tells six
+        # replicates of one set apart, so the head is the part that may be dropped.
+        self.glance_table.setTextElideMode(QtCore.Qt.TextElideMode.ElideLeft)
+        # Stretch 1 against the detail panel's 0: when the section is short -- which it
+        # is at the shipped window size, where all three panes sit at their minimums --
+        # the SUMMARY must survive and the details must scroll, not the reverse. Without
+        # this the panel held its full height and the glance table collapsed to its
+        # header row, so the tab showed column titles and no values.
+        rlay.addWidget(self.glance_table, 1)
+        # FOCUSED-RUN panel -- every quantity of the fit that is not a headline, for the
+        # one run the sidebar has focused. This is the widget this section held before
+        # `_fill_tables` began rebuilding it as one column per measurement, so pointing
+        # it back at a single run is partly a revert. A planned change moves these
+        # quantities onto the Summary tab and takes this panel with them; until then
+        # nothing loses its home.
+        self.focus_label = QtWidgets.QLabel('')
+        self.focus_label.setWordWrap(True)
+        rlay.addWidget(self.focus_label)
         self.result_table = _vtable(_RESULT_ROWS['cumulant'])
         rlay.addWidget(self.result_table)
+        # Export is pinned under the column with the status line (`pin_under_column`
+        # below), not in this pane: when the column is taller than its viewport, the
+        # last pane is the one that scrolls out of view.
         self.export_button = QtWidgets.QPushButton('Export CSV…')
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._on_export)
-        rlay.addWidget(self.export_button)
         rlay.addStretch(1)
         # Vertically resizable control column: drag the grips to size the
         # checklist / fit controls / results panes against each other.
+
+        # The fit controls ride in a scroll area so their MINIMUM stops dictating the
+        # column. `make_vertical_plot_stack` floors each pane at its own
+        # `minimumSizeHint`; this box's form rows put that near 300 px, which the
+        # splitter honours by starving the pane below -- leaving the results section
+        # about 60 px, its title and a header row and no values.
+        fit_scroll = QtWidgets.QScrollArea()
+        fit_scroll.setWidgetResizable(True)
+        fit_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        fit_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        fit_scroll.setWidget(box)
+        # Run is pinned OUTSIDE the scrolled form (the §3 column template): the fit
+        # controls may scroll, the action that runs them may not.
+        fit_pane = QtWidgets.QWidget()
+        fit_layout = QtWidgets.QVBoxLayout(fit_pane)
+        fit_layout.setContentsMargins(0, 0, 0, 0)
+        fit_layout.setSpacing(4)
+        fit_layout.addWidget(fit_scroll, 1)
+        fit_layout.addWidget(self.run_button)
+        # The floor is passed to the stack, NOT set on the widget: Qt's `qSmartMinSize`
+        # lets an explicit `setMinimumHeight` REPLACE the layout-derived minimum rather
+        # than floor it, so a literal clearing the content at the shipped font stops
+        # clearing it at a larger one (measured: 272 px at 9 pt, 320 px at 18 pt, which
+        # 150 % text scaling reaches). `make_vertical_plot_stack` takes the max of the
+        # two. A splitter handed less than a pane needs OVERLAPS its children (R3.2).
         vstack = make_vertical_plot_stack(
-            [self.checklist, box, results_section], sizes=[160, 240, 160],
-            min_heights=[80, 180, 60])
+            [self.checklist, fit_pane, results_section], sizes=[200, 250, 300],
+            min_heights=[80, 120, 300], stretch=COLUMN_STACK_STRETCH)
         left.addWidget(vstack, 1)
 
-        # The status line and the reliability flag sit UNDER the scrolled control
-        # column, not inside it: a flag is an always-visible label (style guide §5),
-        # and at the shipped window size the column was taller than its viewport,
-        # which put the results table and the ⚠ below the fold. Pinning the two here
-        # also takes the word-wrapping labels out of the scrolled layout, so the
-        # scroll area sizes the column to its minimums (which fit) rather than to
-        # the widgets' natural heights (which did not).
+        # Export, the status line and the reliability flag sit UNDER the scrolled
+        # control column, not inside it (style guide R8.6 and the §3 column template):
+        # a flag is an always-visible label (§5), and at the shipped window size the
+        # column is taller than its viewport, so whatever sits last scrolls out of view.
+        # Pinning also takes the word-wrapping labels out of the scrolled layout, so the
+        # scroll area sizes the column to its minimums rather than to the widgets'
+        # natural heights.
         self.status = QtWidgets.QLabel('')
         self.status.setWordWrap(True)
         self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
-        pane = QtWidgets.QWidget()
-        pane_layout = QtWidgets.QVBoxLayout(pane)
-        pane_layout.setContentsMargins(0, 0, 0, 0)
-        pane_layout.addWidget(splitter.widget(0), 1)   # re-parents the scroll area
-        pane_layout.addWidget(self.status)
-        pane_layout.addWidget(self.flag_label)
-        splitter.insertWidget(0, pane)
-        splitter.setStretchFactor(0, 0)          # the control pane keeps its width
-        splitter.setSizes([360, 740])
+        # Passive notices the fit carries about HOW it was obtained (dead channels, a
+        # floating baseline resting on its bound) -- the neutral ⓘ qualifier tier, kept
+        # in its own label so it can never be painted at the flag_label's alarm level
+        # (style guide §5/R5.1). It sits under the results table, not pinned, and
+        # scrolls: it names every run it applies to, so with several ticked, pinned, it
+        # would run past the window's bottom edge.
+        self.notes_label = ThemedLabel('', size=11)
+        self.notes_label.setWordWrap(True)
+        rlay.insertWidget(rlay.count() - 1, scrolling_notes(self.notes_label))
+        pin_under_column(splitter, self.export_button, self.status, self.flag_label)
 
         self.figure = Figure(figsize=(5.5, 4.6), constrained_layout=True)
         _widen_row_gap(self.figure)              # room for the residual grip line
@@ -676,6 +1620,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         # main + side views scale together, the 4th carries the residual's share. The
         # residual lives on this one canvas so it stays aligned under the fit.
         self._resid_ratio = 0.22                 # residual share of the left column
+        self._resid_dragged = False              # set by the drag handle; see the floor
         a = (1.0 - self._resid_ratio) / 3.0
         self._gs = self.figure.add_gridspec(
             4, 2, width_ratios=[3, 1],
@@ -690,8 +1635,9 @@ class _CorrelogramTab(QtWidgets.QWidget):
         # Drag the gap between fit and residual to resize the residual (stays aligned).
         self._resid_resizer = attach_residual_resizer(
             self.canvas, self.figure, self.main_ax, self.resid_ax,
-            self._apply_resid_ratio)
+            self._on_resid_dragged)
         right.addWidget(self.nav_toolbar)
+        right.addWidget(layers_box)
         right.addWidget(self.canvas, 1)
         # The "promote a side view" instruction lives here, not in the axis title: the
         # main axis is narrow (3/4 width minus the side stack), so a long title overflowed
@@ -712,6 +1658,35 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self._gs.set_height_ratios([a, a, a, frac])
         self.canvas.draw_idle()
 
+    def _floor_resid_ratio(self) -> None:
+        """Raise the residual's share until its drawn box clears `_RESID_FLOOR_PX`.
+
+        The share is a FRACTION of a varying stack while the panel's own chrome is a
+        fixed ~29 px, so the fraction under-serves the panel exactly when the stack is
+        short. It does not fire at the shipped window size (measured 59.8 px there);
+        it is insurance for a smaller one.
+
+        Only while the user has not dragged the handle: an explicit drag is a decision
+        and outranks the floor (`_ResidualResizer` owns `_resid_ratio` after that).
+        """
+        if self._resid_dragged:
+            return
+        for _ in range(12):
+            try:
+                box = self.resid_ax.get_window_extent(self.canvas.get_renderer())
+            except Exception:  # noqa: BLE001 — not laid out yet; nothing to floor
+                return
+            if box.height >= _RESID_FLOOR_PX or self._resid_ratio >= 0.40:
+                return
+            self._apply_resid_ratio(min(self._resid_ratio + 0.02, 0.40))
+            self.canvas.draw()
+
+    def _on_resid_dragged(self, frac: float) -> None:
+        """The drag handle moved: apply it, and stop the floor second-guessing it.
+        An explicit drag is a decision and outranks `_floor_resid_ratio`."""
+        self._resid_dragged = True
+        self._apply_resid_ratio(frac)
+
     def reseed_from_settings(self) -> None:
         self.order_spin.setValue(self.controller.settings.cumulant_order)
 
@@ -719,6 +1694,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         super().showEvent(event)
         self.checklist.refresh()
         self._reload_raw()
+        self._sync_layers()
         self._redraw()
         self._refresh_tables()
         self._update_status()
@@ -734,6 +1710,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self._reload_raw()
         self.run_button.setEnabled(bool(self._raw))
         self.export_button.setEnabled(self._any_cached())
+        self._sync_layers()
         self._redraw()
         self._refresh_tables()
         self._update_status()
@@ -743,6 +1720,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self._reload_raw()
         self.run_button.setEnabled(bool(self._raw))
         self.export_button.setEnabled(self._any_cached())
+        self._sync_layers()
         self._redraw()
         self._refresh_tables()
         self._update_status()
@@ -764,49 +1742,186 @@ class _CorrelogramTab(QtWidgets.QWidget):
         if taus:
             allt = np.concatenate(taus)
             self._union_tau = (float(allt.min()), float(allt.max()))
-            self.region.init_from_data(allt)      # seed once (full union range)
+            self.region.init_from_data(allt)      # untouched parts follow the union range
         else:
             self._union_tau = None
         self._fields_from_region()
 
     def _any_cached(self) -> bool:
+        """Whether the METHOD BOX's fit exists for any ticked run. The Export button and
+        the status line follow the Method box, not the layers list: an export writes one
+        method's numbers."""
         key = self.method_combo.currentData()
-        return any(self._cache.get(i, {}).get('key') == key
-                   for i in self.selection.ids())
+        return any((i, key) in self._cache for i in self.selection.ids())
 
     def _any_stale(self) -> bool:
         """True if any co-plotted, method-matching cached fit was computed from
         committed params that have since changed."""
         key = self.method_combo.currentData()
-        for iid in self.selection.ids():
-            v = self._cache.get(iid)
-            if v and v.get('key') == key and v.get('sig') != self._run_signature(iid, key):
-                return True
-        return False
+        return any(self._cache_is_stale(iid, key) for iid in self.selection.ids())
+
+    def _cache_is_stale(self, iid: str, key: str) -> bool:
+        """Whether THIS tab's stored fit of `(iid, key)` was computed from inputs that
+        have since moved. False when there is no such fit -- absent is not stale."""
+        v = self._cache.get((iid, key))
+        return v is not None and v['sig'] != self._run_signature(iid, key)
+
+    # ---- the drawable fits: this tab's, plus the ones the Distribution tab owns ----
+    def _stored_fits(self) -> Dict[Tuple[str, str], Dict]:
+        """Every stored fit available for the TICKED set, keyed `(iid, method)`, each
+        carrying the staleness verdict of the tab that RAN it -- per item 8's rule that
+        staleness is judged by its owner.
+
+        For the four parametric methods that is this tab's per-fit signature comparison.
+        For the three distribution methods it is the Distribution tab's own verdict,
+        which is per fit too: that tab keeps each fit in its own (measurement, method)
+        slot with its own signature (this tab's `_cache` shape), so one run's fit can be
+        fresh beside another's stale one. Its ticks and method boxes do not filter what
+        it hands over; this tab filters by its own ticked set, here."""
+        ticked = set(self.selection.ids())
+        out: Dict[Tuple[str, str], Dict] = {}
+        for (iid, key), v in self._cache.items():
+            if iid in ticked:
+                out[(iid, key)] = {'result': v['result'],
+                                   'stale': self._cache_is_stale(iid, key)}
+        for (iid, key), v in self._distribution_fits().items():
+            if iid in ticked:
+                out[(iid, key)] = v
+        return out
+
+    def _shown_fits(self, stored: Optional[Dict] = None) -> List[Tuple[str, str, object]]:
+        """`[(iid, method, result)]` for every fit the layers list has ticked, in
+        measurement order then method order, skipping the stale ones (item 8: a fit its
+        own tab marks stale is not drawn). The one ordering both the plot and the
+        residual panel beneath it iterate, so the two cannot disagree about which curve
+        is which."""
+        stored = self._stored_fits() if stored is None else stored
+        out = []
+        for iid in self._raw:                    # ticked, in selection order
+            for _label, key in _FIT_METHODS:
+                cb = self.layer_checks.get(key)
+                if cb is None or not cb.isChecked():
+                    continue
+                entry = stored.get((iid, key))
+                if entry is None or entry['stale']:
+                    continue
+                out.append((iid, key, entry['result']))
+        return out
+
+    def _sync_layers(self, stored: Optional[Dict] = None, tick: Iterable[str] = ()) -> None:
+        """Bring the layers list level with what is stored: enable a method once a fit
+        of it exists for a ticked run, say so when the fits it would draw are stale, and
+        tick the methods in `tick` (the ones a Run just produced).
+
+        Signals are blocked over the pass: each programmatic `setChecked` would
+        otherwise re-enter `_redraw` through `stateChanged`, once per box."""
+        stored = self._stored_fits() if stored is None else stored
+        self._syncing_layers = True
+        try:
+            for _label, key in _FIT_METHODS:
+                cb = self.layer_checks[key]
+                have = [v for (_i, k), v in stored.items() if k == key]
+                cb.setEnabled(bool(have))
+                # "(stale)" when EVERY stored fit of this method is stale: with one
+                # fresh fit among them the tick still draws something, and the label
+                # would be claiming otherwise.
+                stale = bool(have) and all(v['stale'] for v in have)
+                cb.setText(_fit_label(key) + (' (stale)' if stale else ''))
+                if key in tick and have:
+                    cb.setChecked(True)
+        finally:
+            self._syncing_layers = False
+
+    @QtCore.Slot()
+    def _on_layer_toggled(self) -> None:
+        if self._syncing_layers:
+            return
+        self._redraw()
+
+    @QtCore.Slot()
+    def on_fits_changed(self, methods) -> None:
+        """The Distribution tab finished a Run, or its ticks changed (it keeps every
+        fit, so `stored_fits` is re-read either way): re-offer its methods here and tick
+        the ones a Run just produced.
+
+        Routed by the owning `DLSModule`, never by that widget reaching into this one
+        (invariant 5's spirit at the widget layer): it owns both tabs and connects the
+        signal to this slot.
+
+        `_reload_raw` FIRST, as `set_measurement` and `_on_selection_changed` both do:
+        removing a ticked run prunes the shared selection, and the Distribution tab --
+        built first, so connected to `SelectionModel.changed` first -- emits from inside
+        that prune, while `self._raw` still holds the deleted id. Redrawing then raised
+        `KeyError` on `ws[iid]`; Qt swallowed it at the emit boundary, so the draw
+        aborted half-done and only a console traceback said so. `_reload_raw` skips ids
+        the workspace no longer has.
+        """
+        self._reload_raw()
+        self._sync_layers(tick=set(methods or ()))
+        self._redraw()
+        # ... and the status, which is where a DRAWN-but-failed fit says so. Without
+        # this the note only appeared after some other gesture refreshed the status,
+        # i.e. never, for the one path that brings a failed lognormal to this tab.
+        self._update_status()
+
+    def _fit_kwargs(self, iid: str, key: Optional[str] = None) -> Dict:
+        """What this method's fit of `iid` reads from the shared region -- the one
+        reading (`_region_fit_kwargs`): the window and the baseline only once the user has
+        set each, measured inside the window, as the one baseline input this method
+        reads. `key` defaults to the method the combo is showing, so the staleness checks
+        and the Run ask the same question.
+        """
+        return _region_fit_kwargs(self.controller, self.region, iid,
+                                  key or self.method_combo.currentData())
 
     def _run_signature(self, iid: str, key: str) -> tuple:
         """Everything a parametric fit of `iid` reads beyond its raw correlogram: the
         measurement's committed params, the method, the cumulant order (cumulant only),
-        the shared delay window, and the settings the engine seeds
-        (skip_initial_channels; the cumulant method, cumulant only). Stored with each
-        cached fit and compared on every redisplay and region edit, so a shown fit is
-        flagged stale exactly when a re-Run would read different inputs."""
+        the shared delay window and this measurement's baseline over the shared
+        region, and the settings the engine seeds (skip_initial_channels; the cumulant
+        method, fit cutoff and weighting, cumulant only). Stored with each cached fit and compared on every
+        redisplay and region edit, so a shown fit is flagged stale exactly when a
+        re-Run would read different inputs -- a dragged baseline handle included.
+
+        The region's APPLIED parts ride here in their own slot as well as through the
+        kwargs they gate, so that pressing Reset beside a shown fit flags it stale exactly
+        as a drag does even in the corner where the kwargs happen not to move (a span that
+        selects no channel on this correlogram emits no `baseline` either way)."""
         s = self.controller.settings
         cumulant = key == 'cumulant'
         return (self.controller.committed_signature([iid]), key,
                 self.order_spin.value() if cumulant else None,
-                tuple(sorted(self.region.window_kwargs().items())),
-                s.skip_initial_channels, s.cumulant_method if cumulant else None)
+                tuple(sorted(self._fit_kwargs(iid, key).items())),
+                self.region.state().applied(),
+                s.skip_initial_channels, s.cumulant_method if cumulant else None,
+                # Settings-seeded, so these ride here rather than beside the plot -- the
+                # reason such a value needs no per-run widget to flag a shown fit stale.
+                # `if cumulant` for the same reason `cumulant_method` is: the exponential
+                # arms take the ENGINE default cutoff and weighting for their seeds, and
+                # do not move when these settings do.
+                s.cumulant_fit_cutoff if cumulant else None,
+                s.cumulant_weighting if cumulant else None)
 
-    def _fit_for(self, iid: str):
-        """The cached result for `iid` IF it was fit with the current method, else
-        None (so switching method without re-running drops stale fits)."""
-        v = self._cache.get(iid)
-        if v and v['key'] == self.method_combo.currentData():
-            return v['result']
-        return None
+    def _fit_for(self, iid: str, key: Optional[str] = None):
+        """This tab's stored result for `(iid, key)`, `key` defaulting to the method the
+        combo is showing -- the tables and the status line, which follow the Method box.
+        None when there is none. What the PLOT draws is `_shown_fits`, which follows the
+        layers list and also reaches the Distribution tab's results."""
+        v = self._cache.get((iid, key or self.method_combo.currentData()))
+        return v['result'] if v else None
 
     # ---- actions ----
+    def _on_fit_input_moved(self) -> None:
+        """A fit INPUT moved beside a shown fit: re-label the layers list (which marks
+        the now-stale entries) and refresh the status.
+
+        One spelling of the response, because it was previously open-coded and four of
+        the nine handlers that move an input had only half of it -- the curve was
+        dropped from the plot while its checkbox still read as live."""
+        self._sync_layers()
+        self._redraw()
+        self._update_status()
+
     @QtCore.Slot()
     def _on_method_changed(self) -> None:
         self.order_spin.setEnabled(self.method_combo.currentData() == 'cumulant')
@@ -827,12 +1942,16 @@ class _CorrelogramTab(QtWidgets.QWidget):
         if runner().is_busy:
             self.status.setText(BUSY_NOTICE)
             return
-        kw = self.region.window_kwargs()        # the shared window (seconds)
         key = self.method_combo.currentData()
         c = self.controller
+        # Cleared WHOLESALE, as before: a failure record carries no signature, so a
+        # kept one cannot say whether the input that caused it has since been fixed.
+        # The defect this round fixed was the READ key, not the lifetime -- keeping
+        # per-method records would need per-method staleness to stay honest.
         self._run_failures = {}
         for iid in ids:
             try:
+                kw = self._fit_kwargs(iid, key)   # window + region, per method
                 if key == 'cumulant':
                     res = c.run_cumulants(iid, order=self.order_spin.value(), **kw)
                 elif key == 'single':
@@ -841,12 +1960,17 @@ class _CorrelogramTab(QtWidgets.QWidget):
                     res = c.run_double_exponential(iid, **kw)
                 else:
                     res = c.run_kww(iid, **kw)
-                self._cache[iid] = {'key': key, 'result': res,
-                                    'sig': self._run_signature(iid, key)}
-            except Exception as exc:               # per-measurement; never abort all
-                self._run_failures[iid] = str(exc)
-                self._cache.pop(iid, None)
+                self._cache[(iid, key)] = {'result': res,
+                                           'sig': self._run_signature(iid, key)}
+            except Exception as exc:  # noqa: BLE001 — per-measurement, failure recorded; per-measurement; never abort all
+                self._run_failures[(iid, key)] = str(exc)
+                # Only THIS method's entry: a failed cumulant Run must not silently
+                # drop the CONTIN reconstruction the user has ticked beside it.
+                self._cache.pop((iid, key), None)
         self.export_button.setEnabled(self._any_cached())
+        # A fresh Run ticks its own method, so the fit just computed is on screen
+        # without a second gesture.
+        self._sync_layers(tick={key})
         self._redraw()
         self._refresh_tables()
         self._update_status()
@@ -854,36 +1978,39 @@ class _CorrelogramTab(QtWidgets.QWidget):
     @QtCore.Slot()
     def _on_export(self) -> None:
         key = self.method_combo.currentData()
-        cached = [(iid, self._cache[iid]['result']) for iid in self.selection.ids()
-                  if self._cache.get(iid, {}).get('key') == key]
+        cached = [(iid, self._cache[(iid, key)]['result'])
+                  for iid in self.selection.ids() if (iid, key) in self._cache]
         if not cached:
             self.status.setText('Run a fit first.')
             return
 
+        name, suffixes = _selection_export_names(
+            self.controller, [(iid, key) for iid, _res in cached], 'correlogram')
+
         def do_export(path: str):
             import os
             stem, ext = os.path.splitext(path)
-            siblings = ([] if len(cached) == 1
-                        else [f'{stem}_{iid}{ext}' for iid, _res in cached])
+            paths = [f'{stem}{sfx}{ext}' for sfx in suffixes]
+            siblings = [] if len(cached) == 1 else paths
             if not confirm_overwrite(self, siblings):
                 return None
             written = []
-            for iid, res in cached:
-                p = path if len(cached) == 1 else f'{stem}_{iid}{ext}'
+            for (iid, res), p in zip(cached, paths, strict=True):
                 written.append(self.controller.export_correlogram_fit(iid, res, p))
-            return '; '.join(written)
+            return written                     # summarised by `export_to_csv`
 
-        status = export_to_csv(
-            self, self.controller,
-            _selection_scoped_name(self.controller, [iid for iid, _res in cached],
-                                   f'correlogram_{key}'),
-            do_export)
+        status = export_to_csv(self, self.controller, name, do_export)
         if status:
             self.status.setText(status)
 
     # ---- region fields <-> shared region (seconds) ----
     _HANDLES = [('tau_min', 'tau_min_s'), ('tau_max', 'tau_max_s'),
                 ('base_lo', 'base_lo_s'), ('base_hi', 'base_hi_s')]
+
+    # Significant figures the four handle fields display. Named because the round-trip
+    # BACK through it decides whether a field was edited (see `_displayed_handle`), so the
+    # writer and the comparison must use one number.
+    _HANDLE_SIG = 4
 
     def _fields_from_region(self) -> None:
         unit = self.tau_unit.currentText()
@@ -893,8 +2020,44 @@ class _CorrelogramTab(QtWidgets.QWidget):
                 self._HANDLES, strict=True):
             x = getattr(self.region, attr)
             edit.setText('' if x is None
-                         else f'{U.from_canonical("time", x, unit):.4g}')
+                         else f'{U.from_canonical("time", x, unit):.{self._HANDLE_SIG}g}')
         self._suppress_fields = False
+
+    def _field_was_edited(self, edit, attr: str, unit: str, value) -> bool:
+        """Did the user actually edit THIS field, or is it just being read back?
+
+        `editingFinished` fires on one widget but the handler parses all four, and the
+        fields render to `_HANDLE_SIG` significant figures, so parsing them all back does
+        not round-trip: a stored 1.234567e-4 comes back as 1.235e-4. Writing that back
+        silently truncated three handles the user never touched -- and, once the baseline
+        region gained a touched state, marked it PLACED when the user had typed a
+        delay-window bound.
+
+        TWO independent tests, OR-ed, because neither alone covers the field:
+
+        - Qt's own `isModified()`, which is True exactly when a human changed the text
+          and False after any programmatic `setText`. This is the one signal that can
+          tell "the user retyped the digits already shown" -- a real confirm-this-region
+          gesture -- from "this box was never touched"; a value comparison cannot, since
+          the two produce identical text.
+        - the value comparison, for the programmatic path: a caller that sets the text
+          and calls the handler (the headless tests, and any future code that drives the
+          fields) leaves `isModified()` False, and would otherwise write nothing at all.
+        """
+        if edit is not None and edit.isModified():
+            return True
+        return value != self._displayed_handle(attr, unit)
+
+    def _displayed_handle(self, attr: str, unit: str):
+        """What `attr`'s field is currently SHOWING, read back in canonical seconds."""
+        x = getattr(self.region, attr)
+        if x is None:
+            return None
+        shown = f'{U.from_canonical("time", x, unit):.{self._HANDLE_SIG}g}'
+        try:
+            return U.to_canonical('time', float(shown), unit)
+        except ValueError:
+            return None
 
     def _on_field_edit(self) -> None:
         if self._suppress_fields:
@@ -923,17 +2086,29 @@ class _CorrelogramTab(QtWidgets.QWidget):
                 and vals['base_lo_s'] >= vals['base_hi_s']):
             self._fields_from_region()
             return
-        for attr, v in vals.items():
-            setattr(self.region, attr, v)
+        for edit, (_name, attr) in zip(
+                (self.tau_min, self.tau_max, self.base_lo, self.base_hi),
+                self._HANDLES, strict=True):
+            v = vals[attr]
+            if self._field_was_edited(edit, attr, unit, v):
+                self.region.set_handle(attr, v)  # marks a MOVED handle's kind touched
+            # Consumed either way: a modified flag left standing would make the NEXT
+            # field's edit rewrite this handle at display precision, which is the
+            # truncation the comparison above exists to prevent.
+            edit.setModified(False)
         self._redraw()
+        self._sync_layers()          # ... and the layers list says which are stale
         self._update_status()        # the window is a fit input: a shown fit may be stale
+        self.regionChanged.emit()
 
     def _on_reset_region(self) -> None:
         """Restore the window + baseline to the from-data defaults."""
         self.region.force_reseed()
         self._reload_raw()           # re-seeds the region from the union lag range
+        self._sync_layers()          # the reset staled every shown fit; say so
         self._redraw()
         self._update_status()
+        self.regionChanged.emit()
 
     # ---- drag the markers on the main correlogram ----
     def _on_press(self, event) -> None:
@@ -973,7 +2148,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         # (top -> window, bottom -> baseline; see _TOP_HANDLES above).
         try:
             yf = self.main_ax.transAxes.inverted().transform((event.x, event.y))[1]
-        except Exception:
+        except Exception:  # noqa: BLE001 — transform guard, no handle
             return None
         wanted = self._TOP_HANDLES if yf >= 0.5 else self._BOTTOM_HANDLES
         y_mid = sum(self.main_ax.get_ylim()) / 2.0
@@ -986,7 +2161,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
                 continue
             try:
                 px = self.main_ax.transData.transform((x * tfac, y_mid))[0]
-            except Exception:
+            except Exception:  # noqa: BLE001 — transform guard, handle skipped
                 continue
             if abs(px - event.x) < best_px:
                 best, best_px = name, abs(px - event.x)
@@ -1003,7 +2178,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         tfac = _disp_factor('time')
         x = self._clamp_handle(self._drag, float(event.xdata) / tfac)
         attr = dict(self._HANDLES)[self._drag]
-        setattr(self.region, attr, x)
+        self.region.set_handle(attr, x)         # marks a MOVED handle's kind touched
         line = self._markers.get(self._drag)
         if line is not None:
             line.set_xdata([x * tfac, x * tfac])   # draw in display units
@@ -1032,14 +2207,19 @@ class _CorrelogramTab(QtWidgets.QWidget):
             return
         self._drag = None
         self._fields_from_region()
+        self._sync_layers()                      # ... and the layers list says so
         self._redraw()                           # recreate markers + baseline span
         self._update_status()                    # a dragged marker moved a fit input
+        self.regionChanged.emit()
 
     # Marker styling + offset-handle geometry: window carets at the
     # top, baseline carets at the bottom (the disambiguation described above).
     # _BASE_HANDLE_Y is kept a touch above the bottom so the caret never lands in
     # the residual-resize gap band below main_ax.
     _WIN_COLOR, _BASE_COLOR = '#2ca02c', '#7e57c2'   # window green, baseline purple
+    # The part of the baseline span outside the delay window, which no fit reads: a
+    # neutral grey, hatched so it stays distinct from the purple fill in both themes.
+    _OUTSIDE_COLOR = PLACEHOLDER_GRAY
     _WIN_HANDLE_Y, _BASE_HANDLE_Y = 0.96, 0.05
 
     def _draw_markers(self) -> None:
@@ -1048,6 +2228,7 @@ class _CorrelogramTab(QtWidgets.QWidget):
         self._markers = {}
         self._handle_glyphs = {}
         self._base_span = None
+        self._base_span_outside = []
         r = self.region
         # The region stores τ in canonical seconds, but the correlogram x-axis is
         # drawn in display units (µs by default, via plot_correlogram_scaled), so
@@ -1078,8 +2259,23 @@ class _CorrelogramTab(QtWidgets.QWidget):
                 r.tau_max_s * tfac, 'v', self._WIN_COLOR, self._WIN_HANDLE_Y)
         if r.base_lo_s is not None and r.base_hi_s is not None:
             lo, hi = sorted((r.base_lo_s * tfac, r.base_hi_s * tfac))
-            self._base_span = self.main_ax.axvspan(lo, hi, color=self._BASE_COLOR,
-                                                   alpha=0.20, label='baseline region')
+            # NOTHING OUTSIDE THE DELAY WINDOW COUNTS: a fit measures the span only over
+            # its part inside the window (`app/analysis_region.py`), so the part outside
+            # is drawn grey and the purple fill stops at the window edge. The handles
+            # still move freely; this only says what the fits will read. The window drawn
+            # is the handles' (an untouched window follows the ticked data's range).
+            wlo = r.tau_min_s * tfac if r.tau_min_s is not None else lo
+            whi = r.tau_max_s * tfac if r.tau_max_s is not None else hi
+            in_lo, in_hi = max(lo, wlo), min(hi, whi)
+            self._base_span = None
+            if in_lo < in_hi:
+                self._base_span = self.main_ax.axvspan(
+                    in_lo, in_hi, color=self._BASE_COLOR, alpha=0.20,
+                    label='baseline region')
+            self._base_span_outside = [
+                self.main_ax.axvspan(a, b, color=self._OUTSIDE_COLOR, alpha=0.25,
+                                     hatch='//', linewidth=0, zorder=0.5)
+                for a, b in ((lo, min(hi, wlo)), (max(lo, whi), hi)) if a < b]
             self._markers['base_lo'] = self.main_ax.axvline(
                 r.base_lo_s * tfac, color=self._BASE_COLOR, ls='--', lw=1.2)
             self._handle_glyphs['base_lo'] = _caret(
@@ -1132,6 +2328,8 @@ class _CorrelogramTab(QtWidgets.QWidget):
             # satellite/residual boxes reads as broken) and show one centred grey message
             # via the shared helper — the same clean empty-state look as the SLS tab.
             # Restored once a curve exists.
+            self.figure.legends.clear()   # outlives ax.clear(); would float alone
+            set_plot_export_dressing(self.canvas, None)   # ... and so does this
             self._placeholder = show_plot_placeholder(
                 self.figure, self.canvas, 'Tick a measurement to plot',
                 axes=(self.main_ax, self.resid_ax, *self.side_axes))
@@ -1141,114 +2339,281 @@ class _CorrelogramTab(QtWidgets.QWidget):
         # Plot saves suggest the same stem as the CSV export for the active method.
         set_plot_export_name(
             self.canvas,
-            _selection_scoped_name(self.controller, list(self._raw),
-                                   f'correlogram_{self.method_combo.currentData()}'))
+            _selection_export_names(
+                self.controller,
+                [(iid, self.method_combo.currentData()) for iid in self._raw],
+                'correlogram')[0])
         ws = self.controller.workspace.measurements
         xs, ys = _SCALE_XY[self._scales[0]]
         x_clamp = self._linear_x_clamp_display()   # frames linear-τ views on the decay
-        # main view: overlay every ticked measurement (data + its fit, same color)
+        # A legend has no sample header above it, so it is one of the two surfaces that
+        # prefixes the sample -- and only when the ticked set spans samples.
+        prefixes = _sample_prefixes(self.controller, self._raw)
+        # Everything drawn on this pass: one entry per (ticked measurement x ticked,
+        # non-stale method). Computed ONCE and grouped by measurement, so the main view,
+        # the three side views and the residual panel below all iterate the same list
+        # and cannot disagree about which curve belongs to which fit.
+        shown = self._shown_fits()
+        fits_by_meas: Dict[str, List[Tuple[str, object]]] = {}
+        for iid, key, res in shown:
+            fits_by_meas.setdefault(iid, []).append((key, res))
+        # main view: every ticked measurement's data ONCE, then each of its ticked fits.
+        # Colour and marker are the MEASUREMENT (item 3); line style is the METHOD.
         for iid, (tau, g2) in self._raw.items():
             col = self.selection.color_for(iid)
-            res = self._fit_for(iid)
-            ft, fg = ((np.asarray(res.fit_tau_s, dtype=float),
-                       np.asarray(res.fitted_g2m1, dtype=float)) if res else (None, None))
-            plot_correlogram_scaled(tau, g2, ft, fg, ax=self.main_ax, xscale=xs,
-                                    yscale=ys, color=col, label=_meas_label(ws[iid]),
+            plot_correlogram_scaled(tau, g2, ax=self.main_ax, xscale=xs,
+                                    yscale=ys, color=col,
+                                    label=measurement_display_name(
+                                        ws[iid], sample=prefixes[iid]),
                                     marker=self.selection.marker_for(iid))
+            for key, res in fits_by_meas.get(iid, ()):
+                plot_correlogram_fit_line(res.fit_tau_s, res.fitted_g2m1, ax=self.main_ax,
+                                     xscale=xs, yscale=ys, color=col,
+                                     linestyle=_METHOD_LINESTYLE[key])
         self.main_ax.set_title(f'Correlogram — {self._scales[0]}')
         self._draw_markers()                     # window + baseline handles
         if xs == 'linear':
-            # Pin a linear delay axis to 0 (negative τ is meaningless) and frame the right
-            # to the decay region so it sits centered, not crushed at the origin. Done
-            # before the residual copies the x-lim below.
+            # Pin a linear delay axis to 0 (negative tau is meaningless) and frame the
+            # right to the decay region so it sits centered, not crushed at the origin.
+            # Done before the residual copies the x-lim below.
             right = x_clamp if x_clamp is not None else self.main_ax.get_xlim()[1]
             self.main_ax.set_xlim(0.0, right)
-        handles, labels = self.main_ax.get_legend_handles_labels()
-        if labels:
-            self.main_ax.legend(frameon=False, fontsize=7, loc='best')
-        # residual panel: one residual per fit (matching color). Plot in the same
-        # DISPLAY units as the main axis (× display factor) so it lines up under the
-        # fit — previously it drew raw seconds on a µs axis and squished to the left.
-        tfac = _disp_factor('time')
-        for iid in self._raw:
-            res = self._fit_for(iid)
-            if res is not None:
-                self.resid_ax.plot(np.asarray(res.fit_tau_s, dtype=float) * tfac,
-                                   np.asarray(res.residuals, dtype=float), '-',
-                                   color=self.selection.color_for(iid), lw=1.0)
-        self.resid_ax.axhline(0.0, color='#444', lw=0.6, ls=':')
-        self.resid_ax.set_xscale(xs)
+        self._draw_legend(shown)
+        # residual panel: the residuals of exactly the fits drawn above, in the same
+        # colour and line style, through the one helper the Distribution tab's panel
+        # also uses. Drawn in the same DISPLAY units as the main axis so it lines up
+        # under the fit -- it once drew raw seconds on a microsecond axis.
+        draw_fit_residuals(
+            self.resid_ax,
+            [(self.selection.color_for(iid), key, res) for iid, key, res in shown],
+            xscale=xs)
         self.resid_ax.set_xlim(self.main_ax.get_xlim())
-        self.resid_ax.set_xlabel(rf'Delay time $\tau$ ({_disp_unit("time")})')
-        self.resid_ax.set_ylabel('resid.')
+        _hide_shared_x(self.main_ax)         # the residual carries the only x axis
         # side views: overlay all measurements at each scale
         for k, sax in enumerate(self.side_axes):
             name = self._scales[k + 1]
             sxs, sys = _SCALE_XY[name]
             for iid, (tau, g2) in self._raw.items():
                 col = self.selection.color_for(iid)
-                res = self._fit_for(iid)
-                ft, fg = ((np.asarray(res.fit_tau_s, dtype=float),
-                           np.asarray(res.fitted_g2m1, dtype=float)) if res
-                          else (None, None))
-                plot_correlogram_scaled(tau, g2, ft, fg, ax=sax, xscale=sxs, yscale=sys,
+                plot_correlogram_scaled(tau, g2, ax=sax, xscale=sxs, yscale=sys,
                                         compact=True, color=col,
                                         marker=self.selection.marker_for(iid))
+                for key, res in fits_by_meas.get(iid, ()):
+                    plot_correlogram_fit_line(res.fit_tau_s, res.fitted_g2m1, ax=sax,
+                                         xscale=sxs, yscale=sys, color=col,
+                                         linestyle=_METHOD_LINESTYLE[key],
+                                         compact=True)
             if sxs == 'linear':                   # pin to 0; frame on the decay
                 right = x_clamp if x_clamp is not None else sax.get_xlim()[1]
                 sax.set_xlim(0.0, right)
             sax.set_title(name, fontsize=8)
         self.canvas.draw_idle()
+        self._floor_resid_ratio()            # after the layout is real, not before
 
-    # ---- tables (one value column per ticked measurement) ----
+    def _draw_legend(self, shown) -> None:
+        """The on-screen KEY -- one entry per METHOD drawn plus the window/baseline
+        markers -- and the dressing that gives the SAVED figure the full legend.
+
+        Not one entry per curve, and no longer one per measurement either. Before B8
+        the data scatter and its fit line were each labelled, so nine ticked runs drew
+        eighteen entries, clipped at eleven, covering the plot area. Fixing the count
+        left thirteen full-length entries that no placement could carry: below the
+        panel they took 154 px and left the residual 19 px of a 477 px canvas.
+
+        The measurement names now go to the file, where a reader has no picker or
+        glance table beside them; on screen those two already name every ticked run
+        against its swatch. What stays here is `_measurement_legend_entries`' worth of
+        nothing and a key that does not grow with the selection.
+
+        The key sits in the figure's EMPTY bottom-right gridspec cell -- `[3, 1]`, the
+        square under the side-view stack and beside the residual, which nothing has
+        ever drawn in -- so it costs the plot no height at all. Measured on the nine-run
+        frame: residual 19.0 -> 59.8 px, fit 154.6 -> 299.6 px. When the user drags the
+        residual small enough that the cell cannot hold the key, it falls back to
+        sitting below the panel.
+        """
+        ws = self.controller.workspace.measurements
+        methods = list(dict.fromkeys(key for _i, key, _r in shown))
+        key_entries = _method_legend_entries(methods) + _marker_legend_entries(
+            self.main_ax)
+        # A fit whose own `success` is False drew a SEED estimate, not a fit, and the
+        # saved image must not present it as fitted (module docstring, owner-ruled).
+        # This tab draws the Distribution tab's stored fits now, so it inherits that
+        # duty; `_shown_fits` hands back the result objects, which carry `success`.
+        failed = {}
+        for iid, key, res in shown:
+            if not getattr(res, 'success', True):
+                failed.setdefault(iid, []).append(_fit_label(key))
+        leg = _draw_key(self.figure, key_entries, bbox=self._key_cell())
+        if leg is not None and not self._key_fits(leg):
+            leg = _draw_key(self.figure, key_entries)      # below the panel instead
+
+        # The saved figure additionally names every measurement, grouped by sample.
+        prefixes = _sample_prefixes(self.controller, self._raw)
+        by_sample = {}
+        for iid in self._raw:
+            sample = prefixes[iid] or _sample_label_of(self.controller, iid)
+            note = failed.get(iid)
+            by_sample.setdefault(sample, []).append(
+                (iid, measurement_display_name(ws[iid])
+                 + (f' ({", ".join(note)} failed)' if note else '')))
+        meas_entries, groups = _measurement_legend_entries(self.selection, by_sample)
+        set_plot_export_dressing(
+            self.canvas,
+            export_legend_dressing(self.figure, meas_entries + key_entries, groups)
+            if meas_entries else None)
+
+    def _key_cell(self):
+        """The region the on-screen key sits in: the SIDE-VIEW column's x-range, at the
+        `[3, 1]` cell's height -- or None before the first draw has positioned it.
+
+        The x-range comes from the drawn side views, not from the gridspec cell. The
+        cell is empty by construction, but with nothing to its right the residual axes
+        SPILLS into it: measured 1015 px against a cell starting at 1003 px at
+        1600x1020, and 1372 against 1351 at 1920x1080, so a key anchored at the cell's
+        left edge printed over the residual plot (owner report, 2026-09-19). It did not
+        at 1280x760, which is why the shipped screenshots did not show it. The side
+        views never spill -- they have the residual's own row beneath them -- and they
+        are the column the key visually belongs to.
+        """
+        try:
+            cell = self._gs[3, 1].get_position(self.figure)
+            side = self.side_axes[-1].get_position()
+        except Exception:  # noqa: BLE001 — no layout yet: fall back to below the panel
+            return None
+        from matplotlib.transforms import Bbox
+        return Bbox([[side.x0, cell.y0], [side.x1, cell.y1]])
+
+    def _key_fits(self, leg) -> bool:
+        """Whether `leg` is inside its cell. The cell shrinks with the residual's
+        share, which the user can drag to a minimum, so this is a real branch."""
+        cell = self._key_cell()
+        if cell is None:
+            return False
+        try:
+            ext = leg.get_window_extent(self.canvas.get_renderer())
+        except Exception:  # noqa: BLE001 — unmeasurable: take the safe placement
+            return False
+        w = self.figure.get_figwidth() * self.figure.dpi
+        h = self.figure.get_figheight() * self.figure.dpi
+        return ext.width <= cell.width * w + 1 and ext.height <= cell.height * h + 1
+
+
+    # ---- tables (a GLANCE row per ticked run + a panel for the focused one) ----
     def _refresh_tables(self) -> None:
         self._rebuild_tables()
         self._fill_tables()
+
+    def _focused_id(self):
+        """The run the detail panel describes: the sidebar's focused measurement when it
+        is ticked, else the first ticked run.
+
+        A panel that blanked whenever focus sat on an unticked run would withhold the
+        detail quantities exactly when several runs are co-plotted -- which is when they
+        are wanted -- so it falls back rather than emptying."""
+        ids = [i for i in self.selection.ids()
+               if i in self.controller.workspace.measurements]
+        if self.item_id in ids:
+            return self.item_id
+        return ids[0] if ids else None
 
     def _rebuild_tables(self) -> None:
         ws = self.controller.workspace.measurements
         ids = [i for i in self.selection.ids() if i in ws]
         key = self.method_combo.currentData()
-        rows = _RESULT_ROWS[key]
         method_label = {k: l for l, k in _CORR_METHODS}.get(key, 'Method')
-        self.results_label.setText(f'{method_label} results')
-        table = self.result_table
-        table.clear()
-        table.setColumnCount(1 + len(ids))
-        table.setRowCount(len(rows))
-        table.horizontalHeader().setVisible(True)
-        table.verticalHeader().setVisible(False)
-        table.setHorizontalHeaderLabels(['', *[_meas_short(ws[i]) for i in ids]])
-        for col, iid in enumerate(ids, start=1):
-            hi = table.horizontalHeaderItem(col)
-            if hi is not None:
-                hi.setForeground(QtGui.QColor(self.selection.color_for(iid)))
-                hi.setToolTip(hi.text())     # a narrow column elides the header
-        table.horizontalHeader().setSectionResizeMode(
-            0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        for col in range(1, 1 + len(ids)):
-            table.horizontalHeader().setSectionResizeMode(
-                col, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        for r, name in enumerate(rows):
-            label = QtWidgets.QTableWidgetItem(name)
-            label.setToolTip(name)
-            table.setItem(r, 0, label)
-            for col in range(1, 1 + len(ids)):
-                table.setItem(r, col, QtWidgets.QTableWidgetItem('—'))
-        row_h = table.verticalHeader().defaultSectionSize()   # real row height
-        table.setMaximumHeight(table.horizontalHeader().height()
-                               + row_h * len(rows) + 2 * table.frameWidth() + 2)
+        # "apparent" is said ONCE here instead of on every headline column: the glance
+        # table is only as readable as its narrowest column, and the qualifier is a
+        # property of the whole table (invariant 7 -- single-angle results are apparent).
+        self.results_label.setText(f'{method_label} results — apparent sizes')
+
+        # `.get`, not a subscript: a method listed in `_CORR_METHODS` with no entry
+        # here is a KeyError on every draw of the tab. The roster gate below makes that
+        # state a red test instead, and this keeps it from being a crash meanwhile.
+        cols = _GLANCE_COLS.get(key, [])
+        g = self.glance_table
+        g.clear()
+        g.setColumnCount(1 + len(cols))
+        g.setRowCount(len(ids))
+        g.setHorizontalHeaderLabels(['Measurement', *[h for h, _idx in cols]])
+        for r, iid in enumerate(ids):
+            lm = ws[iid]
+            name = QtWidgets.QTableWidgetItem(measurement_display_name(lm))
+            # Colour AND marker shape, so a row means the same thing as its curve for a
+            # reader who cannot use the colour (`marker_swatch`, WCAG 1.4.1).
+            name.setIcon(marker_swatch(self.selection.color_for(iid),
+                                       self.selection.marker_for(iid)))
+            name.setToolTip(measurement_hover_card(lm))
+            g.setItem(r, 0, name)
+            for c in range(1, 1 + len(cols)):
+                g.setItem(r, c, QtWidgets.QTableWidgetItem('—'))
+        g.resizeColumnsToContents()
+        # Cap the NAME column and give the rest to the values. Uncapped, one long file
+        # stem takes the whole 360 px control column and pushes the headline values out
+        # -- the defect this table exists to fix. The widget elides left, so the capped
+        # name keeps the tail that tells replicates of one set apart.
+        if g.columnWidth(0) > NAME_COL_MAX_W:
+            g.setColumnWidth(0, NAME_COL_MAX_W)
+        for c in range(1, 1 + len(cols)):
+            g.horizontalHeader().setSectionResizeMode(
+                c, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        # Height capped at `_GLANCE_VISIBLE_ROWS`, NOT grown to the row count. Grown,
+        # nine ticked runs asked for ~320 px of a 330 px section and pushed the
+        # focused-run panel, the export button and its own rows out of the pane -- the
+        # user saw a header row and nothing under it. Beyond the cap it scrolls.
+        row_h = g.verticalHeader().defaultSectionSize()
+        chrome = g.horizontalHeader().height() + 2 * g.frameWidth() + 2
+        shown = min(max(len(ids), 1), _GLANCE_VISIBLE_ROWS)
+        g.setMaximumHeight(chrome + row_h * shown)
+        # ... and a floor, so a squeezed section cannot shrink it to its header alone.
+        g.setMinimumHeight(chrome + row_h * min(max(len(ids), 1), _GLANCE_FLOOR_ROWS))
+
+        # Everything that is not a headline stays on this tab, for the focused run.
+        _repoint_vtable(self.result_table, _RESULT_ROWS.get(key, []))
 
     def _fill_tables(self) -> None:
         key = self.method_combo.currentData()
-        ids = [i for i in self.selection.ids()
-               if i in self.controller.workspace.measurements]
-        for col, iid in enumerate(ids, start=1):
+        ws = self.controller.workspace.measurements
+        ids = [i for i in self.selection.ids() if i in ws]
+        sig = self._no_unc_sig()
+        cols = _GLANCE_COLS.get(key, [])
+        for r, iid in enumerate(ids):
             res = self._fit_for(iid)
             if res is None:
                 continue
-            self._fill_col(self.result_table, col,
-                           self._result_values(key, res, self._no_unc_sig()))
+            # ONE computation feeds both views: the glance cells are indices into the
+            # same `_result_values` list the panel below renders in full, so the two can
+            # never print different numbers for one run.
+            values = self._result_values(key, res, sig)
+            notes = self._result_notes(key, res)
+            for c, (_hdr, idx) in enumerate(cols, start=1):
+                it = self.glance_table.item(r, c)
+                if it is None:
+                    continue
+                it.setText(values[idx])
+                # A flagged value carries its ⚠ on its OWN cell -- the mark sits on the
+                # value it judges, never on the name -- and the reason on hover. With
+                # nothing to explain the tooltip is the cell's own text, which is what
+                # keeps a value recoverable when a narrow column elides it.
+                it.setToolTip(notes[idx] or values[idx])
+
+        focus = self._focused_id()
+        if focus is None:
+            self.focus_label.setText('')
+            self.focus_label.setToolTip('')
+        else:
+            self.focus_label.setText(
+                f'Details — {measurement_display_name(ws[focus])}')
+            self.focus_label.setToolTip(measurement_hover_card(ws[focus]))
+        res = self._fit_for(focus) if focus is not None else None
+        if res is None:
+            _reset_vtable(self.result_table)
+            return
+        _fill_vtable(self.result_table, self._result_values(key, res, sig))
+        for r, note in enumerate(self._result_notes(key, res)):
+            it = self.result_table.item(r, 1)
+            if it is not None:
+                it.setToolTip(note or it.text())
 
     def _no_unc_sig(self) -> int:
         """Sig figs for the ±-less result values (Settings → no-uncertainty precision).
@@ -1270,10 +2635,19 @@ class _CorrelogramTab(QtWidgets.QWidget):
             # A failed nonlinear fit now reports NaN outputs, not a linear-fit
             # substitute — label it '(failed)', and the Rh/Gamma cells read 'n/a'.
             method_lbl = res.method + ('' if res.success else ' (failed)')
-            baseline_lbl = q(res.baseline) if res.method == 'nonlinear' else '—'
-            # PDI cell: value + reliability glyph when measured; an explicit
-            # 'unmeasured' for an order-1 fit (no mu2 term) so a blank PDI is never
-            # read as a confirmed monodisperse PDI = 0.
+            baseline_lbl = q(res.baseline)   # fitted B (nonlinear) or the pinned offset
+
+            # One rule for every order-gated moment cell (PDI/μ₂ at order 2, μ₃ at 3, μ₄
+            # at 4): below the order that fits the quantity it is UNMEASURED and says so,
+            # so a blank is never read as a fitted zero; at or above it the value renders
+            # through q(), which already turns a failed fit's None or NaN into 'n/a'.
+            def moment_cell(value, needed_order):
+                if res.order < needed_order:
+                    return f'unmeasured (order {res.order})'
+                return q(value)
+
+            # PDI cell: value + reliability glyph when measured; 'unmeasured (order 1)'
+            # for an order-1 fit (no mu2 term), 'n/a' for a failed one.
             if math.isfinite(res.pdi):
                 # The printed ceiling is the engine's own constant, never a literal, so
                 # the glyph cannot go stale against the flag it explains.
@@ -1281,10 +2655,8 @@ class _CorrelogramTab(QtWidgets.QWidget):
                              ('⚠<0' if res.pdi < 0
                               else f'⚠>{CUMULANT_PDI_VALIDITY_LIMIT:g}'))
                 pdi_cell = f'{q(res.pdi)} {pdi_glyph}'
-            elif res.order < 2:
-                pdi_cell = 'unmeasured (order 1)'
             else:
-                pdi_cell = q(res.pdi)   # 'n/a' — a failed/degenerate fit (row flagged)
+                pdi_cell = moment_cell(res.pdi, 2)
             # Rh cell: the same glyph convention as its neighbour, for the same reason.
             # The PDI cell carried ✓/⚠ for a long time while the Rh cell beside it stayed
             # bare, so the one judgement that is ABOUT the size was the one the size column
@@ -1294,8 +2666,18 @@ class _CorrelogramTab(QtWidgets.QWidget):
             rh_cell = q(res.rh_nm)
             if not getattr(res, 'rh_reliable', True):
                 rh_cell = f'{rh_cell} ⚠'
+
+            # μ₃ / μ₄ cells: the BARE value, no validity glyph -- the ruling and its reason
+            # are on `CumulantResult`; the caution is the row label's tooltip.
+            mu3_cell = moment_cell(res.mu3_s_inv3, 3)
+            mu4_cell = moment_cell(res.mu4_s_inv4, 4)
+            # mu2 through the SAME order gate as its siblings. It was the one moment
+            # rendered raw, and below order 2 the engine returns 0.0 rather than None, so
+            # the panel printed a bare '0' for a moment it never estimated -- while the
+            # PDI cell directly above said "unmeasured (order 1)" about the same quantity.
             return [q(res.gamma_s_inv), rh_cell, pdi_cell,
-                    q(res.mu2_s_inv2), str(res.order), method_lbl, baseline_lbl]
+                    moment_cell(res.mu2_s_inv2, 2), mu3_cell, mu4_cell,
+                    str(res.order), method_lbl, baseline_lbl]
         # Parametric-fit Rh cells: the same glyph convention as the cumulant Rh cell
         # above — one condition, one tier, across the whole parametric family. A NaN Rh
         # renders 'n/a' via q(); the glyph rides alongside so the blank still says why.
@@ -1312,38 +2694,74 @@ class _CorrelogramTab(QtWidgets.QWidget):
             return cell if getattr(res, 'rh_reliable', True) else f'{cell} ⚠'
         if key == 'single':
             return [q(res.mode.gamma_s_inv), mode_rh(res.mode),
-                    q(res.beta), 'yes' if res.success else 'no']
+                    q(res.beta), q(res.baseline), 'yes' if res.success else 'no']
         if key == 'double':
             return [mode_rh(res.mode1), q(res.mode1.amplitude_fraction),
                     mode_rh(res.mode2), q(res.mode2.amplitude_fraction),
-                    'yes' if res.success else 'no']
+                    q(res.baseline), 'yes' if res.success else 'no']
         return [q(res.stretch), q(res.tau_c_s), q(res.mean_tau_s),
                 rh(res.rh_from_tau_c_nm), rh(res.rh_from_mean_tau_nm),
-                'yes' if res.success else 'no']
+                q(res.baseline), 'yes' if res.success else 'no']
 
     @staticmethod
-    def _fill_col(table, col: int, values: List[str]) -> None:
-        for r, v in enumerate(values):
-            it = table.item(r, col)
-            if it is not None:
-                it.setText(v)
-                # With several measurements ticked a column is ~30 px wide and a
-                # value paints as '0.7…' -- the reliability glyph is the elided tail;
-                # the full text rides the tooltip so number and glyph stay recoverable.
-                it.setToolTip(v)
+    def _result_notes(key: str, res) -> List[str]:
+        """Why each flagged row of `_result_values` is flagged, '' where it is not.
+
+        Index-aligned with `_result_values` and so with `_RESULT_ROWS[key]`, because the
+        glance table addresses both by the same index -- the mark and its reason must
+        land on one cell. The text is the ENGINE's own `reliability_note`, never a
+        restatement: the sentence has one home (`analysis/dls/`), and a static copy in
+        the GUI is the drift this project has been bitten by before.
+
+        A flag answers 'did this method's preconditions hold for this fit' (invariant 4),
+        so the note is attached to the value the judgement is ABOUT -- per MODE for
+        single/double, whose modes are judged independently, and to the result for the
+        cumulant and KWW, which have one verdict. Rows with an inline, self-describing
+        glyph (the PDI cell prints its own '>0.3' ceiling) take no note: there is nothing
+        a tooltip would add that the cell does not already say.
+        """
+        notes = [''] * len(_RESULT_ROWS[key])
+
+        def mode_note(mode) -> str:
+            return ('' if getattr(mode, 'rh_reliable', True)
+                    else getattr(mode, 'reliability_note', '') or '')
+
+        def result_note() -> str:
+            return ('' if getattr(res, 'rh_reliable', True)
+                    else getattr(res, 'reliability_note', '') or '')
+
+        if key == 'cumulant':
+            notes[1] = result_note()
+        elif key == 'single':
+            notes[1] = mode_note(res.mode)
+        elif key == 'double':
+            notes[0] = mode_note(res.mode1)
+            notes[2] = mode_note(res.mode2)
+        else:                                    # kww: one verdict, two derived sizes
+            notes[3] = notes[4] = result_note()
+        return notes
 
     # ---- status / flags ----
     def _update_status(self) -> None:
         key = self.method_combo.currentData()
         ws = self.controller.workspace.measurements
+        # (measurement name, message) PAIRS, not pre-joined strings: the grouping needs
+        # the two apart so one KIND of message can be explained once with each run named
+        # beside its own value. That is item 7's fix -- the commonest message carries its
+        # own number, so three replicates printed the same paragraph three times.
         flags = []
+        skipped = []          # capped differently -- see the join below
+        passive = []
         for iid in self.selection.ids():
             lm = ws.get(iid)
             if lm is None:
                 continue
-            if iid in self._run_failures:
-                flags.append(f'⚠ {_meas_short(lm)}: skipped — '
-                             f'{humanize_field_names(self._run_failures[iid])}')
+            # The DISPLAYED method's failure, never another's: the status area speaks
+            # for the numbers the tables are showing.
+            failure = self._run_failures.get((iid, key))
+            if failure is not None:
+                skipped.append((measurement_display_name(lm),
+                                f'⚠ skipped — {humanize_field_names(failure)}'))
                 continue
             res = self._fit_for(iid)
             if res is None:
@@ -1361,14 +2779,43 @@ class _CorrelogramTab(QtWidgets.QWidget):
             # a bare-prefix line.
             for line in flag.splitlines():
                 if line.strip():
-                    flags.append(f'{_meas_short(lm)}: {line}')
+                    flags.append((measurement_display_name(lm), line))
+            # The result's own passive `notes` tier, measurement-prefixed for the same
+            # reason the flags are: several are co-plotted and an unlabelled second line
+            # would read as the next measurement's.
+            for line in getattr(res, 'notes', ()) or ():
+                if str(line).strip():
+                    passive.append((measurement_display_name(lm), str(line)))
+        # Grouped WITHIN a tier, never across one: a flag and a passive note are
+        # different claims about the fit and must not share a sentence (R5.1).
+        # No cap on the passive tier: its notes are rendered nowhere else.
+        set_flag(self.notes_label, '\n'.join(group_status_lines(passive)),
+                 problem=False)
         notes = []
         if self.controller.is_dirty() and self._any_cached():
             notes.append('(ran on last committed values)')
         if self._any_stale():
             notes.append(_STALE_HINT)
         self.status.setText('  '.join(notes))
-        self.flag_label.setText('\n'.join(flags))
+        # A DRAWN fit that did not converge is a flag of its own, and on this tab it
+        # is the only surface saying so: the layers list draws the Distribution tab's
+        # fits too, and a failed lognormal's curve is its seed estimate. No cap -- the
+        # message has no varying numeral, so a capped listing would degenerate to names.
+        drawn_failures = [
+            (measurement_display_name(ws[iid]),
+             f'⚠ {_fit_label(key)} fit did not converge; the curve drawn is the '
+             'seed estimate, not a fit')
+            for iid, key, res in self._shown_fits()
+            if iid in ws and not getattr(res, 'success', True)]
+        flags.extend(drawn_failures)
+        # The cap applies only to the flags whose premise it rests on: a value-bearing
+        # flag is also on its own glance-table cell, one hover from its reason, so an
+        # elided run stays recoverable. A SKIPPED run has no stored fit, so its glance
+        # row is '—' with no tooltip -- eliding it names it nowhere, the half of round
+        # 2's finding 5 the cap was meant to close. Those go out uncapped.
+        self.flag_label.setText('\n'.join(
+            group_status_lines(skipped)
+            + group_status_lines(flags, value_cap=_STATUS_LIST_MAX)))
 
     def _summary(self, key: str, r) -> Tuple[str, str]:
         # Status-line echoes of the same ±-less numbers the table shows — keep them on
@@ -1452,7 +2899,26 @@ class _DistributionTab(QtWidgets.QWidget):
     """Size / decay-rate distribution view over ONE or MANY ticked measurements,
     each computed by ONE or MANY chosen methods (Lognormal / NNLS / CONTIN). Every
     (measurement × method) curve is overlaid; the τ-window + baseline are shared with
-    the Correlogram tab."""
+    the Correlogram tab.
+
+    Colour and point MARKER are the measurement, line STYLE is the method -- the same
+    coding as the Correlogram tab, and the reason NNLS and CONTIN can now be told apart
+    here (they were drawn in one colour and one solid line). This tab OWNS its three
+    fits; the Correlogram tab reads them through `stored_fits`, via the module that owns
+    both, and is told they moved by `fitsChanged`.
+
+    Each fit is kept in its own (measurement, method) slot with its own signature, the
+    Correlogram tab's `_cache` shape: a fit of one measurement reads nothing of the
+    ticked set, so the ticks and the method boxes choose which stored fits are SHOWN
+    and never discard one. A fit whose inputs have moved stays in its slot, is not
+    drawn, and its run reads "press Run" (`_shown`)."""
+
+    #: Emitted whenever this tab's stored fits change, carrying the method keys a Run
+    #: just produced (empty on a tick change, so the layers list re-reads which fits the
+    #: new ticked set can draw). The owning `DLSModule` routes it to the Correlogram
+    #: tab's layers list, so a CONTIN Run here offers -- and ticks -- CONTIN over there
+    #: without one widget reaching into the other.
+    fitsChanged = QtCore.Signal(list)
 
     def __init__(self, controller, region, selection, parent=None) -> None:
         super().__init__(parent)
@@ -1461,17 +2927,24 @@ class _DistributionTab(QtWidgets.QWidget):
         self.selection = selection              # shared _OverlaySelection
         self.item_id: Optional[str] = None
         self._runnable = False
-        self._results: List[Tuple] = []         # [(iid, method, result), ...] last run
-        self._results_sig: tuple = ()           # committed-param signature of the last run's inputs
-        self._failures: List[str] = []
+        # (iid, method) -> {'result', 'sig'}: every fit this tab has run, each stamped
+        # with `_fit_signature` at dispatch. What is drawn is `_shown()`, never this.
+        self._fits: Dict[Tuple[str, str], Dict] = {}
+        # (iid, method) -> the message naming why that pair failed in the LAST Run.
+        # Replaced wholesale by each Run, as the Correlogram tab's `_run_failures`: a
+        # failure carries no signature, so a kept one could not say whether its cause
+        # has since been fixed. Only the ticked pairs' failures are shown.
+        self._failures: Dict[Tuple[str, str], str] = {}
         # Per-draw reweighting cache: [(iid, method, WeightedDistributionResult or None)],
-        # parallel to self._results. None means intensity (no reweighting) or a reweight
-        # error (the flag names it). Rebuilt every _draw; used by export + the peak table.
+        # parallel to the fits the last _draw showed. None means intensity (no
+        # reweighting) or a reweight error (the flag names it). Rebuilt every _draw;
+        # used by export + the peak table.
         self._weighted: List[Tuple] = []
         self._reweight_errors: List[str] = []
         self._placeholder = None                # empty-state Text artist (no distribution)
-        # Staleness token for async runs: bumped when the ticked set changes, so
-        # a background fit whose inputs are outdated is dropped, not drawn.
+        # Bumped by a tick change and read by a Run's `fail` ONLY, so a whole-Run
+        # failure landing after the ticks moved never paints the status of the view now
+        # shown. `done` needs no such guard: a finished fit lands in its own slot.
         self._run_epoch = 0
         self._build_ui()
 
@@ -1481,12 +2954,13 @@ class _DistributionTab(QtWidgets.QWidget):
         # clipped at the old 340 px default). The Rh-grid triple-spinbox row measures
         # 384 px at the shipped size, so 385 keeps its two '?' badges inside the column
         # (they overhung by 10 and 6 px at 360).
-        _, left, right = make_split_panels(self, left_min_width=385,
-                                           sizes=(403, 717))
+        splitter, left, right = make_split_panels(self, left_min_width=385,
+                                                  sizes=(403, 717))
 
         self.checklist = MeasurementPicker(
             self.controller, self.selection, kinds=('dls',),
-            label_fn=_meas_label, header_fn=_sample_header,
+            label_fn=measurement_display_name, header_fn=sample_display_name,
+            tooltip_fn=measurement_hover_card,
             help_text=_PICKER_HELP, help_bullets=_GROUP_PICKER_BULLETS,
             group_fields=(_GROUP_FIELD_CONC, _GROUP_FIELD_ANGLE))
         self.checklist.selectionChanged.connect(self._on_selection_changed)
@@ -1501,13 +2975,38 @@ class _DistributionTab(QtWidgets.QWidget):
                                  'least free, most stable. If it cannot converge, the '
                                  'curve is labeled “(failed)”, shows the starting '
                                  'estimate, and offers no peaks.',
-                                 'These are distribution-weighted, not z-average — '
-                                 'compare against the cumulant Rh.',
-                                 '<b>CONTIN α selection</b>: GCV (default, '
-                                 'self-calibrating), the L-curve corner, or the F-test '
-                                 '(see the Theory-and-Equations-Guide). '
+                                 'These are distribution-weighted, not the cumulant '
+                                 'average — compare against the cumulant Rh.',
+                                 '<b>Colour and point shape</b> are the measurement; '
+                                 '<b>line style</b> is the method, and means the same '
+                                 'thing on the Correlogram sub-tab — so one run’s '
+                                 'NNLS and CONTIN curves are told apart. The legend '
+                                 'shows a method key; the figure <b>Save</b> writes '
+                                 'names every measurement, grouped by sample.',
+                                 '<b>Keeping fits</b>: each run’s fit is kept, per '
+                                 'method. Unticking a run or a method hides its curves; '
+                                 'ticking it again shows them without a new Run while '
+                                 'nothing it was fitted with has changed. A ticked run '
+                                 'whose fit is missing or out of date asks you to press '
+                                 'Run.',
+                                 '<b>Residual weighting</b>: which noise model the fit '
+                                 'measures its error against — the sourced variance '
+                                 '(default), or the older g₁² form kept to reproduce '
+                                 'distributions reported before this version. The '
+                                 'sourced weight fits twice, so a Run takes about twice '
+                                 'as long; changing it marks a fit already on screen as '
+                                 'out of date.',
+                                 '<b>CONTIN α selection</b>: robust GCV (default), the '
+                                 'L-curve corner, or the F-test (see the '
+                                 'Theory-and-Equations-Guide). '
                                  'For the F-test, a higher “probability to reject” gives '
                                  'a smoother fit, lower gives more detail.',
+                                 '<b>GCV robustness γ</b> (shown for GCV): 0.1 is the '
+                                 'default, robust GCV; 1 is classical GCV. Robust GCV '
+                                 'guards against under-smoothing (extra peaks that come '
+                                 'and go between repeats), which classical GCV is prone '
+                                 'to because the correlator’s channel noise is '
+                                 'correlated. Set 1 to reproduce a classical-GCV result.',
                              ])
         form = QtWidgets.QFormLayout(box)
         # Per-method checkboxes (replacing the old single "Overlay NNLS+CONTIN").
@@ -1550,7 +3049,7 @@ class _DistributionTab(QtWidgets.QWidget):
                 'it re-presents the same ill-posed inversion, so it carries no ±.',
                 'Well-posed only for <b>spheres</b> (Rh = geometric radius); it refuses '
                 'non-spherical models. Number distributions from DLS are deprecated by '
-                'the DLS standard — use them with care (Theory-and-Equations-Guide §3.6).',
+                'the DLS standard — use them with care (Theory-and-Equations-Guide §3.7).',
                 'Pick the sphere scattering model to match the sample: <b>Rayleigh</b> '
                 '(very small particles), <b>RDG</b> (low contrast), or <b>Mie</b> (the '
                 'general high-contrast/large case, e.g. latex in water). RDG and Mie need '
@@ -1580,83 +3079,31 @@ class _DistributionTab(QtWidgets.QWidget):
         self.solute_ri_hint.setWordWrap(True)
         form.addRow('', self.solute_ri_hint)
         self._solute_ri_hint_label = form.labelForField(self.solute_ri_hint)
-        # Rh grid + CONTIN L-curve α: seeded from Settings, overridable per run
-        # (these moved here from the Settings tab — they belong next to the fit).
-        self.rh_min = QtWidgets.QDoubleSpinBox()
-        self.rh_min.setRange(0.01, 1.0e5); self.rh_min.setDecimals(2)
-        self.rh_max = QtWidgets.QDoubleSpinBox()
-        self.rh_max.setRange(0.01, 1.0e5); self.rh_max.setDecimals(1)
-        self.rh_points = QtWidgets.QSpinBox(); self.rh_points.setRange(10, 1000)
-        # A cost hint, not a cap: the range stays 10-1000 (owner-ruled 2026-08-26).
-        self.rh_points.setToolTip(
-            'Grid resolution of the inversion. CONTIN’s automatic α selection solves a '
-            'dense system of this size about 40 times, so the cost climbs steeply with '
-            'the point count — roughly half a second at 100 points, ~5 s at 300 and '
-            '~30 s at 1000 with the default GCV selector on a typical laptop (the '
-            'L-curve corner is cheaper but climbs the same way). The fit runs in the '
-            'background, so the window stays usable.')
-        grow = QtWidgets.QHBoxLayout(); grow.setContentsMargins(0, 0, 0, 0)
-        for w in (self.rh_min, self.rh_max, self.rh_points):
-            grow.addWidget(w)
-        gholder = QtWidgets.QWidget(); gholder.setLayout(grow)
-        form.addRow('R<sub>h</sub> grid (min / max / pts):', gholder)
-        # CONTIN α selection: L-curve corner (default) or Provencher's F-test. The two
-        # methods need different controls, so only the selected method's control is
-        # shown (owner: show/hide, not gray-out — no confusing inert fields).
-        self.alpha_method = QtWidgets.QComboBox()
-        self.alpha_method.addItem('GCV (generalized cross-validation)', 'gcv')
-        self.alpha_method.addItem('L-curve corner', 'lcurve')
-        self.alpha_method.addItem('F-test (probability to reject)', 'ftest')
-        self.alpha_method.setToolTip(
-            'How CONTIN chooses its regularization α automatically.\n'
-            '• GCV (default): generalized cross-validation — self-calibrating and '
-            'robust for this kernel; the recommended choice.\n'
-            '• L-curve corner: the maximum-curvature elbow of the fit-vs-smoothness '
-            'trade-off (tends to smooth more heavily).\n'
-            '• F-test: the smoothest solution whose fit is not significantly worse than '
-            'the best — for comparison against legacy CONTIN output.\n'
-            'See the Theory-and-Equations-Guide (CONTIN).')
-        form.addRow('CONTIN α selection:', self.alpha_method)
-        self.alpha_min = QtWidgets.QLineEdit()
-        self.alpha_max = QtWidgets.QLineEdit()
-        arow = QtWidgets.QHBoxLayout(); arow.setContentsMargins(0, 0, 0, 0)
-        for w in (self.alpha_min, self.alpha_max):
-            arow.addWidget(w)
-        self._alpha_range_holder = QtWidgets.QWidget()
-        self._alpha_range_holder.setLayout(arow)
-        form.addRow('CONTIN α (min / max):', self._alpha_range_holder)
-        self._alpha_range_label = form.labelForField(self._alpha_range_holder)
-        # F-test level (only shown when the F-test method is selected).
-        self.ftest_prob = QtWidgets.QDoubleSpinBox()
-        self.ftest_prob.setRange(0.01, 0.99)
-        self.ftest_prob.setSingleStep(0.05)
-        self.ftest_prob.setDecimals(2)
-        self.ftest_prob.setToolTip(
-            'F-test significance level (default 0.50). A HIGHER value '
-            'accepts more fit degradation and so selects a SMOOTHER, more parsimonious '
-            'distribution; a LOWER value keeps a rougher, more-detailed one.')
-        form.addRow('F-test probability to reject:', self.ftest_prob)
-        self._ftest_prob_label = form.labelForField(self.ftest_prob)
-        self.alpha_method.currentIndexChanged.connect(
-            self._update_alpha_controls_visibility)
+        # The fit inputs: the Rh grid, the residual weighting and CONTIN's α selector,
+        # range, γ and F-test level -- the shared group the Settings tab and the Mode
+        # Map hold too, seeded from Settings and overridable per run. Not
+        # `weighting_combo` above, which re-expresses a finished intensity distribution
+        # as volume/surface/number: that is a presentation of the answer, this group
+        # holds inputs to it.
+        self.fit_fields = DistributionFitFields(self)
+        self.fit_fields.add_rows(form)
         self.reseed_from_settings()
-        self._update_alpha_controls_visibility()
         note = ThemedLabel('Delay window + baseline region are set on the '
                            'Correlogram tab (shared). Each ticked method runs on '
                            'every ticked measurement.', role='hint', size=10)
         note.setWordWrap(True)
         form.addRow(note)
+        # Run is pinned under the scrolled form and Export under the column (the §3
+        # column template), so the form's length can never carry them out of view.
         self.run_button = QtWidgets.QPushButton('Run')
         self.run_button.setToolTip(BACKGROUND_RUN_TOOLTIP)
         self.run_button.clicked.connect(self._on_run)
-        form.addRow(self.run_button)
         self.export_button = QtWidgets.QPushButton('Export CSV…')
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._on_export)
-        form.addRow(self.export_button)
-        # Per-measurement peak results for the ticked curves, mirroring
-        # the Correlogram tab's results panel: one colored column per (measurement ·
-        # method), positional-peak rows. Populated in _draw, cleared on selection change.
+        # Peak results for the ticked curves, mirroring the Correlogram tab's glance
+        # table: one ROW per (measurement · method), one column per positional peak.
+        # Populated in _draw from the shown fits, emptied with the plot.
         results_section = QtWidgets.QWidget()
         rlay = QtWidgets.QVBoxLayout(results_section)
         rlay.setContentsMargins(0, 0, 0, 0)
@@ -1669,24 +3116,41 @@ class _DistributionTab(QtWidgets.QWidget):
         rlay.addWidget(self.result_table, 1)
         # Vertically resizable control column: drag the grips to size the
         # checklist / controls / results panes against each other.
+
+        # Scrolled controls and a stated results floor, for the reason the Correlogram
+        # tab's are: this tab passed the box's own `sizeHint` as the pane minimum
+        # OUTRIGHT, so the splitter starved the pane below it and the peak table fell
+        # off the bottom of the column entirely.
+        dist_scroll = QtWidgets.QScrollArea()
+        dist_scroll.setWidgetResizable(True)
+        dist_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        dist_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        dist_scroll.setWidget(box)
+        dist_pane = QtWidgets.QWidget()
+        dist_layout = QtWidgets.QVBoxLayout(dist_pane)
+        dist_layout.setContentsMargins(0, 0, 0, 0)
+        dist_layout.setSpacing(4)
+        dist_layout.addWidget(dist_scroll, 1)
+        dist_layout.addWidget(self.run_button)
+        # Neutral ⓘ note (steel-blue calmer-warnings tier) for the model-dependence of a
+        # reweighted view — distinct from the red flag_label, which is for problems.
+        # Under the peak table, as on the Correlogram tab.
+        self.info_label = ThemedLabel('', size=11)
+        self.info_label.setWordWrap(True)
+        rlay.addWidget(scrolling_notes(self.info_label))
         vstack = make_vertical_plot_stack(
-            [self.checklist, box, results_section], sizes=[170, 300, 150],
-            min_heights=[90, max(box.sizeHint().height(), 160), 70])
+            [self.checklist, dist_pane, results_section], sizes=[200, 380, 250],
+            min_heights=[90, 150, 200], stretch=COLUMN_STACK_STRETCH)
         left.addWidget(vstack, 1)
         self.status = QtWidgets.QLabel('')
         self.status.setWordWrap(True)
-        left.addWidget(self.status)
         # A red flag label for run-skips, mirroring the Correlogram tab so a skipped
         # measurement uses the same channel everywhere (style guide §5 R5.5) rather than
         # hiding on the muted status line. Set via the shared tiered renderer.
         self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
-        left.addWidget(self.flag_label)
-        # Neutral ⓘ note (steel-blue calmer-warnings tier) for the model-dependence of a
-        # reweighted view — distinct from the red flag_label, which is for problems.
-        self.info_label = ThemedLabel('', size=11)
-        self.info_label.setWordWrap(True)
-        left.addWidget(self.info_label)
+        pin_under_column(splitter, self.export_button, self.status, self.flag_label)
 
         self.figure = Figure(figsize=(5.3, 4.4), constrained_layout=True)
         # The distribution + residual do NOT share x (both carry their own x-label), so a
@@ -1699,6 +3163,7 @@ class _DistributionTab(QtWidgets.QWidget):
         # two do not share x. The residual is height-adjustable via a draggable handle
         # via that handle; a flat gridspec keeps constrained_layout happy.
         self._resid_ratio = 0.22
+        self._resid_dragged = False              # set by the drag handle; see the floor
         a = (1.0 - self._resid_ratio) / 3.0
         self._gs = self.figure.add_gridspec(4, 1, height_ratios=[a, a, a, self._resid_ratio])
         self.ax = self.figure.add_subplot(self._gs[0:3, 0])
@@ -1716,7 +3181,9 @@ class _DistributionTab(QtWidgets.QWidget):
         self.bottom_combo.addItem('α-sweep (CONTIN)', 'alpha')
         self.bottom_combo.setToolTip(
             'What the lower panel shows.\n'
-            '• Residuals: data − reconstructed g₂−1 vs delay time, per curve.\n'
+            '• Residuals: data − reconstructed g₂−1 vs delay time, for the '
+            'methods ticked on this sub-tab, each in its own line style. Parametric '
+            'residuals stay on the Correlogram sub-tab, whose panel follows the same rule.\n'
             '• α-sweep: how CONTIN chose its regularization α — the L-curve corner, '
             'the GCV minimum, or the F-test curve (see the '
             'Theory-and-Equations-Guide). CONTIN results only.')
@@ -1725,18 +3192,29 @@ class _DistributionTab(QtWidgets.QWidget):
         brow.addWidget(HelpBadge(
             'Read the α-sweep to judge whether to trust CONTIN’s automatic α.',
             bullets=[
-                '<b>L-curve</b>: a sharp <b>corner</b> is a clean trade-off between fit '
-                'and smoothness; a flat/round corner means α is poorly determined.',
+                '<b>L-curve</b>: fit residual against the <b>size</b> of the distribution; '
+                'a sharp <b>corner</b> is a clean trade-off, a rounded one means α is '
+                'poorly determined. Under it the halo also marks <b>no corner</b> (the '
+                'sweep held no L-shaped bend; the least-regularized α is reported) and a '
+                'one-point sweep.',
                 '<b>GCV</b>: a distinct <b>minimum</b> is a confident pick; a flat valley '
                 'is ambiguous.',
                 '<b>F-test</b>: the curve climbs with α — the pick is the smoothest fit '
                 'not significantly worse than the best. On fine Rh grids its reference '
-                '<i>is</i> the floor, so it can pin there — the halo says when it did.',
-                'A red halo marks an α pinned to a <b>sweep edge</b>: at the ceiling, '
-                'possible over-regularization; at the floor, the selector wanted a smaller '
-                'α than the range allows — at a low floor (the default 1e-4) that is '
+                '<i>is</i> the floor, so it can pin there — the halo says when it did. '
+                'Two more notes come from CONTIN’s own checks on the F-test: <b>floor not '
+                'small enough</b> (the reference solution is already regularized — lower '
+                'the α floor) and <b>transition not bracketed</b> (the chosen solution’s '
+                'probability to reject lies outside 0.05–0.95, checked when the requested '
+                'level lies inside that band — widen the α range or add sweep points).',
+                'A red halo marks an α pinned to a <b>sweep edge</b>: the selector wanted '
+                'an α beyond the range. At the ceiling it wanted a larger one — the fit '
+                'shown is the smoothest the range holds; raise the α ceiling. At the floor '
+                'it wanted a smaller one — at a low floor (the default 1e-4) that is '
                 'essentially the unregularized NNLS fit, whose extra peaks may be inversion '
-                'noise. Widen the α range.',
+                'noise; lower the floor only if you mean to. The F-test’s two precondition '
+                'notes are about the sweep, not about where the pick sits, so they draw no '
+                'halo — read them on the flag line beside the plot.',
                 'One sweep per CONTIN curve, colored to match the distribution above.',
             ]))
         self.export_sweep_button = QtWidgets.QPushButton('Export α-sweep…')
@@ -1751,11 +3229,16 @@ class _DistributionTab(QtWidgets.QWidget):
         right.addWidget(bholder)
         right.addWidget(self.canvas, 1)
         self._resid_resizer = attach_residual_resizer(
-            self.canvas, self.figure, self.ax, self.resid_ax, self._apply_resid_ratio)
+            self.canvas, self.figure, self.ax, self.resid_ax, self._on_resid_dragged)
         self.axis_bar = AxisControlBar(self.canvas)
         right.addWidget(self.axis_bar)
         self._update_weighting_controls_visibility()
         self._clear('Tick measurements + methods, then Run.')
+        # Connected last, once the axes they redraw exist: a method box and every fit
+        # field choose which stored fits are shown, so each moves the plot at once.
+        for cb in self.method_checks.values():
+            cb.toggled.connect(self._on_fit_input_moved)
+        self.fit_fields.changed.connect(self._on_fit_input_moved)
 
     def _apply_resid_ratio(self, frac: float) -> None:
         """Resize the residual vs the distribution panel (draggable handle)."""
@@ -1764,57 +3247,50 @@ class _DistributionTab(QtWidgets.QWidget):
         self._gs.set_height_ratios([a, a, a, frac])
         self.canvas.draw_idle()
 
-    def _update_alpha_controls_visibility(self) -> None:
-        """Show only the selected α-selection method's control (L-curve α range vs the
-        F-test level) — the owner asked for show/hide, not grayed-out inert fields."""
-        is_ftest = self.alpha_method.currentData() == 'ftest'
-        self._alpha_range_holder.setVisible(not is_ftest)
-        if self._alpha_range_label is not None:
-            self._alpha_range_label.setVisible(not is_ftest)
-        self.ftest_prob.setVisible(is_ftest)
-        if self._ftest_prob_label is not None:
-            self._ftest_prob_label.setVisible(is_ftest)
+    def _on_resid_dragged(self, frac: float) -> None:
+        """The drag handle moved: apply it, and stop the floor second-guessing it.
+        An explicit drag is a decision and outranks `_floor_resid_ratio`."""
+        self._resid_dragged = True
+        self._apply_resid_ratio(frac)
+
+    def _floor_resid_ratio(self) -> None:
+        """Raise the residual's share until its drawn box clears `_RESID_FLOOR_PX`.
+
+        The Correlogram tab's twin, for the same reason and with the same
+        drag-outranks-the-floor rule -- both panels are a fixed FRACTION of a varying
+        stack while their own chrome is fixed, so both under-serve a short stack.
+        """
+        if self._resid_dragged:
+            return
+        for _ in range(12):
+            try:
+                box = self.resid_ax.get_window_extent(self.canvas.get_renderer())
+            except Exception:  # noqa: BLE001 — not laid out yet; nothing to floor
+                return
+            if box.height >= _RESID_FLOOR_PX or self._resid_ratio >= 0.40:
+                return
+            self._apply_resid_ratio(min(self._resid_ratio + 0.02, 0.40))
+            self.canvas.draw()
 
     def reseed_from_settings(self) -> None:
-        """(Re)seed the Rh grid + α fields from the global Settings defaults. The
-        per-run values the user types here always win (run_distribution honors
-        explicit kwargs over its settings setdefault)."""
-        s = self.controller.settings
-        self.rh_min.setValue(s.rh_grid_min_nm)
-        self.rh_max.setValue(s.rh_grid_max_nm)
-        self.rh_points.setValue(s.rh_grid_points)
-        self.alpha_min.setText(f'{s.lcurve_alpha_min:g}')
-        self.alpha_max.setText(f'{s.lcurve_alpha_max:g}')
-        i = self.alpha_method.findData(s.contin_alpha_method)
-        self.alpha_method.setCurrentIndex(i if i >= 0 else 0)
-        self.ftest_prob.setValue(s.contin_ftest_prob_reject)
-        self._update_alpha_controls_visibility()
-
-    @staticmethod
-    def _as_float(text: str, fallback: float) -> float:
-        try:
-            return float(text)
-        except (TypeError, ValueError):
-            return fallback
+        """(Re)seed the fit fields from the global Settings defaults. The per-run values
+        the user sets here always win (run_distribution honors explicit kwargs over its
+        settings setdefault)."""
+        self.fit_fields.seed_from_settings(self.controller.settings)
 
     def _grid_kwargs(self, method: str) -> Dict:
-        """Per-run Rh grid (and, for CONTIN, the L-curve α range) from the fields."""
-        s = self.controller.settings
-        kw = dict(rh_min_nm=self.rh_min.value(), rh_max_nm=self.rh_max.value(),
-                  n_grid=self.rh_points.value())
-        if method == 'contin':
-            kw['alpha_min'] = self._as_float(self.alpha_min.text().strip(),
-                                             s.lcurve_alpha_min)
-            kw['alpha_max'] = self._as_float(self.alpha_max.text().strip(),
-                                             s.lcurve_alpha_max)
-            kw['alpha_method'] = self.alpha_method.currentData()
-            kw['ftest_prob_reject'] = self.ftest_prob.value()
-        return kw
+        """This tab's per-run fit kwargs for `method` -- the shared group's
+        `fit_kwargs`. Riding here also puts them in `_fit_signature`, so moving a field
+        marks a shown fit out of date."""
+        return self.fit_fields.fit_kwargs(method)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self.checklist.refresh()
         self.run_button.setEnabled(self._has_checked())
+        # The shared region moves on the Correlogram tab with no signal to this one, so
+        # the shown subset is re-read here: a fit the move made stale leaves the plot.
+        self._draw()
 
     def _has_checked(self) -> bool:
         ws = self.controller.workspace.measurements
@@ -1828,61 +3304,125 @@ class _DistributionTab(QtWidgets.QWidget):
         # is the only thing that picks measurements for analysis.
         self.checklist.refresh()
         self.run_button.setEnabled(self._has_checked())
-        if not self._results:
-            self._clear('Tick measurements + methods, then Run.')
-        elif self._results_stale():
-            # A displayed result whose inputs changed (a commit, or the shared
-            # window / baseline / grid moved since) — flag it without redrawing.
-            self.status.setText(_STALE_HINT)
+        # The shell re-points here after a commit, so the shown subset is re-read: a fit
+        # whose committed params moved leaves the plot and its run reads "press Run".
+        self._draw()
 
-    def _run_signature(self, pairs) -> tuple:
-        """Everything the distributions for the (measurement, method) `pairs` read beyond
-        their raw correlograms: committed params, per pair the kwargs the Run hands the
-        engine (the shared window + this measurement's baseline over it, the Rh grid
-        and, for CONTIN, the α range and selector), and the settings seed the engine
-        fills in itself (skip_initial_channels). The pairs ride in the signature, so
-        `_results_stale` needs no side table. Compared on redisplay: a distribution
-        fitted under a window or grid since moved is flagged stale (the two tabs share
-        one region, so a Correlogram-tab edit reaches here)."""
-        ids = sorted({iid for iid, _key in pairs})
-        per = tuple(sorted(
-            (iid, key, tuple(sorted({**self._baseline_kwargs(iid),
-                                     **self._grid_kwargs(key)}.items())))
-            for iid, key in pairs))
-        return (self.controller.committed_signature(ids), per,
-                self.controller.settings.skip_initial_channels)
+    def _fit_signature(self, iid: str, key: str) -> tuple:
+        """Everything a `key` distribution fit of `iid` reads beyond its raw correlogram:
+        the measurement's committed params, the method, the kwargs the Run hands the
+        engine (the shared window + this measurement's baseline over it, the Rh grid and,
+        for CONTIN, the α range, the selector and its level or γ), and the settings seed
+        the engine fills in itself (skip_initial_channels). Stamped on each stored fit at
+        dispatch and compared on every redraw, so a fit fitted under a window, grid or
+        commit since moved is flagged stale on its own (the two tabs share one region,
+        so a Correlogram-tab edit reaches here). The region's applied parts ride in their
+        own slot too, as on the Correlogram tab, so Reset flags a shown fit stale even
+        where the kwargs happen not to move.
 
-    def _results_stale(self) -> bool:
-        sig = self._results_sig
-        if not sig:
-            return False
-        return self._run_signature([(iid, key) for iid, key, _kw in sig[1]]) != sig
+        No term for the ticked set: a fit of one measurement does not read it, and
+        `RegionState.applied()` reads only the handles the user has set, so a tick
+        change moves no fit's signature."""
+        return (self.controller.committed_signature([iid]), key,
+                tuple(sorted({**self._baseline_kwargs(iid, key),
+                              **self._grid_kwargs(key)}.items())),
+                self.controller.settings.skip_initial_channels,
+                self.region.state().applied())
+
+    def _fit_is_stale(self, iid: str, key: str) -> bool:
+        """Whether the stored fit of `(iid, key)` was computed from inputs that have
+        since moved. False when there is no such fit -- absent is not stale."""
+        v = self._fits.get((iid, key))
+        return v is not None and v['sig'] != self._fit_signature(iid, key)
+
+    def _ticked_pairs(self) -> List[Tuple[str, str]]:
+        """Every (measurement, method) pair the ticks ask to see: the ticked DLS
+        measurements still in the workspace, in selection order, by the ticked method
+        boxes, in `_DIST_METHODS` order."""
+        ws = self.controller.workspace.measurements
+        ids = [i for i in self.selection.ids() if i in ws and ws[i].kind == 'dls']
+        return [(iid, key) for iid in ids for _label, key in self._ticked_methods()]
+
+    def _shown(self) -> List[Tuple[str, str, object]]:
+        """`[(iid, method, result)]` for every FRESH stored fit of a ticked pair -- the
+        one subset the plot, the peak table, the α-sweep panel, both exports and the
+        status and flag lines read, so none of them can speak for a fit the others do
+        not show. A stale fit keeps its slot and is not shown."""
+        out = []
+        for iid, key in self._ticked_pairs():
+            v = self._fits.get((iid, key))
+            if v is not None and v['sig'] == self._fit_signature(iid, key):
+                out.append((iid, key, v['result']))
+        return out
+
+    def _unshown_note(self) -> str:
+        """The status sentence naming each ticked pair that is not drawn: a stale fit
+        takes the stale hint, a missing one asks for a Run. A pair that failed in the
+        last Run is left to the red flag, which names it with its reason (the
+        Correlogram tab's rule). '' when every ticked pair is shown."""
+        ws = self.controller.workspace.measurements
+        stale: Dict[str, List[str]] = {}
+        missing: Dict[str, List[str]] = {}
+        for iid, key in self._ticked_pairs():
+            if (iid, key) in self._failures:
+                continue
+            v = self._fits.get((iid, key))
+            if v is not None and not self._fit_is_stale(iid, key):
+                continue
+            (stale if v is not None else missing).setdefault(
+                measurement_display_name(ws[iid]), []).append(_fit_label(key))
+
+        def named(runs: Dict[str, List[str]]) -> str:
+            return '; '.join(f'{name} ({", ".join(keys)})' for name, keys in runs.items())
+
+        parts = []
+        if stale:
+            parts.append(f'{named(stale)}: {_STALE_HINT}')
+        if missing:
+            parts.append(f'No fit yet for {named(missing)} — press Run.')
+        return '   '.join(parts)
+
+    def _ticked_failures(self) -> List[str]:
+        """The last Run's failure messages for the pairs ticked now, in tick order."""
+        return [self._failures[p] for p in self._ticked_pairs() if p in self._failures]
 
     @QtCore.Slot()
     def _on_selection_changed(self) -> None:
-        # The checked set changed → previous curves are stale; require a re-Run.
-        # Any in-flight background fit is also stale: bump the epoch so its
-        # result is discarded on arrival.
+        """The ticked set changed. Every stored fit is kept -- each is a fit of one
+        measurement and reads nothing of the ticked set -- so the plot is redrawn from
+        the store: unticking hides a run's curves and ticking it again shows them while
+        they are fresh. A redraw only, on the axes built once (`ax.clear()`, never a new
+        axes), and the Correlogram tab's layers list is told to re-read `stored_fits`."""
         self._run_epoch += 1
-        self._results = []
-        self._results_sig = ()
-        self._failures = []
-        self.export_button.setEnabled(False)
+        # Housekeeping, not correctness: an id is never reused within a workspace, so a
+        # slot whose measurement was removed can never be shown again.
+        ws = self.controller.workspace.measurements
+        self._fits = {p: v for p, v in self._fits.items() if p[0] in ws}
+        self._failures = {p: m for p, m in self._failures.items() if p[0] in ws}
         self.run_button.setEnabled(self._has_checked())
         self._update_weighting_controls_visibility()   # refresh the RDG solute-RI hint
-        self._clear('Selection changed — press Run.')
+        self._draw()
+        self.fitsChanged.emit([])
+
+    def _on_fit_input_moved(self, *_args) -> None:
+        """A method box or a fit field moved: redraw from the store, so a fit whose
+        input moved -- or whose method box is unticked -- leaves the plot and each
+        ticked run without a current fit reads "press Run". Nothing leaves the store:
+        ticking the method again, or moving the field back, shows those fits without a
+        Run. The Correlogram tab's `_on_fit_input_moved` shape."""
+        self._draw()
 
     @QtCore.Slot()
     def _on_axis_changed(self) -> None:
-        if self._results:
-            self._draw()                          # re-plot cached results on new axis
+        if self._shown():
+            self._draw()                          # re-plot the shown fits on the new axis
 
     @QtCore.Slot()
     def _on_weighting_changed(self) -> None:
-        """Weighting or sphere-model changed: update the controls, then re-draw the CACHED
-        intensity results under the new weighting (a re-presentation — never a re-fit)."""
+        """Weighting or sphere-model changed: update the controls, then re-draw the SHOWN
+        intensity fits under the new weighting (a re-presentation — never a re-fit)."""
         self._update_weighting_controls_visibility()
-        if self._results:
+        if self._shown():
             self._draw()
 
     def _active_weighting(self) -> Tuple[str, Optional[str]]:
@@ -1931,16 +3471,12 @@ class _DistributionTab(QtWidgets.QWidget):
         return [(label, key) for label, key in _DIST_METHODS
                 if self.method_checks[key].isChecked()]
 
-    def _baseline_kwargs(self, iid: str) -> Dict:
-        """Shared window + this measurement's own baseline over the shared region."""
-        kw = self.region.window_kwargs()
-        m = self.controller.workspace.measurements[iid]
-        baseline = self.region.baseline_value(
-            np.asarray(m.raw['delay_times_s'], dtype=float),
-            np.asarray(m.raw['correlogram'], dtype=float))
-        if baseline is not None:
-            kw['baseline'] = baseline
-        return kw
+    def _baseline_kwargs(self, iid: str, method: str) -> Dict:
+        """What a `method` inversion of `iid` reads from the shared region -- the one
+        reading (`_region_fit_kwargs`): the window once set, and a baseline value only
+        once the span is placed, measured over its part inside the window. An untouched
+        span sends none, and the engine estimates its own over the window's tail."""
+        return _region_fit_kwargs(self.controller, self.region, iid, method)
 
     @QtCore.Slot()
     def _on_run(self) -> None:
@@ -1951,16 +3487,22 @@ class _DistributionTab(QtWidgets.QWidget):
             self.status.setText('Tick at least one measurement.'); return
         if not methods:
             self.status.setText('Tick at least one distribution method.'); return
+        if any(key == 'contin' for _label, key in methods):
+            problem = self.fit_fields.alpha_problem()
+            if problem:                       # never run an α the engine refuses
+                self.status.setText(problem); return
         # Everything the fit needs is read from the widgets HERE, on the main
         # thread; the thunk below runs on the worker and touches only the
         # controller (the whole method is dispatched regardless of `key`, so a
         # future distribution method inherits background execution for free).
-        jobs = [(iid, key, {**self._baseline_kwargs(iid), **self._grid_kwargs(key)})
+        jobs = [(iid, key, {**self._baseline_kwargs(iid, key), **self._grid_kwargs(key)})
                 for iid in ids for _label, key in methods]
-        labels = {iid: _meas_short(ws[iid]) for iid in ids}
+        # Each fit's signature is taken HERE too, beside the kwargs it describes: a field
+        # moved while the fit runs then leaves it stale on arrival, never fresh.
+        sigs = {(iid, key): self._fit_signature(iid, key) for iid, key, _kw in jobs}
+        labels = {iid: measurement_display_name(ws[iid]) for iid in ids}
         controller = self.controller
         epoch = self._run_epoch
-        sig = self._run_signature([(iid, key) for iid, key, _kw in jobs])
 
         def work():
             results, failures = [], []
@@ -1968,22 +3510,31 @@ class _DistributionTab(QtWidgets.QWidget):
                 try:
                     res = controller.run_distribution(iid, key, **kw)
                     results.append((iid, key, res))
-                except Exception as exc:           # per (measurement, method)
-                    failures.append(
-                        f'{labels[iid]}·{key.upper()}: {humanize_field_names(str(exc))}')
+                except Exception as exc:  # noqa: BLE001 — per (measurement, method), recorded; per (measurement, method)
+                    failures.append((iid, key, f'{labels[iid]}·{key.upper()}: '
+                                               f'{humanize_field_names(str(exc))}'))
             return results, failures
 
         def done(payload) -> None:
-            if epoch != self._run_epoch:
-                return          # selection changed while the fit ran — stale
-            self._results, self._failures = payload
-            self._results_sig = sig
-            self.export_button.setEnabled(bool(self._results))
+            # Every finished fit lands in its own slot whatever is ticked now: it is a
+            # valid fit of that (measurement, method), and only its display is gated
+            # (`_shown`, ui_style_guide.md §4.1 item 2).
+            results, failures = payload
+            for iid, key, res in results:
+                self._fits[(iid, key)] = {'result': res, 'sig': sigs[(iid, key)]}
+            for iid, key, _msg in failures:
+                # Only THIS pair's slot: a failed NNLS must not drop the run's CONTIN.
+                self._fits.pop((iid, key), None)
+            self._failures = {(iid, key): msg for iid, key, msg in failures}
             self._draw()
+            # The Correlogram tab can draw these too: tell it they exist, and which
+            # methods to tick (a fresh Run ticks its own method).
+            self.fitsChanged.emit(
+                list(dict.fromkeys(key for _iid, key, _res in results)))
 
         def fail(exc: BaseException) -> None:
-            # A failure landing after a selection change must not write onto the
-            # view now shown -- the same epoch guard `done` applies.
+            # A whole-Run failure landing after a tick change must not write onto the
+            # view now shown: the epoch a tick change bumps, read here only.
             QtWidgets.QMessageBox.critical(
                 self, 'Analysis failed',
                 f'Could not run the distribution fit.\n\n'
@@ -2001,9 +3552,23 @@ class _DistributionTab(QtWidgets.QWidget):
     def _as_distribution(result):
         return getattr(result, 'distribution', result)
 
+    def stored_fits(self) -> Dict[Tuple[str, str], Dict]:
+        """Every fit this tab has stored, keyed `(iid, method)`, each with its OWN
+        staleness verdict (`_fit_is_stale`) -- the accessor the Correlogram tab reads
+        through its owning module, which filters by its own ticks.
+
+        Per fit, not per Run: each fit keeps its own slot and signature, so one run's
+        fit can be fresh while another's is stale. Neither this tab's ticks nor its
+        method boxes filter the answer; they choose only what THIS tab shows.
+        """
+        return {(iid, key): {'result': self._as_distribution(v['result']),
+                             'stale': self._fit_is_stale(iid, key)}
+                for (iid, key), v in self._fits.items()}
+
     @QtCore.Slot()
     def _on_export(self) -> None:
-        if not self._results:
+        items = self._shown()
+        if not items:
             return
         weighting, _model = self._active_weighting()
         weighted = weighting != INTENSITY
@@ -2012,36 +3577,54 @@ class _DistributionTab(QtWidgets.QWidget):
         # too, so a reweight-errored curve never writes a Γ-axis (decay-rate) CSV into a file
         # offered as a weighted size distribution.
         axis = 'rh' if weighted else self.axis_combo.currentData()
-        items = list(self._results)
         wd_by = {(iid, key): wd for iid, key, wd in self._weighted}
+
+        name, suffixes = _selection_export_names(
+            self.controller, [(iid, key) for iid, key, _res in items],
+            'weighted_distribution' if weighted else 'distribution')
 
         def do_export(path: str):
             import os
             stem, ext = os.path.splitext(path)
-            siblings = ([] if len(items) == 1
-                        else [f'{stem}_{iid}_{key}{ext}' for iid, key, _res in items])
+            paths = [f'{stem}{sfx}{ext}' for sfx in suffixes]
+            siblings = [] if len(items) == 1 else paths
             if not confirm_overwrite(self, siblings):
                 return None
             written = []
-            for iid, key, res in items:
-                p = path if len(items) == 1 else f'{stem}_{iid}_{key}{ext}'
+            for (iid, key, res), p in zip(items, paths, strict=True):
                 wd = wd_by.get((iid, key)) if weighted else None
                 if wd is not None:
-                    written.append(self.controller.export_weighted_distribution(wd, p))
+                    written.append(
+                        self.controller.export_weighted_distribution(wd, p, item_id=iid))
                 else:
                     # Intensity view, or a curve whose reweight errored: export the
                     # intensity distribution (never silently write nothing).
-                    written.append(self.controller.export_distribution(res, p, axis))
-            return '; '.join(written)
+                    written.append(
+                        self.controller.export_distribution(res, p, axis, item_id=iid))
+            return written                     # summarised by `export_to_csv`
 
-        name = _selection_scoped_name(
-            self.controller, [iid for iid, _key, _res in items],
-            'weighted_distribution' if weighted else 'distribution')
         status = export_to_csv(self, self.controller, name, do_export)
         if status:
             self.status.setText(status)
 
     def _draw(self) -> None:
+        """Redraw the plot, the peak table, the bottom panel and the status and flag
+        lines from the store's SHOWN subset (`_shown`) -- the one redraw every gesture
+        ends in: a Run landing, a tick, a method box, a fit field, a view control, a
+        re-point. On the axes built once; nothing shown empties them through `_clear`."""
+        shown = self._shown()
+        self.export_button.setEnabled(bool(shown))
+        if not shown:
+            self._clear('Tick measurements + methods, then Run.'
+                        if not self._ticked_pairs()
+                        else 'No current fit for the ticked runs — press Run.')
+            self.status.setText(self._unshown_note())
+            # `_clear` drops the flag; a ticked pair's failure in the last Run is still
+            # news, and with nothing drawn the flag is where it can still be read.
+            skipped = self._ticked_failures()
+            set_flag(self.flag_label, 'skipped: ' + '; '.join(skipped) if skipped else '',
+                     problem=True)
+            return
         if self._placeholder is not None:    # leaving the empty-state: drop the message
             self._placeholder.remove()
             self._placeholder = None
@@ -2059,33 +3642,61 @@ class _DistributionTab(QtWidgets.QWidget):
         # Plot saves suggest the same stem as the CSV export for the active view.
         set_plot_export_name(
             self.canvas,
-            _selection_scoped_name(
-                self.controller, [iid for iid, _key, _res in self._results],
-                'weighted_distribution' if weighted else 'distribution'))
+            _selection_export_names(
+                self.controller, [(iid, key) for iid, key, _res in shown],
+                'weighted_distribution' if weighted else 'distribution')[0])
         ws = self.controller.workspace.measurements
-        single = len(self._results) == 1
+        single = len(shown) == 1
         peak_items = []          # (x, y, text, color) collected across all curves
+        # Legend material, in draw order: the name each ticked measurement is listed
+        # under, the methods actually drawn, and which of a run's methods failed.
+        legend_names: Dict[str, str] = {}
+        legend_samples: Dict[str, str] = {}
+        methods_drawn: List[str] = []
+        failed_methods: Dict[str, List[str]] = {}
+        drawn: List[Tuple] = []      # (iid, method, distribution) actually plotted
         self._weighted = []
         reweight_errors: List[str] = []
         labelled_invalid = False        # label the shared 'outside model validity' entry once
-        for iid, _key, res in self._results:
+        # As on the Correlogram tab: a legend carries the sample only when the ticked
+        # set spans samples.
+        prefixes = _sample_prefixes(self.controller,
+                                    [iid for iid, _k, _r in shown])
+        for iid, key, res in shown:
             d = self._as_distribution(res)
             color = self.selection.color_for(iid)
-            label = f'{_meas_short(ws[iid])} · {d.method.upper()}'
-            # A failed lognormal fit draws the seed estimate, not a fit — say so in
-            # the legend, matching the cumulant table's '(failed)' cell.
+            # Colour + MARKER are the measurement, line STYLE is the method -- the
+            # Correlogram tab's coding, so a dash pattern means the same thing on both.
+            # The marker is what carries "which measurement" for a reader who cannot use
+            # the colour (R10.1), now that line style has been taken by the method; it
+            # is placed sparsely, since a marker per inversion-grid point is a band.
+            marker = self.selection.marker_for(iid)
+            ls = _METHOD_LINESTYLE.get(key, '-')
+            name = measurement_display_name(ws[iid], sample=prefixes[iid])
+            # The legend bookkeeping is at the BOTTOM of this loop, where the curve
+            # is actually drawn: up here, a skipped curve still got an entry.
+            # A failed lognormal fit draws the seed estimate, not a fit -- say so in
+            # the legend (module docstring, owner-ruled: a SAVED image must not present
+            # a seed curve as fitted). With one entry per measurement rather than one
+            # per curve, the note has to name WHICH method failed, since the entry now
+            # stands for every method drawn for that run.
             if not getattr(d, 'success', True):
-                label += ' (failed)'
+                failed_methods.setdefault(iid, []).append(_fit_label(key))
+            # Every curve is drawn but none is LISTED: the legend below carries one
+            # entry per measurement plus one per method, not one per curve. Nine ticked
+            # runs drew nine `name . METHOD` entries, which overran the axes on both
+            # sides and covered the y-label (measured 2026-09-18).
+            label = '_nolegend_'
             wd = None
             if weighted:
                 try:
                     wd = self.controller.reweight_distribution(iid, d, weighting, model)
                 except OpticalModelError as exc:
-                    reweight_errors.append(f'{_meas_short(ws[iid])}: {exc}')
-                except Exception as exc:                       # defensive
+                    reweight_errors.append(f'{measurement_display_name(ws[iid])}: {exc}')
+                except Exception as exc:  # noqa: BLE001 — surfaced in reweight_errors; defensive
                     reweight_errors.append(
-                        f'{_meas_short(ws[iid])}: {humanize_field_names(str(exc))}')
-            self._weighted.append((iid, _key, wd))
+                        f'{measurement_display_name(ws[iid])}: {humanize_field_names(str(exc))}')
+            self._weighted.append((iid, key, wd))
             if wd is not None:
                 # Label the shared out-of-range marker only on the FIRST flagged curve, so
                 # an overlay's legend never repeats it -- without a second ax.legend() dedup
@@ -2096,47 +3707,61 @@ class _DistributionTab(QtWidgets.QWidget):
                     labelled_invalid = True
                 plot_weighted_distribution(
                     wd, ax=self.ax, label=label, color=color, fill=single,
-                    linestyle=self.selection.linestyle_for(iid) or '-',
-                    invalid_label=inv_lbl)
+                    linestyle=ls, marker=marker, invalid_label=inv_lbl)
                 peak_items.extend(self._collect_weighted_peak_labels(wd, color))
             elif not weighted:
                 plot_distribution(d, ax=self.ax, axis=axis, label=label,
                                   color=color, fill=single,
-                                  linestyle=self.selection.linestyle_for(iid) or '-')
+                                  linestyle=ls, marker=marker)
                 peak_items.extend(self._collect_peak_labels(d, res, axis, color))
-            # weighted-but-wd-None (a reweight error): skip the curve; the flag explains.
+            else:
+                # weighted-but-wd-None (a reweight error): the curve is skipped and the
+                # flag explains. Nothing about it is listed, and it gets no residual.
+                continue
+            drawn.append((iid, key, d))
+            legend_names.setdefault(iid, name)
+            legend_samples.setdefault(
+                iid, prefixes[iid] or _sample_label_of(self.controller, iid))
+            methods_drawn.append(key)
+        self._drawn = drawn
         self._reweight_errors = reweight_errors
         # One de-collided pass so peaks that coincide across curves stagger (capped at
         # 6 + "+N more") instead of piling into an unreadable blob.
         annotate_decollided(self.ax, peak_items)
+        self._draw_legend(legend_names, methods_drawn, failed_methods,
+                          groups=legend_samples)
         self.ax.set_title(
             f'DLS {WEIGHTING_LABELS[weighting].lower()}-weighted size distribution'
             if weighted else 'DLS size / rate distribution')
         self._draw_bottom()                  # residuals OR the CONTIN α-sweep
         self.canvas.draw_idle()
+        self._floor_resid_ratio()            # after the layout is real, not before
         self.axis_bar.attach(self.ax)
         # Status now carries only operational notes; per-result peaks live in the
         # Summary tab (which is also where they persist).
         notes = []
-        n_contin = sum(1 for _i, k, _r in self._results if k == 'contin')
+        n_contin = sum(1 for _i, k, _r in shown if k == 'contin')
         if n_contin > 3:
             notes.append('CONTIN runs an α sweep per measurement — this can be slow.')
-        # α-selection provenance: every CONTIN run this pass shares the same selector
-        # (seeded from one control), so one note names it (method disclosure —
-        # a distribution is never ambiguous about how α was chosen). The wording comes
-        # from the shared `alpha_selection_note` helper the CSV export also uses, so the
-        # two surfaces can't drift as selectors are added. A user-supplied
+        # α-selection provenance: every CONTIN fit shown is fresh, and a fresh fit's
+        # signature carries the α-selection fields as they stand now, so every one ran
+        # under the one selector the control shows and one note names it (method
+        # disclosure — a distribution is never ambiguous about how α was chosen). The
+        # wording comes from the shared `alpha_selection_note` helper the CSV export also
+        # uses, so the two surfaces can't drift as selectors are added. A user-supplied
         # α returns '' here (the α input control already shows it).
-        contin_res = next((r for _i, k, r in self._results if k == 'contin'), None)
+        contin_res = next((r for _i, k, r in shown if k == 'contin'), None)
         alpha_note = alpha_selection_note(
             getattr(contin_res, 'alpha_selection_method', None),
-            getattr(contin_res, 'ftest_prob_reject', None), style='gui')
+            getattr(contin_res, 'ftest_prob_reject', None),
+            gcv_gamma=getattr(contin_res, 'gcv_gamma', None), style='gui')
         if alpha_note:
             notes.append(alpha_note)
-        if self.controller.is_dirty() and self._results:
+        if self.controller.is_dirty():
             notes.append('(ran on last committed values)')
-        if self._results_stale():
-            notes.append(_STALE_HINT)
+        unshown = self._unshown_note()       # the ticked runs this plot is NOT showing
+        if unshown:
+            notes.append(unshown)
         notes.append('Peak values are also in the Summary tab.')
         self.status.setText('   '.join(notes))
         # A skipped run is a data/operational problem, not a muted status note: render it
@@ -2146,7 +3771,7 @@ class _DistributionTab(QtWidgets.QWidget):
         # fit_contin) and only the how-to advice is added here -- kept on the same visible
         # flag, same tier (R5.2: one condition class). Empty text clears it.
         flag_msgs = []
-        failures = getattr(self, '_failures', None)
+        failures = self._ticked_failures()     # the last Run's, for the pairs ticked now
         if failures:
             flag_msgs.append('skipped: ' + '; '.join(failures))
         if getattr(self, '_reweight_errors', None):
@@ -2154,16 +3779,47 @@ class _DistributionTab(QtWidgets.QWidget):
         # The sweep-edge caution is the result's own reliability_note (one wording on
         # every surface); the GUI adds only the how-to advice. Deduped, order-preserving.
         edge_notes = list(dict.fromkeys(
-            getattr(r, 'reliability_note', '') for _i, k, r in self._results
+            getattr(r, 'reliability_note', '') for _i, k, r in shown
             if k == 'contin' and getattr(r, 'reliability_note', '')))
+        # The advice follows which precondition the note names -- the F-test's two manual
+        # checks each have their own remedy, matched on the engine's own constants (the
+        # band note's stem is the template up to its first format field), never on
+        # retyped wording; every other state keeps the generic sweep advice.
+        band_stem = FTEST_BAND_NOTE_TEMPLATE.split('{', 1)[0]
         for note in edge_notes:
-            flag_msgs.append(f'{note} — inspect the α-sweep or widen the α range')
-        for f_iid, _k, r in self._results:
-            if not getattr(self._as_distribution(r), 'success', True):
-                flag_msgs.append(
-                    f'{_meas_short(ws[f_iid])}: lognormal fit did not converge; '
-                    'the curve shows the seed estimate, not a fit')
+            advice = []
+            if FTEST_REFERENCE_NOTE in note:
+                advice.append('lower the α floor')
+            if band_stem in note:
+                advice.append('widen the α range or add sweep points')
+            if not advice:
+                advice.append('inspect the α-sweep or widen the α range')
+            flag_msgs.append(f'{note} — ' + '; '.join(advice))
+        # One sentence however many curves carry it, each run named beside it -- the
+        # same grouping the Correlogram tab's status area uses, on the same helper.
+        # Before this, six failed lognormal curves printed the same sentence six times,
+        # which is the "warnings spam the bottom of the column" this batch set out to
+        # fix on one tab and left standing on its neighbour. No cap: this message has
+        # no per-run value, so the listing degenerates to names and eliding them would
+        # leave the affected runs identified nowhere.
+        failed = [(measurement_display_name(ws[f_iid]),
+                   'lognormal fit did not converge; the curve shows the seed estimate, '
+                   'not a fit')
+                  for f_iid, _k, r in shown
+                  if not getattr(self._as_distribution(r), 'success', True)]
+        flag_msgs.extend(group_status_lines(failed))
         set_flag(self.flag_label, '; '.join(flag_msgs), problem=True)
+        # The drawn fits' own passive `notes` -- the weight's missing count rate, a weight
+        # that could not be formed, a dead channel -- on the neutral tier beside the
+        # reweighted view's. Never on `flag_label`: they qualify a reported fit, they are
+        # not failed preconditions (§5). Deduped by (run, sentence) so a run ticked for two
+        # methods is named once, then grouped so one sentence appears once however many
+        # curves carry it, with the runs named beside it -- the helper the flag label uses
+        # a few lines above.
+        fit_notes = list(dict.fromkeys(
+            (measurement_display_name(ws[iid]), str(line))
+            for iid, _key, d in drawn
+            for line in (getattr(d, 'notes', ()) or ()) if str(line).strip()))
         # Neutral ⓘ model-dependence note for the drawn reweighted view. Aggregate UNIQUE
         # note lines across ALL drawn curves (deduped, order-preserving), so a later curve's
         # out-of-validity caveat is shown even when the first curve is fully in-range — not
@@ -2174,13 +3830,48 @@ class _DistributionTab(QtWidgets.QWidget):
                 for n in wd.notes:
                     if n not in info_lines:
                         info_lines.append(n)
-        set_flag(self.info_label, '\n'.join(info_lines), problem=False)
-        self._refresh_results()
+        set_flag(self.info_label,
+                 '\n'.join(group_status_lines(fit_notes) + info_lines), problem=False)
+        self._refresh_results(shown)
+
+    def _draw_legend(self, names, methods_drawn, failed, groups=None) -> None:
+        """The on-screen KEY, and the dressing that gives the SAVED figure the full
+        legend -- the Correlogram tab's split, with one difference forced by layout.
+
+        THIS figure is a plain 4x1 stack, so it has no empty corner cell to put the key
+        in; it goes below the panel, where four short entries cost about 30 px. The
+        CONTENT and the coding are identical to the other tab's: measurement names on
+        the written file, a method key on screen.
+
+        Any artist the plotters labelled themselves -- the shared "outside model
+        validity" marker -- is kept, ahead of the entries built here. A failed
+        lognormal's note rides its measurement entry into the export legend, which is
+        the surface the owner's ruling is about (a saved image must not present a seed
+        curve as fitted); on screen the same fact is on the status flag.
+        """
+        if self.ax.get_legend() is not None:
+            self.ax.get_legend().remove()
+        plotter = list(zip(*self.ax.get_legend_handles_labels(), strict=True))             if self.ax.get_legend_handles_labels()[1] else []
+        key_entries = plotter + _method_legend_entries(dict.fromkeys(methods_drawn))
+        _draw_key(self.figure, key_entries)
+
+        by_sample = {}
+        for iid, name in names.items():
+            note = failed.get(iid)
+            by_sample.setdefault((groups or {}).get(iid) or '', []).append(
+                (iid, name + (f' ({", ".join(note)} failed)' if note else '')))
+        meas_entries, group_rows = _measurement_legend_entries(
+            self.selection, by_sample)
+        set_plot_export_dressing(
+            self.canvas,
+            export_legend_dressing(self.figure, meas_entries + key_entries,
+                                   group_rows)
+            if names else None)
 
     # ---- bottom panel: residuals <-> CONTIN α-sweep ----
     def _contin_results(self) -> list:
-        """The ticked CONTIN results (in run order) — the only ones with an α-sweep."""
-        return [(iid, res) for iid, key, res in self._results if key == 'contin']
+        """The shown CONTIN fits (in tick order) — the only ones with an α-sweep."""
+        return [(iid, res) for iid, key, res in self._shown() if key == 'contin']
 
     def _draw_bottom(self) -> None:
         """Draw the lower panel per the combo: fit residuals, or the CONTIN α-sweep.
@@ -2195,42 +3886,69 @@ class _DistributionTab(QtWidgets.QWidget):
             self._draw_residuals()
 
     def _draw_residuals(self) -> None:
-        """Per-curve fit residuals (data − reconstructed g₂−1) vs delay time, in the
-        active display units so the τ axis matches the rest of the app."""
-        for iid, _key, res in self._results:
-            d = self._as_distribution(res)
-            tau = np.asarray(d.fit_tau_s, dtype=float) * _disp_factor('time')
-            self.resid_ax.plot(tau, np.asarray(d.residuals, dtype=float),
-                               '-', color=self.selection.color_for(iid), lw=1.0)
-        self.resid_ax.axhline(0.0, color='0.6', lw=0.8)
-        self.resid_ax.set_xscale('log')
-        self.resid_ax.set_xlabel(rf'Delay time $\tau$ ({_disp_unit("time")})')
-        self.resid_ax.set_ylabel('resid.')
+        """Per-curve fit residuals (data − reconstructed g₂−1) vs delay time, through
+        the one helper the Correlogram tab's residual panel also uses -- so the two
+        panels cannot disagree about what a residual panel shows or how it is coded.
+
+        THIS tab's ticked methods only: a parametric residual never appears here, and a
+        distribution residual can appear here and on the Correlogram tab alike. Before
+        the shared helper this drew every method of one measurement in one colour and
+        one solid line, so NNLS and CONTIN could not be told apart; the method line
+        style is what fixes that.
+        """
+        draw_fit_residuals(
+            self.resid_ax,
+            [(self.selection.color_for(iid), key, d)
+             for iid, key, d in getattr(self, '_drawn', [])])
+        # NO `_hide_shared_x` here. This tab's two panels do NOT share an x axis --
+        # the distribution is drawn against Rh (or Γ) and the residual against delay
+        # time τ, which this file's own construction comment states twice and
+        # `_widen_row_gap(hspace=0.20)` exists for. Stripping the upper panel's axis
+        # left a size distribution with no axis of its own sitting over a delay-time
+        # axis on an unrelated range -- a peak position readable off the wrong
+        # quantity, on screen and in the saved file. The helper is the CORRELOGRAM
+        # tab's, where both panels really are τ.
 
     def _draw_alpha_sweep(self, contin: list) -> None:
         """Overlay each ticked CONTIN result's α-selection sweep in its curve color,
         method-aware (L-curve corner / GCV minimum / F-test curve). NNLS/lognormal have
         no sweep; if nothing to draw, show the CONTIN-only empty-state message instead.
 
-        Every CONTIN result here comes from ONE Run pass (which replaces `_results`
-        wholesale and reads a single α-selection control), so they all share one
-        `alpha_selection_method` and therefore one ordinate — the overlay never mixes an
-        L-curve (residual-vs-solution) with a GCV/F-test (score-vs-α) axis on this shared
-        panel. If runs ever become incremental, guard for a mixed-method set here."""
+        Every CONTIN result here is FRESH (`_shown`), and a fresh fit's signature
+        carries the α-selection fields as they stand now, so every one ran under the one
+        selector the control shows: they share one `alpha_selection_method` and
+        therefore one ordinate — the overlay never mixes an L-curve
+        (residual-vs-solution) with a GCV/F-test (score-vs-α) axis on this shared panel.
+        A fit run under another selector is stale: it keeps its slot and is not drawn,
+        here or above. That freshness rule is what holds this premise now that fits
+        persist across Runs; a shown set that could mix selectors would need a guard
+        here."""
         ws = self.controller.workspace.measurements
         drawn = 0
         for iid, res in contin:
             lcurve = getattr(res, 'lcurve', None)
             if lcurve is None:
                 continue
+            # The halo is a POSITIONAL mark, keyed on the states that say where the pick
+            # sits -- the two edge flags and the L-curve's no-corner note (its one-point
+            # sweep included), which reports the least-regularized end -- never on the
+            # `alpha_reliable` roll-up above them: the F-test's two precondition notes
+            # are about the sweep, not the pick's position, and draw nothing here (the
+            # flag line beside the plot carries them). `plot_lcurve` keys the glyph by
+            # the two edge names, so no-corner rides the floor mark; the wording each
+            # state gets is the result's own reliability_note.
+            ceiling = bool(getattr(res, 'alpha_at_ceiling', False))
+            positional = (ceiling or bool(getattr(res, 'alpha_at_floor', False))
+                          or ALPHA_NO_CORNER_NOTE in getattr(res, 'reliability_note', ''))
             try:
                 plot_lcurve(
                     lcurve, ax=self.resid_ax,
                     method=getattr(res, 'alpha_selection_method', 'lcurve'),
                     color=self.selection.color_for(iid),
-                    label=_meas_short(ws[iid]) if iid in ws else None,
-                    mark_ceiling=getattr(res, 'alpha_at_ceiling', False),
-                    mark_floor=getattr(res, 'alpha_at_floor', False))
+                    label=measurement_display_name(ws[iid]) if iid in ws else None,
+                    mark_ceiling=ceiling,
+                    mark_floor=positional and not ceiling,
+                    gcv_gamma=getattr(res, 'gcv_gamma', None))
                 drawn += 1
             except ValueError:
                 # No sweep to show for this result: a user-fixed α (method 'user' —
@@ -2249,7 +3967,7 @@ class _DistributionTab(QtWidgets.QWidget):
     @QtCore.Slot()
     def _on_bottom_changed(self) -> None:
         """Redraw only the lower panel when the Residuals ↔ α-sweep combo changes."""
-        if not self._results:
+        if not self._shown():
             return
         self.resid_ax.set_axis_on()          # a prior empty-state may have hidden it
         self.resid_ax.clear()
@@ -2262,33 +3980,33 @@ class _DistributionTab(QtWidgets.QWidget):
         if not contin:
             return
 
+        # No method token: the alpha sweep is CONTIN's own diagnostic, so the analysis
+        # offers no choice to name.
+        name, suffixes = _selection_export_names(
+            self.controller, [(iid, None) for iid, _res in contin], 'alpha_sweep')
+
         def do_export(path: str):
             import os
             stem, ext = os.path.splitext(path)
-            siblings = ([] if len(contin) == 1
-                        else [f'{stem}_{iid}{ext}' for iid, _res in contin])
+            paths = [f'{stem}{sfx}{ext}' for sfx in suffixes]
+            siblings = [] if len(contin) == 1 else paths
             if not confirm_overwrite(self, siblings):
                 return None
             written = []
-            for iid, res in contin:
-                p = path if len(contin) == 1 else f'{stem}_{iid}{ext}'
-                written.append(self.controller.export_lcurve(res, p))
-            return '; '.join(written)
+            for (iid, res), p in zip(contin, paths, strict=True):
+                written.append(self.controller.export_lcurve(res, p, item_id=iid))
+            return written                     # summarised by `export_to_csv`
 
-        status = export_to_csv(
-            self, self.controller,
-            _selection_scoped_name(self.controller, [iid for iid, _res in contin],
-                                   'alpha_sweep'),
-            do_export)
+        status = export_to_csv(self, self.controller, name, do_export)
         if status:
             self.status.setText(status)
 
-    def _refresh_results(self) -> None:
-        """Fill the peak-results panel from the ticked results — one colored column per
-        (measurement · method), positional-peak rows. Mirrors the
+    def _refresh_results(self, shown: List[Tuple[str, str, object]]) -> None:
+        """Fill the peak-results panel from the `shown` fits — one colored row per
+        (measurement · method), positional-peak columns. Mirrors the
         Correlogram results panel; reuses the same peak source as the plot labels."""
         ws = self.controller.workspace.measurements
-        cols = [(iid, key, res) for iid, key, res in self._results if iid in ws]
+        cols = [(iid, key, res) for iid, key, res in shown if iid in ws]
         # When a reweighted view is active, the peak table shows the SAME weighting as the
         # plot (rh, fraction-in-weighting); otherwise the intensity peaks. A curve whose
         # reweight errored (wd is None) shows no peaks.
@@ -2308,35 +4026,55 @@ class _DistributionTab(QtWidgets.QWidget):
         n_rows = max(max_peaks, 1)
         table = self.result_table
         table.clear()
-        table.setColumnCount(1 + len(cols))
-        table.setRowCount(n_rows)
+        # One ROW per (run · method), one COLUMN per positional peak -- transposed from
+        # the column-per-run shape this table had, for the reason the Correlogram glance
+        # table was rebuilt: this one grows a column per measurement AND per method, so
+        # it failed by construction faster than that one did. The peak count is bounded
+        # (three fit across the control column); the ticked set is not.
+        table.setColumnCount(1 + n_rows)
+        table.setRowCount(len(cols))
         table.horizontalHeader().setVisible(True)
-        suffix = f' · {WEIGHTING_LABELS[weighting]}' if weighted else ''
+        # Units live in the HEADER so a cell is '29.8 · 85%' and three peaks fit.
         table.setHorizontalHeaderLabels(
-            ['', *[f'{_meas_short(ws[iid])} · {key.upper()}{suffix}'
-                   for iid, key, _r in cols]])
-        for col, (iid, _k, _r) in enumerate(cols, start=1):
-            hi = table.horizontalHeaderItem(col)
-            if hi is not None:
-                hi.setForeground(QtGui.QColor(self.selection.color_for(iid)))
-        table.horizontalHeader().setSectionResizeMode(
-            0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        for col in range(1, 1 + len(cols)):
-            table.horizontalHeader().setSectionResizeMode(
-                col, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            ['Measurement', *[f'{_ordinal_peak(r)} (nm · %)' for r in range(n_rows)]])
+        # The weighting names the whole table, not each column: it is one control's
+        # value, and repeating it per column was spending the width the peaks need.
+        self.results_label.setText(
+            f'Peak results — {WEIGHTING_LABELS[weighting]}' if weighted
+            else 'Peak results')
+        # Left-elided and capped like the Correlogram glance table, same reason: a file
+        # stem's TAIL is what tells replicates apart.
+        table.setTextElideMode(QtCore.Qt.TextElideMode.ElideLeft)
         # Distribution peaks are from an ill-posed inversion — no honest ±
         # — so the Rh uses the documented fixed-sig fallback, never a fabricated ±.
         sig = self.controller.settings.no_uncertainty_sig_figs
-        for r in range(n_rows):
-            table.setItem(r, 0, QtWidgets.QTableWidgetItem(_ordinal_peak(r)))
-            for col, peaks in enumerate(peaks_per, start=1):
-                if r < len(peaks):
-                    rh_nm, weight = peaks[r]
-                    txt = (f'{format_fixed_sig(rh_nm, sig)} nm · '
+        for r, (iid, key, _res) in enumerate(cols):
+            name = QtWidgets.QTableWidgetItem(
+                f'{measurement_display_name(ws[iid])} · {key.upper()}'
+                if iid in ws else key.upper())
+            name.setForeground(QtGui.QColor(self.selection.color_for(iid)))
+            name.setIcon(marker_swatch(self.selection.color_for(iid),
+                                       self.selection.marker_for(iid)))
+            if iid in ws:
+                name.setToolTip(measurement_hover_card(ws[iid]))
+            table.setItem(r, 0, name)
+            peaks = peaks_per[r]
+            for c in range(1, 1 + n_rows):
+                if c - 1 < len(peaks):
+                    rh_nm, weight = peaks[c - 1]
+                    txt = (f'{format_fixed_sig(rh_nm, sig)} · '
                            f'{format_fixed_sig(weight * 100, sig)}%')
                 else:
                     txt = '—'
-                table.setItem(r, col, QtWidgets.QTableWidgetItem(txt))
+                it = QtWidgets.QTableWidgetItem(txt)
+                it.setToolTip(txt)
+                table.setItem(r, c, it)
+        table.resizeColumnsToContents()
+        if table.columnWidth(0) > NAME_COL_MAX_W:
+            table.setColumnWidth(0, NAME_COL_MAX_W)
+        for c in range(1, 1 + n_rows):
+            table.horizontalHeader().setSectionResizeMode(
+                c, QtWidgets.QHeaderView.ResizeMode.Stretch)
         # No max-height cap: the peak table sits in a stretch slot of the vertical
         # splitter, so it should fill (and be resizable into) that slot rather than
         # stay pinned to a row-count height (which stopped the results section from
@@ -2394,6 +4132,13 @@ class _DistributionTab(QtWidgets.QWidget):
             self._placeholder = None
         self.ax.clear()
         self.resid_ax.clear()
+        # A figure legend is NOT dropped by `ax.clear()` and `show_plot_placeholder`
+        # only HIDES the axes, so without this the empty-state message renders over the
+        # last run's legend, naming curves that are not drawn -- and a save of that
+        # state writes it. The export dressing goes with it, for the same reason.
+        self.figure.legends.clear()
+        set_plot_export_dressing(self.canvas, None)
+        self._drawn = []
         # Hide BOTH axes and show one centred grey message via the shared helper — the
         # clean empty-state look (a blank 0–1 box reads as broken). _draw restores them.
         self._placeholder = show_plot_placeholder(
@@ -2404,9 +4149,9 @@ class _DistributionTab(QtWidgets.QWidget):
         self._weighted = []
         self._reweight_errors = []
         self.axis_combo.setEnabled(True)        # the weighted view disables it; restore
-        # Drop any stale skipped-run flag: this is the reset choke point (selection
-        # change etc.), and _draw — the only place the flag is set — does not run on a
-        # cleared/empty-results state, so the red alarm would otherwise linger.
+        # Drop any stale skipped-run flag: this is the reset choke point, and only
+        # `_draw` sets the flag -- after this call when nothing is shown, re-stating just
+        # the ticked pairs' failures -- so the red alarm cannot linger.
         self.flag_label.clear()
         self.info_label.clear()
 
@@ -2420,10 +4165,17 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
 
     selectionChanged = QtCore.Signal()           # ticked include-set changed (for the mirror)
 
-    def __init__(self, controller, kind: str, parent=None) -> None:
+    def __init__(self, controller, kind: str, parent=None, *, region=None) -> None:
         super().__init__(parent)
         self.controller = controller
         self.kind = kind                       # 'gamma_q2' or 'conc_extrap'
+        # The DLS tab's shared region (owned by DLSModule), read only when this tab's
+        # "use the Correlogram tab's delay window and baseline" box is ticked; a
+        # standalone tab gets one of its own that nothing ever sets.
+        self._region = region if region is not None else _AnalysisRegion()
+        # (sid, fraction) -> is that box ticked. Per (sample, fraction), like the ticked
+        # set, and never saved: each new (sample, fraction) starts unticked.
+        self._use_region: Dict[tuple, bool] = {}
         self.item_id: Optional[str] = None
         self._runnable = False
         # The fit stores are keyed (sample_id, fraction), NOT sample_id alone:
@@ -2445,26 +4197,16 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        _, left, right = make_split_panels(self, left_min_width=300,
-                                           sizes=(360, 740))
+        splitter, left, right = make_split_panels(self, left_min_width=300,
+                                                  sizes=(360, 740))
 
-        # ---- controls section ----
+        # ---- controls section (the §3 column template: picker, then the region box
+        # and Run, then results; Export and the status pinned under the column) ----
         controls = QtWidgets.QWidget()
         cl = QtWidgets.QVBoxLayout(controls); cl.setContentsMargins(0, 0, 0, 0)
-        note = ('Fits Γ = D q² across the sample\'s DLS angles (current Mw '
-                'fraction).' if self.kind == 'gamma_q2' else
-                'Extrapolates D(c) → c→0 across the sample\'s DLS concentrations '
-                '(current Mw fraction).')
-        lbl = ThemedLabel(note, role='hint', size=11); lbl.setWordWrap(True)
-        cl.addWidget(lbl)
-        # Make the data source explicit AND that nothing is computed until Run.
-        src = ThemedLabel(
-            'Nothing is fitted until you press Run: the table below lists this sample\'s '
-            'measurements, and Run computes Γ (and D = Γ/q²) for each from an internal '
-            '2nd-order cumulant fit — independent of any saved Correlogram/Distribution '
-            'result — using the global skip-channels + cumulant method (Settings).',
-            role='hint', size=10)
-        src.setWordWrap(True); cl.addWidget(src)
+        self.region_box = RegionCheckBox(self._region)
+        self.region_box.toggled.connect(self._on_region_toggled)
+        cl.addWidget(self.region_box)
         self.run_button = QtWidgets.QPushButton('Run')
         self.run_button.setToolTip(BACKGROUND_RUN_TOOLTIP)
         self.run_button.clicked.connect(self._on_run)
@@ -2472,10 +4214,8 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         self.export_button = QtWidgets.QPushButton('Export CSV…')
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._on_export)
-        cl.addWidget(self.export_button)
         self.status = QtWidgets.QLabel('')
         self.status.setWordWrap(True)
-        cl.addWidget(self.status)
 
         # ---- per-measurement table section (tick to include) ----
         tsec = QtWidgets.QWidget()
@@ -2487,6 +4227,14 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             'Measurements (tick to include in the fit)',
             'Tick which of this sample\'s measurements enter the fit, then press Run.',
             bullets=[
+                ('Fits Γ = D q² across the sample\'s DLS angles (current Mw fraction).'
+                 if self.kind == 'gamma_q2' else
+                 'Extrapolates D(c) → c→0 across the sample\'s DLS concentrations '
+                 '(current Mw fraction).'),
+                'Nothing is fitted until you press <b>Run</b>. Run computes Γ (and '
+                'D = Γ/q²) for each ticked measurement from its own cumulant fit — '
+                'independent of any saved Correlogram/Distribution result — using the '
+                'Settings skipped channels, cumulant method and cumulant order.',
                 'Only this sample\'s DLS measurements appear — it is a single-sample fit.',
                 'The fit needs ≥ 2 distinct '
                 + ('angles.' if self.kind == 'gamma_q2' else 'concentrations.'),
@@ -2516,9 +4264,9 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
                  'is dropped by the fit itself — its concentration is marked with a '
                  'dotted line on the plot and named in the notice under the results.')]))
         # Empty/ineligible-state hint + NaN-temperature sibling note.
-        self.table_note = ThemedLabel('', role='hint', size=10)
+        self.table_note = ThemedLabel('', role='hint', size=10, hide_when_empty=True)
         self.table_note.setWordWrap(True); tl.addWidget(self.table_note)
-        self.temp_note = ThemedLabel('', role='hint', size=10)
+        self.temp_note = ThemedLabel('', role='hint', size=10, hide_when_empty=True)
         self.temp_note.setWordWrap(True); tl.addWidget(self.temp_note)
         # Selection helpers: Select all / none + "tick all at X".
         helper = QtWidgets.QWidget()
@@ -2563,18 +4311,26 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         rl.addWidget(self.result_table)
         self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
-        rl.addWidget(self.flag_label)
         # Passive ⓘ notices carried on the result (e.g. a mixed sample identity) — a
         # neutral qualifier tier, separate from the severity-tracking flag_label above.
         # The analysis emits the same text via warnings.warn (keep-both).
         self.notes_label = ThemedLabel('', size=11)
         self.notes_label.setWordWrap(True)
-        rl.addWidget(self.notes_label)
+        # The notes SCROLL: their length follows the result -- each run's relayed
+        # notes, a region note -- and a pane floor sized when the tab was built
+        # overlapped them onto the table once they grew (measured at the shipped window
+        # size: 237 px of content in a 221 px pane). The table keeps its fixed floor
+        # above them. The flag is pinned under the column with the status (R8.6).
+        rl.addWidget(scrolling_notes(self.notes_label), 1)
 
+        # Picker first, then the region box and Run, then results (the §3 column
+        # template). The controls pane is two rows, so it takes no share of extra height.
         vstack = make_vertical_plot_stack(
-            [controls, tsec, rsec], sizes=[200, 220, 160],
-            min_heights=[max(controls.sizeHint().height(), 150), 90, 150])  # rsec: the 5-row results table (R3.2)
+            [tsec, controls, rsec], sizes=[260, 70, 250],
+            min_heights=[90, controls.sizeHint().height(), 150],  # rsec: the 5-row results table (R3.2)
+            stretch=(1, 0, 1))
         left.addWidget(vstack, 1)
+        pin_under_column(splitter, self.export_button, self.status, self.flag_label)
 
         self.figure = Figure(figsize=(5.2, 4.3), constrained_layout=True)
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
@@ -2648,6 +4404,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         if ckey != self._last_ckey:
             self._run_epoch += 1     # re-pointed: drop any in-flight run's display
         self._last_ckey = ckey
+        self.region_box.set_checked_silently(self._use_region.get(ckey, False))
         if not (runnable and sid is not None):
             self.table.setRowCount(0)
             self.run_button.setEnabled(False)
@@ -2713,13 +4470,49 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         """Everything a Γ-q² / D-vs-c fit for (sample, fraction) reads beyond its raw
         data: the committed params of the TICKED measurements (their ids ride in the
         signature, so a tick change moves it) and the settings the engine seeds --
-        skip_initial_channels, the cumulant method, the SE estimator (the ± is
+        skip_initial_channels, the cumulant method, the cumulant fit cutoff and the
+        cumulant residual weighting (the Gamma-vs-q2 fit reads the user's values), the SE
+        estimator (the ± is
         estimator-routed; the confirm in Settings promises a recompute). Stored with
         the cached fit at dispatch and compared on redisplay, so a cached fit is flagged
-        stale exactly when a re-Run would read different inputs."""
+        stale exactly when a re-Run would read different inputs. The cumulant order joins
+        them (every point fits at the Settings order), and so does the region choice --
+        this (sample, fraction)'s box and, when ticked, the region's applied parts -- so
+        toggling the box, or moving the region while it is ticked, flags a shown fit
+        stale and an unticked one is left alone."""
         s = self.controller.settings
         return (self.controller.committed_signature(self._included.get(ckey, set())),
-                s.skip_initial_channels, s.cumulant_method, s.se_estimator)
+                s.skip_initial_channels, s.cumulant_method, s.cumulant_fit_cutoff,
+                s.cumulant_weighting, s.cumulant_order, s.se_estimator,
+                self.region_box.key(self._use_region.get(ckey, False)))
+
+    # ---- the region choice ----
+    def _on_region_toggled(self, on: bool) -> None:
+        sid = self._sample_id()
+        if sid is None:
+            return
+        self._use_region[self._ckey(sid)] = bool(on)
+        self._on_region_input_moved()
+
+    def on_region_changed(self) -> None:
+        """The Correlogram tab moved the shared region: relabel the box, and flag a
+        shown result stale if this (sample, fraction)'s box is ticked."""
+        self.region_box.refresh()
+        self._on_region_input_moved()
+
+    def _on_region_input_moved(self) -> None:
+        """Compare the shown fit's stored key against the live one -- stale when they
+        differ, and the hint cleared when they agree again (a box ticked and unticked)."""
+        sid = self._sample_id()
+        if sid is None:
+            return
+        ckey = self._ckey(sid)
+        if ckey not in self._cache:
+            return
+        if self._cache_sig.get(ckey) != self._run_signature(ckey):
+            self.status.setText(_STALE_HINT)
+        elif self.status.text() == _STALE_HINT:
+            self.status.clear()
 
     # ---- per-measurement table (tick to include) ----
     def _refresh_table(self, sid: str) -> None:
@@ -2931,12 +4724,12 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             self.status.clear()
         return enough
 
-    def _run_engine(self, sid: str, frac, include_ids):
+    def _run_engine(self, sid: str, frac, include_ids, region=None):
         if self.kind == 'gamma_q2':
             return self.controller.run_gamma_q2(
-                sid, fraction=frac, include_ids=include_ids)
+                sid, fraction=frac, include_ids=include_ids, region=region)
         return self.controller.run_concentration_extrapolation(
-            sid, fraction=frac, include_ids=include_ids)
+            sid, fraction=frac, include_ids=include_ids, region=region)
 
     @QtCore.Slot()
     def _on_run(self) -> None:
@@ -2972,6 +4765,9 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             self.status.setText(BUSY_NOTICE)
             return
         include_ids = set(self._included.get(ckey, set()))
+        # Read here, on the main thread: the region is a widget-owned value and a handle
+        # may move while the worker fits.
+        region = self.region_box.region_for_run(self._use_region.get(ckey, False))
         sig = self._run_signature(ckey)
         if ckey == self._last_ckey:
             self._run_epoch += 1            # this run supersedes any in flight
@@ -2998,6 +4794,9 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             self._fill_results(res)
             self._draw(res)
             self.status.clear()
+            # The box and the region stay live while the run is in flight: compare the key
+            # it ran under with the live one, as the Mode Map does on landing.
+            self._on_region_input_moved()
 
         def fail(exc: BaseException) -> None:
             # The dialog names the run's own sample; the status line is written only
@@ -3012,7 +4811,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         description = ('Γ vs q² fit' if self.kind == 'gamma_q2'
                        else 'D vs c extrapolation')
         runner().try_submit(
-            lambda: self._run_engine(sid, frac, include_ids),
+            lambda: self._run_engine(sid, frac, include_ids, region),
             done, fail, description=description,
             busy_widgets=(self.run_button,))
 
@@ -3036,7 +4835,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
         for r, (_label, fn) in enumerate(self._result_spec()):
             try:
                 txt = fn(res)
-            except Exception:
+            except Exception:  # noqa: BLE001 — cell shows a dash
                 txt = '—'
             it = self.result_table.item(r, 1)
             if it is not None:
@@ -3099,7 +4898,7 @@ class _SampleAnalysisTab(QtWidgets.QWidget):
             # place the number is read -- the mode-family sibling says it unconditionally.
             if res.is_diffusive:
                 flag = ('Rh is apparent (one concentration'
-                        + ('; z-average from the cumulant Γ' if res.gamma_source == 'cumulant'
+                        + ('; from the cumulant Γ' if res.gamma_source == 'cumulant'
                            else '') + ').')
             elif not math.isfinite(res.r_squared):
                 # No R² means the linearity criteria were never evaluated (the
@@ -3218,9 +5017,18 @@ class _ModeMapTab(QtWidgets.QWidget):
     _STATE_LABELS = {'VV': 'VV (polarized)', 'VH': 'VH (depolarized)',
                      None: 'Unpolarized (VU / untagged)'}
 
-    def __init__(self, controller, parent=None) -> None:
+    def __init__(self, controller, parent=None, *, distribution_fit_values=None,
+                 region=None) -> None:
         super().__init__(parent)
         self.controller = controller
+        # The shared region and this tab's per-(sample, fraction) choice to read it --
+        # the Γ-vs-q² tab's shape (`_SampleAnalysisTab.__init__`).
+        self._region = region if region is not None else _AnalysisRegion()
+        self._use_region: Dict[tuple, bool] = {}
+        # The Distribution sub-tab's current field values, read once per press of the
+        # copy button -- an accessor handed in by the owning module, so neither tab
+        # reaches into the other (the Correlogram tab's `distribution_fits` shape).
+        self._distribution_fit_values = distribution_fit_values
         self.item_id: Optional[str] = None
         self._runnable = False
         self._points: Dict[str, list] = {}       # sid -> metadata rows
@@ -3236,8 +5044,10 @@ class _ModeMapTab(QtWidgets.QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        _, left, right = make_split_panels(self, left_min_width=300,
-                                           sizes=(360, 740))
+        # The Distribution tab's floor and default, for the reason stated there: the
+        # Inversion Settings group carries the same Rh-grid triple-spinbox row.
+        splitter, left, right = make_split_panels(self, left_min_width=385,
+                                                  sizes=(403, 717))
 
         # ---- controls section ----
         controls = QtWidgets.QWidget()
@@ -3263,15 +5073,20 @@ class _ModeMapTab(QtWidgets.QWidget):
                 'mix VV with VH (Γ_VH carries a rotational term).',
                 'Designate one family "fast" and one "slow" to see the '
                 'amplitude report (A_f/A_s vs sin²(θ/2)).',
-                'Both distribution sources invert on the Rh grid set in the '
-                'Settings tab; the α selection there reaches CONTIN only — '
-                'NNLS is the unregularized case and has no α. A denser Rh '
-                'grid resolves more closely-spaced modes and costs sharply '
-                'more time per run.',
-                'The Distribution tab starts from those same Settings but has '
-                'its own per-run fields, and it applies a τ window and baseline '
-                'the map does not — so a run fitted there can resolve '
-                'differently from the same run on this map.']))
+                'The CONTIN and NNLS sources invert on this tab\'s own '
+                '<b>Inversion Settings</b>, which start from the Settings tab: '
+                'the Rh grid and residual weighting and, for CONTIN, the α '
+                'selection (NNLS is the unregularized case and has no α). A '
+                'denser Rh grid resolves more closely-spaced modes and costs '
+                'sharply more time per run.',
+                '<b>Copy from the Distribution tab</b> fills those fields once '
+                'with the Distribution sub-tab\'s current values — tune CONTIN on '
+                'one run there, then map the sample with the same settings. It is '
+                'a one-time copy, not a link: a later change there does not follow.',
+                'Tick <b>Use the Correlogram tab\'s delay window and baseline</b> to '
+                'extract each run over the region set there, as the Correlogram and '
+                'Distribution tabs fit it; unticked, each run keeps its own lag range '
+                'and baseline estimate.']))
         srow = QtWidgets.QWidget()
         sl = QtWidgets.QFormLayout(srow); sl.setContentsMargins(0, 0, 0, 0)
         self.source_combo = QtWidgets.QComboBox()
@@ -3280,13 +5095,13 @@ class _ModeMapTab(QtWidgets.QWidget):
         self.source_combo.setToolTip(
             'Which fit supplies each run\'s modes: the two-mode double-'
             'exponential (fast), or a CONTIN/NNLS distribution\'s resolved '
-            'peaks (slower per run). Both distribution sources invert on the Rh '
-            'grid from the Settings tab, and CONTIN also on the α selection '
-            'there (NNLS has none); the inversion cost rises steeply with grid '
-            'resolution. The Distribution tab seeds its '
-            'per-run fields from the same Settings but can be changed there, '
-            'and applies its own τ window and baseline. See the '
-            'Theory-and-Equations-Guide.')
+            'peaks (slower per run). Both distribution sources invert on the '
+            'Inversion Settings below — the Rh grid and residual weighting, and '
+            'for CONTIN the α selection (NNLS has none); the inversion cost rises '
+            'steeply with grid resolution. The map reads the Correlogram tab\'s τ '
+            'window and baseline only when its box below the source is ticked. See '
+            'the Theory-and-Equations-Guide.')
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         sl.addRow('Source:', self.source_combo)
         self.facet_combo = QtWidgets.QComboBox()
         self.facet_combo.setToolTip(
@@ -3295,14 +5110,57 @@ class _ModeMapTab(QtWidgets.QWidget):
         self.facet_combo.currentIndexChanged.connect(self._on_facet_changed)
         sl.addRow('Polarization:', self.facet_combo)
         cl.addWidget(srow)
+        self.region_box = RegionCheckBox(self._region)
+        self.region_box.toggled.connect(self._on_region_toggled)
+        cl.addWidget(self.region_box)
+        # The inversion's own fields -- the shared group the Distribution sub-tab and the
+        # Settings tab hold -- shown for the distribution sources only: the parametric
+        # double exponential reads none of them.
+        self.inversion_box = QtWidgets.QGroupBox('Inversion Settings')
+        add_help_to_groupbox(
+            self.inversion_box,
+            'What the CONTIN and NNLS sources invert each ticked run on.',
+            bullets=[
+                'They start from the Settings tab’s DLS Distribution Defaults and '
+                'can be changed here for this map; a change marks a map already '
+                'shown as out of date. A Settings-tab Update that changes any setting, '
+                'or Restore defaults, sets them back to the Settings values, replacing '
+                'an edit or a copy made here — as it does the Distribution sub-tab’s '
+                'fields.',
+                'The Rh grid and residual weighting apply to both sources; the α rows '
+                'are CONTIN’s alone, and hide for NNLS.',
+                '<b>Copy from the Distribution tab</b> fills every field once with the '
+                'Distribution sub-tab’s current values. It is a one-time copy, not a '
+                'link: a later change there does not follow, and the map runs on the '
+                'values shown here.',
+                'The CONTIN α range and, for the F-test selector, its level go into the '
+                'map’s notes; each point records its own α, selector, γ and grid.',
+            ])
+        ibox_form = QtWidgets.QFormLayout(self.inversion_box)
+        self.fit_fields = DistributionFitFields(self)
+        self.fit_fields.add_rows(ibox_form)
+        self.fit_fields.seed_from_settings(self.controller.settings)
+        self.fit_fields.changed.connect(self._on_fit_input_moved)
+        self.copy_fields_button = QtWidgets.QPushButton('Copy from the Distribution tab')
+        self.copy_fields_button.setToolTip(
+            'Fill every field above once with the Distribution sub-tab’s current '
+            'values. A one-time copy: a later change on the Distribution sub-tab does '
+            'not follow, and a Settings-tab Update that changes any setting sets the '
+            'fields back to the Settings values.')
+        self.copy_fields_button.clicked.connect(self._on_copy_fit_fields)
+        self.copy_fields_button.setVisible(self._distribution_fit_values is not None)
+        ibox_form.addRow(self.copy_fields_button)
+        cl.addWidget(self.inversion_box)
+        self._sync_source_controls()
         self.run_button = QtWidgets.QPushButton('Run')
         self.run_button.setToolTip(BACKGROUND_RUN_TOOLTIP)
         self.run_button.clicked.connect(self._on_run)
-        cl.addWidget(self.run_button)
+        # Run is pinned under the scrolled controls and Export under the column (the
+        # §3 column template), so the Inversion Settings group a distribution source
+        # shows can never carry them out of view.
         self.export_button = QtWidgets.QPushButton('Export CSV…')
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._on_export)
-        cl.addWidget(self.export_button)
         self.bounds_button = QtWidgets.QPushButton('Integration bounds…')
         self.bounds_button.setEnabled(False)
         self.bounds_button.setToolTip(
@@ -3325,10 +5183,9 @@ class _ModeMapTab(QtWidgets.QWidget):
             'partitioned by them. A recorded set never follows later re-fits '
             '— record again for a fresh one.')
         self.record_set_button.clicked.connect(self._on_record_set)
-        cl.addWidget(self.record_set_button)
+        # Record mode set… acts on the families, so it sits in their pane below.
         self.status = QtWidgets.QLabel('')
         self.status.setWordWrap(True)
-        cl.addWidget(self.status)
 
         # ---- measurements table (tick to include) ----
         tsec = QtWidgets.QWidget()
@@ -3341,7 +5198,7 @@ class _ModeMapTab(QtWidgets.QWidget):
                 'Grayed rows can\'t be ticked — hover a row to see why.',
                 'A run whose extraction fails contributes no points; the '
                 'reason appears under the results.']))
-        self.table_note = ThemedLabel('', role='hint', size=10)
+        self.table_note = ThemedLabel('', role='hint', size=10, hide_when_empty=True)
         self.table_note.setWordWrap(True); tl.addWidget(self.table_note)
         helper = QtWidgets.QWidget()
         hl = QtWidgets.QHBoxLayout(helper); hl.setContentsMargins(0, 0, 0, 0)
@@ -3396,17 +5253,39 @@ class _ModeMapTab(QtWidgets.QWidget):
         fl.addWidget(self.family_list)
         self.result_table = _vtable([lbl for lbl, _ in self._result_spec()])
         fl.addWidget(self.result_table)
+        fl.addWidget(self.record_set_button)
         self.flag_label = ThemedLabel('', size=11)
         self.flag_label.setWordWrap(True)
-        fl.addWidget(self.flag_label)
         self.notes_label = ThemedLabel('', size=11)
         self.notes_label.setWordWrap(True)
-        fl.addWidget(self.notes_label)
+        fl.addWidget(scrolling_notes(self.notes_label))
 
+        # Scrolled, as the Distribution tab's controls are: the Inversion Settings group
+        # makes the section taller than a short window can give it, and a floor at its
+        # full height would starve the two panes beside it. The floor is the section's
+        # height WITHOUT that group (the default double-exponential source hides it, and
+        # a layout skips a hidden widget); Run is pinned under the scroll area, so it
+        # stays in view whichever source is chosen.
+        controls_scroll = QtWidgets.QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        controls_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        controls_scroll.setWidget(controls)
+        floor = max(controls.sizeHint().height(), 120)
+        ctrl_pane = QtWidgets.QWidget()
+        ctrl_layout = QtWidgets.QVBoxLayout(ctrl_pane)
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
+        ctrl_layout.setSpacing(4)
+        ctrl_layout.addWidget(controls_scroll, 1)
+        ctrl_layout.addWidget(self.run_button)
+        # Picker first, then the controls and Run, then the families and results (the
+        # §3 column template).
         vstack = make_vertical_plot_stack(
-            [controls, tsec, fsec], sizes=[210, 170, 220],
-            min_heights=[max(controls.sizeHint().height(), 150), 130, 120])
+            [tsec, ctrl_pane, fsec], sizes=[150, floor + 40, 200],
+            min_heights=[130, floor, 120], stretch=COLUMN_STACK_STRETCH)
         left.addWidget(vstack, 1)
+        pin_under_column(splitter, self.export_button, self.status, self.flag_label)
 
         # ---- right: view combo + canvas ----
         rw = QtWidgets.QWidget()
@@ -3486,6 +5365,7 @@ class _ModeMapTab(QtWidgets.QWidget):
         if ckey != self._last_ckey:      # (sample, fraction), like the Γ-q² tab
             self._run_epoch += 1
         self._last_ckey = ckey
+        self.region_box.set_checked_silently(self._use_region.get(ckey, False))
         if not (runnable and sid is not None):
             self.table.setRowCount(0)
             self.family_list.clear()
@@ -3534,20 +5414,81 @@ class _ModeMapTab(QtWidgets.QWidget):
 
     def _run_signature(self, ckey: tuple) -> tuple:
         """Everything a mode-map extraction for (sample, fraction) reads beyond its raw
-        data: the committed params of the ticked measurements, the source, and the
-        settings the engine seeds -- skip_initial_channels for every source, plus the
-        Rh grid and (CONTIN) the α range/selector for a distribution source. Stored at
-        dispatch, compared on redisplay (the Γ-q² tab's shape)."""
+        data: the committed params of the ticked measurements, the source, the settings
+        the engine seeds (skip_initial_channels, for every source) and, for a
+        distribution source, the Inversion Settings fields the Run hands it. Stored at
+        dispatch, compared on redisplay and on every edit of those fields (the Γ-q²
+        tab's shape)."""
         s = self.controller.settings
         source = self.source_combo.currentData()
-        seeds: tuple = (s.skip_initial_channels,)
+        # `se_estimator` too: the Run ends by refitting the families, whose ± it routes,
+        # and a switch clears those fits -- so a map shown across one needs a re-Run.
+        seeds: tuple = (s.skip_initial_channels, s.se_estimator)
         if source != 'double':
-            # The controller's ONE seeding home, asked read-only (an empty kwargs
-            # dict) rather than mirrored: a seed added there reaches this key too.
-            seeds += tuple(sorted(
-                self.controller._seed_distribution_kwargs({}, source).items()))
+            seeds += tuple(sorted(self._inversion_kwargs(source).items()))
+        # The region choice (the Γ-q² tab's reasoning): toggling the box, or moving the
+        # region while it is ticked, flags a shown map stale; an unticked one is left be.
         return (self.controller.committed_signature(self._included.get(ckey, set())),
-                source, seeds)
+                source, seeds, self.region_box.key(self._use_region.get(ckey, False)))
+
+    # ---- the region choice ----
+    def _on_region_toggled(self, on: bool) -> None:
+        sid = self._sample_id()
+        if sid is None:
+            return
+        self._use_region[self._ckey(sid)] = bool(on)
+        self._on_fit_input_moved()
+
+    def on_region_changed(self) -> None:
+        """The Correlogram tab moved the shared region: relabel the box and re-check the
+        shown map's key (stale only while this (sample, fraction)'s box is ticked)."""
+        self.region_box.refresh()
+        self._on_fit_input_moved()
+
+    # ---- inversion settings ----
+    def _inversion_kwargs(self, source: str) -> Dict:
+        """The kwargs a Run hands `run_mode_map` from this tab's own fields: none for the
+        parametric source, which would refuse them."""
+        return {} if source == 'double' else self.fit_fields.fit_kwargs(source)
+
+    def _sync_source_controls(self) -> None:
+        """Show the inversion fields for a distribution source only, and CONTIN's own
+        rows for CONTIN only -- show/hide, never an inert field."""
+        source = self.source_combo.currentData()
+        self.inversion_box.setVisible(source != 'double')
+        self.fit_fields.set_contin_rows_visible(source == 'contin')
+
+    def _on_source_changed(self, _i) -> None:
+        self._sync_source_controls()
+        self._on_fit_input_moved()
+
+    def _on_fit_input_moved(self) -> None:
+        """An input the next Run reads moved: say so beside a map drawn under the old
+        inputs. Compared rather than assumed, so moving a field back clears the hint."""
+        sid = self._sample_id()
+        if sid is None or self._map_result(sid) is None:
+            return
+        ckey = self._ckey(sid)
+        if self._cache_sig.get(ckey) != self._run_signature(ckey):
+            self.status.setText(_STALE_HINT)
+        elif self.status.text() == _STALE_HINT:
+            self.status.clear()
+
+    def _on_copy_fit_fields(self) -> None:
+        """Fill the fields ONCE from the Distribution sub-tab's current values. A copy,
+        never a link: after it the map runs on what these fields show, so no value
+        changes behind the Mode Map's back."""
+        if self._distribution_fit_values is None:
+            return
+        self.fit_fields.seed(self._distribution_fit_values())
+        copied = 'Copied the Distribution tab’s fit settings.'
+        stale = self.status.text() == _STALE_HINT
+        self.status.setText(f'{copied} {_STALE_HINT}' if stale else copied)
+
+    def reseed_from_settings(self) -> None:
+        """(Re)seed the Inversion Settings from the Settings defaults -- the cascade the
+        shell runs after a Settings Update, as for the Distribution sub-tab."""
+        self.fit_fields.seed_from_settings(self.controller.settings)
 
     # ---- measurements table ----
     def _refresh_table(self, sid: str) -> None:
@@ -3815,6 +5756,11 @@ class _ModeMapTab(QtWidgets.QWidget):
     def _recompute(self, sid: str, fraction=_FOCUSED) -> None:
         frac = self._fraction() if fraction is _FOCUSED else fraction
         ckey = (sid, frac)
+        if self.source_combo.currentData() == 'contin':
+            problem = self.fit_fields.alpha_problem()
+            if problem:                       # never run an α the engine refuses
+                self.status.setText(problem)
+                return
         if runner().is_busy:
             first = not self._recompute_pending
             self._recompute_pending = ckey   # the LATEST press wins the slot
@@ -3824,6 +5770,10 @@ class _ModeMapTab(QtWidgets.QWidget):
             return
         include_ids = set(self._included.get(ckey, set()))
         source = self.source_combo.currentData()
+        # Read from the widgets HERE, on the main thread; the thunk below runs on the
+        # worker and touches only the controller.
+        inversion_kw = self._inversion_kwargs(source)
+        region = self.region_box.region_for_run(self._use_region.get(ckey, False))
         sig = self._run_signature(ckey)
         if ckey == self._last_ckey:
             self._run_epoch += 1
@@ -3843,6 +5793,9 @@ class _ModeMapTab(QtWidgets.QWidget):
             self._fill_results(self._selected_family_fit(sid))
             self._draw()
             self.status.clear()
+            # The fields stay editable while the run is in flight, so compare the key the
+            # run was dispatched under against the live one rather than assume a match.
+            self._on_fit_input_moved()
 
         def fail(exc: BaseException) -> None:
             QtWidgets.QMessageBox.critical(
@@ -3854,7 +5807,8 @@ class _ModeMapTab(QtWidgets.QWidget):
 
         runner().try_submit(
             lambda: self.controller.run_mode_map(
-                sid, fraction=frac, source=source, include_ids=include_ids),
+                sid, fraction=frac, source=source, include_ids=include_ids,
+                region=region, **inversion_kw),
             done, fail, description='Mode map extraction',
             busy_widgets=(self.run_button,))
 
@@ -3932,7 +5886,7 @@ class _ModeMapTab(QtWidgets.QWidget):
         for r, (_label, fn) in enumerate(self._result_spec()):
             try:
                 txt = fn(fit) if fit is not None else '—'
-            except Exception:
+            except Exception:  # noqa: BLE001 — cell shows a dash
                 txt = '—'
             it = self.result_table.item(r, 1)
             if it is not None:
@@ -4203,9 +6157,13 @@ class _DDLSTab(QtWidgets.QWidget):
 
     selectionChanged = QtCore.Signal()           # included angle set changed (mirror)
 
-    def __init__(self, controller, parent=None) -> None:
+    def __init__(self, controller, parent=None, *, region=None) -> None:
         super().__init__(parent)
         self.controller = controller
+        # The shared region and this tab's choice to read it -- held per SAMPLE, since
+        # DDLS has no fraction (`run_ddls` takes none and this tab caches by sample).
+        self._region = region if region is not None else _AnalysisRegion()
+        self._use_region: Dict[str, bool] = {}
         self.item_id: Optional[str] = None
         self._runnable = False
         self._cache: Dict[str, tuple] = {}      # sample_id -> (result, info) fitted
@@ -4227,22 +6185,19 @@ class _DDLSTab(QtWidgets.QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        _, left, right = make_split_panels(self, left_min_width=300,
-                                           sizes=(360, 740))
-        note = ThemedLabel(
-            'Pairs the sample\'s VV (polarized) and VH (depolarized) correlograms '
-            'by angle and extracts the rotational diffusion coefficient '
-            'D_r = (Γ_VH − Γ_VV)/6 (D_t from the VV channel). Tag each correlogram\'s '
-            'polarization in the Data tab.', role='hint', size=11)
-        note.setWordWrap(True)
-        left.addWidget(note)
+        splitter, left, right = make_split_panels(self, left_min_width=300,
+                                                  sizes=(360, 740))
 
         # Paired angles with an include checkbox (tick to include in the D_r/D_t fit —
         # the same idiom as Γ vs q²), plus each correlogram's polarization + pairing.
         left.addWidget(section_header(
             'Paired Angles (tick to include in the fit)',
             'Tick which paired angles enter the D_r/D_t fit.',
-            bullets=['Only angles with BOTH a VV and a VH correlogram can be paired.',
+            bullets=['DDLS pairs the sample\'s VV (polarized) and VH (depolarized) '
+                     'correlograms by angle and extracts the rotational diffusion '
+                     'coefficient D_r = (Γ_VH − Γ_VV)/6 (D_t from the VV channel).',
+                     'Tag each correlogram\'s polarization in the <b>Data</b> tab.',
+                     'Only angles with BOTH a VV and a VH correlogram can be paired.',
                      'Untick an angle to drop it (e.g. an outlier); the fit re-runs on '
                      'the ticked angles.',
                      'Dropped angles still plot as a gray × (labeled "excluded" in the '
@@ -4252,9 +6207,24 @@ class _DDLSTab(QtWidgets.QWidget):
         self.table.setHorizontalHeaderLabels(['', 'Angle (°)', 'Polarization', 'Paired'])
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setMaximumHeight(170)
+        # No row numbers and a content-sized check column, so the four columns fit the
+        # 300 px column without a sideways scroll bar.
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemChanged.connect(self._on_angle_toggled)
         left.addWidget(self.table)
+        # Outlier removal: untick an angle above to drop it; unticked angles are
+        # grayed on the plot. "Include all" re-ticks every paired angle -- the table's
+        # bulk-select, so it sits under the table.
+        self.reset_excl_button = QtWidgets.QPushButton('Include all angles')
+        self.reset_excl_button.clicked.connect(self._on_include_all)
+        incl_row = QtWidgets.QHBoxLayout()
+        incl_row.setContentsMargins(0, 0, 0, 0)
+        incl_row.addWidget(self.reset_excl_button)
+        incl_row.addStretch(1)
+        left.addLayout(incl_row)
 
         rod_row = QtWidgets.QHBoxLayout()
         rod_row.setContentsMargins(0, 0, 0, 0)
@@ -4268,6 +6238,9 @@ class _DDLSTab(QtWidgets.QWidget):
         rod_row.addWidget(self.rod_edit)
         rod_w = QtWidgets.QWidget(); rod_w.setLayout(rod_row)
         left.addWidget(rod_w)
+        self.region_box = RegionCheckBox(self._region)
+        self.region_box.toggled.connect(self._on_region_toggled)
+        left.addWidget(self.region_box)
 
         self.run_button = QtWidgets.QPushButton('Run')
         self.run_button.setToolTip(BACKGROUND_RUN_TOOLTIP)
@@ -4279,24 +6252,16 @@ class _DDLSTab(QtWidgets.QWidget):
             'Writes the paired angles, D_t / D_r and any shape models to an '
             'Origin-format CSV. A D_r flagged unphysical here is repeated in the '
             'Comments cell of every column that presents it, so the caveat travels '
-            'with the file. See the Theory-and-Equations-Guide §3.4.')
+            'with the file. See the Theory-and-Equations-Guide §3.6.')
         self.export_button.clicked.connect(self._on_export)
-        left.addWidget(self.export_button)
-        # Outlier removal: untick an angle above to drop it; unticked angles are
-        # grayed on the plot. "Include all" re-ticks every paired angle.
-        self.reset_excl_button = QtWidgets.QPushButton('Include all angles')
-        self.reset_excl_button.clicked.connect(self._on_include_all)
-        left.addWidget(self.reset_excl_button)
 
         left.addWidget(QtWidgets.QLabel('Results'))
         self.results = _vtable(self._RESULT_ROWS)
         left.addWidget(self.results)
         self.status = ThemedLabel('', role='muted', size=11)
         self.status.setWordWrap(True)
-        left.addWidget(self.status)
         self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
-        left.addWidget(self.flag_label)
 
         # Shape models (model-dependent dimensions). Framed + captioned so the
         # "assumed shape, not measured" caveat reads clearly vs the D_r/D_t observables.
@@ -4332,6 +6297,8 @@ class _DDLSTab(QtWidgets.QWidget):
         left.addWidget(self.shape_box)
         self.shape_box.setVisible(False)
         left.addStretch(1)
+        # Export, the status and the flag pinned under the column (§3 column template).
+        pin_under_column(splitter, self.export_button, self.status, self.flag_label)
 
         self.figure = Figure(figsize=(5.2, 4.3), constrained_layout=True)
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
@@ -4358,6 +6325,7 @@ class _DDLSTab(QtWidgets.QWidget):
         self._runnable = runnable
         self.flag_label.clear()
         sid = self._sample_id()
+        self.region_box.set_checked_silently(self._use_region.get(sid, False))
         # Run needs a runnable (DLS) measurement AND an assigned sample: _on_run only
         # warns when sid is None, so an enabled button over an ungrouped measurement is
         # a false affordance. Mirror the Γ-q²/D-c tabs this one's docstring follows.
@@ -4506,8 +6474,14 @@ class _DDLSTab(QtWidgets.QWidget):
         """Everything a DDLS fit of `sid` reads beyond its raw correlograms: the
         committed params of the VV/VH pairs feeding it, the rod length, and the
         settings the engine seeds (skip_initial_channels, the cumulant method, the
-        SE estimator behind the D_r/D_t ±). Stored at dispatch with the rod the fit
-        reads (`rod=`), compared on redisplay against the box (the Γ-q² tab's shape)."""
+        cumulant fit cutoff and weighting, the SE estimator behind the D_r/D_t ±). Stored at dispatch
+        with the rod the fit reads (`rod=`), compared on redisplay against the box (the
+        Γ-q² tab's shape).
+
+        The settings half is not maintained by hand: every field
+        `Controller.run_ddls` reads must appear here, and
+        `test_every_run_signature_carries_the_settings_its_engine_path_reads` derives
+        that set by scanning the controller rather than trusting this list."""
         s = self.controller.settings
         if rod is _ROD_FROM_BOX:
             try:
@@ -4515,7 +6489,34 @@ class _DDLSTab(QtWidgets.QWidget):
             except ValueError:
                 rod = self.rod_edit.text().strip()
         return (self.controller.committed_signature(self._input_ids(sid)), rod,
-                s.skip_initial_channels, s.cumulant_method, s.se_estimator)
+                s.skip_initial_channels, s.cumulant_method, s.cumulant_fit_cutoff,
+                s.cumulant_weighting, s.cumulant_order, s.se_estimator,
+                self.region_box.key(self._use_region.get(sid, False)))
+
+    # ---- the region choice (the Γ-q² tab's shape, held per sample) ----
+    def _on_region_toggled(self, on: bool) -> None:
+        sid = self._sample_id()
+        if sid is None:
+            return
+        self._use_region[sid] = bool(on)
+        self._on_region_input_moved()
+
+    def on_region_changed(self) -> None:
+        self.region_box.refresh()
+        self._on_region_input_moved()
+
+    def _on_region_input_moved(self) -> None:
+        """A region input moved: flag the shown fit stale when its stored key no longer
+        matches, and clear the hint when it matches again. Never an automatic refit --
+        unlike an angle tick, which refits the ticked subset -- because the region is
+        another tab's input and the user decides when to re-read it."""
+        sid = self._sample_id()
+        if sid is None or sid not in self._cache:
+            return
+        if self._cache_sig.get(sid) != self._run_signature(sid):    # the rod box, as
+            self.status.setText(_STALE_HINT)                        # set_measurement
+        elif self.status.text() == _STALE_HINT:
+            self.status.clear()
 
     def _recompute(self, sid: str) -> None:
         if runner().is_busy:
@@ -4531,6 +6532,7 @@ class _DDLSTab(QtWidgets.QWidget):
         rod = self._rod_by_sid.get(sid)
         excl = self._excluded_angles(sid)         # paired − included
         controller = self.controller
+        region = self.region_box.region_for_run(self._use_region.get(sid, False))
         sig = self._run_signature(sid, rod=rod)   # names the VV/VH ids feeding this fit
         if sid == self._last_sid:
             self._run_epoch += 1            # this run supersedes any in flight
@@ -4541,16 +6543,15 @@ class _DDLSTab(QtWidgets.QWidget):
 
         def work():
             # ONE thunk for both calls. Run order is load-bearing: run_ddls writes
-            # results[('ddls', sid)] each call (last-write-wins), and ddls_shape reads
-            # THAT cache lazily on the main thread when drawing/exporting the shape
-            # models. Run the EXCLUDED fit LAST so the cache — hence the shape models —
-            # matches the D_t/D_r shown in the table, not the un-excluded angles.
-            # The un-excluded `full` (run first, only when excluding) is kept solely to
-            # draw the excluded-point markers; a cached result also keeps ddls_shape from
-            # re-running the Monte-Carlo fit on the GUI thread.
-            full = (controller.run_ddls(sid, rod_length_nm=rod) if excl else None)
+            # results[('ddls', sid)] each call (last-write-wins), so the EXCLUDED fit runs
+            # LAST and the controller's store ends up holding the fit shown in the table --
+            # the one a caller of ddls_shape with no fit of its own reads. This tab's shape
+            # table and export pass the shown fit itself. The un-excluded `full` (run
+            # first, only when excluding) is kept solely to draw the excluded-point markers.
+            full = (controller.run_ddls(sid, rod_length_nm=rod, region=region)
+                    if excl else None)
             res, info = controller.run_ddls(
-                sid, rod_length_nm=rod, exclude_angles=excl)
+                sid, rod_length_nm=rod, exclude_angles=excl, region=region)
             if full is None:
                 full = (res, info)
             return (res, info), full
@@ -4567,15 +6568,32 @@ class _DDLSTab(QtWidgets.QWidget):
             self.export_button.setEnabled(True)
             self._refresh_table(sid)
             self._draw(res, info)
+            # The box and the region stay live while the run is in flight: compare the key
+            # it ran under with the live one, as the Mode Map does on landing.
+            self._on_region_input_moved()
 
         def fail(exc: BaseException) -> None:
-            QtWidgets.QMessageBox.critical(
-                self, 'DDLS failed',
-                f'Could not run DDLS.\n\n{humanize_field_names(str(exc))}\n\nTag at least '
-                'one angle with BOTH a VV and a VH correlogram (Data tab → Polarization), '
-                'then confirm parameters.')
-            if epoch == self._run_epoch:       # the `done` guard: never paint a late
-                self.status.setText('DDLS failed — see dialog.')       # failure elsewhere
+            # A fit that cannot run is flagged in the panel, not a modal (style guide
+            # R8.4): an angle untick re-runs this live, and a modal would come up per
+            # click. The controller's message is relayed as written. The previous fit's
+            # numbers go with its flag, so none stays on screen under the failure. A
+            # failure for a sample no longer shown is told in a dialog naming it, never
+            # painted over the view now shown; one superseded by a newer run of this
+            # same sample is dropped, because that run reports its own outcome.
+            msg = humanize_field_names(str(exc))
+            if sid != self._last_sid:
+                who = self.controller.workspace.samples.get(sid)
+                QtWidgets.QMessageBox.critical(
+                    self, 'DDLS failed',
+                    f'Could not run DDLS on {sample_display_name(who) if who else sid}.'
+                    f'\n\n{msg}')
+                return
+            if epoch != self._run_epoch:
+                return
+            self._clear_results()
+            self.export_button.setEnabled(False)
+            set_flag(self.flag_label, f'DDLS could not run: {msg}')
+            self.status.setText('DDLS failed — see the warning below.')
 
         runner().try_submit(work, done, fail,
                             description='DDLS rotational-diffusion fit',
@@ -4627,10 +6645,11 @@ class _DDLSTab(QtWidgets.QWidget):
             return
         res, _info = self._cache[sid]
         # Include the shape models when they are available (viscosity present,
-        # physical D_r); export the observables alone otherwise.
+        # physical D_r); export the observables alone otherwise. From the shown fit,
+        # as the shape table is.
         try:
-            shapes = self.controller.ddls_shape(sid, model='both')
-        except Exception:
+            shapes = self.controller.ddls_shape(sid, model='both', result=res)
+        except Exception:  # noqa: BLE001 — shape models optional in export
             shapes = None
         # export_to_csv shows the save dialog and writes the file; its returned
         # status is shown in the (non-error) results label, not the red flag line.
@@ -4721,20 +6740,21 @@ class _DDLSTab(QtWidgets.QWidget):
         self._draw_shape()
 
     def _draw_shape(self) -> None:
-        """Compute and show both shape models for the current sample's DDLS result."""
+        """Compute and show the shape models of the DDLS fit this tab shows for the
+        current sample -- its own cached fit, never the controller's store, which a
+        Settings clear can empty while the tab keeps showing the fit, marked out of date."""
         sid = self._sample_id()
         try:
-            # Memoize by DDLS-result identity: the ellipsoid inverse runs a Monte-Carlo
+            # Memoize by the shown fit's identity: the ellipsoid inverse runs a Monte-Carlo
             # (heavy), and _draw_shape fires on every sample selection, not just Run.
-            res = self.controller.results.get(('ddls', sid))
+            res, _info = self._cache[sid]
             cached = self._shape_cache.get(sid)
-            if res is not None and cached is not None and cached[0] is res:
+            if cached is not None and cached[0] is res:
                 shapes = cached[1]
             else:
-                shapes = self.controller.ddls_shape(sid, model='both')
-                self._shape_cache[sid] = (
-                    self.controller.results.get(('ddls', sid)), shapes)
-        except Exception as exc:
+                shapes = self.controller.ddls_shape(sid, model='both', result=res)
+                self._shape_cache[sid] = (res, shapes)
+        except Exception as exc:  # noqa: BLE001 — surfaced in the caveat
             self.shape_table.setRowCount(0)
             self.shape_table.setToolTip('')      # drop any stale caveat hover
             self.shape_caveat.setText(f'Shape models unavailable: {exc}')
@@ -4880,6 +6900,33 @@ def _ols_marker(se_estimator) -> str:
     return _OLS_MARKER if se_estimator == 'ols' else ''
 
 
+# ONE mark for a cell whose run simply has no such fit. Before this the same state
+# rendered two ways in one table -- 'n/a' from `format_fixed_sig(None)` for the
+# parametric columns, '—' from `_peak_cell([])` for the distribution ones.
+#
+# It is NOT a synonym for 'n/a': a stored NaN means the fit RAN and withheld its value
+# (owner decision D2), and that still reads 'n/a'. `format_fixed_sig` maps missing and
+# non-finite alike to 'n/a', so routing an absent value through it is what destroyed the
+# distinction; `_num` keeps it.
+_ABSENT = '—'
+
+
+class _GroupRow(str):
+    """A table row that is one SPANNING header, not a row of cells.
+
+    A `str` subclass so the row still carries its text with no wrapper to unpack, and
+    so `_replace_table` can tell it from a list of cells by type alone. Used for the
+    Summary per-measurement table's sample bands -- the shape the measurement picker
+    already uses -- in place of a Sample column repeated down every run.
+    """
+
+
+def _num(value, sig: int) -> str:
+    """A Summary number cell: `_ABSENT` when the run has no such fit, else the value
+    (which is 'n/a' when the fit ran and withheld it)."""
+    return _ABSENT if value is None else format_fixed_sig(value, sig)
+
+
 def _peak_cell(peaks: List[Tuple[float, float]], sig: int = 3) -> str:
     """Render a distribution method's peaks as 'Rh (Int %); Rh (Int %)'.
 
@@ -4911,6 +6958,156 @@ def _readonly_table(headers: List[str], rows: List[List[str]]) -> QtWidgets.QTab
     return t
 
 
+#: How deep a cumulant fit must go before a moment is a measurement rather than a blank,
+#: keyed by the detail spec's STABLE STORAGE KEY. `_detail_cell` below is the home of what
+#: the gate does and why it runs before the value is inspected at all.
+_MOMENT_MIN_ORDER = {'mu2': 2, 'mu3': 3, 'mu4': 4}
+
+
+#: How a detail column names the method it belongs to. Short, because it rides on every
+#: detail header and the table is already wide.
+_METHOD_SHORT = {'cumulant': 'cumulant', 'single': 'single exp',
+                 'double': 'dbl exp', 'kww': 'KWW'}
+
+
+def _detail_quantity(name: str, unit: str) -> str:
+    """The quantity half of a detail header: the name, then its unit in parentheses.
+
+    Deliberately the same spelling `_RESULT_ROWS` uses for the Correlogram panel's row
+    labels, so `_RESULT_ROW_TOOLTIPS` keys both surfaces -- the owner-ruled μ₃/μ₄ caution
+    is then one string with one home, copied onto this table rather than restated in it.
+    `test_every_detail_quantity_is_spelled_as_the_correlogram_panel_spells_it` pins the
+    parity for every quantity, not just the two that carry a caution today.
+    """
+    return f'{name} ({unit})' if unit else name
+
+
+def _detail_header(name: str, unit: str, method: str) -> str:
+    """A detail column's full header: the quantity, then the method that produced it.
+
+    The method is named on EVERY detail column, never only where a name would collide.
+    Several parametric arms reuse quantity names -- `baseline` and `converged` on three
+    of them, `Γ` on two -- and the table is built to scroll sideways, so the headline
+    column that would disambiguate is routinely off-screen when the duplicate is read.
+    Measured at 1280 x 760 with all four arms run: 26 columns wanting 1548 px in a 602 px
+    viewport, with two `baseline` columns visible at once and neither headline in view.
+
+    Unconditionally rather than on collision, for the reason the measurement names
+    already follow: a name that changes according to what else is on screen is a name a
+    reader cannot trust or search for. A column means the same thing whatever is beside it.
+    """
+    return f'{_detail_quantity(name, unit)} · {_METHOD_SHORT.get(method, method)}'
+
+
+def _detail_cell(value, key: str, details: Dict, sig: int) -> str:
+    """One detail value, rendered. The stored value is the fit's own; painting is here.
+
+    Three kinds arrive and each is shown as itself: a bool is the convergence answer
+    ('yes'/'no', never 'True'), an int or str is printed as it stands (the order, the
+    cumulant method), and every number goes through the no-uncertainty significant-figures
+    knob -- these come from a single correlogram, so none carries a ± (invariant 8).
+
+    A missing moment is the interesting case. Below the order that fits it there IS no
+    value, and a bare blank -- or worse, a bare 0 -- would read as a fitted result, so the
+    cell says which order the fit actually ran at.
+
+    THE ORDER GATE RUNS FIRST, on the order rather than on the value's shape, and this is
+    the normative home of that rule. The two absences do not look alike: µ₃ and µ₄ come
+    back None below their order, but µ₂ comes back `0.0` -- a real float that is
+    structurally absent rather than fitted -- so a gate that only asked "is it None?"
+    printed a confident zero for the one moment a reader is most likely to act on, while
+    the Correlogram panel's own cell said "unmeasured (order 1)" for the same fit. Asking
+    the fit what order it ran at makes the value's shape stop mattering.
+
+    The gate is keyed by storage key (`_MOMENT_MIN_ORDER`), so retitling a column cannot
+    quietly disarm it.
+    """
+    need = _MOMENT_MIN_ORDER.get(key)
+    order = details.get('order')
+    if need is not None and isinstance(order, int) and order < need:
+        return f'unmeasured (order {order})'
+    if value is None:
+        return _ABSENT
+    if isinstance(value, bool):
+        return 'yes' if value else 'no'
+    if isinstance(value, (int, str)):
+        return str(value)
+    return format_fixed_sig(value, sig)
+
+
+def _with_detail_columns(specs: List, sig: int) -> List:
+    """Expand each parametric method's headline into its full set of detail columns.
+
+    The detail columns are read from the controller's one spec, so this function never
+    names a quantity: it only decides WHERE the expansion goes -- directly after the
+    method's existing headline columns, so a method's quantities stay together under one
+    heading rather than being interleaved with another's.
+    """
+    out = []
+    for spec in specs:
+        out.append(spec)
+        header, _populated, _cell, method, target, _tip = spec
+        details = _DLS_DETAIL_SPECS.get(method)
+        # Only after the method's LAST headline column, so the details follow the whole
+        # headline rather than splitting it (the cumulant has two: Rh and PDI).
+        if not details or spec is not _last_headline_of(specs, method):
+            continue
+        for skey, name, _getter, unit, target in details:
+            out.append((
+                _detail_header(name, unit, method),
+                (lambda m: lambda r: bool(r['details'].get(m)))(method),
+                (lambda m, k: lambda r: _detail_cell(
+                    r['details'].get(m, {}).get(k), k, r['details'].get(m, {}), sig)
+                 )(method, skey),
+                method, target,
+                # The caution is COPIED, keyed by the QUANTITY -- one string, one home
+                # (`_RESULT_ROW_TOOLTIPS`), serving this table and the Correlogram panel.
+                _RESULT_ROW_TOOLTIPS.get(_detail_quantity(name, unit), '')))
+    return out
+
+
+def _last_headline_of(specs: List, method: str):
+    """The final headline column belonging to `method`, or None."""
+    owned = [s for s in specs if s[3] == method]
+    return owned[-1] if owned else None
+
+
+def _with_passive_notes(cell, method: str, target, is_headline: bool, shown):
+    """Wrap a cell builder so a passive notice reaches the cell it is about.
+
+    The ⓘ is the neutral qualifier tier (ui_style_guide section 5): a passive note says
+    how the fit was obtained, never that a precondition failed, so it must not borrow the
+    ⚠ channel. Where a cell carries BOTH -- a flagged value that also rests on a bound --
+    the ⚠ keeps the glyph, because a data-quality problem outranks a neutral remark, and
+    the tooltip carries the flag's sentence first and the notices after it. One glyph per
+    cell: two would say the cell has two kinds of problem when it has one.
+    """
+    def build(r):
+        base = cell(r)
+        notes = (r.get('notes', {}) or {}).get(method, {}) or {}
+        mine = list(notes.get(target, ())) if target else []
+        if is_headline:
+            # Everything with nowhere else to go: whole-fit notices, and any note whose
+            # quantity has no visible column.
+            for key, sentences in notes.items():
+                if not key or key not in shown:
+                    mine.extend(sentences)
+        if not mine:
+            return base
+        # The cell may already be (text, tooltip) or (text, tooltip, ICON) -- the
+        # measurement column carries its plot swatch in a third element. Rebuilding it as
+        # a bare pair dropped that icon, so a run that acquired a passive note silently
+        # lost its colour swatch: an identity mark removed by an unrelated disclosure.
+        # The tail is preserved rather than assumed empty.
+        if isinstance(base, str):
+            text, tip, tail = base, '', ()
+        else:
+            text, tip, tail = base[0], base[1], tuple(base[2:])
+        joined = '\n'.join(([tip] if tip else []) + mine)
+        return (text if text.startswith('⚠') else f'ⓘ {text}', joined, *tail)
+    return build
+
+
 class _SummaryTab(QtWidgets.QWidget):
     """A workspace-wide, durable results table (the DLS Summary view).
 
@@ -4928,16 +7125,17 @@ class _SummaryTab(QtWidgets.QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        _, left, right = make_split_panels(self, left_min_width=300,
-                                           sizes=(360, 740))
+        splitter, left, right = make_split_panels(self, left_min_width=300,
+                                                  sizes=(360, 740))
 
         self.checklist = MeasurementPicker(
             self.controller, self.selection, kinds=('dls',),
-            label_fn=_meas_label, header_fn=_sample_header, title='Measurements',
+            label_fn=measurement_display_name, header_fn=sample_display_name,
+            tooltip_fn=measurement_hover_card, title='Measurements',
             help_text='Tick measurements to filter the Summary table.',
             help_bullets=_SUMMARY_PICKER_BULLETS)
         self.checklist.selectionChanged.connect(self._refresh_tables)
-        left.addWidget(self.checklist)
+        left.addWidget(self.checklist, 1)      # the picker takes the column's spare height
 
         self.ticked_only = QtWidgets.QCheckBox('Ticked only')
         self.ticked_only.setToolTip('Show only the measurements ticked above '
@@ -4945,15 +7143,26 @@ class _SummaryTab(QtWidgets.QWidget):
         self.ticked_only.toggled.connect(self._refresh_tables)
         left.addWidget(self.ticked_only)
 
+        # Off by default: the headline columns are what most readers want, and the full
+        # set is wide. The tooltip is the passive nuance tier (how the numbers behave),
+        # while the how-to-use sits in the picker's "?" badge above.
+        self.show_details = QtWidgets.QCheckBox('Show fit details')
+        self.show_details.setToolTip(
+            'Add every other quantity each parametric fit reports — the decay rate, the '
+            'moments, the fitted order and baseline, the amplitude fractions and the '
+            'stretch. These come from a single correlogram, so none carries an '
+            'uncertainty; see the Theory-and-Equations-Guide §3.')
+        self.show_details.toggled.connect(self._refresh_tables)
+        left.addWidget(self.show_details)
+
         self.export_button = QtWidgets.QPushButton('Export CSV…')
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._on_export)
-        left.addWidget(self.export_button)
 
         self.status = QtWidgets.QLabel('')
         self.status.setWordWrap(True)
-        left.addWidget(self.status)
-        left.addStretch(1)
+        # Export and the status pinned at the column's foot (§3 column template).
+        pin_under_column(splitter, self.export_button, self.status)
 
         right.addWidget(QtWidgets.QLabel('<b>Per-measurement results</b>'))
         self.per_meas_table = _readonly_table(['Sample', 'Measurement'], [])
@@ -4984,58 +7193,133 @@ class _SummaryTab(QtWidgets.QWidget):
         self._fill_sample(sample)
         self.export_button.setEnabled(bool(meas) or bool(sample))
 
+    @staticmethod
+    def _per_meas_columns(recs: List[Dict], sig: int, show_details: bool = False):
+        """[(header, cell_fn, header_tooltip)] for the methods any LISTED run actually has.
+
+        One spec per column, header and cell builder together, so a method cannot show
+        up in the headers and not in the cells. Every method is on demand: before this,
+        the double-exponential and lognormal columns appeared when populated and the
+        other five were always there, so a cumulant-only workspace still paid for four
+        columns of `_ABSENT` -- the asymmetry, not the on-demand rule, was the defect.
+
+        With `show_details`, each parametric method that ran expands from its headline to
+        the full set its detail spec names. The detail columns are built from that spec
+        (`app.controller._DLS_DETAIL_SPECS`), never listed again here, so a quantity
+        added there appears without a second edit -- the same one-spec rule that governs
+        what the durable row saves.
+
+        Every column carries the METHOD it belongs to and the result ATTRIBUTE it shows,
+        which is how a passive note reaches the cell it explains rather than the fit as a
+        whole. The headline column of a method is simply its first, and it is where a
+        fit-level note -- or one whose target no visible column shows -- lands.
+        """
+        rh = 'R<sub>h</sub>'
+
+        def flagged(text, value, note):
+            # The mark sits on the value it judges and explains itself there (⚠, not ℹ:
+            # a data-quality problem, and R5.2 gives one condition one tier across
+            # surfaces). A missing value takes no mark -- the house rule.
+            return (f'⚠ {text}', note) if note and value is not None else text
+
+        def peaks(method: str):
+            return lambda r: flagged(_peak_cell(r['peaks'].get(method, []), sig),
+                                     r['peaks'].get(method) or None,
+                                     r.get('peak_notes', {}).get(method, ''))
+
+        def scalar(key: str, note_key: str):
+            return lambda r: flagged(_num(r[key], sig), r[key], r.get(note_key, ''))
+
+        # (header, populated, cell, method, note-target attribute, header tooltip).
+        # The tooltip is CARRIED rather than looked up from the finished header: a detail
+        # header now names its method too, so the caution's key is the quantity half and
+        # splitting the header back apart would be a second spelling to keep in step.
+        specs = [
+            (f'Cumulant {rh}', lambda r: r['cumulant_rh'] is not None,
+             scalar('cumulant_rh', 'cumulant_rh_note'), 'cumulant', 'rh_nm', ''),
+            ('PDI', lambda r: r['pdi'] is not None,
+             lambda r: _num(r['pdi'], sig), 'cumulant', 'pdi', ''),
+            (f'Single {rh}', lambda r: r['single_rh'] is not None,
+             scalar('single_rh', 'single_rh_note'), 'single', 'rh_nm', ''),
+            (f'Double-exp ({rh} fast / slow)', lambda r: r['double_fast'] is not None,
+             lambda r: flagged(
+                 f"{_num(r['double_fast'], sig)} / {_num(r['double_slow'], sig)}"
+                 if r['double_fast'] is not None else _ABSENT,
+                 r['double_fast'], r.get('double_note', '')), 'double', None, ''),
+            (f'KWW {rh}', lambda r: r['kww_rh'] is not None,
+             scalar('kww_rh', 'kww_rh_note'), 'kww', 'rh_nm', ''),
+            (f'NNLS ({rh} / Int %)', lambda r: bool(r['peaks'].get('nnls')),
+             peaks('nnls'), 'nnls', None, ''),
+            (f'CONTIN ({rh} / Int %)', lambda r: bool(r['peaks'].get('contin')),
+             peaks('contin'), 'contin', None, ''),
+            (f'Lognormal ({rh} / Int %)', lambda r: bool(r['peaks'].get('lognormal')),
+             peaks('lognormal'), 'lognormal', None, ''),
+        ]
+        if show_details:
+            specs = _with_detail_columns(specs, sig)
+
+        live = [s for s in specs if any(s[1](r) for r in recs)]
+        # Which targets a VISIBLE column shows, per method. A note tagged anything else
+        # -- '' for a whole-fit notice, or a quantity whose column is not on screen --
+        # falls back to that method's headline, so no note is ever dropped for want of a
+        # column, and none is guessed onto a neighbour that is not about it.
+        shown = {}
+        first_col_of = {}
+        for idx, (_h, _p, _c, method, target, _tip) in enumerate(live):
+            if target:
+                shown.setdefault(method, set()).add(target)
+            first_col_of.setdefault(method, idx)
+
+        out = []
+        for idx, (header, _populated, cell, method, target, tip) in enumerate(live):
+            is_headline = first_col_of.get(method) == idx
+            out.append((header,
+                        _with_passive_notes(cell, method, target, is_headline,
+                                            shown.get(method, frozenset())),
+                        tip))
+        return out
+
     def _fill_per_meas(self, recs: List[Dict]) -> None:
-        # Optional columns only when some row populates them, to keep it tidy.
-        show_logn = any(r['peaks'].get('lognormal') for r in recs)
-        show_dbl = any(r['double_fast'] is not None for r in recs)
-        _rh = 'R<sub>h</sub>'
-        headers = ['Sample', 'Measurement', f'Cumulant {_rh}', 'PDI', f'Single {_rh}',
-                   f'KWW {_rh}', f'NNLS ({_rh} / Int %)', f'CONTIN ({_rh} / Int %)']
-        if show_logn:
-            headers.append(f'Lognormal ({_rh} / Int %)')
-        if show_dbl:
-            headers.append(f'Double-exp ({_rh} fast / slow)')
         # Every number here is from a single correlogram or an ill-posed inversion — no
         # honest ± — so all use the one no-uncertainty knob, never a
         # fabricated uncertainty.
         sig = self.controller.settings.no_uncertainty_sig_figs
-        rows = []
-        for r in recs:
-            # An unreliable Rh is marked here and explains itself on hover. ⚠ rather
-            # than ⓘ: a data-quality problem, and R5.2 requires one condition to take
-            # one tier across surfaces. The `is not None` guard mirrors the house rule
-            # that a missing value takes no mark.
-            #
-            # EVERY fit column, not just the cumulant: the other three were exempt only
-            # because an exponential's unreliable Rh used to be NaN, with no shown number
-            # to qualify. The undecayed-mode criterion leaves it finite.
-            def flagged(text, value, note):
-                return (f'⚠ {text}', note) if note and value is not None else text
+        ws = self.controller.workspace.measurements
+        order = sidebar_measurement_order(self.controller)
+        recs = sorted(recs, key=lambda r: order.get(r.get('item_id') or '', len(order)))
+        cols = self._per_meas_columns(recs, sig, self.show_details.isChecked())
+        headers = ['Measurement', *[h for h, _cell, _tip in cols]]
+        # Header tooltips are index-aligned with `headers`, so the Measurement column
+        # takes the leading '' rather than the first data column's caution.
+        header_tips = ['', *[tip for _h, _cell, tip in cols]]
 
-            cells = [
-                r['sample_label'], r['measurement_label'],
-                flagged(format_fixed_sig(r['cumulant_rh'], sig),
-                        r['cumulant_rh'], r.get('cumulant_rh_note', '')),
-                format_fixed_sig(r['pdi'], sig),
-                flagged(format_fixed_sig(r['single_rh'], sig),
-                        r['single_rh'], r.get('single_rh_note', '')),
-                flagged(format_fixed_sig(r['kww_rh'], sig),
-                        r['kww_rh'], r.get('kww_rh_note', '')),
-                _peak_cell(r['peaks'].get('nnls', []), sig),
-                flagged(_peak_cell(r['peaks'].get('contin', []), sig),
-                        r['peaks'].get('contin') or None,
-                        r.get('peak_notes', {}).get('contin', '')),
-            ]
-            if show_logn:
-                cells.append(_peak_cell(r['peaks'].get('lognormal', []), sig))
-            if show_dbl:
-                cells.append(flagged(
-                    f"{format_fixed_sig(r['double_fast'], sig)} / "
-                    f"{format_fixed_sig(r['double_slow'], sig)}"
-                    if r['double_fast'] is not None else '—',
-                    r['double_fast'], r.get('double_note', '')))
-            rows.append(cells)
-        self._replace_table(self.per_meas_table, headers, rows)
+        rows: list = []
+        current_sample = None
+        for r in recs:
+            # The sample is a GROUP HEADER row rather than a column repeated down every
+            # run, the shape the measurement picker already uses. It was the widest
+            # column in the table and said the same thing N times.
+            if r['sample_label'] != current_sample:
+                current_sample = r['sample_label']
+                rows.append(_GroupRow(current_sample))
+            iid = r.get('item_id') or ''
+            lm = ws.get(iid)
+            # The Measurement cell carries item 1's hover card, like every other
+            # surface that names a run, and the run's plot swatch when it is TICKED.
+
+            # Gated on the ticked set EXPLICITLY, the way `MeasurementPicker`'s painter
+            # is. `color_for` does NOT answer None for an unticked id -- `_index_of`
+            # returns `len(ids)` for a miss, so every unticked run drew the same real
+            # colour, the one the NEXT ticked run will take. A swatch is an identity
+            # claim, and with "Ticked only" off this table lists unticked runs.
+            ticked = iid in set(self.selection.ids())
+            name = (r['measurement_label'],
+                    measurement_hover_card(lm) if lm is not None else '',
+                    marker_swatch(self.selection.color_for(iid),
+                                  self.selection.marker_for(iid))
+                    if ticked else QtGui.QIcon())
+            rows.append([name, *[cell(r) for _h, cell, _tip in cols]])
+        self._replace_table(self.per_meas_table, headers, rows, header_tips)
 
     def _fill_sample(self, recs: List[Dict]) -> None:
         headers = ['Sample', 'Source', 'Rh (nm)', _SE_HEADER, 'Rh Type', 'From']
@@ -5065,24 +7349,56 @@ class _SummaryTab(QtWidgets.QWidget):
 
     @staticmethod
     def _replace_table(table: QtWidgets.QTableWidget, headers: List[str],
-                       rows: List[List[str]]) -> None:
-        """Rebuild `table`. A cell is a plain string, or `(text, tooltip)`.
+                       rows: List[List[str]],
+                       header_tips: Optional[List[str]] = None) -> None:
+        """Rebuild `table`. A cell is a plain string, `(text, tooltip)` or
+        `(text, tooltip, icon)`; a ROW may instead be a `_GroupRow`, painted as one
+        spanning band.
 
-        The tuple form exists so a marked cell can explain itself where the mark appears
+        The tuple forms exist so a marked cell can explain itself where the mark appears
         (ui_style_guide §5: a soft, always-on interpretive caveat belongs in a passive
-        tooltip). Plain strings still work unchanged -- `_fill_sample` passes only those --
-        and that back-compatibility is asserted, not assumed.
+        tooltip) and so a run can carry its plot swatch beside its name. Plain strings
+        still work unchanged -- `_fill_sample` passes only those -- and that
+        back-compatibility is asserted, not assumed.
+
+        `header_tips`, when given, is index-aligned with `headers` and carries a caution
+        that belongs to the QUANTITY rather than to any one run's value -- the μ₃/μ₄
+        sentence. On the header, not the cells, for the reason `_RESULT_ROW_TOOLTIPS`
+        gives: a value cell's tooltip is reserved for that value's own reason, and the
+        two must not fight.
         """
         table.clear()
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
+        for c, tip in enumerate(header_tips or ()):
+            item = table.horizontalHeaderItem(c)
+            if item is not None and tip:
+                item.setToolTip(tip)
         table.setRowCount(len(rows))
         for r, cells in enumerate(rows):
+            if isinstance(cells, _GroupRow):
+                item = QtWidgets.QTableWidgetItem(str(cells))
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                table.setItem(r, 0, item)
+                # One band across the whole width. Re-set every rebuild because
+                # `clear()` drops the items but not the spans.
+                table.setSpan(r, 0, 1, max(len(headers), 1))
+                continue
+            table.setSpan(r, 0, 1, 1)          # undo any span this row held before
             for c, cell in enumerate(cells):
-                text, tip = cell if isinstance(cell, tuple) else (cell, '')
+                if isinstance(cell, tuple):
+                    text = cell[0]
+                    tip = cell[1] if len(cell) > 1 else ''
+                    icon = cell[2] if len(cell) > 2 else None
+                else:
+                    text, tip, icon = cell, '', None
                 item = QtWidgets.QTableWidgetItem(text)
                 if tip:
                     item.setToolTip(tip)
+                if icon is not None and not icon.isNull():
+                    item.setIcon(icon)
                 table.setItem(r, c, item)
         table.horizontalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
@@ -5131,12 +7447,21 @@ class DLSModule(QtWidgets.QWidget):
         self.selection = SelectionModel(color_cycle=_plot_cycle,
                                         marker_cycle=_marker_cycle(),
                                         linestyle_cycle=_linestyle_cycle())
-        self.correlogram_tab = _CorrelogramTab(controller, self.region, self.selection)
+        # The Distribution tab is built FIRST so the Correlogram tab can be handed its
+        # accessor at construction. Only the construction order moves; the sub-tab order
+        # on screen is set by `addTab` below and is unchanged.
         self.distribution_tab = _DistributionTab(controller, self.region, self.selection)
-        self.gamma_q2_tab = _SampleAnalysisTab(controller, 'gamma_q2')
-        self.mode_map_tab = _ModeMapTab(controller)
-        self.conc_tab = _SampleAnalysisTab(controller, 'conc_extrap')
-        self.ddls_tab = _DDLSTab(controller)
+        self.correlogram_tab = _CorrelogramTab(
+            controller, self.region, self.selection,
+            distribution_fits=self.distribution_fits)
+        # The four tabs that re-run a fit behind the scenes read the region only through
+        # their own "use the Correlogram tab's delay window and baseline" box.
+        self.gamma_q2_tab = _SampleAnalysisTab(controller, 'gamma_q2', region=self.region)
+        self.mode_map_tab = _ModeMapTab(
+            controller, distribution_fit_values=self.distribution_fit_values,
+            region=self.region)
+        self.conc_tab = _SampleAnalysisTab(controller, 'conc_extrap', region=self.region)
+        self.ddls_tab = _DDLSTab(controller, region=self.region)
         self.summary_tab = _SummaryTab(controller, self.selection)
         self._subtabs = [self.correlogram_tab, self.distribution_tab,
                          self.gamma_q2_tab, self.mode_map_tab, self.conc_tab,
@@ -5155,10 +7480,53 @@ class DLSModule(QtWidgets.QWidget):
         # changes WHICH selection is active) all bubble up as selectionChanged.
         self.selection.changed.connect(self.selectionChanged)
         self.tabs.currentChanged.connect(lambda _i: self.selectionChanged.emit())
+        # The module owns both co-plotting tabs, so IT carries the news that the
+        # Distribution tab's stored fits moved -- neither widget reaches into the other.
+        self.distribution_tab.fitsChanged.connect(
+            self.correlogram_tab.on_fits_changed)
         for tab in (self.gamma_q2_tab, self.mode_map_tab, self.conc_tab,
                     self.ddls_tab):
             tab.selectionChanged.connect(self.selectionChanged)
+            # ... and the news that the region moved, the same routing: each box
+            # relabels itself and flags a checked result stale.
+            self.correlogram_tab.regionChanged.connect(tab.on_region_changed)
         self.set_measurement(None)
+
+    def distribution_fits(self) -> Dict[Tuple[str, str], Dict]:
+        """The Distribution sub-tab's stored fits, keyed `(iid, method)`, each with that
+        tab's own staleness verdict.
+
+        The Correlogram tab's "Fits to show" list reads its three distribution entries
+        through here, so the two sibling widgets never touch each other's state: the
+        module that owns both is the only thing that knows they are siblings.
+        """
+        return self.distribution_tab.stored_fits()
+
+    def distribution_fit_values(self) -> Dict:
+        """The Distribution sub-tab's current fit-field values, for the Mode Map's
+        one-time copy -- read through the module that owns both, like
+        `distribution_fits`."""
+        return self.distribution_tab.fit_fields.values()
+
+    def average_prompt_sources(self) -> 'AverageSources':
+        """What the "Average derived results…" prompt can copy or read, handed to it by
+        the module that owns the tabs (the `distribution_fits` accessor shape): the
+        shared region, the Correlogram tab's order box and the Distribution tab's fields.
+        Read at the moment the user confirms, so the copy is of the values shown then."""
+        fields = self.distribution_tab.fit_fields
+
+        def distribution_kwargs(method: str) -> dict:
+            # The copy reads the fields a CONTIN Run reads, so it refuses what that Run
+            # refuses: `alpha_problem` is the one predicate for every consumer of the group.
+            problem = fields.alpha_problem() if method == 'contin' else ''
+            if problem:
+                raise ValueError(problem)
+            return fields.fit_kwargs(method)
+
+        return AverageSources(
+            region=self.region,
+            cumulant_order=lambda: int(self.correlogram_tab.order_spin.value()),
+            distribution_kwargs=distribution_kwargs)
 
     def selected_item_ids(self) -> list:
         """The measurements the ACTIVE sub-tab currently has selected (for the sidebar
@@ -5176,6 +7544,7 @@ class DLSModule(QtWidgets.QWidget):
     def reseed_from_settings(self) -> None:
         self.correlogram_tab.reseed_from_settings()
         self.distribution_tab.reseed_from_settings()
+        self.mode_map_tab.reseed_from_settings()
 
     def focus_mode_map(self) -> None:
         """Bring the Mode Map sub-tab to the front (cross-tab navigation from
@@ -5187,15 +7556,23 @@ class DLSModule(QtWidgets.QWidget):
         if item_id is None:
             self.header.setText('Pick a measurement in the Workspace list; '
                                 'tick measurements in the sub-tabs to analyze.')
+            self.header.setToolTip('')        # the card goes with the measurement
             runnable = False
         else:
             kind = self.controller.workspace.measurements[item_id].kind
             runnable = (kind == 'dls')
+            # Named, not id'd: the one builder, and its hover card for the rest
+            # (the id included, so a bug report still has it).
+            lm = self.controller.workspace.measurements[item_id]
+            name = measurement_display_name(lm)
+            self.header.setToolTip(measurement_hover_card(lm))
             if runnable:
-                self.header.setText(f'DLS measurement: <b>{item_id}</b>')
+                self.header.setText(
+                    f'DLS measurement: <b>{html.escape(name)}</b>')
             else:
                 self.header.setText(
-                    f'<b>{item_id}</b> is a {kind.upper()} measurement — '
+                    f'<b>{html.escape(name)}</b> is a {kind.upper()} '
+                    'measurement — '
                     'open it in the SLS tab.')
         for tab in self._subtabs:
             tab.set_measurement(item_id, runnable)

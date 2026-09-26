@@ -1,0 +1,66 @@
+DLS Buddy -- Synthetic TRACE-ONLY SOLVENT BLANK test data
+=========================================================
+
+Why this set exists
+-------------------
+A solvent blank is often measured WITHOUT a correlogram: there is nothing to fit, and the
+run exists only to record the solvent's intensity. Every committed set until now paired
+every concentration with a correlogram, so the route where the blank arrives as a bare
+count-rate trace had no data at all -- and on a real run it blocked three of five
+fractions until a correlogram was pressed into service to carry the blank through.
+
+The set is built at ONE angle, which also makes it the committed case for the fixed-angle
+Debye ladder: derive the static series from these traces, calibrate against the toluene
+trace, and the single-angle apparent Mw + A2 route runs end to end.
+
+
+HOW TO LOAD IT
+--------------
+  1. Load the four .ASC correlograms (c > 0). They carry their own count-rate traces.
+  2. Load 'Trace - solvent blank (no correlogram).csv' with the count-rate trace button,
+     choosing **time = seconds, count rate = kcps** -- both trace files here are written
+     in kcps, and picking cps instead scales the calibrant intensity, and therefore k_c
+     and Mw, by 1000 with nothing to say so.
+     The blank has NO correlogram and no identity of its own -- that is the point.
+  3. On the SLS tab's Derived Intensity sub-tab, tick the four runs AND the unattached
+     blank trace. The trace row takes the sample's identity from the first ticked run,
+     defaults to c = 0, and seeds its angle from the runs' shared 90 deg.
+  4. Derive. Calibrate with the toluene trace's mean as the calibrant intensity, then run
+     the single-angle Mw + A2 ladder at 90 deg.
+
+
+GROUND TRUTH
+------------
+  Mw               1e+06 g/mol          (what a ONE-ANGLE ladder returns is
+                   APPARENT -- Mw * P(q) -- and at Rg 55 nm and 90 deg that is a
+                   real fraction of it. Read the intercept as apparent, exactly as the
+                   program labels it.)
+  Rg               55.0 nm     (not recoverable from one angle; stated so the
+                   apparent-versus-thermodynamic gap above is checkable)
+  A2               9.5e-05 mol mL/g^2
+  Rh               37.0 nm     at c -> 0. The planted size is
+                   concentration-dependent (kD = +30 mL/g, as in Clean/ and Messy/), so no
+                   single correlogram carries 37.0 nm: the four files were planted at
+                   36.78, 36.35, 35.92, 35.51 nm
+                   at 0.2, 0.6, 1, 1.4 mg/mL. Extrapolate to c = 0 to recover it.
+  Angle            90 deg, single
+  Concentrations   0, 0.2, 0.6, 1, 1.4 mg/mL
+  Solvent          water, n = 1.33, 0.89 cP
+  Temperature      25.0 C (298.15 K)
+  Wavelength       532 nm
+  dn/dc            0.135 mL/g
+
+The traces ARE the static intensities by construction (each trace's mean is the intensity
+below), so the derived series is the static series and nothing about the chain is
+asserted rather than built. Stated in cps, which is the unit the ANALYSIS works in; the
+files themselves are written in kcps, so a trace read at the prompt as kcps has these
+means divided by 1000 on its face:
+
+  c =  0.0 mg/mL   I(90 deg) = 6000.0 cps
+  c =  0.2 mg/mL   I(90 deg) = 144034.0 cps
+  c =  0.6 mg/mL   I(90 deg) = 400573.7 cps
+  c =  1.0 mg/mL   I(90 deg) = 634007.0 cps
+  c =  1.4 mg/mL   I(90 deg) = 847321.3 cps
+
+  Calibrant (toluene) trace mean: 1e+05 cps
+                                  (100 kcps as written in the file)

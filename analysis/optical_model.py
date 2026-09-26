@@ -58,10 +58,11 @@ measurement.
 
 Validity criteria (documented defaults, overridable -- invariant 4)
 ------------------------------------------------------------------
-From Bohren & Huffman 1983 Ch. 6: RDG requires ``|m-1| << 1`` (Eq. 6.2) and
-``k*d*|m-1| << 1`` (Eq. 6.3); for a sphere ``d = 2R`` gives ``2*x*|m-1| << 1``. B&H p.464
-notes errors grow as ``|m-1| -> ~0.1`` (citing Kerker 1969 p.428), so ``0.1`` is used as
-the documented rendering of "<<1". The Rayleigh point-scatterer limit is ``x <= ~0.1``.
+From Bohren & Huffman 1983 Ch. 6, p. 159: RDG requires ``|m-1| << 1`` (Eq. 6.2) and
+``k*d*|m-1| << 1`` (Eq. 6.3); for a sphere ``d = 2R`` gives ``2*x*|m-1| << 1``. They state
+both only qualitatively and print no number, so reading "<<1" as ``0.1`` is this program's
+own threshold -- a flagged convenience simplification (Theory-and-Equations-Guide,
+"Weighted Size Distributions"). The Rayleigh point-scatterer limit is ``x <= ~0.1``.
 Past the sphere form factor's first minimum (``qR ~ 4.4934``) the RDG per-particle
 intensity passes through zero and the ``/I1`` inversion is unstable, so that is a third RDG
 gate (the same first-zero physics as ``analysis.sls.SPHERE_FIRST_MINIMUM_QRG``). **Mie has
@@ -118,7 +119,7 @@ OPTICAL_MODEL_LABELS = {RAYLEIGH: 'Rayleigh point', RDG: 'RDG sphere', MIE: 'Mie
 # Rayleigh point-scatterer size-parameter limit x = 2*pi*R/lambda_medium.
 DEFAULT_RAYLEIGH_X_MAX = 0.1
 # RDG contrast bounds: |m-1| <= 0.1 (B&H Eq. 6.2) and 2*x*|m-1| <= 0.1 (Eq. 6.3, sphere).
-# 0.1 is B&H p.464's "large errors begin" figure -- the documented reading of "<<1".
+# B&H print both conditions only as "<<1" (p. 159); 0.1 is this program's own reading of it.
 DEFAULT_RDG_M1_MAX = 0.1
 DEFAULT_RDG_2XM1_MAX = 0.1
 # Mie is the GENERAL homogeneous-sphere case -- no upper contrast/size *validity* bound

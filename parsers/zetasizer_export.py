@@ -13,63 +13,78 @@ this parser pre-fills them (the user still confirms/edits them at the Data tab).
 
 File format (confirmed from real exports)
 -----------------------------------------
-Comma-separated, with a header row. One measurement per data row. Columns:
+Comma-separated, with a header row. One measurement per data row, and two column
+families carrying the correlogram:
 
-    Sample Name, Material Name, Dispersant Name, Dispersant RI,
-    Temperature (°C), Viscosity (cP),
     Correlation Delay Times[1] (µs) ... Correlation Delay Times[K] (µs),
     Correlation Data[1] ... Correlation Data[K]
 
-- Columns are located by **header name** (case-insensitive, ignoring the
-  parenthetical unit), NOT by fixed position, because the Zetasizer exporter is
-  configurable. The two correlation blocks (Delay Times + Data) are **required**;
-  the named parameter columns are each optional (whatever is present is pre-filled).
+plus whichever named parameter columns the operator put in their template.
+
+- The export is a **vocabulary, not a layout**: every named column is optional,
+  their order carries no meaning, the two families may appear in either order
+  (both committed templates are Delay-first; data-first is accepted and no
+  committed template exercises it), K is whatever the operator acquired, and a
+  header this parser does not name is ignored. Columns are
+  located by **header name**, matched against `_COLUMNS` -- the single place the
+  vocabulary lives.
+- Matching is **exact** on the normalised header (lower-cased, with the ``(unit)``
+  suffix and ``[k]`` index stripped), never a prefix. The vendor namespace carries
+  near-miss labels -- one real template emits both ``Concentration`` and
+  ``Concentrations``, and both ``Duration`` and ``Duration Used`` -- and a prefix
+  lets the shorter key claim the longer column silently, by header order, with a
+  wrong value. Exact matching turns that into a blank field the user fills in.
 - **Units are read from the header.** Each located column's ``(unit)`` suffix is
-  honoured through the shared converters -- ``Temperature (K)`` is kelvin,
-  ``Correlation Delay Times[k] (ms)`` is milliseconds -- and a cell with no suffix
-  takes the documented template's unit: lag time in µs (-> seconds), temperature
-  in °C (-> kelvin), viscosity in cP (-> Pa·s). A lag unit the converter does not
-  know is malformed data (the lag axis cannot be loaded on a guess); an unknown
-  temperature or viscosity unit leaves that field blank for the user to enter,
-  exactly like an unreadable cell.
+  honoured -- ``Temperature (K)`` is kelvin, ``Correlation Delay Times[k] (ms)`` is
+  milliseconds -- and a cell with no suffix takes its `_COLUMNS` template unit. A
+  lag unit the converter does not know is malformed data (the lag axis cannot be
+  loaded on a guess); for every other column an unknown unit, an unusable value or
+  an unreadable cell all leave the field blank for the user to enter.
 - **Correlation Data is g2(tau) - 1** (the Zetasizer "correlation coefficient":
   intercept ~ beta, decaying to 0), stored as-is -- no g1 / Siegert conversion.
+  Note the software's own reported ``Intercept`` is on the **g1** convention, i.e.
+  sqrt(beta), so it is not comparable with this curve's amplitude directly.
   Trailing zero channels are kept as baseline points (trim with the analysis tau
   window if unwanted), matching the clipboard parser.
 
 Column -> field mapping
 -----------------------
-    Sample Name       -> sample_label
-    Material Name     -> polymer_name
-    Dispersant Name   -> solvent_name        (normalized against the vocabulary)
-    Dispersant RI     -> solvent_refractive_index
-    Temperature (°C)  -> temperature_K        (by the declared unit; °C -> +273.15)
-    Viscosity (cP)    -> viscosity_Pa_s       (by the declared unit; cP -> x 1e-3)
+`_COLUMNS` is the mapping, in code; it is not restated here, so the two cannot
+drift. It also names the columns this parser recognises and deliberately does NOT
+read, each with its reason.
 
-Angle, wavelength and concentration are NOT in the export and are left for the
-user to supply at the confirmation step (the Zetasizer file carries none of them).
+**Concentration** is not among them: the Zetasizer computes that field rather than
+echoing what the operator typed (it varies across repeat runs of one sample), so it
+is left for the user to supply at the confirmation step like any other.
 
 Zetasizer export template (document for the user)
 -------------------------------------------------
-The export is configurable; this parser targets a common export template:
+The export is configurable, so this is a suggestion, not a requirement -- the
+parser reads whatever subset is present, in any order:
 
     Settings : include header row; use commas as separators.
-    Parameters (in order): Sample Name, Material Name, Dispersant Name,
-        Dispersant RI, Temperature, Viscosity, Correlation Delay Times,
-        Correlation Data.
+    Parameters : Sample Name, Material Name, Dispersant Name, Dispersant RI,
+        Temperature, Viscosity, Wavelength, Scattering Angle, Mean Count Rate,
+        Correlation Delay Times, Correlation Data.
 
 Change history
 --------------
 2026-06-21  Initial implementation. (zetasizer_export.py v1)
+2026-09-20  Wider column set and exact-match lookup. (zetasizer_export.py v2)
+            The six prefix constants and their hand-written lookups became the
+            `_COLUMNS` table; Wavelength, Scattering Angle and Mean Count Rate are
+            now pre-filled, and Material RI / Material Absorption / Derived Count
+            Rate are recognised without being read.
 """
 
 from __future__ import annotations
 
 import csv
+import math
 import os
 import re
 import warnings
-from typing import List, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
@@ -79,6 +94,7 @@ from parsers.base_parser import (
     DLSFilePreview,
     MalformedDataError,
     ParseError,
+    convert_count_rate,
     convert_temperature,
     convert_viscosity,
 )
@@ -93,25 +109,146 @@ from parsers.base_parser import (
 _ENCODINGS = ('utf-8-sig', 'latin-1')
 _DELIMITER = ','
 
-# The template's units, applied to a header cell that declares none.
+# The template's lag unit, applied to a header cell that declares none.
 _TEMPLATE_LAG_UNIT = 'µs'
-_TEMPLATE_TEMPERATURE_UNIT = '°C'
-_TEMPLATE_VISCOSITY_UNIT = 'cP'
 
-# Header prefixes that identify each column. Matched case-insensitively against
-# the header cell with its parenthetical unit stripped (e.g. 'Temperature (°C)').
-_PREFIX_SAMPLE = 'sample name'
-_PREFIX_MATERIAL = 'material name'
-_PREFIX_DISPERSANT = 'dispersant name'
-_PREFIX_RI = 'dispersant ri'
-_PREFIX_TEMPERATURE = 'temperature'
-_PREFIX_VISCOSITY = 'viscosity'
-_PREFIX_DELAY = 'correlation delay times'
-_PREFIX_DATA = 'correlation data'
+# The two correlation column families. Their normalised keys, like every key in
+# `_COLUMNS` below, are matched EXACTLY -- see `_find`.
+_KEY_DELAY = 'correlation delay times'
+_KEY_DATA = 'correlation data'
 
 # Strip a trailing '(unit)' and any '[k]' index from a header cell for matching.
 _PAREN_RE = re.compile(r'\([^)]*\)')
 _INDEX_RE = re.compile(r'\[\s*\d+\s*\]')
+
+# Units this parser accepts for the two quantities `base_parser` has no factor table
+# for. It has none because no other format declares a unit for either; this one can,
+# so the spelling is checked rather than assumed.
+_WAVELENGTH_UNITS = frozenset({'nm'})
+_ANGLE_UNITS = frozenset({'°', 'deg', 'degree', 'degrees'})
+
+
+def _checked(value: float, unit: str, accepted: frozenset, quantity: str) -> float:
+    """`value` unchanged, once `unit` is one of `accepted` -- a unit check, not a
+    conversion, for a quantity with no factor table.
+
+    Raises ValueError (never MalformedDataError) on an unknown unit or a non-finite
+    value, so the caller degrades the field to blank exactly as an unrecognised
+    temperature or viscosity unit already does. A record column must never condemn
+    the whole file.
+    """
+    if unit.strip().lower() not in accepted:
+        raise ValueError(
+            f"unrecognized {quantity} unit {unit!r}. Accepted: {sorted(accepted)}."
+        )
+    if not math.isfinite(value):
+        raise ValueError(f"{quantity} must be finite, got {value!r}.")
+    return float(value)
+
+
+def _as_nm(value: float, unit: str) -> float:
+    """Wavelength in nm. Positive, as `DLSMeasurement` requires it."""
+    nm = _checked(value, unit, _WAVELENGTH_UNITS, 'wavelength')
+    if nm <= 0:
+        raise ValueError(f"wavelength must be positive, got {value!r}.")
+    return nm
+
+
+def _as_deg(value: float, unit: str) -> float:
+    """Scattering angle in degrees, on `_require_scattering_angle`'s range.
+
+    Bounds-checked here so an out-of-range cell arrives blank for the user to enter,
+    rather than reaching `DLSMeasurement` and raising at Update.
+    """
+    deg = _checked(value, unit, _ANGLE_UNITS, 'scattering angle')
+    if not (0 < deg < 180):
+        raise ValueError(
+            f"scattering angle must be strictly between 0 and 180 degrees, "
+            f"got {value!r}."
+        )
+    return deg
+
+
+def _as_cps(value: float, unit: str) -> float:
+    """Mean count rate in cps, through the shared factor table.
+
+    The guard is on the RESULT, not the input: the conversion is a multiply, so
+    saturation is a property of the product and no input is to blame for it (rule 12).
+    A cell of 1e306 kcps passes any check on `value` and returns `inf`.
+
+    Wrapped at all because `convert_count_rate` is written for arrays and this is the
+    tree's only scalar caller: its own `require_finite_data` raises IndexError, not
+    MalformedDataError, on a 0-d array, and that escapes `autodetect` and fails the
+    load. The finite-and-positive check here runs first and keeps it unreachable.
+    """
+    if not math.isfinite(value):
+        raise ValueError(f"mean count rate must be finite, got {value!r}.")
+    rate = float(convert_count_rate(value, unit))
+    if not (math.isfinite(rate) and rate > 0):
+        raise ValueError(
+            f"mean count rate must convert to a finite positive rate, got {value!r} "
+            f"{unit} -> {rate!r} cps."
+        )
+    return rate
+
+
+class _Column(NamedTuple):
+    """One column the export template may carry.
+
+    `key` is the EXACT normalised header (`_norm_header`) that identifies it. `field`
+    is the `DLSFilePreview` attribute it fills, or **None** for a column we recognise
+    and deliberately do not read -- those rows are documentary, and they are here so
+    the vendor vocabulary lives in one place and the reason sits beside the column it
+    governs. `unit` is the template's unit, used when the header cell declares none,
+    and `convert` takes `(value, unit)` to canonical units; a numeric column with no
+    converter is stored as read. `text` marks a column stored verbatim as a string.
+    """
+
+    key: str
+    field: Optional[str]
+    unit: Optional[str] = None
+    convert: Optional[Callable[[float, str], float]] = None
+    text: bool = False
+
+
+# The export template is user-configurable, so this is a vocabulary, not a layout:
+# every column is optional, order carries no meaning, and a header the table does not
+# name is ignored. Adding a column the vendor starts emitting is one row.
+_COLUMNS = (
+    _Column('sample name', 'sample_label', text=True),
+    _Column('material name', 'polymer_name', text=True),
+    # Stored VERBATIM, exactly like polymer_name above. The dispersant cell is free
+    # text typed by the operator on the instrument ("My Phosphate Buffer" is an
+    # ordinary value for it), so mapping it onto our own solvent names would be
+    # guessing at data we have no claim on.
+    _Column('dispersant name', 'solvent_name', text=True),
+    _Column('dispersant ri', 'solvent_refractive_index'),
+    _Column('temperature', 'temperature_K', '°C', convert_temperature),
+    _Column('viscosity', 'viscosity_Pa_s', 'cP', convert_viscosity),
+    _Column('wavelength', 'wavelength_nm', 'nm', _as_nm),
+    _Column('scattering angle', 'angle_deg', '°', _as_deg),
+    # A RECORD: user-owned and provenance-tagged, carried no differently from a
+    # Brookhaven .dat's. `core.workspace.seed_vendor_records` offers it and the load flow
+    # seeds working AND committed at once, as it does for angle and temperature -- what
+    # makes that invariant-3-safe is the editable, labelled Data-tab row, not a gesture
+    # between load and analysis.
+    _Column('mean count rate', 'vendor_mean_count_rate_cps', 'kcps', _as_cps),
+    # --- recognised, deliberately not read ---
+    # Material RI would fill `solute_refractive_index`, which core.data_models holds in
+    # the dn/dc class: never proposed, defaulted or guessed (invariant 3). Owner ruled
+    # 2026-09-20 that the parser recognise it and not fill it while that policy is
+    # revisited; the roadmap carries the revisit. The sibling half-answer the revisit
+    # should weigh: `parsers/brookhaven_dat.py` keeps its file's particle RI as a RECORD
+    # (`solute_refractive_index_from_file`), never propagated -- dropping it here and
+    # keeping it there both satisfy the ruling, and they differ.
+    _Column('material ri', None),
+    # The imaginary part of the same index. Malvern needs both only for its volume
+    # distribution; nothing here consumes one yet.
+    _Column('material absorption', None),
+    # The mean count rate rescaled to no attenuation, so NOT the detected photon rate
+    # the residual weight's shot-noise terms need. `mean count rate` is that.
+    _Column('derived count rate', None),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -160,9 +297,10 @@ class ZetasizerExportParser(BaseDLSParser):
     """Parser for Malvern Zetasizer structured-export correlation data.
 
     Returns one DLSFilePreview per data row. Each preview carries the correlogram
-    (g2-1) plus the parameters present in the file (sample label, polymer/material,
-    solvent/dispersant, refractive index, temperature, viscosity). Angle,
-    wavelength and concentration are None -- the user supplies them.
+    (g2-1) plus whichever parameters `_COLUMNS` maps and the file carries; anything
+    absent stays None for the user to supply at the confirmation step. Concentration
+    is always among those -- see the module docstring on why the vendor's own
+    Concentration column is not read.
     """
 
     def parse(self, file_path: str) -> List[DLSFilePreview]:
@@ -199,8 +337,8 @@ class ZetasizerExportParser(BaseDLSParser):
         n_cols = len(header)
 
         # --- locate the two required correlation blocks (in header order) ---
-        delay_cols = [i for i, h in enumerate(norm) if h.startswith(_PREFIX_DELAY)]
-        data_cols = [i for i, h in enumerate(norm) if h.startswith(_PREFIX_DATA)]
+        delay_cols = [i for i, h in enumerate(norm) if h == _KEY_DELAY]
+        data_cols = [i for i, h in enumerate(norm) if h == _KEY_DATA]
         if not delay_cols or not data_cols:
             raise ParseError(
                 f"{file_path!r} does not look like a Zetasizer export: expected "
@@ -222,21 +360,19 @@ class ZetasizerExportParser(BaseDLSParser):
         # The delay/data COUNT mismatch just above is still pre-commit: an equal number
         # of the two column families is part of what identifies this export.
 
-        # --- locate the optional parameter columns (first match wins) ---
-        def _find(prefix: str) -> Optional[int]:
+        # --- locate the optional parameter columns (first exact match wins) ---
+        # Exactly, never by prefix. The vendor vocabulary carries near-miss labels --
+        # a real template emits 'Concentration' beside 'Concentrations', and 'Duration'
+        # beside 'Duration Used' -- and under a prefix the shorter key takes the longer
+        # column silently, by header order, with a wrong VALUE. Exact matching makes
+        # that a blank field the user fills instead, and keeps a
+        # 'Correlation Data Quality[k]' family out of `data_cols`, where it would
+        # unbalance the two blocks and lose the file to the generic fallbacks.
+        def _find(key: str) -> Optional[int]:
             for i, h in enumerate(norm):
-                if h.startswith(prefix):
+                if h == key:
                     return i
             return None
-
-        # 'dispersant ri' must be checked before 'dispersant name' would shadow it;
-        # they have distinct prefixes, so independent lookups are unambiguous.
-        col_sample = _find(_PREFIX_SAMPLE)
-        col_material = _find(_PREFIX_MATERIAL)
-        col_dispersant = _find(_PREFIX_DISPERSANT)
-        col_ri = _find(_PREFIX_RI)
-        col_temp = _find(_PREFIX_TEMPERATURE)
-        col_visc = _find(_PREFIX_VISCOSITY)
 
         # The unit each located column DECLARES: the LAST '(...)' group of the cell,
         # read back here instead of thrown away. `_norm_header` strips every group for
@@ -245,13 +381,21 @@ class ZetasizerExportParser(BaseDLSParser):
         # µs / °C / cP applied regardless, so a `(K)` column read 298.15 as 571 K and
         # an `(ms)` lag axis came in 1000x short. A cell with no suffix keeps the
         # template's unit.
-        def _declared_unit(col: Optional[int], template: str) -> str:
+        def _declared_unit(col: Optional[int], template: Optional[str]) -> str:
             groups = _PAREN_RE.findall(header[col]) if col is not None else []
+            template = template or ''
             return (groups[-1][1:-1].strip() or template) if groups else template
 
         lag_unit = _declared_unit(delay_cols[0], _TEMPLATE_LAG_UNIT)
-        temp_unit = _declared_unit(col_temp, _TEMPLATE_TEMPERATURE_UNIT)
-        visc_unit = _declared_unit(col_visc, _TEMPLATE_VISCOSITY_UNIT)
+
+        # Each mapped column the file actually carries, with the unit it declared.
+        # A column the table recognises but does not read (`field is None`) resolves
+        # to nothing: it is named so the vocabulary is complete, not to be extracted.
+        resolved: List[Tuple[_Column, int, str]] = [
+            (spec, idx, _declared_unit(idx, spec.unit))
+            for spec, idx in ((s, _find(s.key)) for s in _COLUMNS)
+            if idx is not None and spec.field is not None
+        ]
 
         abs_path = os.path.abspath(file_path)
         previews: List[DLSFilePreview] = []
@@ -274,10 +418,7 @@ class ZetasizerExportParser(BaseDLSParser):
             preview = self._row_to_preview(
                 row, abs_path, row_no=row_no,
                 delay_cols=delay_cols, data_cols=data_cols,
-                col_sample=col_sample, col_material=col_material,
-                col_dispersant=col_dispersant, col_ri=col_ri,
-                col_temp=col_temp, col_visc=col_visc,
-                lag_unit=lag_unit, temp_unit=temp_unit, visc_unit=visc_unit,
+                resolved=resolved, lag_unit=lag_unit,
             )
             if preview is None:
                 n_bad += 1
@@ -313,15 +454,8 @@ class ZetasizerExportParser(BaseDLSParser):
         row_no: int,
         delay_cols: List[int],
         data_cols: List[int],
-        col_sample: Optional[int],
-        col_material: Optional[int],
-        col_dispersant: Optional[int],
-        col_ri: Optional[int],
-        col_temp: Optional[int],
-        col_visc: Optional[int],
+        resolved: List[Tuple[_Column, int, str]] = (),
         lag_unit: str = _TEMPLATE_LAG_UNIT,
-        temp_unit: str = _TEMPLATE_TEMPERATURE_UNIT,
-        visc_unit: str = _TEMPLATE_VISCOSITY_UNIT,
     ) -> Optional[DLSFilePreview]:
         """Build one preview from a data row, or None if it has no usable data."""
 
@@ -374,43 +508,49 @@ class ZetasizerExportParser(BaseDLSParser):
             ) from exc
         correlogram = np.array(corr, dtype=float)
 
-        # --- parameters (each optional; a bad value degrades to None, no crash) ---
-        sample_label = cell(col_sample) or None
-        polymer_name = cell(col_material) or None
-
-        # Stored VERBATIM, exactly like polymer_name above. The dispersant cell is
-        # free text typed by the operator on the instrument ("My Phosphate Buffer" is
-        # an ordinary value for it), so mapping it onto our own solvent names would be
-        # guessing at data we have no claim on. cell() has already stripped it.
-        solvent_name = cell(col_dispersant) or None
-
-        solvent_ri = _parse_float_or_none(cell(col_ri)) if col_ri is not None else None
-
-        temperature_K: Optional[float] = None
-        temp_raw = _parse_float_or_none(cell(col_temp)) if col_temp is not None else None
-        if temp_raw is not None:
+        # --- parameters (each optional; a bad value degrades to absent, no crash) ---
+        # One loop over the resolved columns, so every mapped field follows the same
+        # rule and a new row in `_COLUMNS` needs no code here. A field left out of
+        # `values` takes DLSFilePreview's own None, which is what "the file did not
+        # say" and "the file said something unusable" both mean to the user: a blank
+        # cell they fill in at the confirmation step.
+        values: Dict[str, Any] = {}
+        for spec, idx, unit in resolved:
+            raw = cell(idx)
+            if spec.text:
+                if raw:
+                    values[spec.field] = raw
+                continue
+            number = _parse_float_or_none(raw)
+            if number is None:
+                continue
+            if spec.convert is None:
+                values[spec.field] = number
+                continue
             try:
-                temperature_K = convert_temperature(temp_raw, temp_unit)
+                values[spec.field] = spec.convert(number, unit)
             except ValueError:
-                temperature_K = None     # unusable value OR unknown unit: the user enters it
+                pass         # unusable value OR unknown unit: the user enters it
 
-        viscosity_Pa_s: Optional[float] = None
-        visc_raw = _parse_float_or_none(cell(col_visc)) if col_visc is not None else None
-        if visc_raw is not None:
-            try:
-                viscosity_Pa_s = convert_viscosity(visc_raw, visc_unit)
-            except ValueError:
-                viscosity_Pa_s = None    # unusable value OR unknown unit: the user enters it
-
+        # Spelled out, not `**values`. Every physical parameter a parser writes has to
+        # stay VISIBLE as a keyword here, because the provenance audit for invariant 3
+        # reads this call to prove each is None or file-derived and never a literal the
+        # file did not state; splatting the dict passed the same values and made this
+        # parser vanish from it. `_COLUMNS` still decides what is read and how, and
+        # `test_zetasizer_export_every_mapped_column_reaches_the_preview` walks the
+        # table by reflection, so a row added without a keyword below is caught.
         return DLSFilePreview(
             source_file=abs_path,
             instrument_name='Malvern Zetasizer',
             delay_times_s=delay_times_s,
             correlogram=correlogram,
-            sample_label=sample_label,
-            polymer_name=polymer_name,
-            solvent_name=solvent_name,
-            solvent_refractive_index=solvent_ri,
-            temperature_K=temperature_K,
-            viscosity_Pa_s=viscosity_Pa_s,
+            sample_label=values.get('sample_label'),
+            polymer_name=values.get('polymer_name'),
+            solvent_name=values.get('solvent_name'),
+            solvent_refractive_index=values.get('solvent_refractive_index'),
+            temperature_K=values.get('temperature_K'),
+            viscosity_Pa_s=values.get('viscosity_Pa_s'),
+            angle_deg=values.get('angle_deg'),
+            wavelength_nm=values.get('wavelength_nm'),
+            vendor_mean_count_rate_cps=values.get('vendor_mean_count_rate_cps'),
         )

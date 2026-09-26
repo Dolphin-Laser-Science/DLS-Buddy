@@ -102,8 +102,8 @@ class SolventProps:
     eta_source_citekey: Optional[str] = None
 
     # ---- per-condition uncertainty descriptor (display-only) ----
-    # Components of sigma_n(lambda, T) and sigma_eta_rel(T) -- see the Advanced
-    # Guide sec. 5 for the model. u_src = the source's stated accuracy floor;
+    # Components of sigma_n(lambda, T) and sigma_eta_rel(T) -- see the
+    # Theory-and-Equations-Guide, "The tolerance: shown, not propagated" for the model. u_src = the source's stated accuracy floor;
     # the node tuples are piecewise-linear UPPER envelopes ((x, r), ...) of the
     # unified-fit residual (clamped flat beyond the end nodes); u_slope = the
     # documented dn/dT-slope allowance. The accessors additionally add the
@@ -741,7 +741,7 @@ def refractive_index_solvent(
     and prints for toluene -- and the linear (dn/dT)(T - T_ref) term is Jakubczyk
     et al. 2023 Eq. 1 (p. 4). Per-solvent coefficients are refit from each solvent's
     own authoritative correlation, which is often neither of those two; the unified
-    form is the house choice (Theory-and-Equations-Guide S5).
+    form is the house choice (Theory-and-Equations-Guide, "The Solvent Inputs: Refractive Index and Viscosity").
     """
     rec = _lookup(name)
     temperature_K = temperature_C + _C_TO_K
@@ -881,7 +881,7 @@ def solvent_uncertainty_n(
     ``hypot`` of the INTERNAL component (``solvent_uncertainty_n_prefloor``:
     source accuracy, unified-fit residual envelopes in lambda and T, propagated
     dn/dT-slope allowance) with the uniform inter-laboratory floor
-    ``N_INTERLAB_FLOOR`` (Theory-and-Equations-Guide sec. 5). Same range guards
+    ``N_INTERLAB_FLOOR`` (Theory-and-Equations-Guide, "The Solvent Inputs: Refractive Index and Viscosity"). Same range guards
     as ``refractive_index_solvent`` (raises outside the box, never
     extrapolates). Display-only per invariant #8 -- never propagated into any
     analysis SE. The box-wide ``n_uncertainty`` is this model's maximum over

@@ -55,7 +55,7 @@ class _Job(QtCore.QRunnable):
     def run(self) -> None:
         try:
             result = self._thunk()
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 — thread boundary, re-emitted
             self._signals.failed.emit(self._id, exc)
         else:
             self._signals.finished.emit(self._id, result)
@@ -169,7 +169,7 @@ class AnalysisRunner(QtCore.QObject):
         succeeded does a drain error surface on its own."""
         try:
             self._drain_idle()
-        except Exception:                     # noqa: BLE001
+        except Exception:                     # noqa: BLE001 — a drain error must not mask the primary
             if primary_exc is None:
                 raise
             # primary_exc is the real failure; swallow the drain error so it wins.

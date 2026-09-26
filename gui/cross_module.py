@@ -66,6 +66,7 @@ from PySide6 import QtCore, QtWidgets
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+from core.naming import sample_display_name
 from plotting.plots import plot_scaling
 from gui.plot_controls import make_canvas_expanding
 from gui.export_helper import confirm_overwrite, export_to_csv
@@ -119,13 +120,6 @@ def _fmt(x: Optional[float], sig: int = 3) -> str:
     return f'{x:.{sig}g}'
 
 
-def _sample_label(sample) -> str:
-    poly, solv, temp = sample.polymer_name, sample.solvent_name, sample.temperature_K
-    if poly and solv and temp is not None and not math.isnan(temp):
-        return f'{poly} / {solv} @ {temp:g} K'
-    return '(unconfirmed sample)'
-
-
 # Candidate grouping for the source-picker combos. Maps a candidate `kind` to
 # (group heading, hidden-by-default). "Hidden" candidates are the long tail of
 # single-condition apparents (per-angle cumulants, per-conc Debye/Guinier) that
@@ -141,6 +135,12 @@ _KIND_GROUP = {
     'dls_cumulant':          ('Single-angle (apparent)', True),
     'sls_debye':             ('Single-condition (apparent)', True),
     'sls_guinier':           ('Single-condition (apparent)', True),
+    # A ladder is a whole concentration SERIES read at one angle, so it is neither
+    # "single-condition" nor extrapolated — its own heading, named for the angle
+    # contingency (invariant 7). Never hidden: it carries auto_selectable=False, which the
+    # visibility test below already exempts, and hiding it would put a sample's only Mw/A2
+    # option behind a checkbox (the degenerate-solution lesson, one kind over).
+    'sls_ladder':            ('Single-angle ladder (apparent)', False),
 }
 _HEADER_SENTINEL = '__HEADER__'
 
@@ -276,7 +276,7 @@ class CrossSampleModule(QtWidgets.QWidget):
                 'density n</b> (the <b>n (branch)</b> column). Model-dependent — the same '
                 'g gives a different n under a different model.',
                 'The <b>coil, branched/star and dendrimer</b> ρ values are <b>tabulated</b> '
-                'theoretical ones (Theory-and-Equations-Guide §2.2), and measured ρ runs '
+                'theoretical ones (Theory-and-Equations-Guide §5.1), and measured ρ runs '
                 'about <b>10–14 % below</b> '
                 'them, so a real sample can read <b>one band low</b> — a narrow θ-solvent '
                 'coil (tabulated 1.50) often measures 1.29–1.35 and reads as branched/star. '
@@ -302,7 +302,7 @@ class CrossSampleModule(QtWidgets.QWidget):
             '(g = (3f−2)/f²); Random tri-/tetra-functional → a branching density n '
             '(branch units per molecule, θ solvent). The same g gives a different n under '
             'a different model, so the reading is model-dependent — it names the '
-            'assumption. g itself is unchanged. See the Theory-and-Equations-Guide §2.4.1.')
+            'assumption. g itself is unchanged. See the Theory-and-Equations-Guide §5.3.1.')
         self.branching_model_combo.currentIndexChanged.connect(
             self._on_branching_model_changed)
         model_row.addWidget(self.branching_model_combo)
@@ -318,7 +318,7 @@ class CrossSampleModule(QtWidgets.QWidget):
                 'The reading is <b>model-dependent</b>: the same g gives a different n '
                 'under a different model (and a different f_eff as a star), so the readout '
                 'names the model. These are the <b>θ-solvent</b> forms; g itself is '
-                'model-free. See the Theory-and-Equations-Guide §2.4.1.',
+                'model-free. See the Theory-and-Equations-Guide §5.3.1.',
             ]))
         model_row.addStretch(1)
         rl.addLayout(model_row)
@@ -327,9 +327,13 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.table.setHorizontalHeader(RichTextHeaderView(self.table))
         self.table.setHorizontalHeaderLabels(self._columns())
         self.table.horizontalHeader().setStretchLastSection(True)
+        # A sample name is 'polymer / solvent @ T K' and runs past the default section
+        # width, so its column follows its contents rather than a fixed size -- the one
+        # cell in this table whose text a reader needs whole to tell two rows apart.
+        self.table.horizontalHeader().setSectionResizeMode(
+            _C_SAMPLE, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         # The ρ header carries the always-visible "± statistical" qualifier and is the
-        # one header longer than the default section width; size it to its text once
-        # (the rich-text header view does not feed its label into the content resize).
+        # one header longer than the default section width; size it to its text once.
         self.table.horizontalHeader().resizeSection(_C_RHO, 250)
         self.table.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
@@ -350,7 +354,7 @@ class CrossSampleModule(QtWidgets.QWidget):
             'fit to the samples you tag Linear (on the Data tab), read at the branched '
             'Mw. Tag samples with the Chain type control on the Data tab. A g/h ± comes '
             'from replicate branched measurements only and excludes the reference-law '
-            'fit uncertainty (Theory-and-Equations-Guide §2.4–2.5).')
+            'fit uncertainty (Theory-and-Equations-Guide §5.3–5.4).')
         rl.addWidget(self.arch_caption, 0)
         exp_row = QtWidgets.QHBoxLayout()
         exp_row.addStretch(1)
@@ -382,7 +386,7 @@ class CrossSampleModule(QtWidgets.QWidget):
                 'The ± on ν is a regression SE (statistical only).',
                 'The readout below names excluded points and flags '
                 'arbitrary-scale or model-dependent values.',
-                'See the Theory-and-Equations-Guide §2.3.',
+                'See the Theory-and-Equations-Guide §5.2.',
             ]))
         self.scaling_fig = Figure(figsize=(4.3, 4.8))
         self.scaling_canvas = make_canvas_expanding(FigureCanvas(self.scaling_fig))
@@ -530,7 +534,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         try:
             data = self.controller.compute_architecture(
                 included, branching_model=self._branching_model)
-        except Exception as exc:                     # defensive: never break the tab
+        except Exception as exc:  # noqa: BLE001 — surfaced in the caption; defensive: never break the tab
             self._arch = None
             self.arch_caption.setText(str(exc))
             return None
@@ -596,7 +600,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         can never describe the same unit differently."""
         try:
             rho = self.controller.compute_sample_rho(sid, fraction)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — surfaced as the detail text
             return str(exc), ''
         flag = ('  [apparent ρ — at least one input is a single-condition '
                 'value]' if rho.is_apparent else '')
@@ -740,16 +744,17 @@ class CrossSampleModule(QtWidgets.QWidget):
         mw_set.clicked.connect(lambda: self._on_manual('mw'))
         grid.addWidget(mw_set, 3, 4)
 
-        # A2 row (feeds the A2-Mw scaling plot): a picker over fit-derived Zimm/Berry
-        # candidates ONLY — no manual entry. A2 is a solvent/T-specific interaction
+        # A2 row (feeds the A2-Mw scaling plot): a picker over fit-derived candidates
+        # ONLY (Zimm/Berry, and the apparent single-angle ladder) — no manual entry. A2 is a solvent/T-specific interaction
         # coefficient (no external "standard" as Mw has) and is the y-axis the scaling
         # plot fits, so a hand-typed value would invite circularity. Scale-dependent,
         # so it carries a calibration badge like Mw.
         grid.addWidget(QtWidgets.QLabel('A₂ (SLS):'), 4, 0)
         self.a2_combo = QtWidgets.QComboBox()
         self.a2_combo.setToolTip(
-            'A₂ from the Zimm/Berry double extrapolation (thermodynamic). '
-            'Calibration-dependent — an uncalibrated A₂ is on an arbitrary scale '
+            'A₂ from the Zimm/Berry double extrapolation (thermodynamic), or from a '
+            'single-angle ladder (apparent — angle-contingent, and never selected for '
+            'you). Calibration-dependent — an uncalibrated A₂ is on an arbitrary scale '
             '(see the Theory-and-Equations-Guide, SLS section). No manual entry: A₂ is a '
             'solvent/temperature-specific interaction coefficient with no external '
             'standard, and it is the y-axis the A₂–Mw plot fits.')
@@ -810,6 +815,12 @@ class CrossSampleModule(QtWidgets.QWidget):
                 '— select it deliberately if the shape fits. It appears only while its '
                 'fit is current; after a mask / calibration / estimator change, re-run it '
                 'on the SLS tab to refresh the option.',
+                '<b>Single-angle ladder</b>: a concentration series read at one angle '
+                'offers an apparent Mw and A₂ under <i>Single-angle ladder (apparent)</i>, '
+                'one entry per angle you ran, each naming its own θ. At one angle there is '
+                'no q → 0 extrapolation, so these are apparent — they are offered but are '
+                '<i>never</i> selected for you, because only you can say which angle should '
+                'represent the sample.',
                 '<b>Show all single-condition results</b>: reveal the per-angle / '
                 'per-concentration apparent values hidden by default.',
                 '<b>⚠ badges</b>: Mw and A₂ are scale-dependent — an uncalibrated fit '
@@ -839,7 +850,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.sample_list.clear()
         by_id = {s.sample_id: s for s in self.controller.samples()}
         for sid in universe:
-            item = QtWidgets.QListWidgetItem(_sample_label(by_id[sid]))
+            item = QtWidgets.QListWidgetItem(sample_display_name(by_id[sid]))
             item.setData(QtCore.Qt.ItemDataRole.UserRole, sid)
             self.sample_list.addItem(item)
             item.setSelected(self._included[sid])
@@ -916,7 +927,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         return format_fixed_sig(v_disp, self.controller.settings.no_uncertainty_sig_figs)
 
     def _unit_label(self, sample, fraction: Optional[str]) -> str:
-        base = _sample_label(sample)
+        base = sample_display_name(sample)
         return f'{base} — {fraction}' if fraction is not None else base
 
     def _rebuild_table(self) -> None:
@@ -944,7 +955,7 @@ class CrossSampleModule(QtWidgets.QWidget):
             chain = _CHAIN_DISPLAY.get(self.controller.sample_chain_type(sid), _EMPTY)
             try:
                 rho = self.controller.compute_sample_rho(sid, frac)
-            except Exception:
+            except Exception:  # noqa: BLE001 — row isolation, cell left blank
                 rho = None
             if rho is not None:
                 # The estimator marker is IN the cell, not only in the (gated) tooltip: an
@@ -1131,7 +1142,7 @@ class CrossSampleModule(QtWidgets.QWidget):
             for q, p in zip((self._size_quantity, 'a2'), targets, strict=True):
                 sd = self.controller.compute_scaling(included, q)
                 written.append(self.controller.export_scaling(sd, p))
-            return '; '.join(written)
+            return written                     # summarised by `export_to_csv`
 
         status = export_to_csv(self, self.controller, 'scaling.csv', do_export)
         if status:
@@ -1195,7 +1206,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         self._suppress = True
         self.sample_combo.clear()
         for sid in included:
-            self.sample_combo.addItem(_sample_label(by_id[sid]))
+            self.sample_combo.addItem(sample_display_name(by_id[sid]))
             self.sample_combo.setItemData(
                 self.sample_combo.count() - 1, sid, QtCore.Qt.ItemDataRole.UserRole)
         self._suppress = False
@@ -1287,7 +1298,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         self._current_unit = None
         self.source_box.setEnabled(False)
         sample = self.controller.workspace.samples.get(sid)
-        label = _sample_label(sample) if sample is not None else sid
+        label = sample_display_name(sample) if sample is not None else sid
         self._set_interp(
             f'{label} is excluded from Cross-Sample (unticked in the membership list). '
             'Re-tick it to pick sources or enter manual values.')

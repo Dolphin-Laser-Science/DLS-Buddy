@@ -50,6 +50,7 @@ Change history
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -57,7 +58,8 @@ import tempfile
 import warnings
 from datetime import datetime
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -69,14 +71,19 @@ from core.workspace import (
     reset_result_quantity, RegroupLoss,
     _DLS_PARAM_KEYS, _SLS_PARAM_KEYS, _PROVENANCE_KEYS, _absent,
 )
+from core.naming import (measurement_display_name, measurement_name,
+                         sample_display_name, source_file_name)
 from core.data_models import (_normalize_chain_type, casefold_identity_name,
                               polarization_state as _polarization_state,
                               round_angle_for_identity,
                               round_concentration_for_identity,
-                              round_temperature_for_identity)
+                              round_temperature_for_identity, usable_rate)
 from physics import solvents as solvents_lib
 from app.settings import SettingsState
+from app.analysis_region import (REGION_LABEL, REGION_NOTE_PREFIX, RegionState,
+                                 describe_region, region_fit_kwargs)
 from analysis import dls as dls_engine
+from analysis.dls.cumulants import _pdi_check as _dls_pdi_check
 from analysis.dls.cumulants import _size_range_check as _dls_size_range_check
 from analysis.dls import DEFAULT_AMPLITUDE_FLOOR, MIN_DECAY_COMPLETENESS
 from analysis import sls as sls_engine
@@ -134,6 +141,48 @@ def _value_in(value: Optional[float], excluded) -> bool:
     if value is None or not excluded:
         return False
     return any(np.isclose(float(value), float(e)) for e in excluded)
+
+
+def _in_axis_terms(build, kw):
+    """Run a multi-angle synthetic build, translating ONE refusal into the lag-axis terms.
+
+    `synthetic_dataset._tuple_multi_angle`'s pattern, one layer up: when the caller passed
+    no `run_duration_s` on a multi-tau axis (the Utilities generator offers no run duration,
+    so the set runs for the builder's default), a lag axis that outlasts the run is refused
+    in the multi-tau settings the caller CAN change. The predicate stays in
+    `build_multi_angle_dls`; only the vocabulary moves.
+    """
+    try:
+        return build()
+    except ValueError as exc:
+        if ('run_duration_s' in kw or kw.get('grid') != 'multitau'
+                or 'does not outlast' not in str(exc)):
+            raise
+        run_s = inspect.signature(synth.build_multi_angle_dls).parameters[
+            'run_duration_s'].default
+        raise ValueError(
+            f"The lag axis runs past the synthetic set's {run_s:g} s run, and no lag can "
+            f"outlast the run that measured it. Shorten the axis: fewer Blocks (octaves), "
+            f"a smaller Δt₀, or fewer Channels/octave.") from exc
+
+
+def _refuse_an_average_as_a_repeat(lms) -> None:
+    """Raise if a selection handed to any averaging action holds a replicate average.
+
+    An average is not a repeat, so it never enters another average (combination doctrine
+    rule 1, core/data_models.py, which is this refusal's normative home). Counted beside its
+    own sources it adds no scatter but raises N; beside independent runs it counts as one
+    repeat while carrying a fraction of one run's variance. Either way the replicate +/-
+    under-reports. Keyed on the item's own tag, never on its sources, so no source-id
+    bookkeeping can go stale.
+    """
+    n_avg = sum(1 for lm in lms if lm.derived_kind == 'replicate_average')
+    if n_avg:
+        raise ValueError(
+            f"The selection holds {n_avg} averaged measurement(s). An average is not a "
+            f"repeat measurement, so it cannot enter another average: counted as one it "
+            f"understates the replicate ±. Select the source runs instead of the average "
+            f"(fit the average on its own to use its cleaner curve).")
 
 
 def _ddls_paired_angles(angle_geometry_pairs) -> set:
@@ -285,6 +334,59 @@ def _per_series_source_id(kind: str, index: int, conc: float) -> str:
     return f'{kind}@{index}:{conc}'
 
 
+# The candidate `kind` of a single-angle ladder fit (the fixed-angle Debye plot over a
+# concentration series). Spelled once: the Mw and A2 builders, the picker's grouping table
+# in gui/cross_module.py and the tests all name the same token.
+_LADDER_KIND = 'sls_ladder'
+
+
+def _ladder_source_id(angle_deg: float) -> str:
+    """The identity of ONE single-angle ladder fit: its ANGLE.
+
+    A sample may carry several ladders at once -- one per angle the user ran -- and each is
+    offered as its own explicit pick (owner-ruled 2026-09-03), so the angle is exactly what
+    tells them apart. It is also the whole of the stored result's identity within a
+    (sample, fraction): `results[('single_angle_ladder', sid, angle, fraction)]`.
+
+    `:g` matches `_fmt_deg`, so the id and the label name the same angle in the same
+    spelling; a ladder re-run at the same angle mints the same id, which is the point (the
+    user's pick survives the re-run)."""
+    return f'ladder@{float(angle_deg):g}'
+
+
+#: The suffix naming a tier-1 Rh candidate that is the user's OWN stored Correlogram
+#: cumulant fit, as `gamma_q2@run` names a stored Gamma-vs-q^2 run.
+_STORED_FIT_SUFFIX = '@run'
+
+
+def _stored_fit_source_id(item_id: str) -> str:
+    """The identity of the tier-1 candidate read from the user's own Correlogram fit of
+    `item_id`, told apart from the candidate re-derived at the Settings order (whose id
+    is the bare item_id) because the two are different fits: a change of the Settings
+    order invalidates a pick of the second and never of the first, which ran at the
+    Correlogram tab's own order box."""
+    return f'{item_id}{_STORED_FIT_SUFFIX}'
+
+
+def _is_stored_fit_source_id(source_id) -> bool:
+    return isinstance(source_id, str) and source_id.endswith(_STORED_FIT_SUFFIX)
+
+
+def _ladder_candidate_label(res) -> str:
+    """The picker/export provenance label for one single-angle ladder fit — SINGLE source
+    shared by the Mw and A2 candidate builders (the `_ff_candidate_label` pattern: one physical
+    fit must not get two divergent labels).
+
+    It names the ANGLE because at one angle the q → 0 extrapolation was never done
+    (invariant 7): the Mw is Mw·P(q) and the slope is 2·A2 only where P(q) ≈ 1, so "apparent"
+    here is a property of the angle the user chose, and a reader of the label — in the picker,
+    on `SampleResult.mw_label`, or in the Cross-Sample export's source column — must be able to
+    see which angle that was."""
+    return (f"Single-angle ladder at θ = {_fmt_deg(getattr(res, 'angle_deg', None))}, "
+            f"{int(getattr(res, 'n_conc', 0))} concentrations "
+            f"(apparent{_scale_caveat(res)}, R² = {_fmt_r2(float(res.r_squared))})")
+
+
 def _ff_candidate_label(name: str, sol, degenerate: bool, descriptor: str, r2: float) -> str:
     """The picker/export provenance label for one form-factor solution — SINGLE source shared by the
     Rg and Mw candidate builders (rule 10: one physical fit must not get two divergent labels). A
@@ -390,6 +492,27 @@ def _result_degenerate(res, quantity: str) -> bool:
     return dg
 
 
+def _scaling_point_source(res, quantity: str) -> str:
+    """The plain-language provenance of ONE plotted scaling point: where its Mw came from,
+    and where the plotted y value (Rg / Rh / A2) came from.
+
+    The stored `<q>_label` verbatim, never a re-derivation — the same rule the picker and the
+    architecture export's `Rg source` / `Rh source` columns follow, and the reason a
+    single-angle ladder's angle reaches the file at all: the angle lives in the label
+    (`_ladder_candidate_label`), not in a flag. A value with no label yet (nothing selected,
+    or a pre-key session) names its source tier instead of printing an empty cell, so the
+    column never reads as "no provenance" when the real answer is "hand-entered".
+    """
+    y_field = {'rg': 'rg', 'rh': 'rh', 'a2': 'a2'}[quantity]
+    y_name = {'rg': 'Rg', 'rh': 'Rh', 'a2': 'A2'}[quantity]
+
+    def _one(prefix: str, q: str) -> str:
+        label = getattr(res, f'{q}_label', '') or ''
+        return f"{prefix}: {label or (getattr(res, f'{q}_source', '') or 'unknown')}"
+
+    return f"{_one('Mw', 'mw')}; {_one(y_name, y_field)}"
+
+
 def _result_arbitrary_scale(res, quantity: str) -> bool:
     """Whether a SampleResult contributes an ARBITRARY-SCALE value to a cross-sample analysis of
     `quantity`: its Mw is on an arbitrary scale (Mw is the X axis of EVERY scaling plot, so its
@@ -423,6 +546,11 @@ _SHARED_PARAM_KEYS = (
     # propagated like polymer_name; it feeds the Cross-Sample g/h readouts and is
     # deliberately NOT part of sample_group_key (a label, not a grouping key).
     'chain_type',
+    # The typed 90 deg solvent intensity: a property of the SOLVENT, so it is entered
+    # once per sample exactly as dn/dc is, not per concentration. SLS-only -- it is
+    # absent from _DLS_PARAM_KEYS, and `set_shared_param` writes a key only when the
+    # sibling's own kind roster allows it, so DLS members skip it.
+    'solvent_blank_intensity_90deg',
 )
 
 # Parameter keys the Reset button preserves: the scattering
@@ -468,6 +596,159 @@ _DLS_PARAM_UNITS = {
     'PDI': '', 'β': '', 'τc': 's', 'stretch': '',
 }
 
+# Per-method FIT DETAILS -- every quantity of a parametric fit that is not already a
+# headline column -- as `(storage key, display name, getter, unit, note-target key)`. Read
+# by BOTH the snapshot writer and the Summary columns, so a quantity cannot be saved without
+# being shown or shown without being saved. `_collect_fit_details` below is the contract's
+# normative home: what each element means, why this is a sibling of `_DLS_PARAM_SPECS`
+# rather than part of it, and what is stored versus rendered.
+_DLS_DETAIL_SPECS = {
+    'cumulant': [
+        ('gamma', 'Γ', lambda r: r.gamma_s_inv, 's⁻¹', 'gamma_s_inv'),
+        ('mu2', 'μ₂', lambda r: r.mu2_s_inv2, 's⁻²', 'mu2_s_inv2'),
+        ('mu3', 'μ₃', lambda r: r.mu3_s_inv3, 's⁻³', 'mu3_s_inv3'),
+        ('mu4', 'μ₄', lambda r: r.mu4_s_inv4, 's⁻⁴', 'mu4_s_inv4'),
+        ('order', 'order', lambda r: r.order, '', 'order'),
+        ('method', 'method', lambda r: r.method, '', 'method'),
+        # `baseline_b` and not `baseline`, and the distinction is load-bearing rather than
+        # cosmetic: on the nonlinear arm this is a FITTED parameter, while every entry
+        # below is the caller's PINNED offset handed back unchanged. They are different
+        # quantities that share a word, they behave differently under a solver, and a test
+        # tolerance keys on this one alone (`tests/test_session_roundtrip_family.py`).
+        ('baseline_b', 'baseline B', lambda r: r.baseline, '', 'baseline'),
+    ],
+    'single': [
+        ('gamma', 'Γ', lambda r: r.mode.gamma_s_inv, 's⁻¹', None),
+        ('beta', 'β', lambda r: r.beta, '', 'beta'),
+        ('baseline', 'baseline', lambda r: r.baseline, '', 'baseline'),
+        ('converged', 'converged', lambda r: r.success, '', 'success'),
+    ],
+    'double': [
+        ('frac_fast', 'fast frac', lambda r: r.mode1.amplitude_fraction, '', None),
+        ('frac_slow', 'slow frac', lambda r: r.mode2.amplitude_fraction, '', None),
+        ('baseline', 'baseline', lambda r: r.baseline, '', 'baseline'),
+        ('converged', 'converged', lambda r: r.success, '', 'success'),
+    ],
+    'kww': [
+        ('stretch', 'stretch s', lambda r: r.stretch, '', 'stretch'),
+        ('tau_c', 'τ<sub>c</sub>', lambda r: r.tau_c_s, 's', 'tau_c_s'),
+        ('mean_tau', '⟨τ⟩', lambda r: r.mean_tau_s, 's', 'mean_tau_s'),
+        # The SECOND size this arm reports. One decay, two ways of reporting it: the
+        # Summary headline carries the tau_c size, so without this one the mean-tau size
+        # is on no durable surface at all and a reloaded session cannot show it.
+        ('rh_mean_tau', 'R<sub>h</sub>(⟨τ⟩)', lambda r: r.rh_from_mean_tau_nm,
+         'nm, apparent', None),
+        ('baseline', 'baseline', lambda r: r.baseline, '', 'baseline'),
+        ('converged', 'converged', lambda r: r.success, '', 'success'),
+    ],
+}
+
+
+def _collect_fit_details(method: str, res) -> Dict[str, Any]:
+    """The detail quantities of one parametric fit, keyed by their display names.
+
+    This docstring is the normative home of `_DLS_DETAIL_SPECS`'s contract.
+
+    EACH ENTRY is `(storage key, display name, getter, unit, note-target key)`.
+
+    THE STORAGE KEY is what `fit_details` is keyed by in the session, and it is a stable
+    ASCII token that is NOT the display name. The two were one string at first, which
+    welded the session format to a user-visible label: renaming a column -- the kind of
+    edit this project's quality bar licenses as cheap and unreviewed -- would have made
+    every saved value for that quantity unreachable, falling back to a blank cell with no
+    error and no version bump to notice. Display names are now free to change; storage
+    keys are not, and `tests/test_session_roundtrip_family.py` pins the roster by
+    identity so a change to one has to be deliberate. (No migration was owed: the
+    display-name form existed only between two commits on one unreleased version, so no
+    session outside this repository was ever written with it.)
+
+    A SIBLING of `_DLS_PARAM_SPECS` rather than an extension of it, deliberately: that
+    dict's getters are fed into the replicate-averaging path's numeric mean, and `method`
+    and `converged` here are a string and a bool. Same shape, different consumer.
+
+    THE FOURTH ELEMENT is the RESULT ATTRIBUTE the column shows, which is how a passive
+    note reaches the cell it explains: `_keyed_notes` (analysis/dls/_common.py) tags each
+    note with the attribute it is about, and a note whose tag matches this key lands on
+    this column. `None` means no note can target it -- the value is nested (an exponential
+    mode's Gamma) and no note builder names it. A note tagged '' (about the whole fit, as
+    the dead-channel note is), or tagged an attribute no column shows, falls back to the
+    method's headline cell: never dropped, and never guessed onto a neighbour.
+
+    WHAT IS STORED is the fit result's own value -- the raw `method` string, the raw
+    `success` bool -- never the painted '... (failed)' or 'yes'/'no'. Rendering is the
+    table's job, which is what lets a test assert the saved row equals the result.
+
+    Driven entirely by `_DLS_DETAIL_SPECS`, so adding a quantity there is the only edit
+    needed to have it saved: there is no second list here to keep in step. A method with
+    no detail spec (every distribution method -- their cells are resolved peaks, which
+    have no fixed parameter set) collects nothing and gets an empty mapping.
+
+    A getter that raises is a quantity this result does not carry -- a shape the caller
+    should never produce, since the spec is written against the arm's own result class,
+    but a snapshot writer is the wrong place to lose a whole row of good numbers over one
+    missing attribute. The quantity is left out and the rest are stored.
+    """
+    out: Dict[str, Any] = {}
+    for key, _name, getter, _unit, _target in _DLS_DETAIL_SPECS.get(method, ()):
+        try:
+            value = getter(res)
+        except AttributeError:
+            continue
+        # numpy scalars serialize as their own type through the session's JSON writer;
+        # store the plain Python value so a reloaded row compares equal to the fit.
+        if isinstance(value, (np.floating, np.integer)):
+            value = value.item()
+        out[key] = value
+    return out
+
+
+def _collect_passive_notes(res) -> Dict[str, List[str]]:
+    """A fit's passive notices, grouped by the result attribute each is about.
+
+    Reads the engine's index-aligned `notes` / `note_targets` pair and turns it into the
+    mapping the durable row stores (`MeasurementResultRow.passive_notes`), which is the
+    shape the Summary table reads: it asks a column "what notes are about you?" and never
+    has to index two tuples itself.
+
+    UNEQUAL LENGTHS ARE TREATED AS ALL-FIT-LEVEL, never as a partial alignment. A result
+    built by a producer that has not been taught targets carries none, and guessing that
+    the first N notes line up with the N targets would put a note on a number it is not
+    about -- which is worse than the '' fallback, where the note still reaches the reader
+    on the fit's headline cell. `_common._keyed_notes` is why this stays a defensive
+    branch rather than a live one: a producer cannot build a misaligned pair through it.
+    """
+    notes = tuple(getattr(res, 'notes', ()) or ())
+    targets = tuple(getattr(res, 'note_targets', ()) or ())
+    if len(targets) != len(notes):
+        targets = ('',) * len(notes)
+    out: Dict[str, List[str]] = {}
+    # strict=True asserts what the branch above just guaranteed: after it the two are
+    # equal in length on every path, so a raise here would mean that normalization had
+    # stopped working -- which is worth hearing about rather than silently truncating a
+    # note off the end.
+    for target, note in zip(targets, notes, strict=True):
+        out.setdefault(target, []).append(note)
+    return out
+
+
+def _relayed_run_notes(named) -> List[str]:
+    """Each run's PASSIVE fit notes for a result built from several runs: `named` is
+    [(run name, its notes)], and each distinct note is returned once with the runs that
+    carried it named in front ("A, B: <note>"), in first-seen order, a name once each.
+    A caller passes the notes `_collect_passive_notes` records on a single run's Summary
+    row, flattened across the columns they are about.
+
+    `analysis/dls/angular.py::_relayed_point_notes`' shape, naming runs where that one
+    numbers points. A replicate average or a DDLS result is the only surface that shows its
+    number, so a note about how a run was fitted -- a floating baseline or µ2 resting on its
+    bound, dead channels -- must reach it; the flags are the result's own and untouched."""
+    noted: Dict[str, List[str]] = {}
+    for name, notes in named:
+        for note in notes:
+            if note:
+                noted.setdefault(note, []).append(name)
+    return [f"{', '.join(dict.fromkeys(names))}: {note}" for note, names in noted.items()]
+
 # Distribution methods yield a VARIABLE number of size-distribution peaks (not a
 # fixed parameter set), so replicate averaging aligns their peaks positionally
 # (Rh-ascending) instead of by name. They are report-only (no single Rh written).
@@ -482,6 +763,106 @@ _DLS_DISTRIBUTION_METHODS = ('nnls', 'contin', 'lognormal')
 #: carry a high-PDI point's verdict on `rh_reliable`. `'fit_failed'` / `'nonpositive_q'`
 #: stop here, because there is no Γ to hand on at all.
 FIT_ELIGIBLE_QUALITIES = ('ok', 'high_pdi', 'nonpositive_gamma')
+
+
+#: The Settings cumulant residual-weighting POLICY tokens and the engine request each maps
+#: to: 'sourced' is `weighting=None`, each arm's own sourced default; 'uniform' is the
+#: unweighted opt-in on either arm. A policy, never an engine token, so a later weighting
+#: joins here without migrating a persisted setting.
+CUMULANT_WEIGHTING_POLICIES = {'sourced': None, 'uniform': 'uniform'}
+
+
+def _cumulant_weighting_request(policy: str) -> Optional[str]:
+    """The `fit_cumulants` weighting request for a Settings policy token.
+
+    Takes the TOKEN rather than reading the settings, so every reader names
+    `self.settings.cumulant_weighting` in its own body -- the form the staleness census
+    (`test_every_run_signature_carries_the_settings_its_engine_path_reads`) can see. An
+    unrecognised value -- a hand-edited settings.json -- raises naming the setting, the
+    landing a hand-edited `cumulant_method` gets at the engine; never a silent fall-back
+    to 'sourced'."""
+    if policy not in CUMULANT_WEIGHTING_POLICIES:
+        raise ValueError(
+            f"Settings cumulant_weighting must be one of "
+            f"{sorted(CUMULANT_WEIGHTING_POLICIES)}, got {policy!r}. Choose the residual "
+            f"weighting in Settings.")
+    return CUMULANT_WEIGHTING_POLICIES[policy]
+
+
+#: The Settings distribution residual-weighting POLICY tokens and the engine request each
+#: maps to: 'sourced' is `weighting=None`, the distribution arms' own sourced default;
+#: 'g1-squared' is the older constant-variance form on all three arms. A policy, never an
+#: engine token, so a later weighting joins here without migrating a persisted setting --
+#: which this control is built to take (the whitened form is specified and parked).
+DISTRIBUTION_WEIGHTING_POLICIES = {'sourced': None, 'g1-squared': 'g1-squared'}
+
+
+def distribution_weighting_request(policy: str) -> Optional[str]:
+    """The distribution fits' weighting request for a Settings policy token.
+
+    PUBLIC, unlike its cumulant sibling: the DLS tab's per-run weighting control maps its
+    choice through this function, so the widget and the Settings seed cannot disagree about
+    what a token means. Takes the TOKEN rather than reading the settings. Its one reader
+    of the Setting is the seed home `_seed_distribution_kwargs`, a helper the staleness
+    census cannot see into (its walk is one level deep), so what keeps a shown result
+    honest is each tab's own `_run_signature`: the Distribution tab and the Mode Map each
+    ride their own per-run control there (`DistributionFitFields.fit_kwargs`).
+    An unrecognised value -- a hand-edited settings.json -- raises naming the setting, the
+    landing a hand-edited `cumulant_method` gets at the engine; never a silent fall-back
+    to 'sourced'."""
+    if policy not in DISTRIBUTION_WEIGHTING_POLICIES:
+        raise ValueError(
+            f"Settings distribution_weighting must be one of "
+            f"{sorted(DISTRIBUTION_WEIGHTING_POLICIES)}, got {policy!r}. Choose the "
+            f"residual weighting in Settings.")
+    return DISTRIBUTION_WEIGHTING_POLICIES[policy]
+
+
+# "no argument given", distinct from an explicit None (which is a legal typed-blank
+# value meaning "no solvent subtraction"). Module-level so the default is one object.
+_UNSET = object()
+
+
+def _typed_blank_problem(i90: Optional[float], dark_count_rate: float) -> str:
+    """Why a typed 90 deg solvent intensity cannot be used, or '' when it can.
+
+    ONE predicate, shared by the commit-time courtesy check (`validate_typed_blank`)
+    and by `_typed_blank_for`, where the blank is actually constructed -- so the two
+    boundaries cannot be sized differently (rule 12). It judges the RAW inputs; the
+    finiteness of the constructed array is checked separately, on the array itself,
+    because saturation is a property of the result and only the cross-product of I90
+    with every angle in the series can reach it.
+
+    Legal: empty (None) and exactly zero, both meaning "no solvent subtraction"; and
+    any value at or above the dark count. Refused: anything non-finite, and anything
+    strictly between zero and the dark count -- there the net solvent term
+    `(I90 - d)/sin(theta)` is negative, i.e. a solvent that scatters less than the
+    detector's own dark floor, which no measurement produces.
+    """
+    if i90 is None:
+        return ''
+    try:
+        v = float(i90)
+    except (TypeError, ValueError):
+        return ('The solvent blank intensity at 90 degrees must be a number, or blank '
+                'for no solvent subtraction.')
+    if not math.isfinite(v):
+        return ('The solvent blank intensity at 90 degrees must be finite, or blank '
+                'for no solvent subtraction.')
+    if v == 0.0:
+        return ''
+    d = float(dark_count_rate)
+    if v < 0.0:
+        return (f'The solvent blank intensity at 90 degrees cannot be negative '
+                f'(got {v:g}). Leave it blank, or enter zero, to run with no solvent '
+                f'subtraction.')
+    if v < d:
+        return (f'The solvent blank intensity at 90 degrees ({v:g}) is below the '
+                f'committed dark count rate ({d:g}), so the net solvent intensity '
+                f'would be negative. Raise the blank intensity, lower the dark count '
+                f'rate on the SLS tab, or clear the blank intensity to run with no '
+                f'solvent subtraction.')
+    return ''
 
 
 def _rh_value_promotable(rh) -> bool:
@@ -518,6 +899,22 @@ def _flag_suffix(result, flag: str = 'rh_reliable') -> str:
     return f" — unreliable: {getattr(result, 'reliability_note', '') or 'flagged'}"
 
 
+def _reliability_note_suffix(result, flag: str) -> str:
+    """The engine's OWN reliability sentence as a label suffix — `_flag_suffix` without its
+    reason-less `'flagged'` fallback, and the shared body behind `_guinier_suffix` and the
+    single-angle ladder candidates.
+
+    The fallback is dropped deliberately: a False `<flag>` whose cause is one of the SCALE
+    gates (uncalibrated, no dn/dc) carries no engine sentence, and those causes already travel
+    on the label through `_scale_caveat` — so printing "unreliable: flagged" beside that caveat
+    states a second, reason-less verdict about the same fact. No sentence, no suffix.
+    (`_guinier_suffix`'s own comments record where that was learned.)"""
+    if getattr(result, flag, True):
+        return ''
+    note = getattr(result, 'reliability_note', '') or ''
+    return f" — unreliable: {note}" if note else ''
+
+
 def _guinier_suffix(result) -> str:
     """The Guinier sibling of `_flag_suffix`, read on the Mw candidate: a Guinier fit
     whose largest MEASURED q*Rg exceeds the validity limit is offered with the engine's
@@ -535,17 +932,13 @@ def _guinier_suffix(result) -> str:
     # (owner-ruled 2026-08-27; analysis/sls.py's guinier block names the reasoning).
     if not hasattr(result, 'guinier_valid'):
         return ''                       # Debye / single-angle: no regime verdict at all
-    if getattr(result, 'mw_reliable', True):
-        return ''
     # A False `mw_reliable` has causes the ENGINE writes no sentence for -- uncalibrated,
     # no dn/dc -- and those already travel on the label through `_scale_caveat`. Without
     # a note this printed a reason-less "unreliable: flagged" beside that caveat, and on a
     # no-extractable-Rg fit it printed a sentence that DENIES the verdict it carries. The
-    # suffix exists to surface the engine's own regime sentence; no sentence, no suffix.
-    note = getattr(result, 'reliability_note', '') or ''
-    if not note:
-        return ''
-    return f" — unreliable: {note}"
+    # suffix exists to surface the engine's own regime sentence; no sentence, no suffix --
+    # the rule now lives in `_reliability_note_suffix`, shared with the ladder candidates.
+    return _reliability_note_suffix(result, 'mw_reliable')
 
 
 # ===========================================================================
@@ -945,7 +1338,8 @@ class RecordedModePoint:
     Frozen (the structural half of the snapshot ruling, owner 2026-08-14):
     recording copies the VALUES off the mode map at record time -- amplitude,
     decay rate, the source run's committed concentration, the inversion's
-    regularization and size grid, and the integration bounds -- so a later
+    regularization, size grid and residual weighting, and the integration
+    bounds -- so a later
     re-fit, re-pick or parameter edit cannot re-aim what a partition already
     consumed. `item_id`
     is provenance and MAY dangle after the source run is deleted; the snapshot
@@ -967,9 +1361,20 @@ class RecordedModePoint:
     min_decay_completeness: float = MIN_DECAY_COMPLETENESS
     alpha: Optional[float] = None              # CONTIN regularization (None otherwise)
     alpha_selection_method: str = ''           # 'gcv'|'lcurve'|'ftest'|'user'|''
+    # The robust-GCV gamma beside a 'gcv' token ('gcv' names a family, so the pair is the
+    # provenance). None when the selector was not GCV, and on a session written before the
+    # field existed -- "this record names no gamma", not a claim about which functional ran.
+    gcv_gamma: Optional[float] = None
     rh_min_nm: float = float('nan')            # the size grid the inversion ran on
     rh_max_nm: float = float('nan')
     n_grid: int = 0
+    # Which residual weight built the inversion these amplitudes came from, and what that
+    # weight read (`ModePoint`'s three, snapshotted with everything else). A session
+    # written before they existed reads back '' on all three -- "this record names no
+    # weighting form", which is the truth about it, not a claim that the older weight ran.
+    weighting: str = ''
+    sample_time_provenance: str = ''           # 'instrument' | 'axis' | ''
+    run_duration_form: str = ''                # 'finite' | 'infinite' | ''
     bounds_lo_rh_nm: float = float('nan')      # integration lobe (distribution sources)
     bounds_hi_rh_nm: float = float('nan')
     bounds_source: str = ''                    # 'auto' | 'manual' | ''
@@ -988,9 +1393,13 @@ class RecordedModePoint:
             'min_decay_completeness': self.min_decay_completeness,
             'alpha': self.alpha,
             'alpha_selection_method': self.alpha_selection_method,
+            'gcv_gamma': self.gcv_gamma,
             'rh_min_nm': _nan_to_none(self.rh_min_nm),
             'rh_max_nm': _nan_to_none(self.rh_max_nm),
             'n_grid': self.n_grid,
+            'weighting': self.weighting,
+            'sample_time_provenance': self.sample_time_provenance,
+            'run_duration_form': self.run_duration_form,
             'bounds_lo_rh_nm': _nan_to_none(self.bounds_lo_rh_nm),
             'bounds_hi_rh_nm': _nan_to_none(self.bounds_hi_rh_nm),
             'bounds_source': self.bounds_source,
@@ -1014,9 +1423,13 @@ class RecordedModePoint:
                 d.get('min_decay_completeness', MIN_DECAY_COMPLETENESS)),
             alpha=d.get('alpha'),
             alpha_selection_method=d.get('alpha_selection_method', ''),
+            gcv_gamma=d.get('gcv_gamma'),
             rh_min_nm=_none_to_nan(d.get('rh_min_nm')),
             rh_max_nm=_none_to_nan(d.get('rh_max_nm')),
             n_grid=int(d.get('n_grid', 0)),
+            weighting=d.get('weighting', ''),
+            sample_time_provenance=d.get('sample_time_provenance', ''),
+            run_duration_form=d.get('run_duration_form', ''),
             bounds_lo_rh_nm=_none_to_nan(d.get('bounds_lo_rh_nm')),
             bounds_hi_rh_nm=_none_to_nan(d.get('bounds_hi_rh_nm')),
             bounds_source=d.get('bounds_source', ''),
@@ -1159,6 +1572,14 @@ class ScalingData:
     # distinguish) -> the exponent rests on an ambiguity the user resolved, flagged one tier stronger
     # than model_dependent alone (review-01; rule-10 sibling of any_model_dependent).
     any_degenerate: bool = False
+    # Per-point provenance, parallel to the lists above: the plain-language label of the Mw
+    # and of the plotted y value, as `_scaling_point_source` composes them. Carried so the
+    # scaling EXPORT can name where each point came from, the `export_architecture` Rg
+    # source / Rh source pattern applied to the axes this file actually plots -- which is
+    # what makes an apparent single-angle-ladder Mw or A2 name its angle in the file rather
+    # than only on screen.
+    sources: List[str] = field(default_factory=list)
+    branched_sources: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1299,6 +1720,12 @@ class Controller:
         self.sample_calibration_committed: Dict[str, CalibrationState] = {}
         # Per-sample SLS data masks (live analysis filters; persisted in sessions).
         self.sls_masks: Dict[str, SLSMask] = {}
+        # Sample ids whose user confirmed running SLS with NO MEASURED solvent blank.
+        # DELIBERATELY TRANSIENT -- it is an acknowledgement of a disclosure, not data,
+        # so it is never written to a session and a reloaded session asks again. Empty
+        # by default, which is what keeps `_rayleigh_for_sample` refusing for every
+        # headless caller and every existing test.
+        self._unmeasured_blank_ack: Set[str] = set()
         # Per-(sample, fraction) mode-map family picks (user state; persisted in
         # sessions exactly like the masks). Value-keyed -- see ModeFamilyPicks.
         self.mode_picks: Dict[tuple, ModeMapPicks] = {}
@@ -1322,6 +1749,11 @@ class Controller:
         # its flags -- instead of re-deriving one that ignores all three. See
         # run_gamma_q2 (stamps it), _stored_dls_run (gates on it).
         self._dls_run_sig: Dict[tuple, tuple] = {}
+        # The same store holds each cumulant fit's stamp under ('cumulants', item_id), so
+        # tier 1 promotes the user's own fresh fit (`_stored_cumulant_fit`); the purges
+        # reach it by its key. The fit number inside the stamp is never reused, like
+        # `_distribution_stamp_counter`, so a re-Run that moves no input still misses the memo.
+        self._cumulant_fit_counter = 0
         # Memoized SLS candidate/A2 computations for the Cross-Sample tab, keyed by the
         # full sls_run_signature: refresh() re-runs the same
         # Zimm/Debye/Guinier fits 3-5x per fraction (auto-select + source panel), so this
@@ -1914,13 +2346,16 @@ class Controller:
 
         - the committed params of the fraction's DLS measurements (feed the tier-1
           cumulant, tier-2 Γ-q², tier-3 D-vs-c fits — all via `lm.build()`);
-        - `settings.skip_initial_channels`, `settings.cumulant_method` and
+        - `settings.skip_initial_channels`, `settings.cumulant_method`,
+          `settings.cumulant_fit_cutoff`, `settings.cumulant_weighting` and
           `settings.se_estimator`, which the tiers read: tier 1's cumulant fit takes the
-          first two, and the Gamma-q2 / D-vs-c fits behind tiers 2 and 3 take all three
-          -- the estimator moves the candidate's ± (and, through the user's opt-in, the
-          ± promoted onto the sample), so it is a key like the SLS one. It used to be
-          left out on the stated ground that tiers 2/3 were called without it, which was
-          the very omission that let an HC3 ± be promoted over the user's OLS choice;
+          first four, and the Gamma-q2 / D-vs-c fits behind tiers 2 and 3 take all five
+          -- the estimator moves the candidate's ±
+          (and, through the user's opt-in, the ± promoted onto the sample), so it is a key
+          like the SLS one. It used to be left out on the stated ground that tiers 2/3
+          were called without it, which was the very omission that let an HC3 ± be
+          promoted over the user's OLS choice; `cumulant_fit_cutoff` joined the key with
+          the setting itself rather than after the same lesson a second time;
         - EVERY durable `sample_rh_rows` row for this (sample, fraction) that the
           candidate list surfaces but does not compute — replicate averages AND
           mode-family rows, keyed on source_kind so a new kind can never sit
@@ -1937,7 +2372,11 @@ class Controller:
           The stamp (not `id(res)`) is the change key: a freed result's id can be
           reused by a later re-run (CPython ABA), which would let a stale signature
           falsely match; the strictly-increasing `_distribution_stamps` counter is
-          never reused, so a re-fit always moves the signature and misses.
+          never reused, so a re-fit always moves the signature and misses;
+        - `settings.cumulant_order`, which every tier re-derives at, and the stamp of
+          each of these measurements' stored Correlogram cumulant fits: tier 1 READS a
+          fresh one instead of re-deriving, and a re-Run moves no committed param or
+          Setting, so the stamp's never-reused fit number is what makes it miss.
 
         The raw correlogram data is not keyed: it is immutable once loaded, and a
         reload clears every cache."""
@@ -1962,9 +2401,14 @@ class Controller:
             for k in self.results
             if isinstance(k, tuple) and len(k) == 3 and k[0] == 'distribution'
             and k[1] in dls_id_set))
+        cumulant_fits = tuple(sorted(
+            (iid, self._dls_run_sig.get(('cumulants', iid)))
+            for iid in dls_ids if ('cumulants', iid) in self.results))
         return (committed, self.settings.skip_initial_channels,
-                self.settings.cumulant_method, self.settings.se_estimator, rep, dist,
-                self._dls_run_state(sample_id, fraction))
+                self.settings.cumulant_method, self.settings.cumulant_fit_cutoff,
+                self.settings.cumulant_weighting, self.settings.cumulant_order,
+                self.settings.se_estimator, rep, dist,
+                self._dls_run_state(sample_id, fraction), cumulant_fits)
 
     # ----------------------------------------------------------------------
     # Stored Γ-vs-q² / D-vs-c runs: freshness stamps (the form-factor pattern)
@@ -1972,13 +2416,18 @@ class Controller:
     def _dls_run_stamp(self, item_ids) -> tuple:
         """Everything a stored Γ-vs-q² / D-vs-c run was computed from: the committed
         params of the measurements it FITTED (their item_ids ride inside, as
-        `committed_signature` embeds them) plus the three Settings the run seeds. Written
+        `committed_signature` embeds them) plus the six Settings the run seeds -- the
+        cumulant order among them, since the points fit at it. Written
         beside the result by the run (`run_gamma_q2` / `run_concentration_extrapolation`)
         and compared by `_stored_dls_run` -- the DLS analogue of `_form_factor_run_sig`.
         The fitted set, not the whole fraction: a new measurement loaded beside a run
-        leaves that run exactly what the Summary table still shows."""
+        leaves that run exactly what the Summary table still shows. The analysis region a
+        checked run read is not here: it is the tab's input, not a Setting, and moving it
+        later flags the tab's display stale without withdrawing a promoted value."""
         return (self.committed_signature(item_ids), self.settings.skip_initial_channels,
-                self.settings.cumulant_method, self.settings.se_estimator)
+                self.settings.cumulant_method, self.settings.cumulant_fit_cutoff,
+                self.settings.cumulant_weighting, self.settings.cumulant_order,
+                self.settings.se_estimator)
 
     def _stored_dls_run(self, kind: str, sample_id: str, fraction: Optional[str]):
         """The user's stored run of `kind` ('gamma_q2' | 'conc_extrap') for (sample,
@@ -2081,6 +2530,47 @@ class Controller:
             'sample_calibration': {sid: cc.to_dict() for sid, cc
                                    in self.sample_calibration_committed.items()},
         }
+
+    def snapshot_working_params(self) -> Dict[str, Dict[str, Any]]:
+        """Every measurement's WORKING parameters, copied -- a restore point for a
+        gesture that must mutate in order to decide whether to mutate.
+
+        The working-params sibling of `_snapshot_committed`, and public because the
+        Data tab calls it: its committed counterpart is private only because nothing
+        outside this class needs it.
+
+        Two deliberate differences from that sibling. It carries no calibration state,
+        because the one caller's pre-decision writes (`apply_value_to_items` and
+        `set_shared_param`, plus `_tag_user_edit`'s provenance sidecar) land inside
+        `working_params` and nowhere else. And its restore does not regroup, because
+        nothing was committed, so the grouping never moved.
+
+        Whole-workspace on purpose. A shared key propagates to every member of the
+        measurement's committed sample, so the touched set is wider than any selection
+        the caller knows about -- and COMPUTING that set here would be a second
+        computation of `set_shared_param`'s propagation boundary, which is exactly the
+        shape that has gone wrong before (rule 12). Copying everything is cheap and
+        cannot be wrong.
+        """
+        return {iid: dict(m.working_params)
+                for iid, m in self.workspace.measurements.items()}
+
+    def restore_working_params(self, snap: Dict[str, Dict[str, Any]]) -> None:
+        """Put a `snapshot_working_params` restore point back.
+
+        Measurements created since the snapshot are left alone and ones that have gone
+        are skipped, matching `_restore_committed`'s own skip rule. Committed state is
+        untouched, so no regroup is owed.
+
+        The contract this upholds is the shared regroup confirm's: "Cancel ... the
+        caller applies nothing on it" (`gui/widgets.py`). What would invalidate it is a
+        caller growing a pre-decision write that reaches something OTHER than
+        `working_params` -- that write would survive the restore silently.
+        """
+        for iid, params in snap.items():
+            m = self.workspace.measurements.get(iid)
+            if m is not None:
+                m.working_params = dict(params)
 
     def _restore_committed(self, snap: Dict[str, Any]) -> None:
         """Restore a snapshot into BOTH committed and working state, then re-group.
@@ -2481,6 +2971,15 @@ class Controller:
                                  or owner_live(k[1])})
         self._dls_candidate_cache = {
             k: v for k, v in self._dls_candidate_cache.items() if k[0] in live}
+        # The blankless-run acknowledgement is DROPPED, never carried (owner-ruled
+        # 2026-09-17). Every other store this function follows is work the user did --
+        # masks, picks, recorded sets, a hand-entered calibration -- where losing it
+        # costs real effort. This one is consent to a disclosure, and re-giving it costs
+        # one dialog. It is already non-persisted so a reloaded session re-asks; dropping
+        # it here is that same principle at the other trigger. Without this the ids are
+        # deterministic enough that renaming a sample away and back resurrected consent
+        # the re-formed sample had never been given.
+        self._unmeasured_blank_ack &= live
 
     # ---- pre-checks: what would a regroup destroy? (asked BEFORE the act) ----
     def _calibration_regroup_losses(self, plan) -> List['RegroupLoss']:
@@ -2650,33 +3149,53 @@ class Controller:
     # ----------------------------------------------------------------------
     # Cumulant-method switch: identify + clear results that depend on it
     # ----------------------------------------------------------------------
-    def _cumulant_dependent_cache_keys(self) -> List[tuple]:
+    def _cumulant_dependent_cache_keys(self, *, order_only: bool = False) -> List[tuple]:
         """Result-cache keys whose value depends on the chosen cumulant method:
-        every per-measurement cumulant fit, plus Gamma-vs-q^2 / D-vs-c results
-        that derived their per-point Gamma from the cumulant (gamma_source)."""
+        every per-measurement cumulant fit, every DDLS result (each of its VV/VH
+        correlograms is a cumulant fit from the seed home, at the Settings method and
+        order), plus Gamma-vs-q^2 / D-vs-c results that derived their per-point Gamma
+        from the cumulant (gamma_source).
+
+        `order_only` narrows the set to what reads the Settings cumulant ORDER: the
+        Gamma-vs-q^2, D-vs-c and DDLS results, which fit every point at it. A
+        per-measurement cumulant fit ran at the Correlogram tab's own order box and is
+        kept. Every order-cleared kind is also method-cleared, so a change of the order
+        and another input together clears the wider set alone.
+
+        Clearing a DDLS result takes nothing from the DDLS tab: its shape models are
+        computed from the fit the tab shows (`ddls_shape`'s `result`), which the tab
+        keeps and marks out of date."""
         keys = []
         for k, v in self.results.items():
             if k[0] == 'cumulants':
+                if not order_only:
+                    keys.append(k)
+            elif k[0] == 'ddls':
                 keys.append(k)
             elif (k[0] in ('gamma_q2', 'conc_extrap')
                   and getattr(v, 'gamma_source', None) == 'cumulant'):
                 keys.append(k)
         return keys
 
-    def cumulant_dependent_result_count(self) -> int:
+    def cumulant_dependent_result_count(self, *, order_only: bool = False) -> int:
         """How many cumulant-derived results currently exist (cumulant fits,
-        cumulant Gamma-vs-q^2 / D-vs-c, cumulant replicate averages). Used to
-        decide whether switching the cumulant method needs a clear-and-warn."""
-        n = sum(1 for r in self.workspace.dls_result_rows.values()
-                if r.method == 'cumulant')
-        n += sum(1 for k in self._cumulant_dependent_cache_keys()
-                 if k[0] in ('gamma_q2', 'conc_extrap'))
+        cumulant Gamma-vs-q^2 / D-vs-c, DDLS, cumulant replicate averages). Used to
+        decide whether switching the cumulant method needs a clear-and-warn.
+
+        `order_only` counts only what reads the Settings cumulant order -- the scope a
+        change of that order clears (`_cumulant_dependent_cache_keys`)."""
+        n = 0
+        if not order_only:
+            n += sum(1 for r in self.workspace.dls_result_rows.values()
+                     if r.method == 'cumulant')
+        n += sum(1 for k in self._cumulant_dependent_cache_keys(order_only=order_only)
+                 if k[0] in ('gamma_q2', 'conc_extrap', 'ddls'))
         n += sum(1 for r in self.workspace.sample_rh_rows.values()
                  if r.source_kind == 'replicate_avg'
                  and str(r.source_set).split('|')[0] == 'cumulant')
         return n
 
-    def _cumulant_dependent_picks(self) -> List[tuple]:
+    def _cumulant_dependent_picks(self, *, order_only: bool = False) -> List[tuple]:
         """(sample_id, fraction, SampleResult) for every PICKED sample Rh whose
         producing analysis a cumulant-method switch invalidates.
 
@@ -2692,33 +3211,45 @@ class Controller:
         nothing durable records which gamma source fed a pick, and every pick the
         app can mint is cumulant-fed (`gamma_source` is not user-selectable), so
         kind implies dependence. If gamma_source ever becomes user-selectable, the
-        minted source_id gains the token and this test sharpens with it."""
+        minted source_id gains the token and this test sharpens with it.
+
+        `order_only` keeps only the picks whose producer read the Settings cumulant
+        order: a cumulant replicate average, every picked Gamma-vs-q^2 / D-vs-c value
+        (stored run and re-derivation alike fit at it), and a single-run cumulant Rh the
+        candidate builder RE-DERIVED at it. A single-run pick of the user's own
+        Correlogram fit, which ran at its order box, is told apart by its source id
+        (`_stored_fit_source_id`) and kept."""
         picks = []
         for sid, s in self.workspace.samples.items():
             for frac, r in s.fraction_results.items():
                 if r.rh_source != 'picked' or r.rh_nm is None:
                     continue
-                dependent = (
-                    r.rh_kind == 'dls_cumulant'
-                    or (r.rh_kind == 'dls_replicate_avg'
-                        and r.rh_source_id == replicate_rh_key(f'cumulant|{frac}')[1])
-                    or r.rh_kind in ('dls_gamma_q2', 'dls_conc_extrap'))
+                replicate = (r.rh_kind == 'dls_replicate_avg'
+                             and r.rh_source_id == replicate_rh_key(
+                                 f'cumulant|{frac}')[1])
+                pooled = r.rh_kind in ('dls_gamma_q2', 'dls_conc_extrap')
+                single = r.rh_kind == 'dls_cumulant'
+                if order_only:
+                    single = single and not _is_stored_fit_source_id(r.rh_source_id)
+                dependent = replicate or pooled or single
                 if dependent:
                     picks.append((sid, frac, r))
         return picks
 
-    def cumulant_dependent_picked_count(self) -> int:
+    def cumulant_dependent_picked_count(self, *, order_only: bool = False) -> int:
         """How many PICKED sample Rh values a cumulant-method switch would clear.
         Read by the Settings confirm so it can name them before the clear runs --
         and it must gate the dialog alongside `cumulant_dependent_result_count`,
-        whose rows/cache can be empty while a dangling pick persists."""
-        return len(self._cumulant_dependent_picks())
+        whose rows/cache can be empty while a dangling pick persists. `order_only`
+        is the Settings-order scope, as there."""
+        return len(self._cumulant_dependent_picks(order_only=order_only))
 
-    def clear_cumulant_dependent_results(self) -> int:
-        """Drop every cumulant-derived result so the workspace stays consistent
-        after the cumulant method changes. NEVER touches distributions, SLS,
-        traces, single/double/KWW (cumulant is only their seed), a hand-entered
-        (user) Rh, or a picked Rh of an unaffected kind (distribution peak).
+    def clear_cumulant_dependent_results(self, *, order_only: bool = False) -> int:
+        """Drop every cumulant-derived result -- the cumulant fits, the cumulant
+        Gamma-vs-q^2 / D-vs-c runs, DDLS and the cumulant replicate averages -- so the
+        workspace stays consistent after the cumulant method changes. NEVER touches
+        distributions, SLS, traces, single/double/KWW (cumulant is only their seed), a
+        hand-entered (user) Rh, or a picked Rh of an unaffected kind (distribution peak).
         Returns the number of result-cache entries removed.
 
         THE REPLICATE-AVERAGE HALF IS DELEGATED TO `_clear_replicate_rh`, the exact
@@ -2732,9 +3263,15 @@ class Controller:
         (step 5): the switch is a deliberate act, and the Settings dialog confirms
         first, with Cancel backing the whole switch out -- the tier rule lives in
         the `SampleResult` docstring.
+
+        `order_only` clears only what reads the Settings cumulant ORDER -- the scope of
+        a change to that order: the Gamma-vs-q^2, D-vs-c and DDLS results, the cumulant
+        replicate averages, and the picks those and the tier-1 re-derivation produced. It
+        never reaches the Correlogram tab's own fits (they ran at its order box). The same
+        enumerations, narrowed, so the Settings confirm's count stays the set cleared.
         """
-        # 1. result cache (cumulant fits + cumulant-sourced gamma_q2 / conc_extrap)
-        dead = self._cumulant_dependent_cache_keys()
+        # 1. result cache (cumulant fits, DDLS, cumulant-sourced gamma_q2 / conc_extrap)
+        dead = self._cumulant_dependent_cache_keys(order_only=order_only)
         # remember which sample Rh rows the cleared multi-step results fed
         rh_rows_to_drop = set()
         for k in dead:
@@ -2744,10 +3281,12 @@ class Controller:
                 rh_rows_to_drop.add(('conc_extrap', k[1], k[2]))
             self.results.pop(k, None)
             self._dls_run_sig.pop(k, None)      # keep the run stamps in step
-        # 2. per-measurement cumulant Summary rows
-        self.workspace.dls_result_rows = {
-            key: r for key, r in self.workspace.dls_result_rows.items()
-            if r.method != 'cumulant'}
+        # 2. per-measurement cumulant Summary rows (fitted at their own order box, so a
+        #    Settings-order change leaves them)
+        if not order_only:
+            self.workspace.dls_result_rows = {
+                key: r for key, r in self.workspace.dls_result_rows.items()
+                if r.method != 'cumulant'}
         # 3. sample Rh rows fed by the cleared multi-step results (gamma_q2 /
         #    conc_extrap). The cumulant REPLICATE rows are handled in step 4, which
         #    deletes the row and the promotion together.
@@ -2780,7 +3319,145 @@ class Controller:
         #    Settings dialog confirmed before this ran). Key-matched, so it also
         #    catches a pick whose Table-2 row was already removed by a declined
         #    re-run, which step 4's row-driven loop can never visit.
-        for _sid, _frac, r in self._cumulant_dependent_picks():
+        for _sid, _frac, r in self._cumulant_dependent_picks(order_only=order_only):
+            reset_result_quantity(r, 'rh')
+        return len(dead)
+
+    # ----------------------------------------------------------------------
+    # Skipped-lag-channels change: identify + clear every DLS-derived result
+    # ----------------------------------------------------------------------
+    # The result-cache kinds a change of the skipped lag channels invalidates: every DLS
+    # fit of a correlogram, and every result built on one -- the live Mode Map run and what
+    # is read off its points among them. The scope is owner-ruled 2026-09-23; its home is
+    # `clear_skip_dependent_results`' docstring.
+    _SKIP_DEPENDENT_KINDS = ('cumulants', 'single_exp', 'double_exp', 'kww', 'distribution',
+                             'gamma_q2', 'conc_extrap', 'ddls',
+                             'mode_map', 'mode_family', 'mode_amplitude')
+    # The Summary Table 2 row kinds the same change clears.
+    _SKIP_DEPENDENT_ROW_KINDS = ('gamma_q2', 'conc_extrap', 'mode_family', 'replicate_avg')
+
+    def _skip_dependent_cache_keys(self) -> List[tuple]:
+        """Result-cache keys whose value depends on the Settings skipped lag channels:
+        every per-measurement DLS fit of every method, the Gamma-vs-q^2 and D-vs-c runs
+        whatever their Gamma source, DDLS, and the live Mode Map run with the mode-family
+        fits and amplitude report read off its points. A superset of
+        `_cumulant_dependent_cache_keys` in either of its scopes."""
+        return [k for k in self.results if k[0] in self._SKIP_DEPENDENT_KINDS]
+
+    def _skip_dependent_rh_rows(self) -> List[SampleRhRow]:
+        """Every Summary Table 2 row a skip change clears: the Gamma-vs-q^2, D-vs-c and
+        mode-family rows, and the replicate averages of every method. ONE enumeration
+        behind the Settings confirm's count and the clear."""
+        return [r for r in self.workspace.sample_rh_rows.values()
+                if r.source_kind in self._SKIP_DEPENDENT_ROW_KINDS]
+
+    def _skip_dependent_pooled_results(self) -> set:
+        """(kind, sample_id, fraction) of every Gamma-vs-q^2 and D-vs-c result a skip
+        change clears: a stored run, its Summary Table 2 row, or both. A reopened session
+        holds the row without the run (runs are runtime state), and the clear removes it
+        all the same, so the count reads the union the clear acts on."""
+        out = {k for k in self._skip_dependent_cache_keys()
+               if k[0] in ('gamma_q2', 'conc_extrap')}
+        out |= {(r.source_kind, r.sample_id, r.fraction)
+                for r in self._skip_dependent_rh_rows()
+                if r.source_kind in ('gamma_q2', 'conc_extrap')}
+        return out
+
+    def skip_dependent_result_count(self) -> int:
+        """How many DLS-derived results a change of the skipped lag channels clears: every
+        Summary row of every method, the Gamma-vs-q^2 and D-vs-c results, the DDLS
+        results, the live Mode Map runs and their mode-family rows, and the replicate
+        averages of every method -- read off the enumerations the clear acts on. The
+        Settings confirm reads it, beside `skip_dependent_picked_count`, before
+        `clear_skip_dependent_results` runs. A per-measurement fit is counted by its
+        Summary row, as the cumulant arm counts it, and a map run stands for the family
+        fits and amplitude report read off it."""
+        keys = self._skip_dependent_cache_keys()
+        n = len(self.workspace.dls_result_rows)
+        n += len(self._skip_dependent_pooled_results())
+        n += sum(1 for k in keys if k[0] in ('ddls', 'mode_map'))
+        n += sum(1 for r in self._skip_dependent_rh_rows()
+                 if r.source_kind in ('mode_family', 'replicate_avg'))
+        return n
+
+    def _skip_dependent_picks(self) -> List[tuple]:
+        """(sample_id, fraction, SampleResult) for every PICKED sample Rh whose producer a
+        change of the skipped lag channels invalidates: every DLS kind. ONE enumeration
+        behind the Settings confirm's count and the clear.
+
+        Matched on the key's kind, so a DLS kind minted later is cleared by default --
+        over-inclusion is the safe direction. A pick taken from a mode family goes too
+        (owner-ruled 2026-09-23): the change clears the row it was taken from, and the
+        estimator switch, which moves only its ±, already clears it. A keyless pick and a
+        hand-entered Rh are spared as `_cumulant_dependent_picks` spares them."""
+        picks = []
+        for sid, s in self.workspace.samples.items():
+            for frac, r in s.fraction_results.items():
+                if r.rh_source != 'picked' or r.rh_nm is None:
+                    continue
+                if (r.rh_kind or '').startswith('dls_'):
+                    picks.append((sid, frac, r))
+        return picks
+
+    def skip_dependent_picked_count(self) -> int:
+        """How many PICKED sample Rh values a change of the skipped lag channels would
+        clear. Gates the Settings confirm alongside `skip_dependent_result_count`, whose
+        rows and cache can be empty while a dangling pick persists."""
+        return len(self._skip_dependent_picks())
+
+    def clear_skip_dependent_results(self) -> int:
+        """Drop every DLS-derived result after the Settings skipped lag channels change
+        (owner-ruled 2026-09-23): every DLS fit reads that setting, so every result built
+        from a fit of a correlogram is stale. Returns the number of result-cache entries
+        removed.
+
+        CLEARED: the per-measurement fits of every method and their Summary rows; the
+        Gamma-vs-q^2 and D-vs-c runs whatever their Gamma source, with every Summary
+        Table 2 row of theirs; DDLS; the live Mode Map run, which `run_mode_map` extracted
+        at the old setting, with what is read off its points -- the mode-family fits and
+        their Table 2 rows (`run_mode_family_fits`) and the amplitude report
+        (`mode_amplitude_report`); the replicate averages of every method, row and
+        promotion together (`_clear_replicate_rh`, as the cumulant arm does); and every
+        picked Rh of a DLS kind, a mode family's included (`_skip_dependent_picks`). Until
+        the map is re-run, recording a mode set refuses for want of one (`record_mode_set`).
+
+        KEPT, each for a stated reason:
+        - The recorded mode sets, and the partition and per-mode static results computed
+          from one (`run_mode_partition`, `run_mode_static`): they read the recorded
+          snapshot, never the live map, and a recorded set is the user's frozen record.
+        - The mode families picked on the map (`mode_picks`): the user's assignments, kept
+          as such. They are matched by value, and the new setting moves the modes, so on
+          the double-exponential source a re-run map orphans them, which the Families panel
+          shows; a distribution source re-matches only where its peaks stay on the grid.
+        - SLS, and every hand-entered value.
+
+        The scope contains the cumulant arm's in either scope, so a skip change made with
+        another cumulant input clears this set alone, after one confirm."""
+        # 1. result cache, with each result's run stamps
+        dead = self._skip_dependent_cache_keys()
+        for k in dead:
+            self.results.pop(k, None)
+            self._dls_run_sig.pop(k, None)
+            self._distribution_stamps.pop(k, None)
+        # 2. the Summary rows, every method
+        self.workspace.dls_result_rows = {}
+        # 3. the Summary Table 2 rows of a cleared kind: a pooled run's (stored run or not)
+        #    and a mode family's outright; a replicate average's row and the Rh promoted
+        #    from it together, via the inverse of the write, an orphaned row (its sample
+        #    regrouped away) dropped alone -- the cumulant arm's step 4.
+        for r in self._skip_dependent_rh_rows():
+            if r.source_kind != 'replicate_avg':
+                self.workspace.remove_sample_rh_row(r.sample_id, r.source_kind,
+                                                    r.source_set)
+                continue
+            method = str(r.source_set).split('|')[0]
+            if r.sample_id in self.workspace.samples:
+                self._clear_replicate_rh(r.sample_id, r.fraction, method)
+            else:
+                self.workspace.remove_sample_rh_row(
+                    r.sample_id, 'replicate_avg', f'{method}|{r.fraction}')
+        # 4. picked promotions of a DLS kind, key-matched (the cumulant arm's step 5)
+        for _sid, _frac, r in self._skip_dependent_picks():
             reset_result_quantity(r, 'rh')
         return len(dead)
 
@@ -2790,7 +3467,8 @@ class Controller:
     # Cached analyses that carry a regression standard error routed through the
     # selectable covariance estimator (uncertainty.linear_fit / multilinear_fit).
     # Switching HC3 <-> OLS changes only the ±, never the point estimate.
-    _SE_BEARING_KINDS = ('zimm', 'debye', 'guinier', 'cal_free_a2', 'form_factor',
+    _SE_BEARING_KINDS = ('zimm', 'debye', 'guinier', 'cal_free_a2', 'single_angle_ladder',
+                         'form_factor',
                          'gamma_q2', 'conc_extrap', 'mode_family', 'mode_static', 'ddls')
 
     def se_dependent_result_count(self) -> int:
@@ -2837,7 +3515,7 @@ class Controller:
 
     def clear_se_dependent_results(self) -> int:
         """Drop cached SE-bearing analyses (Zimm/Berry, Debye, Guinier, calibration-
-        free A2, Γ-vs-q², D-vs-c) so they recompute under the newly-selected
+        free A2, Γ-vs-q², D-vs-c, DDLS) so they recompute under the newly-selected
         covariance estimator, and clear every PICKED sample value whose ± the
         de-selected estimator produced. A pick is inert to the passive refresh
         that would re-tag its ±, so keeping it would freeze a ± from a de-selected
@@ -2859,14 +3537,133 @@ class Controller:
     # ----------------------------------------------------------------------
     # DLS analysis orchestration
     # ----------------------------------------------------------------------
-    def run_cumulants(self, item_id: str, order: Optional[int] = None, **kw):
-        m = self.workspace.measurements[item_id].build()
-        if order is None:                       # seed from settings when not given
-            order = self.settings.cumulant_order
+    def _seed_cumulant_kwargs(self, kw: dict) -> dict:
+        """Seed one `fit_cumulants` call's kwargs from Settings -- the ONE home.
+
+        Every controller path that fits a cumulant seeds from here: the Correlogram tab's
+        own fit, the tier-1 Rh candidate, the Gamma-vs-q^2 / D-vs-c points and pooled fits,
+        DDLS and replicate averaging. They share no other code, so a Settings value one of
+        them read and another missed is how the promoted number and the shown number came
+        to be two fits of one correlogram (enforced by
+        `test_every_dls_fit_call_site_reads_its_inputs_from_their_one_home`).
+
+        `setdefault` throughout, because Settings SEED and never override: an explicit
+        caller value -- the Correlogram tab's order box, an API call, a test -- still wins.
+        The ORDER is seeded here too: every path without an order control of its own fits
+        at the Settings order, so the Settings order means one thing on all of them. The
+        weighting is looked up only when the caller gave none, so an explicit value never
+        runs through the policy mapping and its refusal of an unknown token.
+
+        Returns the kwargs under `fit_cumulants`' own names, `order` included."""
+        kw.setdefault('order', self.settings.cumulant_order)
         kw.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
         kw.setdefault('method', self.settings.cumulant_method)
-        res = dls_engine.fit_cumulants(m, order=order, **kw)
-        self.results[('cumulants', item_id)] = res
+        kw.setdefault('fit_cutoff', self.settings.cumulant_fit_cutoff)
+        if 'weighting' not in kw:
+            kw['weighting'] = _cumulant_weighting_request(self.settings.cumulant_weighting)
+        return kw
+
+    @staticmethod
+    def _pooled_cumulant_kwargs(seeds: dict) -> dict:
+        """`_seed_cumulant_kwargs`' values under the names the Gamma-vs-q^2 and D-vs-c
+        engines take them by -- a renaming, never a second seed."""
+        return dict(skip_initial_channels=seeds['skip_initial_channels'],
+                    cumulant_method=seeds['method'],
+                    cumulant_fit_cutoff=seeds['fit_cutoff'],
+                    cumulant_weighting=seeds['weighting'],
+                    cumulant_order=seeds['order'])
+
+    def analysis_region_kwargs(self, item_id: str, method: str,
+                               region: Optional[RegionState]) -> Dict:
+        """The engine kwargs one `method` fit of measurement `item_id` reads from the DLS
+        analysis region -- the one reading every surface and path shares
+        (`app/analysis_region.py` states the rule).
+
+        Reads the measurement's raw correlogram and the Settings the fit itself reads
+        (the skipped channels, and the cumulant method, which decides between the two
+        baseline inputs), so the channels a span is counted over are the fit's own. A
+        measurement no longer in the workspace -- a ticked id can outlive it between a
+        removal and the selection's prune -- gets the window alone, so a staleness check
+        compares rather than raises. `region` None is the unticked box: nothing."""
+        lm = self.workspace.measurements.get(item_id)
+        if lm is None:
+            return region_fit_kwargs(np.zeros(0), np.zeros(0), method,
+                                     None if region is None else RegionState(
+                                         region.tau_min_s, region.tau_max_s,
+                                         window_touched=region.window_touched))
+        return region_fit_kwargs(
+            np.asarray(lm.raw['delay_times_s'], dtype=float),
+            np.asarray(lm.raw['correlogram'], dtype=float), method, region,
+            cumulant_method=self.settings.cumulant_method,
+            skip_initial_channels=self.settings.skip_initial_channels)
+
+    @staticmethod
+    def region_note(region: Optional[RegionState]) -> str:
+        """The sentence a checked run records in its notes (`describe_region`): '' for
+        an unticked box, which runs on each run's own defaults -- the silent default."""
+        return describe_region(region)
+
+    def _region_inputs(self, lms, method: str,
+                       region: Optional[RegionState]) -> Dict[str, Dict]:
+        """{item_id: that measurement's region kwargs} for a checked path, {} unticked."""
+        if region is None:
+            return {}
+        return {lm.item_id: self.analysis_region_kwargs(lm.item_id, method, region)
+                for lm in lms}
+
+    def _cumulant_fit_stamp(self, item_id: str, seeds: dict) -> tuple:
+        """What a stored per-measurement cumulant fit read from OUTSIDE its own tab: the
+        measurement's committed params and the Settings seeds the fit took -- the skipped
+        channels, method, cutoff and weighting request. Not the order or the region,
+        which were the tab's own (its order box, its handles) and are not a Setting that
+        could move under it."""
+        return (self.committed_signature([item_id]), seeds['skip_initial_channels'],
+                seeds['method'], seeds['fit_cutoff'], seeds['weighting'])
+
+    def _stored_cumulant_fit(self, item_id: str):
+        """The user's own Correlogram cumulant fit of `item_id` while it is FRESH -- its
+        stamp still equals what the same committed params and Settings give now -- else
+        None. The `_stored_dls_run` shape, one measurement wide: stale when a commit or a
+        Settings change moved an input the fit read, and unstamped reads as stale.
+        A Settings value the seed home refuses (a hand-edited weighting) reads as stale
+        too, so the builder re-derives and isolates that refusal as before."""
+        key = ('cumulants', item_id)
+        res = self.results.get(key)
+        stamp = self._dls_run_sig.get(key)
+        if res is None or stamp is None:
+            return None
+        try:
+            now = self._cumulant_fit_stamp(item_id, self._seed_cumulant_kwargs({}))
+        except ValueError:
+            return None
+        return res if stamp[1] == now else None
+
+    def run_cumulants(self, item_id: str, order: Optional[int] = None, **kw):
+        m = self.workspace.measurements[item_id].build()
+        if order is not None:                   # an explicit order (the tab's box) wins
+            kw['order'] = order
+        # Settings-seeded from the one home -- `setdefault`, so an explicit caller value
+        # still wins. The committed mean count rate and the parser's per-channel sample
+        # times -- the inputs the nonlinear arm's sourced residual weight reads -- ride on
+        # `m` itself (`LoadedMeasurement.build()`), so nothing is threaded here for them;
+        # `CumulantResult.weighting` and `.sample_time_provenance` disclose what entered.
+        self._seed_cumulant_kwargs(kw)
+        key = ('cumulants', item_id)
+        try:
+            res = dls_engine.fit_cumulants(m, **kw)
+        except Exception:
+            # A refused re-Run leaves no fit behind, as on the Correlogram tab, which drops
+            # its own copy: the tier-1 candidate must not go on promoting the fit the user
+            # just tried to replace.
+            self.results.pop(key, None)
+            self._dls_run_sig.pop(key, None)
+            raise
+        # STAMP-BEFORE-PUBLISH, as run_gamma_q2: the tier-1 candidate reads the fit only
+        # while its stamp matches.
+        self._cumulant_fit_counter += 1
+        self._dls_run_sig[key] = (self._cumulant_fit_counter,
+                                  self._cumulant_fit_stamp(item_id, kw))
+        self.results[key] = res
         self._snapshot_parametric(item_id, 'cumulant', res)
         return res
 
@@ -2909,18 +3706,26 @@ class Controller:
 
         The method split mirrors the fitter dispatch below: the alpha sweep and
         its selection method are CONTIN's alone, and NNLS/lognormal would refuse
-        them.
+        them. The residual weighting is NOT in that split: all three arms take
+        `weighting`, and a weight that reached only CONTIN would give the same
+        measurement two analyses depending on which arm the user picked.
         """
         kw.setdefault('rh_min_nm', self.settings.rh_grid_min_nm)
         kw.setdefault('rh_max_nm', self.settings.rh_grid_max_nm)
         kw.setdefault('n_grid', self.settings.rh_grid_points)
         kw.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
+        # Not `setdefault`: its default is evaluated eagerly, so the mapping's refusal of an
+        # unrecognised token fired even when the caller's own choice was about to win.
+        if 'weighting' not in kw:
+            kw['weighting'] = distribution_weighting_request(
+                self.settings.distribution_weighting)
         if method not in ('nnls', 'lognormal'):
             kw.setdefault('alpha_min', self.settings.lcurve_alpha_min)
             kw.setdefault('alpha_max', self.settings.lcurve_alpha_max)
             kw.setdefault('alpha_method', self.settings.contin_alpha_method)
             kw.setdefault('ftest_prob_reject',
                           self.settings.contin_ftest_prob_reject)
+            kw.setdefault('gcv_gamma', self.settings.contin_gcv_gamma)
         return kw
 
     def run_distribution(self, item_id: str, method: str = 'contin', **kw):
@@ -2997,7 +3802,7 @@ class Controller:
                 try:
                     lm.build()
                     reason = 'ok'
-                except Exception:
+                except Exception:  # noqa: BLE001 — unbuilt is the disclosed reason
                     reason = 'unbuilt'
             rows.append({
                 'item_id': lm.item_id,
@@ -3047,15 +3852,20 @@ class Controller:
                 n += 1
         return n
 
-    def _dls_run_points(self, sample_id: str, fraction: Optional[str]):
+    def _dls_run_points(self, sample_id: str, fraction: Optional[str],
+                        region: Optional[RegionState] = None):
         """Per-measurement cumulant points for one fraction of a sample, computed at
-        **Run** time (not on focus). One 2nd-order cumulant fit per buildable measurement
-        — the same fit the line uses — yielding Γ, q², D_app, and a `quality` tag the GUI
-        shows so the user can vet/untick a bad point in place. Failure-tolerant.
+        **Run** time (not on focus). One cumulant fit per buildable measurement at the
+        Settings order, on each measurement's own region inputs when a checked run passes
+        `region` -- the same fit the line uses, input for input -- yielding Γ, q², D_app,
+        and a `quality` tag the GUI shows so the user can vet/untick a bad point in
+        place. Failure-tolerant: a fit that raises is tagged 'fit_failed' and its reason
+        rides the point (`fit_error`), so a checked run can say why it left it out.
 
         `quality`: 'ok' | 'fit_failed' (Γ non-finite) | 'nonpositive_gamma' (Γ ≤ 0) |
         'nonpositive_q' (q ≤ 0) | 'high_pdi' (PDI > the cumulant validity limit — fit ran
-        but is unreliable).
+        but is unreliable). At order 1 the fit reports no PDI, so no point is judged on
+        one: it is tagged on its other criteria alone.
         Returns a list of dicts aligned with the fraction's buildable measurements.
 
         `d_app` comes from `_d_from_gamma`, the same helper the engines use, and NOT from
@@ -3068,12 +3878,10 @@ class Controller:
         because the fit did converge; what it returned is unphysical (rule 10: the
         surfacing paths get swept with the engine).
 
-        This does NOT make the engine's own drop redundant. This table always fits an
-        order-2 cumulant with the Settings method, while the extrapolation honours the
-        run's `gamma_source` / `cumulant_method` / delay window — so the two can disagree
-        about a borderline point, and the engine still has to handle one it is handed.
-        Both layers, deliberately: this one so the user SEES the bad point before running,
-        that one so the answer is right whoever calls it."""
+        This does NOT make the engine's own drop redundant: the engine still has to
+        handle a point it is handed, whoever calls it. Both layers, deliberately: this one
+        so the user SEES the bad point before running, that one so the answer is right
+        whoever calls it."""
         points = []
         for lm in self.workspace.sample_measurements(sample_id, 'dls'):
             p = lm.committed_params
@@ -3083,20 +3891,21 @@ class Controller:
                 continue
             try:
                 m = lm.build()
-            except Exception:
+            except Exception:  # noqa: BLE001 — unconfirmed params drop out
                 continue                        # unconfirmed params -> not a point
+            fit_error = ''
             try:
-                cu = dls_engine.fit_cumulants(
-                    m, order=2,
-                    skip_initial_channels=self.settings.skip_initial_channels,
-                    method=self.settings.cumulant_method)
-                gamma, pdi_valid = float(cu.gamma_s_inv), bool(cu.pdi_valid)
-            except Exception:
-                gamma, pdi_valid = float('nan'), False
+                seeds = self._seed_cumulant_kwargs(
+                    self.analysis_region_kwargs(lm.item_id, 'cumulant', region))
+                cu = dls_engine.fit_cumulants(m, **seeds)
+                gamma, pdi = float(cu.gamma_s_inv), float(cu.pdi)
+            except Exception as exc:  # noqa: BLE001 — NaN gamma is the disclosed failure
+                gamma, pdi = float('nan'), float('nan')
+                fit_error = str(exc)
             try:
                 q = float(phys.scattering_vector_q_m(
                     m.angle_deg, m.wavelength_nm, m.solvent_refractive_index))
-            except Exception:
+            except Exception:  # noqa: BLE001 — NaN q is the disclosed failure
                 q = float('nan')
             if not math.isfinite(gamma):
                 quality = 'fit_failed'
@@ -3104,7 +3913,10 @@ class Controller:
                 quality = 'nonpositive_gamma'
             elif not (math.isfinite(q) and q > 0.0):
                 quality = 'nonpositive_q'
-            elif not pdi_valid:
+            elif not _dls_pdi_check(pdi)[0]:
+                # The engine's own polydispersity rule, PDI above the limit -- never the PDI
+                # cell's wider `pdi_valid`, which also rejects an order-1 fit's missing PDI
+                # and the ~ -1e-15 a clean exponential returns; neither is a PDI past it.
                 quality = 'high_pdi'
             else:
                 quality = 'ok'
@@ -3123,6 +3935,7 @@ class Controller:
                 'q2_m2': q2,
                 'd_app_m2_s': d_app,
                 'quality': quality,
+                'fit_error': fit_error,
             })
         return points
 
@@ -3190,19 +4003,19 @@ class Controller:
                 f'scatter, so one line through both fits neither. Tick a single '
                 f'geometry, or use the DDLS analysis to get D_r from the VV/VH pair.')
 
-    def run_gamma_q2(self, sample_id: str, fraction: Optional[str] = None,
-                     include_ids=None, **kw):
-        """Gamma vs q^2 across the DLS angles of a sample (optionally one fraction).
+    def _pooled_run_inputs(self, sample_id: str, fraction: Optional[str], include_ids,
+                           region: Optional[RegionState], kind: str, kw: dict):
+        """The shared front half of `run_gamma_q2` / `run_concentration_extrapolation`:
+        the per-point table, the fitted measurements, their per-measurement region
+        inputs and the seeded engine kwargs -- ONE computation, so the table the user
+        vets and the line it belongs to are one fit, input for input (at the Settings
+        order, and on the region's inputs when the box is checked).
 
-        `include_ids` (a set of measurement item_ids) restricts the fit to the ticked
-        measurements, so the user can choose a subset / drop outliers and recompute.
-        `None` = every eligible measurement.
-
-        The result also carries `all_points` — every eligible measurement's per-point
-        Γ/q²/D_app + quality, so the tab can fill its table and gray
-        the excluded points from the run itself rather than a separate on-focus fit. Only
-        fit-usable ticked points (quality 'ok'/'high_pdi', finite) enter the line fit."""
-        points = self._dls_run_points(sample_id, fraction)
+        Returns (points, fitted LoadedMeasurements, built measurements, engine kwargs,
+        notes). A ticked run a CHECKED region leaves unfittable -- the window holds too
+        few of its channels, say -- is left out of the line and named in a note, as the
+        Correlogram tab records such a run rather than failing the whole set."""
+        points = self._dls_run_points(sample_id, fraction, region)
         usable = {pt['item_id'] for pt in points
                   if pt['quality'] in FIT_ELIGIBLE_QUALITIES}
         # Combination doctrine rule 1 (partition), core/data_models.py: fraction=None
@@ -3214,16 +4027,60 @@ class Controller:
                   and lm.item_id in usable]
         meas = [lm.build() for lm in fitted]
         if len(meas) < 2:
-            msg = self._too_few_usable_message(points, include_ids, 'gamma_q2')
+            msg = self._too_few_usable_message(points, include_ids, kind)
             if msg:
                 raise ValueError(msg)
         msg = self._mixed_polarization_message(meas)
         if msg:
             raise ValueError(msg)
-        kw.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
-        kw.setdefault('cumulant_method', self.settings.cumulant_method)
+        seeds = self._seed_cumulant_kwargs({})
+        for name, value in self._pooled_cumulant_kwargs(seeds).items():
+            kw.setdefault(name, value)
         kw.setdefault('estimator', self.settings.se_estimator)
-        res = dls_engine.analyze_gamma_q2(meas, **kw)
+        notes: List[str] = []
+        if region is not None:
+            inputs = self._region_inputs(fitted, 'cumulant', region)
+            kw['fit_kwargs'] = [inputs[lm.item_id] for lm in fitted]
+            axis = 'angle_deg' if kind == 'gamma_q2' else 'concentration_g_per_mL'
+            for pt in points:
+                if ((include_ids is None or pt['item_id'] in include_ids)
+                        and pt['quality'] == 'fit_failed' and pt.get('fit_error')):
+                    where = pt.get(axis)
+                    at = ('' if where is None else
+                          f' at {where:g} deg' if kind == 'gamma_q2' else
+                          f' at {where:.4g} g/mL')
+                    notes.append(f"Left out of the fit{at}: its cumulant fit refused the "
+                                 f"inputs it was given ({pt['fit_error']})")
+            notes.append(self.region_note(region))
+        return points, fitted, meas, kw, notes
+
+    @staticmethod
+    def _with_notes(res, notes: List[str]):
+        """`res` with `notes` appended to its own, in order."""
+        if notes:
+            res.notes = tuple(res.notes) + tuple(n for n in notes if n)
+        return res
+
+    def run_gamma_q2(self, sample_id: str, fraction: Optional[str] = None,
+                     include_ids=None, region: Optional[RegionState] = None, **kw):
+        """Gamma vs q^2 across the DLS angles of a sample (optionally one fraction).
+
+        `include_ids` (a set of measurement item_ids) restricts the fit to the ticked
+        measurements, so the user can choose a subset / drop outliers and recompute.
+        `None` = every eligible measurement.
+
+        `region` is the DLS analysis region when the tab's "use the Correlogram tab's
+        delay window and baseline" box is ticked, None when it is not: each point is then
+        fitted on that measurement's own reading of it (`analysis_region_kwargs`), and the
+        result's notes and Summary row say so.
+
+        The result also carries `all_points` — every eligible measurement's per-point
+        Γ/q²/D_app + quality, so the tab can fill its table and gray
+        the excluded points from the run itself rather than a separate on-focus fit. Only
+        fit-usable ticked points (quality 'ok'/'high_pdi', finite) enter the line fit."""
+        points, fitted, meas, kw, notes = self._pooled_run_inputs(
+            sample_id, fraction, include_ids, region, 'gamma_q2', kw)
+        res = self._with_notes(dls_engine.analyze_gamma_q2(meas, **kw), notes)
         res.all_points = points
         key = ('gamma_q2', sample_id, fraction)
         # STAMP-BEFORE-PUBLISH, as run_form_factor: the Cross-Sample candidate builder
@@ -3239,47 +4096,32 @@ class Controller:
             rh_nm=getattr(res, 'rh_nm', None), rh_se=getattr(res, 'rh_se', None),
             is_apparent=True, rh_type_label='apparent',
             from_label=(f'Γ vs q² ({int(np.isfinite(np.asarray(res.gamma_s_inv, dtype=float)).sum())} '
-                        f'angles)'),   # the FITTED angles: a dropped one rides as NaN
+                        f'angles{", " + REGION_LABEL if region is not None else ""})'),
+            # ^ the FITTED angles: a dropped one rides as NaN
             fraction=fraction,
             se_estimator=getattr(res, 'se_estimator', None)))
         return res
 
     def run_concentration_extrapolation(self, sample_id: str,
                                         fraction: Optional[str] = None,
-                                        include_ids=None, **kw):
+                                        include_ids=None,
+                                        region: Optional[RegionState] = None, **kw):
         """D vs c -> c->0 across the DLS concentrations of a sample (apparent D per
         measurement is angle-independent, so a multi-angle set still extrapolates).
 
         `include_ids` (a set of measurement item_ids) restricts the fit to the ticked
         measurements, so the user can choose a subset / drop outliers and recompute.
-        `None` = every eligible measurement.
+        `None` = every eligible measurement. `region` as in `run_gamma_q2`.
 
         As with `run_gamma_q2`, the result carries `all_points` (every eligible
         measurement's per-point D_app + quality); only fit-usable
         ticked points enter the extrapolation."""
-        points = self._dls_run_points(sample_id, fraction)
-        usable = {pt['item_id'] for pt in points
-                  if pt['quality'] in FIT_ELIGIBLE_QUALITIES}
-        # Same partition rule as run_gamma_q2 above: this filter has the same shape,
-        # so it takes the same literal-None semantics rather than waiting to be found.
-        fitted = [lm for lm in self.workspace.sample_measurements(sample_id, 'dls')
-                  if lm.committed_params.get('mw_fraction') == fraction
-                  and (include_ids is None or lm.item_id in include_ids)
-                  and lm.item_id in usable]
-        meas = [lm.build() for lm in fitted]
-        if len(meas) < 2:
-            msg = self._too_few_usable_message(points, include_ids, 'conc_extrap')
-            if msg:
-                raise ValueError(msg)
-        # Same guard as run_gamma_q2 above: this filter has the same shape and the same
-        # gap, so it gets the same refusal rather than waiting to be found separately.
-        msg = self._mixed_polarization_message(meas)
-        if msg:
-            raise ValueError(msg)
-        kw.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
-        kw.setdefault('cumulant_method', self.settings.cumulant_method)
-        kw.setdefault('estimator', self.settings.se_estimator)
-        res = dls_engine.extrapolate_diffusion_vs_concentration(meas, **kw)
+        # The same front half as run_gamma_q2 -- same partition rule, same refusal of a
+        # mixed-polarization set, same seeds -- so the two cannot drift apart.
+        points, fitted, meas, kw, notes = self._pooled_run_inputs(
+            sample_id, fraction, include_ids, region, 'conc_extrap', kw)
+        res = self._with_notes(
+            dls_engine.extrapolate_diffusion_vs_concentration(meas, **kw), notes)
         res.all_points = points
         key = ('conc_extrap', sample_id, fraction)
         # STAMP-BEFORE-PUBLISH -- see run_gamma_q2.
@@ -3294,7 +4136,9 @@ class Controller:
             # FITTED, so a supplied-count here would label the same run 5 in Cross-Sample
             # and 4 in the DLS tab after a drop (rule 11 -- the sites that rot are the ones
             # that never referenced the field).
-            from_label=f'D vs c ({res.n_concentrations} concentrations)', fraction=fraction,
+            from_label=(f'D vs c ({res.n_concentrations} concentrations'
+                        f'{", " + REGION_LABEL if region is not None else ""})'),
+            fraction=fraction,
             se_estimator=getattr(res, 'se_estimator', None)))
         return res
 
@@ -3302,8 +4146,15 @@ class Controller:
     # Mode-resolved dynamics (the mode map)
     # ----------------------------------------------------------------------
     def run_mode_map(self, sample_id: str, fraction: Optional[str] = None,
-                     source: str = 'double', include_ids=None, **kw):
+                     source: str = 'double', include_ids=None,
+                     region: Optional[RegionState] = None, **kw):
         """Extract every mode of every eligible DLS run onto one (q², Γ) map.
+
+        `region` is the DLS analysis region when the tab's "use the Correlogram tab's
+        delay window and baseline" box is ticked: each run is then extracted on its own
+        reading of it -- the double exponential takes the window and a subtracted
+        baseline, CONTIN and NNLS the window and a normalizing baseline -- and the map's
+        notes say so. None (unticked) extracts every run on its own defaults.
 
         Heavy (one double-exponential or CONTIN/NNLS fit per measurement) --
         the GUI dispatches it on the worker. Failure-tolerant per run: an
@@ -3338,7 +4189,12 @@ class Controller:
         if source != 'double':
             self._seed_distribution_kwargs(kw, source)
         points: list = []
-        notes: list = []
+        # note -> the angles of the runs that carried it, in first-seen order. A note that is
+        # word for word the same on several runs is reported ONCE with every angle named in
+        # front (the replicate report's "every kind, once"): an N-angle map on a run with no
+        # committed count rate would otherwise print that one sentence N times on the panel
+        # and in the export's Angle cell, burying the per-angle caveats under it.
+        noted: Dict[str, List[str]] = {}
         for lm in self.workspace.sample_measurements(sample_id, 'dls'):
             p = lm.committed_params
             # Combination doctrine rule 1 (partition): fraction=None is the
@@ -3349,15 +4205,15 @@ class Controller:
                 continue
             try:
                 m = lm.build()
-            except Exception:
+            except Exception:  # noqa: BLE001 — disclosed below, not silent
                 # Disclosed, not silent: the map must not render complete while missing a loaded
                 # run. Ordinary GUI runs pass include_ids of buildable rows,
                 # so this note fires mainly for direct API calls.
                 angle = p.get('angle_deg')
-                notes.append(
-                    (f'{angle:g} deg: ' if angle is not None else '')
-                    + 'measurement could not be built (parameters not '
-                      'confirmed or invalid); not on the map.')
+                noted.setdefault(
+                    'measurement could not be built (parameters not '
+                    'confirmed or invalid); not on the map.', []).append(
+                        '' if angle is None else f'{angle:g}')
                 continue
             # Stored manual integration bounds apply to DISTRIBUTION sources
             # only ('double' is parametric and would refuse them; they stay
@@ -3369,20 +4225,40 @@ class Controller:
             mb = (store.manual_bounds.get(lm.item_id)
                   if store is not None and source != 'double' else None)
             angle = p.get('angle_deg')
+            # The run's own reading of a checked region, laid over the shared kwargs; the
+            # double exponential reads it as the parametric fit it is, the inversions as
+            # an inversion (`analysis_region_kwargs` names the method).
+            run_kw = {**kw, **self.analysis_region_kwargs(lm.item_id, source, region)}
             try:
                 ext = dls_engine.extract_modes(
-                    m, source, manual_bounds_rh_nm=mb, **kw)
+                    m, source, manual_bounds_rh_nm=mb, **run_kw)
             except ValueError as exc:
-                notes.append(
-                    (f'{angle:g} deg: ' if angle is not None else '')
-                    + f'not on the map: {exc}')
+                noted.setdefault(f'not on the map: {exc}', []).append(
+                    '' if angle is None else f'{angle:g}')
                 continue
             pol = _polarization_state(p.get('analyzer_geometry'))
             for pt in ext.modes:
                 points.append(replace(
                     pt, item_id=lm.item_id, polarization_state=pol))
             for n in ext.notes:
-                notes.append(f'{angle:g} deg: {n}' if angle is not None else n)
+                noted.setdefault(n, []).append('' if angle is None else f'{angle:g}')
+        notes = []
+        if source == 'contin' and kw.get('alpha') is None:
+            # Each point records its own alpha, selector, gamma and grid; the sweep's bounds
+            # and the F-test level are not on the point, so the map's notes -- the export's
+            # Angle comments and the tab's notes line -- name them. `.15g`, so the record is
+            # the value that ran. A caller's fixed `alpha` runs no sweep (its points record
+            # the selector 'user'), so no sweep is named then.
+            note = (f"CONTIN alpha swept from {kw['alpha_min']:.15g} "
+                    f"to {kw['alpha_max']:.15g}")
+            if kw.get('alpha_method') == 'ftest':
+                note += f", F-test probability to reject {kw['ftest_prob_reject']:.15g}"
+            notes.append(note + '.')
+        for text, angles in noted.items():
+            named = [a for a in dict.fromkeys(angles) if a]
+            notes.append(f"{', '.join(named)} deg: {text}" if named else text)
+        if region is not None:
+            notes.append(self.region_note(region))
         res = dls_engine.ModeMapRun(points=tuple(points), source_method=source,
                                     notes=tuple(notes))
         self.results[('mode_map', sample_id, fraction)] = res
@@ -3477,8 +4353,8 @@ class Controller:
                             f'Stokes-Einstein used T = '
                             f'{cp.get("temperature_K")} K, eta = '
                             f'{cp.get("viscosity_Pa_s")} Pa*s (run '
-                            f'{matched[0].item_id}). Align the committed '
-                            f'values for a well-defined Rh.',)
+                            f'{measurement_display_name(first)}). Align the '
+                            f'committed values for a well-defined Rh.',)
                     if unmatched:
                         fit.notes = fit.notes + (
                             f'{unmatched} pick(s) matched no extracted mode -- '
@@ -3491,13 +4367,18 @@ class Controller:
             # re-tagged run moves the data under the snapshot (rule 12). One computation: the same
             # `states` set the mixed-state refusal above examined.
             if fit is not None and 'VH' not in fitted_states:
+                # A map run with the region box ticked says so in its row too, read off
+                # the map's own region note (record_mode_set's predicate).
+                region = (f', {REGION_LABEL}'
+                          if any(n.startswith(REGION_NOTE_PREFIX) for n in map_res.notes)
+                          else '')
                 self.workspace.upsert_sample_rh_row(SampleRhRow(
                     sample_id=sample_id, source_kind='mode_family',
                     source_set=row_set,
                     rh_nm=fit.rh_nm, rh_se=fit.rh_se,
                     is_apparent=True, rh_type_label='apparent, mode-resolved',
                     from_label=(f'Mode map: {fam.label} '
-                                f'({fit.angles_deg.size} modes)'),
+                                f'({fit.angles_deg.size} modes{region})'),
                     fraction=fraction,
                     se_estimator=fit.se_estimator))
             elif map_res is not None:
@@ -3658,7 +4539,8 @@ class Controller:
         """Snapshot the current picked mode families into a RecordedModeSet.
 
         Copies VALUES off the cached map (amplitudes, decay rates, alpha,
-        bounds) plus each source run's committed concentration -- so the set is
+        the residual weighting and what it read, bounds) plus each source run's
+        committed concentration -- so the set is
         self-contained and a later re-fit cannot re-aim it. Refusals (rule-1
         backstop, mirroring the family-fit ones): no cached map; no non-empty
         picked family with matched points; included families bound to
@@ -3708,8 +4590,12 @@ class Controller:
                     min_decay_completeness=p.min_decay_completeness,
                     alpha=p.alpha,
                     alpha_selection_method=p.alpha_selection_method,
+                    gcv_gamma=p.gcv_gamma,
                     rh_min_nm=p.rh_min_nm, rh_max_nm=p.rh_max_nm,
                     n_grid=p.n_grid,
+                    weighting=p.weighting,
+                    sample_time_provenance=p.sample_time_provenance,
+                    run_duration_form=p.run_duration_form,
                     bounds_lo_rh_nm=p.bounds_lo_rh_nm,
                     bounds_hi_rh_nm=p.bounds_hi_rh_nm,
                     bounds_source=p.bounds_source))
@@ -3730,6 +4616,11 @@ class Controller:
                 f'committed concentration; they cannot join a '
                 f'per-concentration partition until one is set and the set '
                 f're-recorded.')
+        # A map extracted on the Correlogram tab's region says so in its notes; the set
+        # records that sentence too, so a partition built from it can still tell which
+        # window and baseline its amplitudes came from. Found by the one prefix
+        # `describe_region` writes, never by rewording it.
+        notes.extend(n for n in map_res.notes if n.startswith(REGION_NOTE_PREFIX))
         existing = self.mode_sets.setdefault((sample_id, fraction), [])
         base = label or f'Mode set {len(existing) + 1}'
         final = base
@@ -3792,16 +4683,28 @@ class Controller:
         """The one-line alpha summary of a recorded set ('' for non-CONTIN
         sources) -- THE one computation behind both the sets-table Method cell
         and the exported provenance, so the two surfaces cannot drift (the
-        GUI's own copy already omitted the selection method)."""
+        GUI's own copy already omitted the selection method).
+
+        'gcv' names a family, so a GCV point's gamma is named beside the token
+        (`alpha = 0.17, gcv, gamma=1 (classical)`), in the distribution
+        export's one spelling (`exporter.gcv_gamma_tag`); a record written
+        before gamma existed says `gcv` alone -- it names no gamma."""
         s = self._mode_set(sample_id, fraction, set_id)
-        alphas = {(p.alpha, p.alpha_selection_method)
+        alphas = {(p.alpha, p.alpha_selection_method, p.gcv_gamma)
                   for m in s.modes for p in m.points if p.alpha is not None}
         if not alphas:
             return ''
+
+        def selector(meth: str, gamma) -> str:
+            if meth == 'gcv' and gamma is not None:
+                return f'{meth}, {exporter.gcv_gamma_tag(gamma)}'
+            return meth
+
         if len(alphas) == 1:
-            a, meth = next(iter(alphas))
-            return f'alpha = {a:g}, {meth}' if meth else f'alpha = {a:g}'
-        meths = {meth for _a, meth in alphas if meth}
+            a, meth, gamma = next(iter(alphas))
+            return (f'alpha = {a:g}, {selector(meth, gamma)}' if meth
+                    else f'alpha = {a:g}')
+        meths = {selector(meth, gamma) for _a, meth, gamma in alphas if meth}
         return (f'alpha per run, {"/".join(sorted(meths))}'
                 if meths else 'alpha per run')
 
@@ -3826,10 +4729,42 @@ class Controller:
             return f'Rh grid {lo:g}-{hi:g} nm, {n} pts'
         return 'Rh grid per run'
 
+    def mode_set_weighting_summary(self, sample_id: str, fraction: Optional[str],
+                                   set_id: str) -> str:
+        """The one-line residual-weighting summary of a recorded set ('' when no
+        point carries one, i.e. the parametric source).
+
+        The weight is a user choice that moves the recovered distribution, the
+        selected alpha and therefore every amplitude in the set -- the
+        `se_estimator` obligation of invariant 8 clause A in another material --
+        so the durable record says which form produced it. A COMPONENT of
+        `mode_set_inversion_summary`, like the alpha and grid summaries: a
+        consumer takes the joined text from there.
+
+        The AXIS-DERIVED sample time is named here too, because the partition file takes
+        a recorded set's provenance from this composed line
+        (`tests/test_export.py::test_the_partition_export_names_the_recorded_sets_residual_weighting`
+        drives it end to end): an amplitude weighted on an inferred quantity never
+        travels unlabelled, the obligation `export._sample_time_note` discharges for a
+        per-fit file. Silent for the instrument's own sample times and for a form that
+        read none.
+        """
+        s = self._mode_set(sample_id, fraction, set_id)
+        points = [p for m in s.modes for p in m.points]
+        forms = {p.weighting for p in points if p.weighting}
+        if not forms:
+            return ''
+        text = (f'residual weighting: {next(iter(forms))}' if len(forms) == 1
+                else f'residual weighting per run: {"/".join(sorted(forms))}')
+        if any(p.sample_time_provenance == 'axis' for p in points):
+            text += ' (sample time derived from the delay axis)'
+        return text
+
     def mode_set_inversion_summary(self, sample_id: str,
                                    fraction: Optional[str], set_id: str) -> str:
         """How the recorded set's amplitudes were obtained, in one line --
-        regularization and size grid, '' for the parametric source.
+        regularization, size grid and residual weighting, '' for the parametric
+        source.
 
         THE one computation behind every surface that shows it: the sets-table
         Method cell and the exported provenance both read this rather than
@@ -3838,7 +4773,8 @@ class Controller:
         components' single home was supposed to prevent in the first place.
         """
         parts = (self.mode_set_alpha_summary(sample_id, fraction, set_id),
-                 self.mode_set_grid_summary(sample_id, fraction, set_id))
+                 self.mode_set_grid_summary(sample_id, fraction, set_id),
+                 self.mode_set_weighting_summary(sample_id, fraction, set_id))
         return '; '.join(t for t in parts if t)
 
     def _mode_set_state(self, sample_id: str, fraction: Optional[str]) -> tuple:
@@ -4039,7 +4975,12 @@ class Controller:
                 clone.q2_nm2, clone.excess_rayleigh_cm_inv,
                 source_item_ids=ids, estimator=est,
                 qrg_max_valid=self.settings.guinier_qrg_max,
-                derived_provenance=clone.derived_provenance)
+                derived_provenance=clone.derived_provenance,
+                # `amplitude_guinier` takes bare arrays, so the blank fact cannot ride
+                # in with the data -- both callers fill it from the Rayleigh result the
+                # amplitudes were partitioned out of. The default is True, so a MISSED
+                # caller reports a typed-blank Rg as reliable and nothing goes red.
+                blank_measured=bool(getattr(clone, 'blank_measured', True)))
             res.notes = res.notes + _partition_caveats([c])
         elif method in ('guinier', 'debye'):
             c, clone = _one_concentration()
@@ -4146,9 +5087,16 @@ class Controller:
         # EVERY arm, not just the cumulant. While an exponential's only unreliability cause
         # NaN'd its Rh the finite gate silently excused the other three; the undecayed-mode
         # criterion leaves it FINITE, so a flagged value reached this row bare.
+
+        # Finiteness no longer gates the note. It did while a NaN Rh meant "no fit ran";
+        # now a flagged no-decay correlogram returns a NaN Rh WITH the sentence explaining
+        # it, and dropping the note left the Summary row blank and unexplained while the
+        # DLS tab showed the reason. `success is False` joins the test so a
+        # converged-but-withheld result and a failed one read alike.
         def _note_for(source, value) -> str:
-            return ('' if getattr(source, 'rh_reliable', True) or not np.isfinite(value)
-                    else getattr(source, 'reliability_note', ''))
+            unreliable = (not getattr(source, 'rh_reliable', True)
+                          or getattr(source, 'success', True) is False)
+            return getattr(source, 'reliability_note', '') if unreliable else ''
 
         if method == 'cumulant':
             row.rh_nm, row.pdi = res.rh_nm, res.pdi
@@ -4173,6 +5121,12 @@ class Controller:
             # KWW's verdict is result-level by design: one decay, two ways of reporting it.
             row.rh_nm = res.rh_from_tau_c_nm
             row.reliability_note = _note_for(res, res.rh_from_tau_c_nm)
+        # The fit's remaining quantities and its passive notices, driven from the one
+        # detail spec so the saved row and the Summary columns cannot disagree about what
+        # a method reports. Both are what makes a RELOADED session a full record of the
+        # fit rather than the headline the tab's glance tables show.
+        row.fit_details = _collect_fit_details(method, res)
+        row.passive_notes = _collect_passive_notes(res)
         self.workspace.upsert_dls_result_row(row)
 
     def _snapshot_distribution(self, item_id: str, method: str, res) -> None:
@@ -4183,7 +5137,7 @@ class Controller:
         # itself refuses it (the one home for that rule), so `peaks` comes back empty.
         try:
             peaks = dls_engine.find_distribution_peaks(dist)
-        except Exception:
+        except Exception:  # noqa: BLE001 — unresolvable fit writes no rows
             peaks = []
         # The CONTIN sweep-edge flags travel on the rows exactly as the parametric
         # rows above carry their reliability_note -- the Summary table and its rh_note
@@ -4194,7 +5148,14 @@ class Controller:
                 item_id=item_id, method=method, peak_index=j,
                 rh_nm=float(pk.rh_nm), int_fraction=float(pk.weight_fraction),
                 is_apparent=True, label=f'{method.upper()} peak {j + 1}',
-                reliability_note=edge_note))
+                reliability_note=edge_note,
+                # The PASSIVE tier travels too, on the same row as the flag tier beside
+                # it. All three distribution fitters emit the dead-channel note, and
+                # without this it stopped at the Distribution tab: the Summary showed a
+                # cumulant cell marked and the CONTIN cell beside it silent about the
+                # same correlogram, and a reload lost it entirely. These notes are
+                # fit-level ('' target), so they land on the method's headline cell.
+                passive_notes=_collect_passive_notes(res)))
 
     def distribution_peaks(self, result):
         """Resolved peaks of a distribution result as (rh_nm, gamma_s_inv,
@@ -4203,7 +5164,7 @@ class Controller:
         dist = getattr(result, 'distribution', result)
         try:
             peaks = dls_engine.find_distribution_peaks(dist)
-        except Exception:
+        except Exception:  # noqa: BLE001 — label helper, no peaks
             return []
         return [(float(p.rh_nm), float(p.gamma_s_inv), float(p.weight_fraction))
                 for p in peaks]
@@ -4214,31 +5175,23 @@ class Controller:
         the reweighted view without importing the analysis layer (invariant 5)."""
         try:
             peaks = optical.find_weighted_peaks(weighted_result)
-        except Exception:
+        except Exception:  # noqa: BLE001 — label helper, no peaks
             return []
         return [(float(p.rh_nm), float(p.weight_fraction)) for p in peaks]
 
     # ---- DLS Summary tab: read-back accessors over the snapshot store ----
     def _measurement_label(self, item_id: str) -> str:
-        """A short human label for a DLS measurement (angle / concentration /
-        fraction), built from committed params. Qt-free."""
+        """A DLS measurement's display name, from `core.naming` -- the one builder every
+        surface shares (axes, then the name: '90° · 3'). Qt-free.
+
+        No sample prefix: every consumer here carries the sample in its own column.
+        An id this workspace does not hold IS the subject of the answer, so it is
+        returned as itself.
+        """
         lm = self.workspace.measurements.get(item_id)
         if lm is None:
             return item_id
-        p = lm.committed_params
-        bits = []
-        ang = p.get('angle_deg')
-        if ang is not None and np.isfinite(ang):
-            bits.append(f'{ang:g}°')
-        conc = p.get('concentration_g_per_mL')
-        if conc is not None and np.isfinite(conc):
-            bits.append(f'{conc:g} g/mL')
-        frac = p.get('mw_fraction')
-        if frac:
-            bits.append(f'[{frac}]')
-        if lm.derived_kind == 'replicate_average':
-            bits.append('(avg correlogram)')
-        return ' '.join(bits) if bits else item_id
+        return measurement_display_name(lm)
 
     def dls_summary_measurement_rows(
             self, ticked_only_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -4264,8 +5217,27 @@ class Controller:
                     'double_fast': None, 'double_slow': None, 'double_note': '',
                     'peaks': {},     # method -> [(rh_nm, int_fraction), ...]
                     'peak_notes': {},  # method -> reliability_note ('' = unflagged)
+                    # The durable fit details and passive notices, per parametric
+                    # method, exactly as the saved row holds them. Carried whether or
+                    # not the table is currently showing details: the controller answers
+                    # what was computed, and what to DISPLAY is the GUI's decision
+                    # (invariant 5 -- no display state reaches back into this layer).
+                    'details': {},   # method -> {display name: value}
+                    'notes': {},     # method -> {note target: [sentence, ...]}
                 }
                 by_item[row.item_id] = rec
+            # `getattr` defaults, not direct access: a row loaded from a session written
+            # before these fields existed has neither, and reads as "no details".
+            #
+            # NOT gated on the detail-spec roster. The details are parametric-only because
+            # only those arms have a fixed parameter set, but the NOTES are every method's
+            # -- a distribution fit emits the same dead-channel notice, and gating both
+            # halves on one roster silently dropped it.
+            if getattr(row, 'fit_details', None):
+                rec['details'][row.method] = dict(row.fit_details)
+            if getattr(row, 'passive_notes', None):
+                rec['notes'][row.method] = {k: list(v)
+                                            for k, v in row.passive_notes.items()}
             if row.method == 'cumulant':
                 rec['cumulant_rh'], rec['pdi'] = row.rh_nm, row.pdi
                 rec['cumulant_rh_note'] = getattr(row, 'reliability_note', '')
@@ -4333,6 +5305,7 @@ class Controller:
         comes from `average_dls_results` (the spread across per-replicate fits).
         """
         lms = self._require_dls_items(item_ids)
+        _refuse_an_average_as_a_repeat(lms)
         meas = [lm.build() for lm in lms]
         avg = dls_engine.average_replicate_correlograms(meas)   # raises on mismatch
 
@@ -4341,17 +5314,33 @@ class Controller:
         # `check_replicate_identity` compares, so those are every replicate's values.
         # Everything else is inherited from the FIRST replicate, including the physical
         # `viscosity_Pa_s` and the two refractive indices -- deliberately not compared (the
-        # reasoning is in `check_replicate_identity`'s docstring). They set the size through
-        # Rh = kT/6.pi.eta.D and q, and the solute index sets the RDG/Mie reweighting. Runs
-        # that disagree average to the first one's values: garbage in, garbage out, and the
-        # parameters are the user's (invariant 3).
+        # reasoning is in `check_replicate_identity`'s docstring, and the parameters are
+        # the user's: invariant 3). The one exception is the LABEL, which names ONE
+        # replicate: inherited, the average reads and exports as the name of one of its
+        # own inputs. It is named for what it is -- 'avg of N' -- until the user labels it.
         params = dict(lms[0].committed_params)
+        params.pop('label', None)
         raw = {
             'delay_times_s': [float(x) for x in avg.delay_times_s],
             'correlogram': [float(x) for x in avg.mean_g2m1],
             # per-channel SD across replicates, kept for reference (ignored by build())
             'g2m1_sd': [float(x) for x in avg.sd_g2m1],
         }
+        # The replicates share one lag grid (`check_replicate_identity`), so a per-channel
+        # sample time they ALL carry, identically, is the average's too. Any replicate
+        # without one, or a disagreement, leaves the average without: the fit then
+        # derives a stand-in and says so, rather than inheriting one run's layout.
+        stated = [lm.raw.get('sample_times_s') for lm in lms]
+        if all(s is not None for s in stated) and all(
+                np.allclose(s, stated[0], rtol=1e-9, atol=0.0) for s in stated[1:]):
+            raw['sample_times_s'] = [float(x) for x in stated[0]]
+        # The run duration follows the same rule: each replicate is one run of that length
+        # and averaging divides the variance by their number, leaving Eq. (9)'s relative
+        # shape and its T as they were -- so a duration every replicate states, identically,
+        # is the average's; any other case leaves it off and the fit says so.
+        durations = [lm.raw.get('duration_s') for lm in lms]
+        if all(d is not None for d in durations) and len(set(durations)) == 1:
+            raw['duration_s'] = float(durations[0])
         lm = LoadedMeasurement(
             item_id=new_id, kind='dls', raw=raw,
             working_params=dict(params), committed_params=dict(params),
@@ -4373,10 +5362,62 @@ class Controller:
         spec = _DLS_PARAM_SPECS.get(method)
         return bool(spec and spec[1])
 
+    def average_inputs_text(self, method: str, *, cumulant_order: Optional[int] = None,
+                            distribution_kwargs: Optional[dict] = None) -> str:
+        """The fit settings a replicate average of `method` runs on, in one sentence: the
+        Settings values when nothing was copied (None), else the copy the averaging
+        prompt took from the Correlogram tab (the order) or the Distribution tab (the
+        inversion's fields). '' for a method with no such settings (single, double, KWW).
+
+        ONE computation behind the prompt's "the Settings values" line, the summary's
+        note and -- through `_average_detail` -- the written row's label, so what the
+        prompt showed, what ran and what was recorded cannot disagree."""
+        if method == 'cumulant':
+            if cumulant_order is None:
+                return f'Fitted at the Settings cumulant order ({self.settings.cumulant_order}).'
+            return f"Fitted at the Correlogram tab's cumulant order ({int(cumulant_order)})."
+        if method not in _DLS_DISTRIBUTION_METHODS:
+            return ''
+        if distribution_kwargs is None:
+            kw, whose = self._seed_distribution_kwargs({}, method), 'the Settings values'
+        else:
+            kw, whose = dict(distribution_kwargs), "the Distribution tab's values"
+        weighting = kw.get('weighting')
+        parts = [f"Rh grid {kw['rh_min_nm']:g}–{kw['rh_max_nm']:g} nm "
+                 f"({int(kw['n_grid'])} points)",
+                 f"residual weighting {weighting or 'sourced (default)'}"]
+        if method == 'contin':
+            selector = {'gcv': f"GCV (γ = {kw.get('gcv_gamma'):g})",
+                        'lcurve': 'L-curve corner',
+                        'ftest': f"F-test (probability to reject "
+                                 f"{kw.get('ftest_prob_reject'):g})"}.get(
+                kw.get('alpha_method'), str(kw.get('alpha_method')))
+            parts.append(f"α swept from {kw['alpha_min']:g} to {kw['alpha_max']:g}, "
+                         f"selected by {selector}")
+        return f"Inverted on {whose}: {'; '.join(parts)}."
+
+    def _average_detail(self, n_runs: int, method: str, cumulant_order: Optional[int],
+                        region: Optional[RegionState]) -> str:
+        """The parenthetical a written replicate-average Rh carries -- its run count and
+        method, the cumulant ORDER it ran at (named whether it came from Settings or the
+        Correlogram tab, since an order-1 average has no PDI to caveat it), and the
+        region when the box was ticked."""
+        parts = [f'{n_runs} runs', method]
+        if method == 'cumulant':
+            order = (self.settings.cumulant_order if cumulant_order is None
+                     else int(cumulant_order))
+            parts.append(f'order {order}')
+        if region is not None:
+            parts.append(REGION_LABEL)
+        return ', '.join(parts)
+
     def average_dls_results(self, item_ids: List[str], method: str,
                             tau_min_s: Optional[float] = None,
                             tau_max_s: Optional[float] = None,
-                            write_to_sample: bool = True) -> Dict[str, Any]:
+                            write_to_sample: bool = True, *,
+                            region: Optional[RegionState] = None,
+                            cumulant_order: Optional[int] = None,
+                            distribution_kwargs: Optional[dict] = None) -> Dict[str, Any]:
         """Fit each replicate independently and report the mean +/- SD/sqrt(N).
 
         This is the ISO 22412 repeat-measurement path and the ONLY place the
@@ -4400,8 +5441,18 @@ class Controller:
         (Rh-ascending) and warn when replicates disagree on the peak count (see
         `_average_distribution_results`). Returns a summary dict the GUI renders
         (and the validation asserts on).
+
+        THE AVERAGING PROMPT'S TWO CHOICES arrive here. `region` is the DLS analysis
+        region when its "use the Correlogram tab's delay window and baseline" box was
+        ticked (None when not): each replicate is then fitted on its own reading of it.
+        `cumulant_order` / `distribution_kwargs` are the one-time copy of the Correlogram
+        tab's order or the Distribution tab's fields, taken when the prompt's copy box was
+        ticked; None runs on the Settings values. Either way the summary's `notes` say
+        which settings and which region the fits read, and a written Summary row names
+        the order it ran at.
         """
         lms = self._require_dls_items(item_ids)
+        _refuse_an_average_as_a_repeat(lms)
         # All replicates must belong to one sample (we write one Rh to one sample).
         sids = {self._sample_id_of(iid) for iid in item_ids}
         if len(sids) > 1:
@@ -4420,17 +5471,37 @@ class Controller:
         meas = [lm.build() for lm in lms]
         dls_engine.check_replicate_identity(meas)      # raises on mismatch
         fraction = lms[0].committed_params.get('mw_fraction')
+        region_kw = self._region_inputs(lms, method, region)
+        notes = [n for n in (self.average_inputs_text(
+            method, cumulant_order=cumulant_order,
+            distribution_kwargs=distribution_kwargs), self.region_note(region)) if n]
 
         if method in _DLS_DISTRIBUTION_METHODS:
-            return self._average_distribution_results(
-                lms, method, sample_id, fraction)
+            summary = self._average_distribution_results(
+                lms, method, sample_id, fraction,
+                replicate_kwargs={lm.item_id: {**(distribution_kwargs or {}),
+                                               **region_kw.get(lm.item_id, {})}
+                                  for lm in lms})
+            summary['notes'] = [*notes, *summary['notes']]   # the fits' relayed notes last
+            return summary
 
         # Per-method extraction: name -> (unit, value), plus which name is the Rh
         # to write back. `primary_rh` is None for multi-mode methods.
         specs, primary_rh = _DLS_PARAM_SPECS[method]
+        order_run = (self.settings.cumulant_order if cumulant_order is None
+                     else int(cumulant_order))
+        if method == 'cumulant' and order_run < 2:
+            # Order 1 fits a single decay rate and reports no PDI (NaN by construction).
+            # The all-or-nothing drop below would discard every replicate for a quantity
+            # the order does not produce, so at order 1 the PDI row is not averaged --
+            # the rule the Gamma-vs-q^2 table applies to an order-1 point's PDI tag.
+            specs = [(name, getter) for name, getter in specs if name != 'PDI']
         window = {'tau_min_s': tau_min_s, 'tau_max_s': tau_max_s}
+        if method == 'cumulant' and cumulant_order is not None:
+            window['order'] = int(cumulant_order)
 
         per_param: Dict[str, List[float]] = {name: [] for name, _ in specs}
+        relayed: List[tuple] = []   # (run name, its passive notes) of each contributing fit
         n_ok = 0
         n_flagged = 0            # contributing fits whose Rh is UNUSABLE (outside the
                                  # technique's size range -- `_dls_rh_promotable`); a
@@ -4447,10 +5518,19 @@ class Controller:
                                  # producer and leaves the Rh FINITE, so the cause is no
                                  # longer knowable here and the message below must not
                                  # name one.
-        for m in meas:
+        for lm, m in zip(lms, meas, strict=True):
             try:
-                res = self._fit_one_replicate(m, method, window)
-            except Exception:
+                # The shared window, with this replicate's own reading of a checked
+                # region laid over it (its window and its baseline).
+                res = self._fit_one_replicate(
+                    m, method, {**window, **region_kw.get(lm.item_id, {})})
+            except Exception as exc:  # noqa: BLE001 — replicate isolation
+                if region is not None:
+                    # A replicate the checked region left unfittable is named, as the
+                    # pooled fits and DDLS name theirs; unchecked, the count says it.
+                    notes.append(f"Left out of the average: "
+                                 f"{measurement_display_name(lm)}'s fit refused the "
+                                 f"inputs it was given ({exc})")
                 continue                       # a single failed fit just drops out
             # Skip a converged-but-flagged-failed fit (single/double/kww carry it).
             if getattr(res, 'success', True) is False:
@@ -4468,6 +5548,8 @@ class Controller:
             for name, val in vals.items():
                 per_param[name].append(val)
             n_ok += 1
+            relayed.append((measurement_display_name(lm), [
+                note for notes in _collect_passive_notes(res).values() for note in notes]))
             # Counted AFTER the all-or-nothing drop above, so a fit that never
             # contributed to the mean is never counted against it. Per-fit, not on the
             # averaged MEAN: four fits at 30 nm plus one at 2e4 nm average to 4152 nm,
@@ -4480,6 +5562,9 @@ class Controller:
                 flagged_note = flagged_note or getattr(res, 'reliability_note', '')
             elif not getattr(res, 'rh_reliable', True):
                 warn_note = warn_note or getattr(res, 'reliability_note', '')
+        # The average is the only surface showing its number, so each contributing fit's
+        # passive notes reach it -- notes, not verdicts: no value or flag moves.
+        notes.extend(_relayed_run_notes(relayed))
 
         parameters = []
         rh_stats = None
@@ -4592,7 +5677,8 @@ class Controller:
             # disclose split (SampleResult docstring).
             replaced = self.picks_a_run_would_replace(sample_id, fraction, ('rh',))
             rh_skip_reason = self._write_replicate_rh(
-                sample_id, fraction, rh_stats, method, warn_note=warn_note)
+                sample_id, fraction, rh_stats, method, warn_note=warn_note,
+                detail=self._average_detail(rh_stats.n, method, cumulant_order, region))
             if rh_skip_reason is None and replaced:
                 rh_replaced_pick = replaced[0][1]
         rh_written = rh_skip_reason is None
@@ -4609,17 +5695,20 @@ class Controller:
             'rh_written': rh_written,
             'rh_skip_reason': rh_skip_reason,
             'rh_replaced_pick': rh_replaced_pick,
+            'notes': notes,
         }
 
     def _average_distribution_results(self, lms, method: str, sample_id: str,
-                                      fraction: Optional[str]) -> Dict[str, Any]:
+                                      fraction: Optional[str], *,
+                                      replicate_kwargs: Optional[Dict[str, dict]] = None
+                                      ) -> Dict[str, Any]:
         """Average a distribution method's PEAKS across replicates, positionally.
 
         Each replicate is fitted (NNLS / CONTIN / lognormal) and its peaks resolved
         (`find_distribution_peaks`, already Rh-ascending). Peaks are aligned by
         **order of appearance**: position k averages the k-th-smallest-Rh peak over
         every replicate that resolved at least k peaks. Per position we report
-        Rh = mean ± SD/√n (Theory-and-Equations-Guide §6.4, replicate mean/SEM),
+        Rh = mean ± SD/√N (Theory-and-Equations-Guide §6.4, replicate mean/SEM),
         the mean intensity weight, and how many runs
         resolved it. When runs disagree on the peak count, a warning is set --
         positional alignment can misalign if a run misses a peak, so the user is
@@ -4633,13 +5722,18 @@ class Controller:
         per_replicate_peaks = []           # list of (Rh-ascending) peak lists
         n_ok = 0
         edge_notes: List[str] = []
+        weight_forms: List[str] = []       # the recorded form of each contributing fit
+        relayed: List[tuple] = []          # (run name, its passive notes), the same fits
         for lm in lms:
             m = lm.build()
             try:
-                res = self._fit_distribution_replicate(m, method)
+                # `replicate_kwargs` are the prompt's copied fields and this replicate's
+                # reading of a checked region; the seed home fills the rest from Settings.
+                res = self._fit_distribution_replicate(
+                    m, method, **(replicate_kwargs or {}).get(lm.item_id, {}))
                 dist = getattr(res, 'distribution', res)   # ContinResult wraps it
                 peaks = dls_engine.find_distribution_peaks(dist)
-            except Exception:
+            except Exception:  # noqa: BLE001 — replicate isolation
                 continue                   # a single failed fit just drops out
             if not peaks:
                 continue                   # incl. seed-shaped fits: the scanner refuses them
@@ -4650,6 +5744,11 @@ class Controller:
             note = getattr(res, 'reliability_note', '')
             if note:
                 edge_notes.append(note)
+            weight_forms.append(getattr(dist, 'weighting', '') or '')
+            # The passive notes off the result as the engine returned it -- the object
+            # `_snapshot_distribution` records a single run's notes from.
+            relayed.append((measurement_display_name(lm), [
+                n for notes in _collect_passive_notes(res).values() for n in notes]))
 
         counts = [len(p) for p in per_replicate_peaks]
         max_k = max(counts) if counts else 0
@@ -4679,6 +5778,15 @@ class Controller:
             edge = (f"{len(edge_notes)} of {n_ok} replicate fits pinned at a sweep edge "
                     f"({distinct}); the per-peak averages inherit that caveat.")
             warning = edge if warning is None else warning + ' ' + edge
+        if len(set(weight_forms)) > 1:
+            # Same reason, same place: the inversion result is dropped above, and a fit
+            # whose sourced weight could not be formed ran under the older weight -- a
+            # different precision map from its siblings' -- before entering the mean.
+            tally = ', '.join(f'{weight_forms.count(form)} × {form}'
+                              for form in dict.fromkeys(weight_forms))
+            mixed = (f"the replicate fits ran under different residual weights ({tally}); "
+                     f"the per-peak averages mix them.")
+            warning = mixed if warning is None else warning + ' ' + mixed
 
         return {
             'method': method,
@@ -4695,15 +5803,17 @@ class Controller:
                 f"sample. For an averaged Rh that feeds ρ, use 'Average correlation "
                 f"functions' and fit that curve."),
             'rh_replaced_pick': None,      # report-only: nothing written or replaced
+            'notes': _relayed_run_notes(relayed),
         }
 
-    def _fit_distribution_replicate(self, m, method: str):
+    def _fit_distribution_replicate(self, m, method: str, **kw):
         """Fit one replicate with a distribution method and return the engine's
         result as-is (CONTIN's ContinResult keeps its sweep-edge flags; the caller
         unwraps `.distribution`). Takes `run_distribution`'s Settings seeds from their
         one home -- a replicate is fitted the way a single run is -- but does not
-        touch the results cache."""
-        kw = self._seed_distribution_kwargs({}, method)
+        touch the results cache. An explicit kwarg (a copied field, a region's window or
+        baseline) wins over its seed."""
+        kw = self._seed_distribution_kwargs(kw, method)
         if method == 'nnls':
             return dls_engine.fit_nnls(m, **kw)
         if method == 'lognormal':
@@ -4724,19 +5834,26 @@ class Controller:
             if lm is None:
                 raise ValueError(f"No measurement {iid!r}.")
             if lm.kind != 'dls':
+                # Named, not id'd: unlike the branch above, this measurement exists.
                 raise ValueError(
-                    f"Replicate averaging is DLS-only; {iid!r} is {lm.kind!r}.")
+                    f"Replicate averaging is DLS-only; "
+                    f"{measurement_display_name(lm)!r} is {lm.kind!r}.")
             lms.append(lm)
         return lms
 
     def _fit_one_replicate(self, m, method: str, window: Dict[str, Any]):
-        """Fit one replicate with the chosen dynamic method and the shared window."""
+        """Fit one replicate with the chosen dynamic method and the shared window.
+
+        The replicate's committed count rate and sample times ride on `m` itself
+        (`LoadedMeasurement.build()`), so every cumulant fit in the program is the same
+        fit (owner-ruled 2026-09-08; `analysis/dls/angular.py::_gamma_for_measurement`)."""
         window = {**window}   # don't mutate the caller's dict
-        window.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
         if method == 'cumulant':
-            return dls_engine.fit_cumulants(
-                m, order=self.settings.cumulant_order,
-                method=self.settings.cumulant_method, **window)
+            # From the one seed home, the order among them -- unless the averaging
+            # prompt's copy of the Correlogram tab's order rides in `window`.
+            return dls_engine.fit_cumulants(m, **self._seed_cumulant_kwargs(window))
+        window.pop('order', None)
+        window.setdefault('skip_initial_channels', self.settings.skip_initial_channels)
         if method == 'single':
             return dls_engine.fit_single_exponential(m, **window)
         if method == 'double':
@@ -4843,12 +5960,16 @@ class Controller:
         return out
 
     def _write_replicate_rh(self, sample_id: str, fraction: Optional[str],
-                            rh_stats, method: str, warn_note: str = '') -> Optional[str]:
+                            rh_stats, method: str, warn_note: str = '',
+                            detail: Optional[str] = None) -> Optional[str]:
         """Write the replicate-averaged Rh +/- SE into the sample, respecting a
         user override. `warn_note` is the first contributing fit's reliability note
         when a fit was flagged but usable (a PDI past the validity limit, an undecayed
         window): the value promotes and the note rides its label, the `_flag_suffix`
-        shape -- a flag warns, it does not withhold (CLAUDE.md invariant 4).
+        shape -- a flag warns, it does not withhold (CLAUDE.md invariant 4). `detail` is
+        the label's parenthetical (`_average_detail`: runs, method, the cumulant order,
+        the region), written into both the promotion and the Summary row; None is the
+        bare run count and method.
 
         Returns the skip reason, or None when the write happened -- reason-only, so
         "was it written" has exactly one representation and cannot drift from its
@@ -4877,7 +5998,8 @@ class Controller:
         # The "± = SD/√N" clause is only appended when there IS a ±: a zero spread
         # withholds the SEM, and a label naming the method beside an empty ± cell would
         # describe an uncertainty the row does not carry.
-        label = f"DLS replicate average ({rh_stats.n} runs, {method}); "
+        detail = detail or f'{rh_stats.n} runs, {method}'
+        label = f"DLS replicate average ({detail}); "
         label += ("± = SD/√N across runs (ISO 22412)" if rh_stats.sem is not None else
                   "no ± — the runs agreed exactly, so the spread is not a measurement "
                   "of precision")
@@ -4901,7 +6023,7 @@ class Controller:
             source_set=f'{method}|{fraction}', rh_nm=float(rh_stats.mean),
             rh_se=unc.se_or_none(rh_stats.sem), is_apparent=True,
             rh_type_label='apparent',
-            from_label=f'replicate avg ({rh_stats.n} runs, {method})',
+            from_label=f'replicate avg ({detail})',
             fraction=fraction))
         if declined:
             return ("the sample already has a hand-entered Rh, which is never "
@@ -4972,8 +6094,17 @@ class Controller:
         recomputed on demand by `solvent_blank_status`, never stored. When the blank is
         not the sample reference -- or the sample holds more than one blank -- it is
         named in the result's own `blank_provenance` record.
+
+        NO MEASURED BLANK -- refuse by default, compute on an explicit acknowledgement.
+        A sample whose resolver finds no blank at all still raises, exactly as it always
+        has, so a headless caller and every existing test are unchanged. Only after
+        `acknowledge_unmeasured_blank(sample_id)` -- transient, never written to a
+        session -- does the series compute, against a blank BUILT from the committed
+        `solvent_blank_intensity_90deg` (`_typed_blank_for`). Every result then carries
+        `blank_measured = False`, which gates every reliability verdict downstream.
         """
-        if self.workspace.solvent_reference(sample_id) is None:
+        typed_blank_needed = self.workspace.solvent_reference(sample_id) is None
+        if typed_blank_needed and sample_id not in self._unmeasured_blank_ack:
             raise ValueError(
                 f"Sample {sample_id!r} has no solvent reference (c = 0); SLS "
                 f"calibration needs one.")
@@ -4986,21 +6117,32 @@ class Controller:
         for lm in self.workspace.sample_measurements(sample_id, 'sls'):
             if lm.committed_params.get('mw_fraction') != fraction:
                 continue
-            status = self.solvent_blank_status(lm.item_id)
-            ref_lm = self.workspace.measurements[status['item_id']]
-            if ref_lm.item_id not in built:
-                # The BLANK can be trace-derived too -- a c = 0 derived point lands in
-                # a blank slot through the ordinary regroup -- so its origin belongs
-                # on the same disclosure as the series'. Built once per distinct blank.
-                built[ref_lm.item_id] = (
-                    ref_lm.build(), self.derived_intensity_provenance(ref_lm.item_id))
-            solvent, blank_provenance = built[ref_lm.item_id]
-            which = ''
-            if status['differs'] or status['n_blanks'] > 1:
-                which = 'solvent blank: {0}'.format(status['label'])
-                if status['source'] == 'user':
-                    which += ' (user-selected)'
             sample = lm.build()
+            status = self.solvent_blank_status(lm.item_id)
+            if status['item_id'] is None:
+                # No measured blank anywhere in this sample. Build one at THIS series'
+                # own angles from the typed 90 deg value. Deliberately not cached in
+                # `built`: a typed blank has no item_id to key on, and the angle grid
+                # differs per series, so it is built per series.
+                solvent, which = self._typed_blank_for(sample_id, sample, dark)
+                blank_provenance = ''
+                blank_measured = False
+            else:
+                ref_lm = self.workspace.measurements[status['item_id']]
+                if ref_lm.item_id not in built:
+                    # The BLANK can be trace-derived too -- a c = 0 derived point lands
+                    # in a blank slot through the ordinary regroup -- so its origin
+                    # belongs on the same disclosure as the series'. Built once per
+                    # distinct blank.
+                    built[ref_lm.item_id] = (
+                        ref_lm.build(), self.derived_intensity_provenance(ref_lm.item_id))
+                solvent, blank_provenance = built[ref_lm.item_id]
+                blank_measured = True
+                which = ''
+                if status['differs'] or status['n_blanks'] > 1:
+                    which = 'solvent blank: {0}'.format(status['label'])
+                    if status['source'] == 'user':
+                        which += ' (user-selected)'
             rr.append(sls_engine.compute_excess_rayleigh_ratio(
                 sample, solvent, calibration_constant=k_c,
                 standard_refractive_index=n_std, dark_count_rate=dark,
@@ -5011,8 +6153,157 @@ class Controller:
                     blank_provenance),
                 # WHICH blank, in its own record: the derivation reducers must never
                 # read it.
-                blank_provenance=which))
+                blank_provenance=which,
+                blank_measured=blank_measured))
         return rr
+
+    # ---- the typed 90 deg solvent blank ----
+
+    def committed_typed_blank(self, sample_id: Optional[str]) -> Optional[float]:
+        """The sample's COMMITTED `solvent_blank_intensity_90deg`, or None.
+
+        A sample-shared parameter, so every SLS member carries the same value and the
+        first one answers. Reads COMMITTED params like every analysis path: an
+        un-applied edit never reaches a fit.
+        """
+        if sample_id is None or sample_id not in self.workspace.samples:
+            return None
+        for lm in self.workspace.sample_measurements(sample_id, 'sls'):
+            v = lm.committed_params.get('solvent_blank_intensity_90deg')
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def validate_typed_blank(self, sample_id: str,
+                             i90: Optional[float] = _UNSET) -> str:
+        """'' if this sample's typed blank is usable, else why not -- the commit-time
+        courtesy check. The SAME predicate runs again in `_typed_blank_for`, which is
+        where the blank is built and therefore where the guard has to bind: the dark
+        count is a calibration field the user can edit after committing this value.
+
+        Pass `i90` to judge a value the user has typed but not yet committed; omit it
+        to judge what is committed now.
+        """
+        value = self.committed_typed_blank(sample_id) if i90 is _UNSET else i90
+        dark = self._calibration_for_sample(sample_id).dark_count_rate
+        return _typed_blank_problem(value, dark)
+
+    def sample_has_measured_blank(self, sample_id: Optional[str]) -> bool:
+        """Does this sample hold ANY measured c = 0 blank? The question the Data tab's
+        greying and the SLS tab's confirmation both ask -- one predicate, so the field
+        cannot be editable while the run is asking, or the reverse.
+
+        A sample the workspace does not hold answers False: it holds nothing, which is
+        `committed_typed_blank`'s shape one screen up. `Workspace.solvent_reference`
+        subscripts `samples` and so RAISES on an unknown id; a tab caches its
+        `sample_id` across workspace edits, so the guard binds here rather than at each
+        of the four call sites.
+        """
+        if sample_id is None or sample_id not in self.workspace.samples:
+            return False
+        return self.workspace.solvent_reference(sample_id) is not None
+
+    def acknowledge_unmeasured_blank(self, sample_id: str) -> None:
+        """Record that the user confirmed running this sample without a measured blank.
+
+        TRANSIENT and never persisted: it lives only on this controller instance, so a
+        reloaded session asks again (`load_session` clears it). The controller stays
+        Qt-free -- the asking is the GUI's job; this is only where the answer lands.
+        """
+        self._unmeasured_blank_ack.add(sample_id)
+
+    def clear_unmeasured_blank_acknowledgement(
+            self, sample_id: Optional[str] = None) -> None:
+        """Forget one sample's acknowledgement, or all of them (`sample_id=None`)."""
+        if sample_id is None:
+            self._unmeasured_blank_ack.clear()
+        else:
+            self._unmeasured_blank_ack.discard(sample_id)
+
+    def has_unmeasured_blank_acknowledgement(self, sample_id: str) -> bool:
+        """Has this sample's blankless run already been confirmed in this session?"""
+        return sample_id in self._unmeasured_blank_ack
+
+    # The sentences a computed or absent blank writes into `blank_provenance`, and from
+    # there into the affected export columns' Comments cells. Each NAMES THE FAILED
+    # PRECONDITION rather than a proxy (invariant 4): what was not measured, and what
+    # stood in for it.
+    _TYPED_BLANK_NOTE = (
+        'solvent blank not measured: computed from a typed 90° intensity under an '
+        'angle-independent-solvent assumption')
+    _NO_BLANK_NOTE = 'solvent blank not measured: no solvent subtraction applied'
+
+    def _typed_blank_for(self, sample_id: str, sample, dark_count_rate: float):
+        """The stand-in solvent blank for a series with no measured c = 0 point.
+
+        Returns `(SLSMeasurement, provenance_sentence)`. The blank is an ORDINARY
+        measurement at the series' own angles, so `compute_excess_rayleigh_ratio`
+        gains no branch (invariant 1) and every later step -- volume correction,
+        refractive-index correction, calibration -- is byte-identical to the
+        measured-blank path.
+
+        The model. With `d` the committed dark count rate and `I90` the typed 90 deg
+        intensity, the constructed blank is
+
+            I_solvent(theta) = d + (I90 - d) / sin(theta)
+
+        so that after the pipeline's own dark subtraction the NET solvent term is
+        `(I90 - d) / sin(theta)`. The dark count is additive and is not volume-scaled,
+        which is why `d` sits outside the 1/sin(theta): a measured blank reads
+        `d + I_true/sin(theta)`.
+
+        Empty or zero `I90` both mean NO SOLVENT SUBTRACTION, and they are the same
+        case -- zero is not a special code. The blank is then `d` at every angle, so
+        the engine still removes the dark count from the sample and subtracts nothing
+        else. Neither of the tempting alternatives is right: an array of zeros would
+        CANCEL the sample's own dark subtraction, and `d - d/sin(theta)` has net solvent
+        term `-d/sin(theta)`, which ADDS intensity at every angle -- including 90 deg,
+        where it adds exactly `d`. The three forms coincide only when `d = 0`.
+
+        The guard lives HERE, where the blank is constructed, not at commit alone
+        (rule 12). The dark count is a calibration field the user may edit on the SLS tab
+        after committing the typed value, so a commit-time check is invalidated by an
+        ordinary edit; `validate_typed_blank` runs the same predicate at commit as a
+        courtesy. The finiteness check is on the CONSTRUCTED ARRAY, so guard and operation
+        are one computation and no gap sits between `I90 / sin(theta)` and
+        `d + (I90 - d)/sin(theta)`.
+
+        WHICH TAIL EACH HALF CLOSES, stated rather than implied. The array check closes
+        the OVERFLOW tail only: `I90 - d >= 0` is already guaranteed by the scalar
+        predicate, and `sin(theta)` is confined to (0, 1] because the data model refuses
+        0 and 180 deg, so dividing by it only increases magnitude -- the result can
+        saturate upward but can never underflow below `d`. The lower bound is therefore
+        closed by `_typed_blank_problem`, not here. The `blank < d` term is kept as a
+        cheap structural assertion of that reasoning, not because an input can reach it;
+        if the angle bounds or the scalar predicate ever change, it is what fires.
+        """
+        angles = np.asarray(sample.angles_deg, dtype=float)
+        d = float(dark_count_rate)
+        i90 = self.committed_typed_blank(sample_id)
+        if i90 is None or i90 == 0.0:
+            blank = np.full(angles.shape, d, dtype=float)
+            note = self._NO_BLANK_NOTE
+        else:
+            problem = _typed_blank_problem(i90, d)
+            if problem:
+                raise ValueError(problem)
+            blank = d + (i90 - d) / np.sin(np.radians(angles))
+            note = self._TYPED_BLANK_NOTE
+        # Two-sided finiteness on the RESULT, not on the inputs: a huge I90 overflows
+        # at the smallest angle, a tiny one underflows, and only the constructed array
+        # sees the cross-product of both with every angle in the series.
+        if not np.all(np.isfinite(blank)) or np.any(blank < d):
+            smallest = float(np.min(angles)) if angles.size else float('nan')
+            raise ValueError(
+                f"The typed solvent blank intensity at 90 deg ({i90!r}) is too large to "
+                f"use with the committed dark count rate ({d!r}): scaled by 1/sin(theta) "
+                f"it overflows at this series' smallest angle ({smallest:g} deg). Enter a "
+                f"smaller value, or clear it to run with no solvent subtraction.")
+        return replace(sample, intensities=blank,
+                       concentration_g_per_mL=0.0), note
 
     def run_zimm(self, sample_id: str, method: str = 'zimm',
                  fraction: Optional[str] = None):
@@ -5026,6 +6317,16 @@ class Controller:
                 f"Debye or Guinier for single-concentration analysis.")
         res = sls_engine.zimm_analysis(rr, method=method, estimator=self.settings.se_estimator)
         self.results[('zimm', sample_id, method, fraction)] = res
+        if not getattr(res, 'blank_measured', True):
+            # Owner-ruled: a blankless fit is not offered to Cross-Sample, and what that
+            # BUYS is an outcome -- the sample result and a saved session stay
+            # byte-identical to a run that never made it. Withholding this write is the
+            # only way to deliver it: `compute_scaling` reads these stored values and
+            # never the candidate rosters, and filtering later would need a field on
+            # `SampleResult` the same ruling leaves untouched. The fit is unaffected
+            # (returned, cached, shown with its flags, exported) and the non-write is
+            # disclosed in the pre-run confirmation and on the status line after.
+            return res
         # attach Mw/Rg/A2 to this fraction's sample result, marking provenance.
         # Each bundle guard protects 'user' ALONE: an explicit Run is a deliberate
         # act, so it replaces a pick, and the GUI reports what it replaced
@@ -5320,8 +6621,14 @@ class Controller:
         return rows
 
     def run_ddls(self, sample_id: str, rod_length_nm: Optional[float] = None,
-                 cumulant_order: int = 2, exclude_angles=()):
+                 cumulant_order: Optional[int] = None, exclude_angles=(),
+                 region: Optional[RegionState] = None):
         """Pair a sample's VV/VH correlograms and extract rotational diffusion D_r.
+
+        Each correlogram is fitted from the cumulant seed home -- at the Settings order
+        unless `cumulant_order` is given -- and, when the tab's "use the Correlogram
+        tab's delay window and baseline" box is ticked, on its own reading of `region`
+        (the result's notes then say so).
 
         Gathers the sample's DLS correlograms, groups them by polarization tag
         (analyzer_geometry), pairs a VV with a VH at each shared angle, fits each
@@ -5353,8 +6660,15 @@ class Controller:
         vh: Dict[float, list] = {}
         untagged = []
         angle_geom = []
+        # Each correlogram's own fit inputs: the seeds, plus its reading of a checked
+        # region. Keyed by the built measurement's identity, which the buckets hold.
+        seeds_for: Dict[int, dict] = {}
+        base_seeds = {} if cumulant_order is None else {'order': int(cumulant_order)}
         for lm in self.workspace.sample_measurements(sample_id, 'dls'):
             m = lm.build()
+            seeds_for[id(m)] = self._seed_cumulant_kwargs(
+                {**base_seeds,
+                 **self.analysis_region_kwargs(lm.item_id, 'cumulant', region)})
             a = round_angle_for_identity(m.angle_deg)
             state = _polarization_state(m.analyzer_geometry)
             # The helper re-applies both forms; they are idempotent, so feeding
@@ -5381,14 +6695,7 @@ class Controller:
             if not paired_angles:
                 raise ValueError('All paired angles are excluded — nothing to fit.')
 
-        # Temperature and viscosity come from the runs that actually enter the fit, not
-        # from whichever correlogram the workspace happened to list first: a VU or
-        # untagged run is skipped as unpairable, so its eta has no business setting the
-        # Stokes-Einstein scale for D_t / D_r. (Viscosity is deliberately outside the
-        # identity check -- see check_replicate_identity -- so it can genuinely differ.)
         paired = [m for a in paired_angles for m in (vv[a] + vh[a])]
-        t_k = paired[0].temperature_K
-        eta = next((m.viscosity_Pa_s for m in paired if m.viscosity_Pa_s is not None), None)
 
         # ONE identity question over every run entering the fit -- the same
         # `{m.sample_key for m in ...}` comparison analyze_gamma_q2 makes of its angle set,
@@ -5408,34 +6715,104 @@ class Controller:
                 "concentration reaches this analysis looking like a replicate. Re-tag or "
                 "remove the odd run in the Data tab.")
 
-        def _avg_gamma(measurements: list) -> float:
-            """Mean field decay rate over replicate correlograms (one fit each).
+        left_out: List[str] = []
+
+        def _run_name(m) -> str:
+            return f'{m.angle_deg:g} deg {m.analyzer_geometry or "untagged"}'
+
+        def _avg_gamma(measurements: list) -> tuple:
+            """Mean field decay rate over replicate correlograms (one fit each), with the
+            (run, fit) pairs that entered it and the refusals of the runs that did not.
 
             Identity is settled above, across the whole fit; this only averages.
+            Under a checked region a replicate whose fit refuses the inputs the region
+            gives it (a delay window holding too few of its channels) is left out and
+            named in a note, as the Correlogram tab records such a run, rather than
+            failing the whole set; unchecked, a refusal raises as it always has.
             """
-            gammas = [float(dls_engine.fit_cumulants(
-                          m, order=cumulant_order,
-                          skip_initial_channels=self.settings.skip_initial_channels,
-                          method=self.settings.cumulant_method).gamma_s_inv)
-                      for m in measurements]
-            return float(np.mean(gammas))
+            fits, refused = [], []
+            for m in measurements:
+                try:
+                    fits.append((m, dls_engine.fit_cumulants(m, **seeds_for[id(m)])))
+                except ValueError as exc:
+                    if region is None:
+                        raise
+                    refused.append(f'{_run_name(m)}: {exc}')
+            # DROP the failed replicates and average the rest, which is what the
+            # replicate-averaging path already does. A bare `np.mean` was safe only while
+            # an unfittable correlogram RAISED; now that it returns a flagged NaN, one bad
+            # replicate NaN'd the whole angle, the point was dropped, and a downstream
+            # raise blamed the VV/VH pairing -- naming a cause that was not the one.
+            # NaN when NOTHING survives: the caller leaves out an angle with no VV rate.
+            # A rate at or below zero is no decay rate: `analyze_ddls` refuses one, and
+            # the Gamma-vs-q^2 fits drop one, so it enters no mean here either.
+            entered = [(m, f) for m, f in fits
+                       if f.success and np.isfinite(f.gamma_s_inv) and f.gamma_s_inv > 0]
+            # A fit that returned but did not enter is named with the refusals, so the notes
+            # account for every replicate supplied, as the Gamma-vs-q^2 fits name a dropped Gamma.
+            kept = {id(f) for _m, f in entered}
+            refused.extend(f'{_run_name(m)}: its fit returned no usable decay rate'
+                           for m, f in fits if id(f) not in kept)
+            gamma = (float(np.mean([float(f.gamma_s_inv) for _m, f in entered]))
+                     if entered else float('nan'))
+            return gamma, entered, refused
 
         points = []
         replicates: Dict[float, tuple] = {}
+        relayed: List[tuple] = []     # (run name, its passive notes), each fit that entered
+        entered_runs: list = []       # the runs whose fit entered a fitted angle's mean
         for a in paired_angles:
-            g_vv = _avg_gamma(vv[a])
-            g_vh = _avg_gamma(vh[a])
-            replicates[a] = (len(vv[a]), len(vh[a]))
+            g_vv, vv_in, vv_refused = _avg_gamma(vv[a])
+            g_vh, vh_in, vh_refused = _avg_gamma(vh[a])
+            if not math.isfinite(g_vv):
+                # D_t is a through-origin fit that drops no point, so an angle with no VV
+                # rate is left out here and named rather than failing the whole set with a
+                # cause that is not the one. A missing VH rate stays: `analyze_ddls` keeps
+                # the angle's VV rate in D_t, drops it from D_r, and flags D_r for it.
+                cause = ('no VV run could be fitted' if math.isfinite(g_vh)
+                         else 'no VV run and no VH run could be fitted')
+                refused = vv_refused + vh_refused
+                why = f' ({"; ".join(refused)})' if refused else ''
+                left_out.append(f'{a:g} deg — {cause}{why}')
+                continue
+            left_out.extend(vv_refused + vh_refused)
+            relayed.extend((_run_name(m), [n for notes in _collect_passive_notes(f).values()
+                                           for n in notes])
+                           for m, f in vv_in + vh_in)
+            entered_runs.extend(m for m, _f in vv_in + vh_in)
+            replicates[a] = (len(vv_in), len(vh_in))     # the runs averaged, not supplied
+            # q from the optics of a run whose rate entered, as T and eta are read below.
             q = phys.scattering_vector_q_m(
-                a, vv[a][0].wavelength_nm, vv[a][0].solvent_refractive_index)
+                a, vv_in[0][0].wavelength_nm, vv_in[0][0].solvent_refractive_index)
             points.append(depol_engine.DDLSRatePoint(
                 angle_deg=a, q_m_inv=q, gamma_vv_s_inv=g_vv, gamma_vh_s_inv=g_vh))
+        if not points:
+            raise ValueError(
+                'No paired angle has a VV run that could be fitted, so DDLS has nothing '
+                'to fit. ' + ' '.join(f'Left out of the fit: {entry}.' for entry in left_out))
+        fitted_angles = list(replicates)
+
+        # Temperature and viscosity come from the runs that actually enter the fit, not
+        # from whichever correlogram the workspace happened to list first: a VU or
+        # untagged run is skipped as unpairable, and a left-out angle's runs and a refused or
+        # unfitted replicate never enter, so their eta has no business setting the
+        # Stokes-Einstein scale for D_t / D_r. (Viscosity is deliberately outside the
+        # identity check -- see check_replicate_identity -- so it can genuinely differ.)
+        t_k = entered_runs[0].temperature_K
+        eta = next((m.viscosity_Pa_s for m in entered_runs
+                    if m.viscosity_Pa_s is not None), None)
 
         res = depol_engine.analyze_ddls(
             points, temperature_K=t_k, viscosity_Pa_s=eta, rod_length_nm=rod_length_nm,
             estimator=self.settings.se_estimator)
+        extra = [f'Left out of the fit: {entry}.' for entry in left_out]
+        extra.append(self.region_note(region))
+        # Each entered fit's passive notes, relayed as replicate averaging relays them:
+        # this result is the only surface showing D_t and D_r. Notes, not verdicts.
+        extra.extend(_relayed_run_notes(relayed))
+        res.notes = ' '.join(n for n in [res.notes, *extra] if n)
         info = {
-            'paired_angles': paired_angles,
+            'paired_angles': fitted_angles,
             'vv_only': sorted(set(vv) - set(vh)),
             'vh_only': sorted(set(vh) - set(vv)),
             'untagged': untagged,
@@ -5446,24 +6823,32 @@ class Controller:
         self.results[('ddls', sample_id)] = res
         return res, info
 
-    def ddls_shape(self, sample_id: str, model: str = 'both') -> Dict[str, Any]:
-        """Particle dimensions from the sample's DDLS D_t, D_r (model-dependent).
+    def ddls_shape(self, sample_id: str, model: str = 'both',
+                   result=None) -> Dict[str, Any]:
+        """Particle dimensions from a DDLS D_t, D_r (model-dependent).
 
-        Runs the shape inverse on the cached DDLS result (computing it first if
-        needed): the **sphere** model (R from D_r, with a sphericity check vs Rh), the
-        **rod** model (L, d from the Tirado inversion), and the **ellipsoid** model
-        (a, b from the Perrin inversion). `model` selects 'sphere', 'rod', 'ellipsoid',
-        or 'both'/'all' (default 'both' = sphere+rod+ellipsoid). Returns a dict with the
-        requested result objects. NB: `out['ellipsoid']` is a **list** (a given D_t/D_r
-        admits up to three ellipsoids -- 1 prolate + 2 oblate), whereas 'sphere'/'rod'
-        are single objects; the two display/export call sites special-case it. These are
-        dimensions of an ASSUMED shape, not measurements -- the result objects carry that
-        caveat. Raises if D_t/D_r are non-positive or the solvent viscosity is missing
-        (the shape models need it; the decay rates do not).
+        Runs the shape inverse on `result` -- the fit the DDLS tab shows, which the tab
+        passes -- or, when none is given, on the sample's stored DDLS result: the
+        **sphere** model (R from D_r, with a sphericity check vs Rh), the **rod** model
+        (L, d from the Tirado inversion), and the **ellipsoid** model (a, b from the Perrin
+        inversion). `model` selects 'sphere', 'rod', 'ellipsoid', or 'both'/'all'
+        (default 'both' = sphere+rod+ellipsoid). Returns a dict with the requested result
+        objects. NB: `out['ellipsoid']` is a **list** (a given D_t/D_r admits up to three
+        ellipsoids -- 1 prolate + 2 oblate), whereas 'sphere'/'rod' are single objects;
+        the two display/export call sites special-case it. These are dimensions of an
+        ASSUMED shape, not measurements -- the result objects carry that caveat.
+
+        It never runs DDLS itself: a re-run here would fit on the defaults -- no region,
+        every angle back in -- and put shapes from that fit beside the D_t/D_r the tab
+        shows. With neither a `result` nor a stored fit it raises, naming the Run. It
+        also raises if D_t/D_r are non-positive or the solvent viscosity is missing (the
+        shape models need it; the decay rates do not).
         """
-        res = self.results.get(('ddls', sample_id))
+        res = result if result is not None else self.results.get(('ddls', sample_id))
         if res is None:
-            res, _ = self.run_ddls(sample_id)
+            raise ValueError(
+                'No DDLS fit for this sample yet — press Run on the DDLS tab; the shape '
+                'models are computed from that fit.')
         # isfinite as well as > 0: a bare `> 0` admits +inf, which would sail past this
         # purpose-written message into the physics layer and surface as its generic
         # refusal instead (2026-07-31 spec-01; the same gate shape hardened across
@@ -5503,7 +6888,7 @@ class Controller:
                 out['ellipsoid'] = depol_engine.ellipsoid_dimensions_from_diffusion(
                     res.d_t_m2_s, res.d_r_rad2_s, temperature_K=t_k, viscosity_Pa_s=eta,
                     d_t_se=res.d_t_se, d_r_se=res.d_r_se, se_estimator=est)
-            except Exception:                        # noqa: BLE001 (degrade, don't lose rod/sphere)
+            except Exception:                        # noqa: BLE001 — degrade, don't lose rod/sphere
                 out['ellipsoid'] = []
         return out
 
@@ -5556,6 +6941,20 @@ class Controller:
         r = self._rayleigh_at_concentration(sample_id, concentration_g_per_mL, fraction)
         res = sls_engine.single_angle_mw(r, angle_deg)
         self.results[('single_angle', sample_id, concentration_g_per_mL, angle_deg, fraction)] = res
+        return res
+
+    def run_single_angle_ladder(self, sample_id: str, angle_deg: float,
+                                fraction: Optional[str] = None):
+        """Apparent Mw and A2 from the concentration series at ONE angle -- the
+        fixed-angle Debye plot, the analysis a single-angle ladder (a derived
+        90-degree series, a single-angle instrument) can reach where Zimm/Berry
+        refuse for want of a second angle. Everything it returns is apparent
+        (invariant 7); the masked Rayleigh results feed it like every sibling."""
+        rr = [r for r in self.masked_rayleigh(sample_id, fraction)
+              if r.concentration_g_per_mL != 0]
+        res = sls_engine.single_angle_ladder(rr, angle_deg,
+                                             estimator=self.settings.se_estimator)
+        self.results[('single_angle_ladder', sample_id, angle_deg, fraction)] = res
         return res
 
     def run_calibration_free_a2(self, sample_id: str, angle_deg: float,
@@ -6099,15 +7498,24 @@ class Controller:
                    lm.committed_params.get('analyzer_geometry')) != 'VH']
         cands: List[ResultCandidate] = []
 
-        # tier 1 -- per-measurement cumulant Rh (apparent, single point)
+        # tier 1 -- per-measurement cumulant Rh (apparent, single point). THE USER'S OWN
+        # Correlogram fit while it is fresh (`_stored_cumulant_fit`), labelled as theirs
+        # and promoted as it ran -- its own order box and its own region -- so the Rh the
+        # panel shows is the Rh that travels. Only without one does the builder
+        # re-derive, from the one seed home at the Settings order and each run's own
+        # defaults (no region: a passive refresh has no box to tick).
         for lm in lms:
-            try:
-                res = dls_engine.fit_cumulants(
-                    lm.build(), order=2,
-                    skip_initial_channels=self.settings.skip_initial_channels,
-                    method=self.settings.cumulant_method)
-            except Exception:
-                continue
+            stored = self._stored_cumulant_fit(lm.item_id)
+            if stored is not None:
+                res, source_id, how = (stored, _stored_fit_source_id(lm.item_id),
+                                       'as fitted in the DLS tab, ')
+            else:
+                try:
+                    res = dls_engine.fit_cumulants(
+                        lm.build(), **self._seed_cumulant_kwargs({}))
+                except Exception:  # noqa: BLE001 — candidate isolation
+                    continue
+                source_id, how = lm.item_id, ''
             if not np.isfinite(res.rh_nm):
                 continue
             p = lm.committed_params
@@ -6122,11 +7530,11 @@ class Controller:
             cands.append(ResultCandidate(
                 value=float(res.rh_nm),
                 label=(f"Cumulant Rh at {_fmt_deg(ang)}, {_fmt_conc(conc)} "
-                       f"(apparent, single angle){_flag_suffix(res)}"),
+                       f"({how}apparent, single angle){_flag_suffix(res)}"),
                 kind='dls_cumulant', is_apparent=True, tier=1,
                 quality=(-float(res.rms_error)
                          if np.isfinite(res.rms_error) else None),
-                quality_kind='neg_rms', source_id=lm.item_id,
+                quality_kind='neg_rms', source_id=source_id,
                 auto_selectable=_dls_rh_promotable(res)))
 
         # replicate-averaged Rh from the durable Summary store (apparent, but the only
@@ -6187,13 +7595,16 @@ class Controller:
                 # A failed (seed-shaped) fit yields no peaks -- the scanner refuses it,
                 # so it can never become a rho source here.
                 peaks = dls_engine.find_distribution_peaks(dist)
-            except Exception:
+            except Exception:  # noqa: BLE001 — candidate isolation
                 continue
-            # A CONTIN alpha pinned to a sweep edge is OFFERED but never silently chosen
-            # (same treatment as the out-of-range cumulant Rh above): the flag would
-            # otherwise stop at the DLS panel while the peak went on into rho = Rg/Rh.
-            edge_note = getattr(res, 'reliability_note', '')   # '' for NNLS/lognormal
-            suffix = f' — {edge_note}' if edge_note else ''
+            # A CONTIN fit whose alpha selection carries a reliability note -- pinned to a
+            # sweep edge, no corner, or an F-test precondition that failed -- is OFFERED
+            # but never silently chosen (same treatment as the out-of-range cumulant Rh
+            # above): the flag would otherwise stop at the DLS panel while the peak went
+            # on into rho = Rg/Rh. The roll-up is read, not the two edge flags, because a
+            # failed precondition is a flagged result exactly as an edge pick is.
+            flag_note = getattr(res, 'reliability_note', '')   # '' for NNLS/lognormal
+            suffix = f' — {flag_note}' if flag_note else ''
             p = self.workspace.measurements[item_id].committed_params
             ang = p.get('angle_deg')
             conc = p.get('concentration_g_per_mL')
@@ -6218,7 +7629,7 @@ class Controller:
                     quality=(-rms if np.isfinite(rms) else None),
                     quality_kind='neg_rms',
                     source_id=f'{method}@{item_id}#{j}',
-                    auto_selectable=bool(not edge_note and size_ok)))
+                    auto_selectable=bool(not flag_note and size_ok)))
 
         # The pooled tiers see only the points the RUN path would fit: the same per-point
         # quality ladder, the same eligibility tuple. Fitting the raw set let one dead
@@ -6226,7 +7637,8 @@ class Controller:
         # from the q->0 extrapolation to a single-angle apparent cumulant.
         usable = {pt['item_id'] for pt in self._dls_run_points(sample_id, fraction)
                   if pt['quality'] in FIT_ELIGIBLE_QUALITIES}
-        meas = [lm.build() for lm in lms if lm.item_id in usable]
+        fitted_lms = [lm for lm in lms if lm.item_id in usable]
+        meas = [lm.build() for lm in fitted_lms]
 
         # tier 2 -- Gamma vs q^2 -> q->0 (apparent). The user's stored run first.
         gq = self._stored_dls_run('gamma_q2', sample_id, fraction)
@@ -6274,10 +7686,9 @@ class Controller:
                     continue
                 try:
                     gq = dls_engine.analyze_gamma_q2(
-                        ms, skip_initial_channels=self.settings.skip_initial_channels,
-                        cumulant_method=self.settings.cumulant_method,
-                        estimator=self.settings.se_estimator)
-                except Exception:
+                        ms, estimator=self.settings.se_estimator,
+                        **self._pooled_cumulant_kwargs(self._seed_cumulant_kwargs({})))
+                except Exception:  # noqa: BLE001 — candidate isolation
                     continue
                 if not np.isfinite(gq.rh_nm):
                     continue
@@ -6334,10 +7745,9 @@ class Controller:
                     continue
                 try:
                     ce = dls_engine.extrapolate_diffusion_vs_concentration(
-                        ms_c, skip_initial_channels=self.settings.skip_initial_channels,
-                        cumulant_method=self.settings.cumulant_method,
-                        estimator=self.settings.se_estimator)
-                except Exception:
+                        ms_c, estimator=self.settings.se_estimator,
+                        **self._pooled_cumulant_kwargs(self._seed_cumulant_kwargs({})))
+                except Exception:  # noqa: BLE001 — candidate isolation
                     continue
                 if not np.isfinite(ce.rh0_nm):
                     continue
@@ -6456,12 +7866,20 @@ class Controller:
         from `sls_run_signature`: the Rg candidates READ the recorded sets (the per-mode
         amplitude-Guinier branch), while no ordinary SLS fit does -- keying the live
         signature on them would spuriously flag every cached Zimm/Debye payload stale the
-        moment a set is recorded. Bounded: only the current signature is kept per (kind,
-        sample, fraction)."""
+        moment a set is recorded. The single-angle ladder ROSTER is in the key for the third
+        time on the same reasoning (running a ladder moves no committed input), carrying only
+        the angles because the ladder's value is re-derived rather than read. Bounded: only
+        the current signature is kept per (kind, sample, fraction)."""
         sig = self.sls_run_signature(sample_id, fraction)
         key = (kind, sample_id, fraction, sig,
                self._form_factor_run_state(sample_id, fraction),
-               self._mode_set_state(sample_id, fraction))
+               self._mode_set_state(sample_id, fraction),
+               # The ladder ROSTER (`_ladder_angles`), for the form-factor run-state's reason:
+               # running a ladder on the SLS tab moves no committed input, so the live
+               # signature is unchanged and a memoized list would keep hiding the new
+               # candidate. Only the angles, not a freshness stamp -- the ladder's value is
+               # re-derived, so there is nothing stored here to go stale.
+               tuple(self._ladder_angles(sample_id, fraction)))
         cache = self._sls_candidate_cache
         if key in cache:
             return cache[key]
@@ -6493,6 +7911,25 @@ class Controller:
         cache[key] = val
         return val
 
+    @staticmethod
+    def _offers_cross_sample_candidates(rayleigh_results) -> bool:
+        """May a sample's SLS fits be offered to the Cross-Sample tab? (owner-ruled)
+
+        ONE predicate, keyed on the record and applied where the candidates are
+        GATHERED -- not a check repeated at each of the twenty `ResultCandidate(` mint
+        sites, where the twenty-first would be the one that forgets it.
+
+        A fit computed without a measured solvent blank is not offered. It stays on the
+        SLS tab, flagged and exportable, and a user who wants its value in a scaling
+        plot enters it by hand -- the existing route for a number the program does not
+        vouch for. The reason is the feature's own purpose: it exists for a quick look
+        BEFORE a real run, and `plot_scaling` carries no scale disclosure at all (flags
+        are GUI-owned overlays, never drawn into a figure), so a badge on one input is
+        easy to lose by the time it is a point on a scaling line. A sample's
+        measured-blank fits are offered exactly as before.
+        """
+        return all(bool(getattr(r, 'blank_measured', True)) for r in rayleigh_results)
+
     def sls_rg_candidates(self, sample_id: str,
                           fraction: Optional[str] = None) -> List[ResultCandidate]:
         """Available SLS-derived Rg values for a sample, each with provenance (memoized by
@@ -6520,7 +7957,9 @@ class Controller:
         cands: List[ResultCandidate] = []
         try:
             rr = self.masked_rayleigh(sample_id, fraction)
-        except Exception:
+        except Exception:  # noqa: BLE001 — no reference, no candidates
+            return cands
+        if not self._offers_cross_sample_candidates(rr):
             return cands
         nonzero = [r for r in rr if r.concentration_g_per_mL != 0]
         n_conc = len({round_concentration_for_identity(r.concentration_g_per_mL)
@@ -6532,7 +7971,7 @@ class Controller:
                 try:
                     res = sls_engine.zimm_analysis(rr, method=method,
                                                    estimator=self.settings.se_estimator)
-                except Exception:
+                except Exception:  # noqa: BLE001 — candidate isolation
                     continue
                 if not np.isfinite(res.rg_nm):
                     continue
@@ -6575,7 +8014,7 @@ class Controller:
                         value_se=unc.se_or_none(getattr(d, 'rg_apparent_se', None)),
                         value_se_estimator=getattr(d, 'se_estimator', None),
                         auto_selectable=bool(getattr(d, 'rg_reliable', True))))
-            except Exception:
+            except Exception:  # noqa: BLE001 — candidate isolation
                 pass
             try:
                 # The Settings qRg limit is seeded here as on every other Guinier call
@@ -6600,7 +8039,7 @@ class Controller:
                         value_se=unc.se_or_none(getattr(g, 'rg_se', None)),
                         value_se_estimator=getattr(g, 'se_estimator', None),
                         auto_selectable=bool(getattr(g, 'rg_reliable', True))))
-            except Exception:
+            except Exception:  # noqa: BLE001 — candidate isolation
                 pass
 
         # tier 2 -- per-mode amplitude-Guinier from every recorded mode set
@@ -6630,7 +8069,7 @@ class Controller:
                 seen_ckeys.add(ckey)
                 try:
                     part = mode_partition.partition_rayleigh(r, inputs)
-                except Exception:
+                except Exception:  # noqa: BLE001 — candidate isolation
                     continue
                 for pm in part.per_mode:
                     try:
@@ -6640,8 +8079,12 @@ class Controller:
                             source_item_ids=self._mode_point_ids(
                                 rset, pm.label, ckey, r.angles_deg),
                             estimator=self.settings.se_estimator,
-                            qrg_max_valid=self.settings.guinier_qrg_max)
-                    except Exception:
+                            qrg_max_valid=self.settings.guinier_qrg_max,
+                            # See the run arm above: the second of the two callers that
+                            # must fill this, and the reason the sweep drives both.
+                            blank_measured=bool(
+                                getattr(pm.rayleigh, 'blank_measured', True)))
+                    except Exception:  # noqa: BLE001 — candidate isolation
                         continue
                     if not np.isfinite(ag.rg_app_nm):
                         continue
@@ -6771,6 +8214,127 @@ class Controller:
             degenerate=degenerate, auto_selectable=not degenerate,
             solution_descriptor=descriptor)
 
+    @staticmethod
+    def _ladder_mw_candidate(res) -> ResultCandidate:
+        """Build the apparent-Mw `ResultCandidate` for one single-angle ladder fit.
+
+        Mirrors `_form_factor_mw_candidate` — one builder per offered fit — with
+        three deliberate differences, all from the owner's 2026-09-03 ruling:
+
+        * `auto_selectable=False`, ALWAYS. The ladder is "made selectable, never chosen for
+          you": the angle is the user's choice, and nothing here may pick one for them. It is
+          therefore never the passive default (`select_default_candidate` filters it out), even
+          when it is the only candidate the sample has.
+        * `is_apparent=True` / tier 2, always (invariant 7 — one angle, no q → 0 extrapolation),
+          so a thermodynamic Zimm/Berry Mw always outranks it.
+        * an uncalibrated or dn/dc-less ladder is still OFFERED (the Debye/Guinier rule), not
+          excluded the way `_ff_mw_offered` excludes an uncalibrated form-factor Mw: the two
+          scale flags travel as real fields and the label carries `_scale_caveat`, so the
+          picker badges it and the user can still pick it deliberately. `model_dependent` stays
+          False — the ladder is a slope/intercept, assuming no shape.
+        """
+        r2 = float(getattr(res, 'r_squared', float('nan')))
+        return ResultCandidate(
+            value=float(res.mw_apparent_g_per_mol),
+            label=(_ladder_candidate_label(res)
+                   + _reliability_note_suffix(res, 'mw_reliable')),
+            kind=_LADDER_KIND, is_apparent=True, tier=2,
+            quality=(r2 if np.isfinite(r2) else None),
+            quality_kind='r_squared',
+            source_id=_ladder_source_id(res.angle_deg),
+            value_se=unc.se_or_none(getattr(res, 'mw_apparent_se', None)),
+            value_se_estimator=getattr(res, 'se_estimator', None),
+            calibrated=bool(res.calibrated),
+            dn_dc_supplied=bool(res.dn_dc_supplied),
+            auto_selectable=False)
+
+    @staticmethod
+    def _ladder_a2_candidate(res) -> ResultCandidate:
+        """The A2 sibling of `_ladder_mw_candidate` — same fit, same label, same rules.
+
+        A2 = slope/2 of the very line whose intercept gives Mw, so it inherits the angle
+        contingency in full: it is 2·A2 only where P(q) ≈ 1, which is why it is apparent
+        (tier 2) beside the thermodynamic Zimm/Berry A2 (tier 3). Its ± is the linear
+        pass-through `slope_se/2` the engine already computed, copied as provenance
+        (invariant 8 clause A), and its reliability sentence reads `a2_reliable` — the flag
+        the engine writes for A2 — not Mw's.
+
+        The calibration-free 2·A2·Mw product the same fit carries is NOT enrolled: it is a
+        different quantity from A2 (a product, not a second virial coefficient), the picker
+        has no axis for it, and offering it beside A2 would put two incomparable numbers under
+        one heading."""
+        r2 = float(getattr(res, 'r_squared', float('nan')))
+        return ResultCandidate(
+            value=float(res.a2_apparent_mol_mL_per_g2),
+            label=(_ladder_candidate_label(res)
+                   + _reliability_note_suffix(res, 'a2_reliable')),
+            kind=_LADDER_KIND, is_apparent=True, tier=2,
+            quality=(r2 if np.isfinite(r2) else None),
+            quality_kind='r_squared',
+            source_id=_ladder_source_id(res.angle_deg),
+            value_se=unc.se_or_none(getattr(res, 'a2_apparent_se', None)),
+            value_se_estimator=getattr(res, 'se_estimator', None),
+            calibrated=bool(res.calibrated),
+            dn_dc_supplied=bool(res.dn_dc_supplied),
+            auto_selectable=False)
+
+    def _ladder_angles(self, sample_id: str,
+                       fraction: Optional[str] = None) -> List[float]:
+        """The angles this (sample, fraction) has a STORED single-angle ladder for, sorted —
+        the picker's ladder roster.
+
+        The roster is the stored results (`results[('single_angle_ladder', sid, angle,
+        fraction)]`, written by `run_single_angle_ladder`), because the ANGLE is the user's
+        choice and the picker must not make it: one candidate per ladder the user actually ran,
+        several angles coexisting as separate explicit picks (owner-ruled 2026-09-03).
+
+        The VALUE, however, is re-derived from the current masked series by the candidate
+        builders, exactly as the Zimm / Debye / Guinier candidates beside it are — the
+        divergence from `_form_factor_solutions`, which reads its stored fit and gates it on a
+        freshness stamp. The reason is cost, and it is the reason that stamp exists: a
+        form-factor fit is a heavy multi-start solve dispatched to the worker thread and must
+        never be re-run on a Cross-Sample refresh, while a ladder is one two-column least
+        squares over a handful of points, cheaper than the Debye fit already recomputed in the
+        same loop. Re-deriving removes the staleness question outright — there is no stored
+        value here that could be offered against inputs it never saw — at the price of the
+        picker's number tracking the current mask while the SLS tab still shows the fit as run
+        (which that tab flags stale on its own surface).
+
+        Iterates a SNAPSHOT (`list(...)`): `run_single_angle_ladder` writes `self.results` on
+        the worker thread while this reads on the main thread, so a live iteration could raise
+        "dictionary changed size". `self.results` holds MIXED-arity keys, so the 4-tuple shape
+        is matched by length AND by `key[0]` (`('guinier', sid, conc, frac)` and
+        `('form_factor', sid, model, frac)` are 4-tuples too)."""
+        angles = {float(key[2]) for key in list(self.results)
+                  if len(key) == 4 and key[0] == 'single_angle_ladder'
+                  and key[1] == sample_id and key[3] == fraction}
+        return sorted(angles)
+
+    def _ladder_fits(self, sample_id: str, fraction: Optional[str],
+                     nonzero_rayleigh) -> List:
+        """One freshly-derived `SingleAngleLadderResult` per angle on the roster
+        (`_ladder_angles`), in angle order; angles whose ladder no longer fits are dropped.
+
+        The engine raises where the current data cannot support the fit — fewer than two
+        non-zero concentrations carry the angle, or dropping the non-positive Kc/dR points
+        leaves fewer than two — which is exactly the "no honest candidate" case, so it is
+        swallowed per angle the way the Debye/Guinier loop swallows its own. Its
+        `RuntimeWarning` for a dropped non-positive point is left to fire, exactly as the
+        Debye and Guinier fits in the same builder leave theirs (`debye_analysis` warns on the
+        same drop and nothing suppresses it): `warnings.catch_warnings` mutates a PROCESS-GLOBAL
+        filter list, so suppressing here on the main thread would also swallow a warning a
+        worker-thread fit raised in the same window -- a cost the sibling fits do not pay and
+        this one has no reason to."""
+        out: List = []
+        for angle in self._ladder_angles(sample_id, fraction):
+            try:
+                out.append(sls_engine.single_angle_ladder(
+                    nonzero_rayleigh, angle,
+                    estimator=self.settings.se_estimator))
+            except Exception:  # noqa: BLE001 — ladder-angle isolation
+                continue
+        return out
+
     def _form_factor_solutions(self, sample_id: str,
                                fraction: Optional[str] = None) -> List[tuple]:
         """The ``(model, solution)`` pairs from the form-factor fits the user has run for this
@@ -6887,7 +8451,9 @@ class Controller:
         cands: List[ResultCandidate] = []
         try:
             rr = self.masked_rayleigh(sample_id, fraction)
-        except Exception:
+        except Exception:  # noqa: BLE001 — no reference, no candidates
+            return cands
+        if not self._offers_cross_sample_candidates(rr):
             return cands
         nonzero = [r for r in rr if r.concentration_g_per_mL != 0]
         n_conc = len({round_concentration_for_identity(r.concentration_g_per_mL)
@@ -6898,7 +8464,7 @@ class Controller:
                 try:
                     res = sls_engine.zimm_analysis(rr, method=method,
                                                    estimator=self.settings.se_estimator)
-                except Exception:
+                except Exception:  # noqa: BLE001 — candidate isolation
                     continue
                 if not np.isfinite(res.mw_g_per_mol):
                     continue
@@ -6928,7 +8494,7 @@ class Controller:
                      {'qrg_max_valid': self.settings.guinier_qrg_max})):
                 try:
                     res = fn(r, estimator=self.settings.se_estimator, **extra)
-                except Exception:
+                except Exception:  # noqa: BLE001 — candidate isolation
                     continue
                 mw = float(getattr(res, mw_attr))
                 if not np.isfinite(mw):
@@ -6957,6 +8523,15 @@ class Controller:
                     auto_selectable=(
                         bool(res.mw_reliable) if hasattr(res, 'guinier_valid')
                         else True)))
+
+        # The single-angle ladders the user has RUN, one candidate each (owner-ruled
+        # 2026-09-03): apparent, angle-labeled, and never the passive default. Placed after
+        # the per-concentration loop so the picker lists it below Debye/Guinier at the same
+        # tier, and offered whatever its scale flags say -- the Debye/Guinier rule, not
+        # `_ff_mw_offered`'s exclusion (see `_ladder_mw_candidate`).
+        for lad in self._ladder_fits(sample_id, fraction, nonzero):
+            if np.isfinite(lad.mw_apparent_g_per_mol):
+                cands.append(self._ladder_mw_candidate(lad))
 
         # model-DEPENDENT form-factor Mw (only when calibrated + reliable -- Mw is scale-
         # dependent, exactly like Zimm's). Same tier as the agnostic sibling; flagged
@@ -7027,8 +8602,11 @@ class Controller:
         """Available SLS-derived A2 values for a sample, each with provenance.
 
         A2 is a second-virial (two-concentration) coefficient, so only the
-        thermodynamic Zimm / Berry double extrapolation yields one -- there is no
-        single-concentration A2 (Debye/Guinier give none). Like Mw, **A2 is
+        thermodynamic Zimm / Berry double extrapolation yields a THERMODYNAMIC one --
+        there is no single-concentration A2 (Debye/Guinier give none). A single-angle
+        LADDER does give one, and since 2026-09-03 it is offered: apparent
+        (angle-contingent, tier 2), labeled with its angle and never the passive
+        default -- see `_ladder_a2_candidate`. Like Mw, **A2 is
         calibration-dependent**: an uncalibrated run puts A2 on an arbitrary scale, and
         so does a missing dn/dc (K = 1). BOTH are recorded as real flags on each
         candidate (never parsed back out of the label).
@@ -7037,7 +8615,9 @@ class Controller:
         cands: List[ResultCandidate] = []
         try:
             rr = self.masked_rayleigh(sample_id, fraction)
-        except Exception:
+        except Exception:  # noqa: BLE001 — no reference, no candidates
+            return cands
+        if not self._offers_cross_sample_candidates(rr):
             return cands
         nonzero = [r for r in rr if r.concentration_g_per_mL != 0]
         n_conc = len({round_concentration_for_identity(r.concentration_g_per_mL)
@@ -7048,7 +8628,7 @@ class Controller:
             try:
                 res = sls_engine.zimm_analysis(rr, method=method,
                                                estimator=self.settings.se_estimator)
-            except Exception:
+            except Exception:  # noqa: BLE001 — candidate isolation
                 continue
             if not np.isfinite(res.a2_mol_mL_per_g2):
                 continue
@@ -7068,6 +8648,14 @@ class Controller:
                 value_se=unc.se_or_none(getattr(res, 'a2_se', None)),
                 value_se_estimator=getattr(res, 'se_estimator', None),
                 calibrated=cal, dn_dc_supplied=dn_dc))
+
+        # The apparent ladder A2, one per stored ladder -- the Mw builder's sibling, offered
+        # under the same rules (owner-ruled 2026-09-03). The `n_conc < 2` return above is not
+        # in its way: a ladder needs two concentrations too, so a sample that fails that test
+        # has no ladder to offer either.
+        for lad in self._ladder_fits(sample_id, fraction, nonzero):
+            if np.isfinite(lad.a2_apparent_mol_mL_per_g2):
+                cands.append(self._ladder_a2_candidate(lad))
         return cands
 
     def set_sample_a2(self, sample_id: str, candidate: ResultCandidate,
@@ -7225,6 +8813,8 @@ class Controller:
                 f"quantity must be 'rg', 'rh', or 'a2', got {quantity!r}.")
         labels, mw, y, ids = [], [], [], []
         b_mw, b_y, b_labels = [], [], []       # branched points: plotted, NOT fitted
+        # Per-point provenance, parallel to each block (see `_scaling_point_source`).
+        sources, b_sources = [], []
         arbitrary_scale = False
         model_dependent = False
         degenerate = False
@@ -7259,17 +8849,20 @@ class Controller:
                     # hollow). Untagged samples are treated as linear (the default).
                     b_mw.append(m); b_y.append(yv)
                     b_labels.append(self._sample_label(sid, frac))
+                    b_sources.append(_scaling_point_source(res, quantity))
                     continue
                 ids.append(sid)
                 labels.append(self._sample_label(sid, frac))
                 mw.append(m)
                 y.append(yv)
+                sources.append(_scaling_point_source(res, quantity))
         fit = fit_power_law(mw, y, estimator=self.settings.se_estimator)
         return ScalingData(quantity=quantity, fit=fit, sample_ids=ids, labels=labels,
                            mw=mw, y=y, any_arbitrary_scale=arbitrary_scale,
                            n_excluded=excluded, branched_mw=b_mw, branched_y=b_y,
                            branched_labels=b_labels, any_model_dependent=model_dependent,
-                           any_degenerate=degenerate)
+                           any_degenerate=degenerate,
+                           sources=sources, branched_sources=b_sources)
 
     def sample_fractions_any(self, sample_id: str) -> List[Optional[str]]:
         """Distinct Mw-fraction labels across BOTH kinds (SLS for Rg, DLS for Rh), so a
@@ -7476,13 +9069,15 @@ class Controller:
 
     def _sample_label(self, sample_id: str,
                       fraction: Optional[str] = None) -> str:
-        s = self.workspace.samples[sample_id]
-        if s.polymer_name and s.solvent_name and s.temperature_K is not None \
-                and np.isfinite(s.temperature_K):
-            base = f'{s.polymer_name} / {s.solvent_name} @ {s.temperature_K:g} K'
-        else:
-            base = sample_id
-        return f'{base} [{fraction}]' if fraction is not None else base
+        """A sample's display name, from `core.naming` -- the one builder the GUI
+        surfaces share. Qt-free, so the exports and the controller read the same body.
+
+        An unconfirmed sample reads '(unconfirmed sample)', never the raw
+        `polymer|solvent|temperature` key: that key used to reach the DLS Summary table
+        and the exported CSV (owner-ruled 2026-09-17). An id the workspace does not
+        hold still raises, as it did -- a failed lookup's subject IS the id.
+        """
+        return sample_display_name(self.workspace.samples[sample_id], fraction)
 
     # ----------------------------------------------------------------------
     # Utilities: I*sin(theta) instrument check + synthetic generator
@@ -7507,13 +9102,19 @@ class Controller:
         # the subtrahend for the series from its own file, so it is exactly the c = 0
         # curve to vet here.
         candidates += self.workspace.blank_candidates(sample_id)
-        meas = [lm.build() for lm in candidates
-                if lm.committed_params.get('concentration_g_per_mL') == 0]
-        if not meas:
+        blanks = [lm for lm in candidates
+                  if lm.committed_params.get('concentration_g_per_mL') == 0]
+        if not blanks:
             raise ValueError(
                 "I·sin θ shows only solvent-reference (c = 0) curves, and this "
                 "sample has none. Load or assign a c = 0 SLS measurement.")
-        res = util.i_sin_theta(meas, mode=mode)
+        meas = [lm.build() for lm in blanks]
+        # The engine formats a name it is GIVEN (invariant 1). Every curve here is a
+        # c = 0 blank of ONE sample, so the sample is the plot's subject and the name
+        # carries only what tells the blanks apart.
+        res = util.i_sin_theta(
+            meas, mode=mode,
+            display_names=[measurement_display_name(lm) for lm in blanks])
         self.results[('i_sin_theta', sample_id, mode)] = res
         return res
 
@@ -7528,27 +9129,60 @@ class Controller:
     # is displaying; the controller stays the only caller of `exporting/`. These
     # are thin wrappers so the widgets never import the export layer directly.
     # ----------------------------------------------------------------------
+    def _export_source_record(self, item_id: Optional[str]) -> Tuple[str, str]:
+        """`(Source file cell, Comments note)` for a one-measurement export.
+
+        The workspace is the only place a measurement's provenance lives -- the
+        engine object the exporters receive is built from the committed parameters
+        alone -- so this is where it is read, once, for every such export.
+
+        A loaded measurement gives its bare file name and no note. A measurement
+        with no file of its own gives an empty cell: a REPLICATE AVERAGE then names
+        its contributors in the note (it is a many-source export by the column's
+        rule, and the note is the export's only record of what went into it, so the
+        list is complete rather than capped), and anything else says so plainly. An
+        id the workspace no longer holds yields no cell rather than an error: an
+        export already in flight must not fail over a name.
+        """
+        lm = self.workspace.measurements.get(item_id) if item_id else None
+        if lm is None:
+            return '', ''
+        name = source_file_name(lm)
+        if name:
+            return name, ''
+        sources = list(getattr(lm, 'derived_from', None) or [])
+        if getattr(lm, 'derived_kind', None) == 'replicate_average' and sources:
+            named = ', '.join(
+                measurement_name(self.workspace.measurements[s])
+                if s in self.workspace.measurements else s for s in sources)
+            return '', f'averaged from {len(sources)} measurements: {named}'
+        return '', ''
+
     def export_correlogram_fit(self, item_id: str, result, file_path: str) -> str:
         """Export a parametric DLS fit (cumulant / single / double / KWW)."""
         m = self.workspace.measurements[item_id].build()
-        return exporter.export_correlogram_fit(m, result, file_path)
+        source_file, source_note = self._export_source_record(item_id)
+        return exporter.export_correlogram_fit(
+            m, result, file_path, source_file=source_file, source_note=source_note)
 
-    def export_distribution(self, result, file_path: str, axis: str = 'rh') -> str:
-        """Export an NNLS / CONTIN / lognormal distribution."""
-        d = getattr(result, 'distribution', result)
-        # CONTIN carries how α was chosen on the wrapper (ContinResult); pass it so the
-        # export records the α-selection method (never ambiguous downstream).
+    def export_distribution(self, result, file_path: str, axis: str = 'rh', *,
+                            item_id: Optional[str] = None) -> str:
+        """Export an NNLS / CONTIN / lognormal distribution. Accepts a ContinResult
+        (the exporter reads how α was chosen and the sweep-edge note off it) or a
+        bare DistributionResult; the result is passed through unflattened."""
+        source_file, source_note = self._export_source_record(item_id)
         return exporter.export_distribution(
-            d, file_path, axis=axis,
-            alpha_selection_method=getattr(result, 'alpha_selection_method', None),
-            ftest_prob_reject=getattr(result, 'ftest_prob_reject', None),
-            alpha_edge_note=getattr(result, 'reliability_note', ''))
+            result, file_path, axis=axis,
+            source_file=source_file, source_note=source_note)
 
-    def export_lcurve(self, result, file_path: str) -> str:
-        """Export a CONTIN alpha-selection sweep. Accepts a ContinResult (uses its
-        `.lcurve`) or a bare LCurveResult."""
-        lcurve = getattr(result, 'lcurve', result)
-        return exporter.export_lcurve(lcurve, file_path)
+    def export_lcurve(self, result, file_path: str, *,
+                      item_id: Optional[str] = None) -> str:
+        """Export a CONTIN alpha-selection sweep. Accepts a ContinResult or a bare
+        LCurveResult and hands the RESULT through: the exporter unwraps the sweep itself
+        and reads the gamma off the ContinResult, which the bare sweep does not carry."""
+        source_file, source_note = self._export_source_record(item_id)
+        return exporter.export_lcurve(result, file_path, source_file=source_file,
+                                      source_note=source_note)
 
     def export_gamma_q2(self, result, file_path: str) -> str:
         return exporter.export_gamma_q2(result, file_path)
@@ -7725,9 +9359,14 @@ class Controller:
             if allow is not None and row.item_id not in allow:
                 continue
             sid = self._sample_id_of(row.item_id)
+            lm = self.workspace.measurements.get(row.item_id)
             records.append({
                 'sample': self._sample_label(sid) if sid else '',
                 'measurement': self._measurement_label(row.item_id),
+                # Which file this row was loaded from -- empty for a measurement
+                # with no file of its own (a replicate average), whose contributors
+                # the `From` column already names.
+                'source_file': source_file_name(lm) if lm is not None else '',
                 'method': row.method,
                 'rh': row.rh_nm, 'rh_se': row.rh_se, 'pdi': row.pdi,
                 'int_pct': None if row.int_fraction is None
@@ -7748,6 +9387,9 @@ class Controller:
                 'sample': self._sample_label(row.sample_id, row.fraction)
                 if row.sample_id in self.workspace.samples else row.sample_id,
                 'measurement': '', 'method': row.source_kind,
+                # A sample-level row is built from several measurements: no single
+                # source file, and `From` carries its contributors.
+                'source_file': '',
                 'rh': row.rh_nm, 'rh_se': row.rh_se, 'pdi': None,
                 'int_pct': None, 'rh_fast': None, 'rh_slow': None,
                 'rh_type': row.rh_type_label,
@@ -7789,14 +9431,20 @@ class Controller:
             return exporter.export_ellipsoid_form_factor(results, file_path)
         return exporter.export_form_factor(result, file_path)
 
-    def export_weighted_distribution(self, result, file_path: str) -> str:
-        return exporter.export_weighted_distribution(result, file_path)
+    def export_weighted_distribution(self, result, file_path: str, *,
+                                     item_id: Optional[str] = None) -> str:
+        source_file, source_note = self._export_source_record(item_id)
+        return exporter.export_weighted_distribution(
+            result, file_path, source_file=source_file, source_note=source_note)
 
     def export_single_angle(self, result, file_path: str) -> str:
         return exporter.export_single_angle(result, file_path)
 
     def export_calibration_free_a2(self, result, file_path: str) -> str:
         return exporter.export_calibration_free_a2(result, file_path)
+
+    def export_single_angle_ladder(self, result, file_path: str) -> str:
+        return exporter.export_single_angle_ladder(result, file_path)
 
     def export_rayleigh_series(self, results, file_path: str) -> str:
         return exporter.export_rayleigh_series(results, file_path)
@@ -7814,7 +9462,9 @@ class Controller:
                                        branched_labels=sd.branched_labels,
                                        branched_mw=sd.branched_mw,
                                        branched_y=sd.branched_y,
-                                       n_excluded=sd.n_excluded)
+                                       n_excluded=sd.n_excluded,
+                                       sources=sd.sources,
+                                       branched_sources=sd.branched_sources)
 
     def export_architecture(self, included_sample_ids: List[str],
                             file_path: str, *,
@@ -7834,7 +9484,7 @@ class Controller:
             for frac in self.sample_fractions_any(sid):      # the table's unit list
                 try:
                     r = self.compute_sample_rho(sid, frac)
-                except Exception:
+                except Exception:  # noqa: BLE001 — row isolation
                     continue
                 # The ± and its estimator travel with rho, as the g/h block's SEs do
                 # (invariant 8 clause A): the screen shows them, so the file carries them.
@@ -7901,12 +9551,13 @@ class Controller:
 
     def synth_multi_angle_dls(self, population_specs: List[Dict[str, float]], **kw):
         """Correlograms (+ count-rate trace) at every angle, one ALV-file's worth."""
-        return synth.build_multi_angle_dls(self._pops(population_specs), **kw)
+        return _in_axis_terms(
+            lambda: synth.build_multi_angle_dls(self._pops(population_specs), **kw), kw)
 
     def synth_two_mode_dls(self, **kw):
         """A fast+slow two-mode multi-angle set with per-angle ground truth
         (defaults to the 82° crossing configuration — see build_two_mode_dls)."""
-        return synth.build_two_mode_dls(**kw)
+        return _in_axis_terms(lambda: synth.build_two_mode_dls(**kw), kw)
 
     def synth_mode_resolved_tuple(self, **kw):
         """The linked mode-resolved set: two-mode correlograms + matched traces
@@ -8005,12 +9656,15 @@ class Controller:
                           viscosity_Pa_s: float, beta: float = 0.9,
                           vh_noise_level: float = 0.02, n_points: int = 200,
                           seed=None, label: str = 'DDLS',
-                          concentration_g_per_mL: float = 0.0):
+                          concentration_g_per_mL: float = 0.0, baseline: float = 0.0):
         """The 'Depolarized (VV/VH)' artifact: a static intensity pair (drives the SLS
         Cabannes readout) + a dynamic VV/VH multi-angle set (drives DDLS D_r + shape).
+        `baseline` is the generator's flat offset, planted on both channels.
 
-        `shape` is 'rod' (dims = (L, d), Tirado) or 'ellipsoid' (dims = (a, b), Perrin).
-        `rho_v` is the static depolarization ratio in [0, 3/4). Returns a
+        `shape` is 'rod' (dims = (L, d), Tirado), 'ellipsoid' (dims = (a, b), Perrin) or
+        'sphere' (dims = (R, R), Stokes-Einstein-Debye -- the one-unknown model whose
+        R from D_r and R from D_t must agree, which is what `ddls_shape(model='sphere')`
+        checks). `rho_v` is the static depolarization ratio in [0, 3/4). Returns a
         DepolarizedArtifact (`.pair`, `.ddls`).
         """
         return synth.build_depolarized(
@@ -8018,7 +9672,7 @@ class Controller:
             wavelength_nm=wavelength_nm, n_solvent=n_solvent, temperature_K=temperature_K,
             viscosity_Pa_s=viscosity_Pa_s, beta=beta, vh_noise_level=vh_noise_level,
             n_points=n_points, seed=seed, label=label,
-            concentration_g_per_mL=concentration_g_per_mL)
+            concentration_g_per_mL=concentration_g_per_mL, baseline=baseline)
 
     def synth_architecture_series(self) -> Dict[str, dict]:
         """The branching-architecture ground-truth spec (linear ladder + stars + random
@@ -8096,6 +9750,13 @@ class Controller:
             solvent_refractive_index=float(result.solvent_refractive_index),
             viscosity_Pa_s=float(viscosity_Pa_s if viscosity_Pa_s is not None
                                  else result.viscosity_Pa_s))
+        self._seed_generator_inputs(raw, params, sample_times_s=result.sample_times_s,
+                                    grid=result.grid, rate_cps=result.mean_count_rate_cps,
+                                    duration_s=result.duration_s)
+        # After the axes are in `params`: the label only needs a suffix where they
+        # cannot tell this run from one already loaded.
+        params['label'] = self._generated_label(
+            result, polymer_name, solvent_name, params)
         item_id = self.add_loaded('dls', raw, params)
         if trace is not None:
             self.add_trace(
@@ -8104,6 +9765,74 @@ class Controller:
                 sample_label=(trace_label or trace.label or 'synthetic trace'),
                 measurement_id=item_id)
         return item_id
+
+    def _generated_label(self, artifact, polymer_name: str, solvent_name: str,
+                         params: Dict[str, Any]) -> str:
+        """The label a GENERATED measurement carries, in the generator's own idiom --
+        made DISTINCT where the within-sample axes cannot do it.
+
+        A generated measurement has no source file, so without a label it would be
+        named by its internal id, which a saved figure or an exported file carries to
+        a reader who has no workspace to look it up in. The producers already build a
+        name (`'{poly} in {solv}'`, `'... DDLS VH'`) and the injectors dropped it; this
+        hands it to the measurement, falling back to the same idiom when an artifact
+        carries none.
+
+        The suffix is decided on the prospective DISPLAY NAME rather than on the label,
+        because the axes already tell most generated runs apart: a multi-angle set gets
+        no suffix at all. Replicates at ONE angle and concentration are the case the
+        sample-level idiom cannot distinguish -- and the case this sheet exists to fix,
+        where six runs otherwise read as one string and the engine's
+        count-rate-disagreement note names three runs identically in an exported cell
+        (owner-ruled 2026-09-18).
+        """
+        label = str(getattr(artifact, 'label', '') or '').strip()
+        if not label:
+            poly, solv = (polymer_name or '').strip(), (solvent_name or '').strip()
+            label = f'{poly} in {solv}' if poly and solv else (poly or solv or 'generated')
+        # The ONE builder decides the collision, on a stand-in carrying the parameters
+        # this measurement is about to be created with -- never a second copy of the
+        # display format (invariant: `core.naming` is the only place a name is built).
+        taken = {measurement_display_name(lm)
+                 for lm in self.workspace.measurements.values()}
+        probe = SimpleNamespace(committed_params=dict(params), item_id='',
+                                derived_kind=None, derived_from=None, source_path=None)
+        base, k = label, 1
+        while True:
+            probe.committed_params['label'] = label
+            if measurement_display_name(probe) not in taken:
+                return label
+            k += 1
+            label = f'{base} #{k}'
+
+    @staticmethod
+    def _seed_generator_inputs(raw: Dict[str, Any], params: Dict[str, Any], *,
+                               sample_times_s, grid, rate_cps, duration_s) -> None:
+        """Hand a generated draw's own instrument inputs to the measurement being injected.
+
+        The multi-tau builder's EXACT per-channel sample times go into `raw` beside the
+        lags (the same place a parser's go), and the mean count rate the draw's
+        shot-noise terms consumed (`rate_cps`) is seeded as the committed count rate,
+        tagged 'generator' -- so the cumulant fit's sourced weight is evaluated on the
+        very inputs the noise was drawn with, and synthetic ground truth exercises the
+        instrument-input path end to end. Only the multi-tau grid's sample times are the
+        layout's own: on a plain log or linear grid the generator's array is the same
+        axis-derived stand-in the engine would produce, so seeding it would let the fit
+        record 'instrument' for a sample time nothing stated. A draw on a plain grid, or
+        one that consumed no rate, seeds nothing for that input. The run duration
+        (`duration_s`) goes into `raw` too, an instrument fact like the sample times,
+        when the producer states one. The inputs are named by the caller, never read off
+        a producer by attribute: a producer missing one fails at the call site instead of
+        silently seeding a default. Mutates `raw` and `params`.
+        """
+        if sample_times_s is not None and grid == 'multitau':
+            raw['sample_times_s'] = [float(x) for x in sample_times_s]
+        rate = usable_rate(rate_cps)
+        if rate is not None:
+            params['mean_count_rate_cps'] = rate
+            params['mean_count_rate_cps_source'] = 'generator'
+        if duration_s is not None:
+            raw['duration_s'] = float(duration_s)
 
     def inject_multi_angle_dls(self, dls, *, polymer_name: str, solvent_name: str,
                                add_traces: bool = True,
@@ -8121,8 +9850,15 @@ class Controller:
         `mw_fraction`, when given, tags every injected correlogram's fraction label. It
         lives here rather than on the generated set because it is a label, not physics --
         the same reason `analyzer_geometry` and `chain_type` do.
+
+        Each angle is committed the count rate ITS OWN draw consumed (`noise_rate_cps`,
+        the set's brightness model at that angle -- the number its trace is built
+        around), never one set-wide scalar: the committed rate and the linked trace then
+        describe one quantity, and a static series derived from the set carries the
+        set's angular shape rather than a flat line against its own traces.
         """
         delay = [float(x) for x in dls.delay_times_s]
+        rates = dls.noise_rate_cps or {}
         ids: List[str] = []
         for a in dls.angles_deg:
             raw = {'delay_times_s': delay,
@@ -8140,6 +9876,14 @@ class Controller:
                 params['chain_type'] = chain_type
             if mw_fraction is not None:
                 params['mw_fraction'] = mw_fraction
+            # The set's run duration goes to every angle whatever its noise model: it is
+            # what the set's ALV file states and its parser reads, so the injected set and
+            # the file written from it hand the engine one T.
+            self._seed_generator_inputs(raw, params, sample_times_s=dls.sample_times_s,
+                                        grid=dls.grid, rate_cps=rates.get(a),
+                                        duration_s=dls.run_duration_s)
+            params['label'] = self._generated_label(
+                dls, polymer_name, solvent_name, params)
             iid = self.add_loaded('dls', raw, params)
             ids.append(iid)
             if add_traces:
@@ -8180,6 +9924,8 @@ class Controller:
                 params['shell_refractive_index'] = float(sls.shell_refractive_index)
             if chain_type is not None:
                 params['chain_type'] = chain_type
+            params['label'] = self._generated_label(
+                sls, polymer_name, solvent_name, params)
             ids.append(self.add_loaded('sls', raw, params))
         if prefill_calibration and sls.calibrated:
             self._prefill_calibration_from_spec(sls.cal)
@@ -8388,10 +10134,16 @@ class Controller:
         if trace_id not in self.workspace.traces:
             raise KeyError(f'No such trace: {trace_id!r}')
         lm = self.workspace.measurements.get(item_id)
-        if lm is None or lm.kind != 'dls':
+        # An unresolvable id IS the subject of its own refusal; a measurement of the
+        # wrong kind is nameable, and is named (the `_require_dls_items` shape).
+        if lm is None:
             raise ValueError(
                 f'{item_id!r} is not a DLS measurement; a count-rate trace can '
                 f'only be attached to one.')
+        if lm.kind != 'dls':
+            raise ValueError(
+                f'{measurement_display_name(lm)!r} is not a DLS measurement; a '
+                f'count-rate trace can only be attached to one.')
         # Detach through the same path a user-driven detach takes, so a value the
         # displaced trace produced is invalidated rather than left behind -- both
         # for this measurement's incumbent and for wherever this trace came from.
@@ -8440,7 +10192,8 @@ class Controller:
 
     @staticmethod
     def _mean_cr_family(tag: Optional[str]) -> str:
-        """The source family of a mean-count-rate tag ('trace', 'vendor', 'user')."""
+        """The source family of a mean-count-rate tag ('trace', 'vendor', 'generator',
+        'user')."""
         return (tag or '').split(':')[0]
 
     def _trace_mean_cps(self, trace_id: str,
@@ -8468,8 +10221,11 @@ class Controller:
         that is empty or already carries a derived ('trace:*') tag -- the guard that
         makes a re-derivation incapable of overwriting a 'user' or 'vendor' value.
 
-        A non-finite or negative value is refused: a photon count rate can be
-        neither. Returns True if it wrote.
+        A value that is not a usable rate -- non-finite, zero or negative
+        (`core.data_models.usable_rate`, the one predicate every reader shares) -- is
+        refused: a photon count rate can be none of these, and an all-zero trace's mean
+        must not commit a placeholder the fit would then read as "no rate". Returns
+        True if it wrote.
         """
         lm = self.workspace.measurements.get(item_id)
         if lm is None or lm.kind != 'dls':
@@ -8483,9 +10239,10 @@ class Controller:
             lm.working_params.pop(self._MEAN_CR_KEY, None)
             lm.working_params.pop(self._MEAN_CR_SOURCE_KEY, None)
             return True
-        if value is None or not np.isfinite(value) or value < 0:
+        value = usable_rate(value)
+        if value is None:
             return False
-        lm.working_params[self._MEAN_CR_KEY] = float(value)
+        lm.working_params[self._MEAN_CR_KEY] = value
         lm.working_params[self._MEAN_CR_SOURCE_KEY] = source
         return True
 
@@ -8535,14 +10292,17 @@ class Controller:
         the value is transparent, labelled with its origin, freely overridable, and
         never overwritten once the user types over it.
 
-        The mean count rate is now the same kind of value. It reaches an analysis
-        only through a deliberate gesture the user makes with it in front of them:
-        the Derived Intensity sub-tab lists every run's rate and its source, and
-        nothing is computed until Derive is pressed. An earlier version of this
-        docstring rested the safety argument on `build()` not forwarding the field;
-        that argument was true only while the field had no consumer, and
-        `preview_derived_static_series` -- which reads `committed_params` directly --
-        is the consumer that ended it.
+        The mean count rate is now the same kind of value, and its safety rests on
+        the same footing -- the Data tab's row, where it is shown with its source
+        tag, is editable, and once typed over is never overwritten -- not on any
+        gesture between the commit and the analysis. It has two consumers: the
+        Derived Intensity sub-tab (`preview_derived_static_series`, which reads
+        `committed_params` and computes nothing until Derive is pressed) and every
+        cumulant fit of the run, which reads the committed rate off the measurement
+        `LoadedMeasurement.build()` constructs and records on the result whether
+        it entered. Two earlier versions of this paragraph rested the argument on
+        the field having no consumer, then on the Derive gesture; each was true only
+        until the next consumer arrived, which is why it now rests on the row.
 
         Where nothing has written the working cell yet, the highest-precedence OFFER
         is adopted first, so a format that records its own mean count rate but ships
@@ -8607,7 +10367,7 @@ class Controller:
         out: Dict[str, Any] = {
             'value': None, 'source': None, 'trace_id': None,
             'trace_mean_cps': None, 'rel_diff': None,
-            'diverges': False, 'note': None,
+            'diverges': False, 'note': None, 'usable': None,
         }
         lm = self.workspace.measurements.get(item_id)
         if lm is None or lm.kind != 'dls':
@@ -8617,6 +10377,16 @@ class Controller:
         source = params.get(self._MEAN_CR_SOURCE_KEY)
         out['value'] = value
         out['source'] = source
+        # The same predicate `build()` applies: a committed value it maps to None (a
+        # legacy 0.0, a typed 0) is one the fit never sees, so the status says so instead
+        # of comparing it against a trace as if the fit used it.
+        out['usable'] = (usable_rate(value) is not None) if value is not None else None
+        if out['usable'] is False:
+            out['note'] = (
+                'The committed mean count rate is not a usable rate (a positive, finite '
+                'number is needed), so the nonlinear cumulant runs in the classical '
+                'limit, as if none were committed. Enter a rate or clear the cell.')
+            return out
 
         linked = self.workspace.traces_for_measurement(item_id)
         if not linked:
@@ -8651,43 +10421,109 @@ class Controller:
     # one place a source is chosen (invariant 3).
     DERIVED_SLS_KIND = 'trace_derived_sls'
 
-    def derived_intensity_candidates(self, sample_id: str) -> List[Dict[str, Any]]:
-        """Every DLS run in this sample, with whether it can supply a static point.
+    def derived_intensity_candidates(
+            self, sample_id: str,
+            trace_params: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Every DLS run in this sample, and every UNATTACHED count-rate trace, with
+        whether each can supply a static point.
 
         Reports rather than filters: an ineligible run is listed with the reason,
         so the surface can show the user what to fix instead of silently offering
         a shorter list (doctrine rule 2 -- disclosure, at the display surface).
         Nothing is written.
+
+        Each row carries `kind`: 'dls' for a run of the sample, 'trace' for a
+        standalone trace (`measurement_id` None). A solvent blank is often measured
+        WITHOUT a correlogram -- there is nothing to fit, the run exists to measure
+        the solvent's intensity -- so such a blank reaches the derived route only
+        through the trace it left behind. A trace carries no identity or angle of
+        its own, so a trace row takes the sample's identity from the first ticked
+        DLS run at derive time (`preview_derived_static_series`), its concentration
+        defaults to 0 (a blank), and its angle is SEEDED when the sample's DLS runs
+        share one angle -- otherwise it must be entered. `trace_params` maps a
+        trace id to the user's own `angle_deg` / `concentration_g_per_mL` for that
+        row; it overrides the seeds and is what the surface hands back.
         """
         sample = self.workspace.samples.get(sample_id)
         if sample is None:
             return []
         rows: List[Dict[str, Any]] = []
+        dls_angles = set()
+        n_template = 0
         for item_id in sample.dls_item_ids:
             lm = self.workspace.measurements.get(item_id)
             if lm is None:
                 continue
+            n_template += 1
             p = lm.committed_params
             rate = p.get(self._MEAN_CR_KEY)
             conc = p.get('concentration_g_per_mL')
+            if p.get('angle_deg') is not None:
+                dls_angles.add(round_angle_for_identity(p['angle_deg']))
             # A CODE, not a sentence: the wording is the display surface's, so the
             # controller stays free of user-facing prose and the tooltip text can be
             # resolved statically (tests/test_method_docs_sync.py).
             reason = None
-            if rate is None:
+            if lm.derived_kind == 'replicate_average':
+                # First: it copies its first source's rate, so it would otherwise pass
+                # as eligible (combination doctrine rule 1, core/data_models.py).
+                reason = 'replicate_average'
+            elif rate is None:
                 reason = 'no_count_rate'
-            elif not np.isfinite(rate) or rate <= 0:
+            elif usable_rate(rate) is None:
                 reason = 'bad_count_rate'
             elif conc is None:
                 reason = 'no_concentration'
             rows.append({
                 'item_id': item_id,
-                'label': p.get('label') or lm.item_id,
+                'kind': 'dls',
+                # The BARE name, not the display format: this row's own Angle and
+                # c columns already carry the axes (item 1f), and the hover card
+                # carries the rest.
+                'label': measurement_name(lm),
                 'angle_deg': p.get('angle_deg'),
                 'concentration_g_per_mL': conc,
                 'mean_count_rate_cps': rate,
                 'source': p.get(self._MEAN_CR_SOURCE_KEY),
                 'analyzer_geometry': p.get('analyzer_geometry'),
+                'eligible': reason is None,
+                'reason_code': reason,
+            })
+        seed_angle = next(iter(dls_angles)) if len(dls_angles) == 1 else None
+        overrides = trace_params or {}
+        for trace in self.workspace.traces.values():
+            if trace.measurement_id is not None:
+                continue                      # attached: its run is listed above
+            given = overrides.get(trace.trace_id, {})
+            angle = given.get('angle_deg', seed_angle)
+            conc = given.get('concentration_g_per_mL', 0.0)
+            rate = self._trace_mean_cps(trace.trace_id, 'trace:mean')
+            reason = None
+            if n_template == 0:
+                reason = 'no_template_run'
+            elif usable_rate(rate) is None:
+                reason = 'bad_count_rate'
+            elif angle is None:
+                reason = 'no_angle'
+            # The data model's own range predicates (a scattering angle lies strictly
+            # inside (0, 180); a concentration is finite and non-negative), applied on
+            # the row so a typed value is refused where it was typed, not at Derive.
+            elif not (np.isfinite(angle) and 0.0 < angle < 180.0):
+                reason = 'bad_angle'
+            elif conc is None:
+                reason = 'no_concentration'
+            elif not (np.isfinite(conc) and conc >= 0.0):
+                reason = 'bad_concentration'
+            rows.append({
+                'item_id': trace.trace_id,
+                'kind': 'trace',
+                'label': trace.sample_label or trace.trace_id,
+                'angle_deg': angle,
+                'concentration_g_per_mL': conc,
+                'mean_count_rate_cps': rate,
+                'source': 'trace:mean',
+                'analyzer_geometry': None,
                 'eligible': reason is None,
                 'reason_code': reason,
             })
@@ -8697,35 +10533,65 @@ class Controller:
         return rows
 
     def preview_derived_static_series(
-            self, item_ids: Sequence[str]) -> List[Any]:
+            self, item_ids: Sequence[str], *,
+            trace_params: Optional[Dict[str, Dict[str, Any]]] = None,
+            template_sample_id: Optional[str] = None) -> List[Any]:
         """The static series these runs WOULD produce, one per concentration.
 
         Pure with respect to the workspace -- it creates nothing. The surface uses
         it to show the points and any disclosure before the user commits them.
         Raises ValueError through the engine on a category error (mixed
         polarization, mixed concentration within a group, an unusable rate).
+
+        An id may name an UNATTACHED trace (see `derived_intensity_candidates`).
+        Such an entry has no measurement of its own, so it is built as a snapshot
+        of a TEMPLATE run's identity -- polymer, solvent, temperature, wavelength,
+        refractive index, geometry and fraction -- with the concentration and angle
+        the user gave for it (`trace_params`; concentration 0 and the sample's
+        one shared angle when not given). The template is the first DLS run in the
+        selection, else the first DLS run of `template_sample_id`: the user's tick
+        picks the fraction the blank belongs to, exactly as it picks the ladder.
+        The engine's own disclosure then compares the trace entry against the runs
+        it is collated with like any other member.
         """
         by_conc: Dict[Any, List[derived_sls.DerivedIntensityInput]] = {}
         built: List[Any] = []
+        overrides = trace_params or {}
+        template = self._derived_template_run(item_ids, template_sample_id)
         for item_id in item_ids:
+            trace = self.workspace.traces.get(item_id)
+            if trace is not None and trace.measurement_id is None:
+                entry = self._trace_derived_entry(
+                    trace, template, overrides.get(item_id, {}))
+                built.append(entry.measurement)
+                by_conc.setdefault(
+                    round_concentration_for_identity(
+                        entry.measurement.concentration_g_per_mL), []).append(entry)
+                continue
             lm = self.workspace.measurements.get(item_id)
-            if lm is None or lm.kind != 'dls':
+            if lm is None:
+                # An unresolvable id IS the subject of this answer: a lookup failed on
+                # an id the user never chose, so there is nothing to name it by.
                 raise ValueError(
                     '{0!r} is not a DLS measurement, so it has no count rate to '
                     'derive a static point from.'.format(item_id))
+            name = measurement_display_name(lm)
+            if lm.kind != 'dls':
+                raise ValueError(
+                    '{0!r} is not a DLS measurement, so it has no count rate to '
+                    'derive a static point from.'.format(name))
+            _refuse_an_average_as_a_repeat([lm])
             p = lm.committed_params
             rate = p.get(self._MEAN_CR_KEY)
             if rate is None:
                 raise ValueError(
-                    'Run {0!r} has no committed mean count rate. Set one on the '
-                    'Data tab, or leave the run out.'.format(
-                        p.get('label') or item_id))
+                    'Measurement {0!r} has no committed mean count rate. Set one on '
+                    'the Data tab, or leave it out.'.format(name))
             conc = p.get('concentration_g_per_mL')
             if conc is None:
                 raise ValueError(
-                    'Run {0!r} has no committed concentration. A static '
-                    'measurement needs one; set it on the Data tab.'.format(
-                        p.get('label') or item_id))
+                    'Measurement {0!r} has no committed concentration. A static '
+                    'measurement needs one; set it on the Data tab.'.format(name))
             key = round_concentration_for_identity(conc)
             measurement = lm.build()
             built.append(measurement)
@@ -8733,8 +10599,14 @@ class Controller:
                 derived_sls.DerivedIntensityInput(
                     item_id=item_id,
                     measurement=measurement,
-                    mean_count_rate_cps=float(rate),
+                    # The committed value as-is: the engine applies the one usable-rate
+                    # predicate and refuses what is not a rate, naming the run.
+                    mean_count_rate_cps=rate,
                     source=p.get(self._MEAN_CR_SOURCE_KEY) or 'user',
+                    # The engine prints names it is GIVEN (invariant 1): its
+                    # count-rate-disagreement note reaches the exported Comments cell,
+                    # where an internal id resolves to nothing.
+                    display_name=name,
                 ))
         # The partition is checked across the WHOLE selection, before grouping.
         # Grouping by concentration makes every group internally uniform, so the
@@ -8745,8 +10617,88 @@ class Controller:
         return [derived_sls.derive_static_series(by_conc[k])
                 for k in sorted(by_conc)]
 
+    def _derived_template_run(self, item_ids: Sequence[str],
+                              template_sample_id: Optional[str]):
+        """The DLS run an unattached trace takes its identity from, or None.
+
+        The first DLS measurement in the selection wins -- the ticked ladder names
+        the fraction and the optics a trace-only blank belongs to. With no DLS run
+        ticked, the sample's first DLS run stands in, so a blank can be derived on
+        its own for a ladder that already exists as loaded SLS data.
+        """
+        for item_id in item_ids:
+            lm = self.workspace.measurements.get(item_id)
+            if lm is not None and lm.kind == 'dls':
+                return lm
+        sample = (self.workspace.samples.get(template_sample_id)
+                  if template_sample_id else None)
+        if sample is not None:
+            for item_id in sample.dls_item_ids:
+                lm = self.workspace.measurements.get(item_id)
+                if lm is not None:
+                    return lm
+        return None
+
+    def _trace_derived_entry(self, trace, template, given: Dict[str, Any]):
+        """One `DerivedIntensityInput` for an unattached trace.
+
+        The measurement is a snapshot of the template run's identity with the
+        trace's own concentration and angle substituted; its correlogram arrays
+        are the template's and are never read by the derived route, which
+        collates count rates. Everything the point will carry -- polymer, solvent,
+        temperature, optics, geometry, fraction -- is therefore the user's own
+        committed parameters on a run they chose (invariant 3), and the source
+        tag says the number is the trace's plain mean.
+        """
+        if template is None:
+            raise ValueError(
+                'Trace {0!r} cannot supply a static point on its own: an unattached '
+                'trace takes its sample identity (polymer, solvent, temperature, '
+                'optics) from a DLS run, and this sample has none.'.format(
+                    trace.sample_label or trace.trace_id))
+        seed = self._trace_seed_angle(template)
+        angle = given.get('angle_deg', seed)
+        if angle is None:
+            raise ValueError(
+                'Trace {0!r} has no scattering angle: the sample\'s runs span '
+                'several angles, so enter the angle this trace was recorded at.'
+                .format(trace.sample_label or trace.trace_id))
+        conc = given.get('concentration_g_per_mL', 0.0)
+        if conc is None:
+            raise ValueError(
+                'Trace {0!r} has no concentration; a static measurement needs one '
+                '(0 for a solvent blank).'.format(
+                    trace.sample_label or trace.trace_id))
+        rate = self._trace_mean_cps(trace.trace_id, 'trace:mean')
+        if rate is None:
+            raise ValueError(
+                'Trace {0!r} has no usable mean count rate.'.format(
+                    trace.sample_label or trace.trace_id))
+        measurement = replace(
+            template.build(), concentration_g_per_mL=float(conc),
+            angle_deg=float(angle))
+        return derived_sls.DerivedIntensityInput(
+            item_id=trace.trace_id, measurement=measurement,
+            mean_count_rate_cps=float(rate), source='trace:mean',
+            # A trace is not a measurement, so it keeps the trace name every other
+            # trace surface shows -- the engine's note just stops printing a raw id.
+            display_name=trace.sample_label or trace.trace_id)
+
+    def _trace_seed_angle(self, template) -> Optional[float]:
+        """The one angle the template's sample shares, else None (must be entered)."""
+        sid = self._sample_id_of(template.item_id)
+        sample = self.workspace.samples.get(sid) if sid else None
+        angles = set()
+        for item_id in (sample.dls_item_ids if sample else ()):
+            lm = self.workspace.measurements.get(item_id)
+            if lm is not None and lm.committed_params.get('angle_deg') is not None:
+                angles.add(round_angle_for_identity(lm.committed_params['angle_deg']))
+        return next(iter(angles)) if len(angles) == 1 else None
+
     def derive_static_points(self, item_ids: Sequence[str], *,
                              dn_dc_mL_per_g: Optional[float] = None,
+                             trace_params: Optional[Dict[str, Dict[str, Any]]] = None,
+                             template_sample_id: Optional[str] = None,
                              ) -> Dict[str, Any]:
         """Materialize one SLS measurement per concentration from these DLS runs.
 
@@ -8761,9 +10713,13 @@ class Controller:
 
         `dn_dc_mL_per_g` is optional and never guessed (invariant 3). Absent, the
         point carries no dn/dc and the existing arbitrary-optical-scale disclosure
-        travels with every result computed from it.
+        travels with every result computed from it. `trace_params` and
+        `template_sample_id` are `preview_derived_static_series`'s, for the
+        unattached-trace entries.
         """
-        series_list = self.preview_derived_static_series(item_ids)
+        series_list = self.preview_derived_static_series(
+            item_ids, trace_params=trace_params,
+            template_sample_id=template_sample_id)
         # Deriving again REPLACES the previous derived point at each concentration
         # rather than adding a second one: the tab's help promises a refresh, and two
         # points at one concentration would sit in the same Zimm with no way for the
@@ -8775,8 +10731,15 @@ class Controller:
         notes: List[str] = []
         for series in series_list:
             source_ids = list(series.source_item_ids)
+            # Sources named by KIND, the sibling of `derived_intensity_provenance`'s
+            # sentence: a trace-only blank has no DLS run behind it.
+            n_tr = sum(1 for i in source_ids if i in self.workspace.traces)
+            n_run = len(source_ids) - n_tr
+            what = ('{0} DLS run(s)'.format(n_run) if n_tr == 0
+                    else '{0} count-rate trace(s)'.format(n_tr) if n_run == 0
+                    else '{0} DLS run(s) and {1} count-rate trace(s)'.format(n_run, n_tr))
             params: Dict[str, Any] = {
-                'label': 'Derived from {0} DLS run(s)'.format(len(source_ids)),
+                'label': 'Derived from {0}'.format(what),
                 'polymer_name': series.polymer_name,
                 'solvent_name': series.solvent_name,
                 'concentration_g_per_mL': series.concentration_g_per_mL,
@@ -8839,15 +10802,22 @@ class Controller:
     def _superseded_derived_points(self, series_list) -> List[str]:
         """Existing DERIVED points these series would duplicate.
 
-        Matched on the same identity a sample is grouped by plus the concentration
-        the new point carries -- so re-deriving a ladder replaces it entry for entry,
-        and a derived point for some other sample or concentration is left alone.
+        Matched on the same identity a sample is grouped by, PLUS the two axes the
+        sample key deliberately leaves out and the fits filter on -- the
+        molecular-weight fraction and the concentration -- so re-deriving a ladder
+        replaces it entry for entry, and a derived point of another fraction, sample
+        or concentration is left alone. The fraction is compared EXACTLY (None and a
+        label differ), the same comparison `_rayleigh_for_sample` selects a series
+        by and `check_replicate_identity` averages by. Without it every fraction's
+        blank collides at c = 0: deriving one fraction's blank deleted another's
+        (measured on a five-fraction molar-mass series; three fractions bitten).
         Loaded measurements are never returned: the user's own data is not ours to
         supersede.
         """
         wanted = {(casefold_identity_name(sr.polymer_name),
                    casefold_identity_name(sr.solvent_name),
                    round_temperature_for_identity(sr.temperature_K),
+                   sr.mw_fraction,
                    round_concentration_for_identity(sr.concentration_g_per_mL))
                   for sr in series_list
                   if sr.concentration_g_per_mL is not None}
@@ -8862,6 +10832,7 @@ class Controller:
             key = (casefold_identity_name(p.get('polymer_name') or ''),
                    casefold_identity_name(p.get('solvent_name') or ''),
                    round_temperature_for_identity(p.get('temperature_K') or 0.0),
+                   p.get('mw_fraction'),
                    round_concentration_for_identity(conc))
             if key in wanted:
                 out.append(item_id)
@@ -8876,12 +10847,25 @@ class Controller:
         lm = self.workspace.measurements.get(item_id)
         if lm is None or lm.derived_kind != self.DERIVED_SLS_KIND:
             return None
-        n = len(lm.derived_from or ())
+        sources = list(lm.derived_from or ())
+        n_traces = sum(1 for i in sources if i in self.workspace.traces)
+        n_runs = len(sources) - n_traces
         source = lm.committed_params.get('derived_intensity_source') or 'unknown'
-        parts = ['derived from {0} DLS run(s); mean count rate source: {1}'.format(
-            n, source)]
+        # Sources named by KIND: a trace-only blank has no DLS run behind it, and
+        # saying it did misstates what was measured. The run-only wording is
+        # unchanged -- the exports pin it.
+        if n_traces == 0:
+            what = '{0} DLS run(s)'.format(n_runs)
+        elif n_runs == 0:
+            what = '{0} count-rate trace(s)'.format(n_traces)
+        else:
+            what = '{0} DLS run(s) and {1} count-rate trace(s)'.format(n_runs, n_traces)
+        parts = ['derived from {0}; mean count rate source: {1}'.format(what, source)]
+        # A source may be a run OR an unattached trace (a trace-only blank), so
+        # both stores are consulted before a source is called removed.
         missing = [i for i in (lm.derived_from or ())
-                   if i not in self.workspace.measurements]
+                   if i not in self.workspace.measurements
+                   and i not in self.workspace.traces]
         if missing:
             parts.append('{0} source run(s) removed'.format(len(missing)))
         # The engine's rule-2 disclosures ride the SAME path as the provenance, so a
@@ -8926,6 +10910,13 @@ class Controller:
             (self._sample_id_of(iid),
              self.workspace.measurements[iid].committed_params.get('mw_fraction'))
             for iid in ids if self.workspace.measurements[iid].kind == 'dls'}
+        # The SLS sibling, read at the same moment and for the same reason. Every SLS fit
+        # consumes the WHOLE series (and its c = 0 blank), so a sample that loses any SLS
+        # member has had the inputs behind its stored Mw/Rg/A2 changed underneath it.
+        sls_owners = {
+            (self._sample_id_of(iid),
+             self.workspace.measurements[iid].committed_params.get('mw_fraction'))
+            for iid in ids if self.workspace.measurements[iid].kind == 'sls'}
         for iid in ids:
             self.workspace.remove_measurement(iid)
         vanished = samples_before - set(self.workspace.samples.keys())
@@ -8970,6 +10961,8 @@ class Controller:
             # mode_set_provenance), never cascade-deletes.
             self.mode_sets = {k: v for k, v in self.mode_sets.items()
                               if k[0] not in vanished}
+            # ...and the acknowledgement goes with the sample, for the reason above.
+            self._unmeasured_blank_ack -= vanished
         # A SURVIVING sample's cached mode map must not keep a removed run's
         # points: the value-keyed picks still match cached points, so a stale
         # map lets a fit read (or KeyError on) deleted measurements. Prune the points, note the drop,
@@ -9015,6 +11008,21 @@ class Controller:
                 r = self.workspace.samples[sid].result_for(frac)
                 if r.rh_source == 'computed' and r.rh_nm == row.rh_nm:
                     reset_result_quantity(r, 'rh')
+        # The SLS triple, mirroring the aggregate-Rh sweep above. Removing an SLS member
+        # invalidates every fit built on that series -- most sharply the c = 0 blank,
+        # whose departure changes every excess Rayleigh ratio -- yet the stored Mw/Rg/A2
+        # survived, so Cross-Sample kept serving a value under a label the loaded data
+        # could no longer produce. Over-inclusion is the safe direction, the same call
+        # the Rh sweep documents: one re-Run restores a value that did not need clearing,
+        # while a stale Mw feeds the scaling plots, rho and the Summary export. Keyed to
+        # the tier, so a hand-entered or picked value is never touched.
+        for sid, frac in sls_owners:
+            if sid is None or sid not in self.workspace.samples:
+                continue                      # a vanished sample is handled wholesale above
+            r = self.workspace.samples[sid].result_for(frac)
+            for q in ('mw', 'rg', 'a2'):
+                if getattr(r, f'{q}_source', '') == 'computed':
+                    reset_result_quantity(r, q)
         for sid in vanished:
             self.sample_calibration_working.pop(sid, None)
             self.sample_calibration_committed.pop(sid, None)
@@ -9246,6 +11254,9 @@ class Controller:
         self._sls_candidate_cache.clear()   # the memo belongs to the old workspace
         self._dls_candidate_cache.clear()   # (same — keyed to the old measurements)
         self._distribution_stamps.clear()   # stamps belong to the old results
+        # A blankless-run acknowledgement is never persisted, so a reloaded session must
+        # ask again -- and these sample ids belong to the OLD workspace anyway.
+        self._unmeasured_blank_ack.clear()
         # The undo history belongs to the previous session's measurements; drop it so
         # Undo can't step back into a no-longer-loaded state.
         self._commit_history.clear()

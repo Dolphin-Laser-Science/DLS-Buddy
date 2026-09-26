@@ -13,6 +13,21 @@ Gamma as the physical g1 decay rate:
 Each is seeded from a second-order cumulant fit, computed internally on the same
 delay window, and returns plot-ready arrays.
 
+Each accepts an optional PINNED baseline: a flat offset the caller determined (the
+Correlogram tab's baseline region) that is subtracted from g2 - 1 before the fit and
+recorded on the result, so the model is `g2 - 1 = baseline + beta |g1|^2`. The default
+subtracts nothing. The baseline is a fit INPUT, not a fitted parameter: ISO 22412:2017
+Annex A.1.2 determines the baseline A beforehand and subtracts it before linearizing
+(Formula A.16, `y = 1/2 ln[G2 - A]`), and Stepanek (1993, Ch. 4 of Brown, ed.) states the
+same fork for the single exponential -- when B is reliably known, fit `log(G2/B - 1)`
+(Eqs. 4.4-4.5, printed p. 178) -- and prints the stretched exponential with an additive
+baseline term (Eq. 4.41, printed p. 196). The deliberate deviation here is that the
+offset is PINNED to the determined value rather than fitted: a floating baseline recovers
+the offset only where the correlogram has already decayed, and drifts as the window
+shortens. A flat offset that is NOT removed is absorbed differently by each model -- the double
+exponential turns it into a spurious, infinitely slow mode -- which is why the offset is
+a fit input rather than left to the optimizer.
+
 The seed is deliberately NOT a parameter. A caller-supplied seed was removed once no
 caller was found to pass one, and the obvious reason to add one back
 -- reusing a cumulant fit the controller already ran -- would feed these fits a
@@ -33,7 +48,7 @@ from scipy import optimize, special
 
 from core.data_models import DLSMeasurement
 from analysis.dls._common import (
-    _apply_tau_window,
+    _apply_tau_window_live,
     _d_from_gamma,
     _decay_completeness,
     _decay_completeness_check,
@@ -43,6 +58,8 @@ from analysis.dls._common import (
     _decay_rate_to_rh_nm,
     _measurement_q_m,
     MIN_DECAY_COMPLETENESS,
+    _keyed_notes,
+    _pinned_offset,
     _require_viscosity,
     _result_flags,
     NO_VISCOSITY_NOTE,
@@ -50,6 +67,7 @@ from analysis.dls._common import (
     _seed_or_floor,
 )
 from analysis.dls.cumulants import (
+    _dead_channel_note,
     CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM, _size_range_check, fit_cumulants)
 
 
@@ -97,6 +115,18 @@ class SingleExponentialResult:
     # export surface reads one shape across the parametric family.
     rh_reliable: bool = True
     reliability_note: str = ''
+    # The flat offset subtracted from g2 - 1 before the fit (the caller's pinned baseline;
+    # 0.0 when none was supplied) -- recorded so every surface can say what the fit was
+    # given, the same field name CumulantResult carries.
+    baseline: float = 0.0
+    # Passive notes, the shape CumulantResult carries and the GUI/export read generically:
+    # today the dead-channel note (`cumulants._dead_channel_note`) when the live-channel
+    # mask dropped a channel from this fit.
+    notes: tuple = ()
+    # What each note is about, index-aligned with `notes`; see CumulantResult, whose
+    # field this mirrors. Every note this arm emits today is fit-level (''), which is
+    # the honest answer for a dead channel and not a placeholder.
+    note_targets: tuple = ()
 
 
 @dataclass
@@ -115,6 +145,10 @@ class DoubleExponentialResult:
     # surface that has not been taught about modes over-flags rather than missing a flag.
     rh_reliable: bool = True
     reliability_note: str = ''
+    # The pinned offset the fit was given (0.0 when none); see SingleExponentialResult.
+    baseline: float = 0.0
+    notes: tuple = ()                 # see SingleExponentialResult
+    note_targets: tuple = ()          # see SingleExponentialResult
 
 
 @dataclass
@@ -141,9 +175,13 @@ class KWWResult:
     # not of tau_c; see fit_kww for why a rate-based test cannot work for this model.
     rh_reliable: bool = True
     reliability_note: str = ''
+    notes: tuple = ()                 # see SingleExponentialResult
+    note_targets: tuple = ()          # see SingleExponentialResult
     # Which cause, for the same reason ExponentialMode carries it: an undecayed correlogram
     # makes tau_c and <tau> themselves extrapolations, a missing viscosity does not.
     decay_incomplete: bool = False
+    # The pinned offset the fit was given (0.0 when none); see SingleExponentialResult.
+    baseline: float = 0.0
 
 
 def _tau_span_s(tau) -> float:
@@ -208,8 +246,9 @@ def fit_single_exponential(
     min_decay_completeness: float = MIN_DECAY_COMPLETENESS,
     max_rh_nm: float = CUMULANT_MAX_RH_NM,
     min_rh_nm: float = CUMULANT_MIN_RH_NM,
+    baseline: Optional[float] = None,
 ) -> SingleExponentialResult:
-    """Fit g2(tau) - 1 = beta exp(-2 Gamma tau) by nonlinear least squares.
+    """Fit g2(tau) - 1 = baseline + beta exp(-2 Gamma tau) by nonlinear least squares.
 
     Initial guesses are taken from a cumulant fit computed internally on the same
     delay window (see the module docstring on why the seed is not a parameter).
@@ -230,28 +269,51 @@ def fit_single_exponential(
         The size range DLS can establish, outside which the mode's Rh is FLAGGED (not
         rejected); defaults CUMULANT_MAX_RH_NM / CUMULANT_MIN_RH_NM, the same two-sided
         `_size_range_check` the cumulant applies.
+    baseline : float, optional
+        A flat offset, determined by the caller, subtracted from g2 - 1 before the fit
+        and recorded on the result (the module docstring on the pinned-offset form).
+        Default None subtracts nothing.
 
     Returns
     -------
     SingleExponentialResult
     """
-    tau, g2m1 = _apply_tau_window(
+    tau, g2m1, alive = _apply_tau_window_live(
         measurement.delay_times_s, measurement.correlogram,
         tau_min_s, tau_max_s, min_points=2,
         skip_initial_channels=skip_initial_channels,
     )
+    offset = _pinned_offset(baseline)
+    y = g2m1 - offset
+    dead_note = _dead_channel_note(int(np.count_nonzero(~alive)), int(g2m1.size))
+    # A SEED, not a result -- and it needs no guard of its own. The linear cumulant
+    # RETURNS a NaN-bearing result for a correlogram with no decay (a data property) and
+    # RAISES only for a baseline the caller set above the data (an input error the user
+    # must see). NaN is the withheld-seed signal `_seed_or_floor` was written for, so the
+    # first case degrades to each floor here and the second propagates, both without a
+    # `try`. An earlier form caught the refusal and re-derived that split at this call
+    # site; separating the two AT THE SOURCE deleted the need for it.
+
+    # It also keeps the ENGINE DEFAULT amplitude cutoff rather than the user's Settings
+    # value: a seed is an implementation detail of the method that owns it, so it must not
+    # move when a display-side control does. The one `analysis/` site that DOES read the
+    # user's value is the Gamma-vs-q2 cumulant in `angular.py` -- there it IS the user's
+    # own fit, on the measurement they just configured.
     seed_cumulant = fit_cumulants(measurement, order=2,
                                   tau_min_s=tau_min_s, tau_max_s=tau_max_s,
-                                  skip_initial_channels=skip_initial_channels)
+                                  skip_initial_channels=skip_initial_channels,
+                                  baseline=baseline)
+    beta_seed = seed_cumulant.beta
+    gamma_seed = seed_cumulant.gamma_s_inv
 
     q = _measurement_q_m(measurement)
-    p0 = [_seed_or_floor(seed_cumulant.beta, 1e-6), _seed_or_floor(seed_cumulant.gamma_s_inv, 1e-3)]
+    p0 = [_seed_or_floor(beta_seed, 1e-6), _seed_or_floor(gamma_seed, 1e-3)]
     bounds = ([0.0, 0.0], [np.inf, np.inf])
 
     success = True
     try:
         popt, _ = optimize.curve_fit(
-            _single_exp_model, tau, g2m1, p0=p0, bounds=bounds, maxfev=20000
+            _single_exp_model, tau[alive], y[alive], p0=p0, bounds=bounds, maxfev=20000
         )
         beta, gamma = float(popt[0]), float(popt[1])
     except (RuntimeError, ValueError, TypeError):
@@ -261,7 +323,7 @@ def fit_single_exponential(
         success = False
         beta, gamma = float('nan'), float('nan')
 
-    fitted = _single_exp_model(tau, beta, gamma)
+    fitted = _single_exp_model(tau, beta, gamma) + offset
     residuals = g2m1 - fitted
 
     d = _d_from_gamma(gamma, q)
@@ -273,19 +335,23 @@ def fit_single_exponential(
         rh = float('nan')
         visc_note = NO_VISCOSITY_NOTE
 
+    # The span the fit SAW: a dead tail would stretch the window past the last observation.
     completeness, mode_reliable, mode_note, undecayed = _mode_flags(
-        gamma, _tau_span_s(tau), min_decay_completeness, not visc_note,
+        gamma, _tau_span_s(tau[alive]), min_decay_completeness, not visc_note,
         rh, max_rh_nm, min_rh_nm)
     mode = ExponentialMode(amplitude_fraction=1.0, gamma_s_inv=gamma,
                            d_m2_s=d, rh_nm=rh,
                            rh_reliable=mode_reliable, reliability_note=mode_note,
                            decay_completeness=completeness, decay_incomplete=undecayed)
     rh_reliable, reliability_note = _result_flags(mode_note)
+    notes, note_targets = _keyed_notes(('', dead_note))
     return SingleExponentialResult(
         beta=beta, mode=mode, q_m_inv=q, fit_tau_s=tau,
         fitted_g2m1=fitted, residuals=residuals,
-        rms_error=_rms_error(residuals), success=success,
+        rms_error=_rms_error(residuals[alive]), success=success,
         rh_reliable=rh_reliable, reliability_note=reliability_note,
+        baseline=offset,
+        notes=notes, note_targets=note_targets,
     )
 
 
@@ -307,10 +373,11 @@ def fit_double_exponential(
     min_decay_completeness: float = MIN_DECAY_COMPLETENESS,
     max_rh_nm: float = CUMULANT_MAX_RH_NM,
     min_rh_nm: float = CUMULANT_MIN_RH_NM,
+    baseline: Optional[float] = None,
 ) -> DoubleExponentialResult:
     """Fit two discrete decay modes via the full Siegert relation.
 
-        g2 - 1 = beta [ f1 exp(-G1 tau) + (1-f1) exp(-G2 tau) ]^2
+        g2 - 1 = baseline + beta [ f1 exp(-G1 tau) + (1-f1) exp(-G2 tau) ]^2
 
     The squared (rather than additive) form keeps the cross term, which is the
     physically correct Siegert expansion of two modes. Initial guesses follow the
@@ -334,34 +401,59 @@ def fit_double_exponential(
         rejected), per mode; defaults CUMULANT_MAX_RH_NM / CUMULANT_MIN_RH_NM. A fast
         mode below the floor is the usual signature of afterpulsing absorbed into the
         fit -- drop the leading channels rather than read it as a size.
+    baseline : float, optional
+        A flat offset, determined by the caller, subtracted from g2 - 1 before the fit
+        and recorded on the result. Default None subtracts nothing. This is the fit
+        that most needs it: an unremoved offset is absorbed as a spurious, infinitely
+        slow second mode, and the surviving fast mode is biased with nothing to flag it.
 
     Returns
     -------
     DoubleExponentialResult
     """
-    tau, g2m1 = _apply_tau_window(
+    tau, g2m1, alive = _apply_tau_window_live(
         measurement.delay_times_s, measurement.correlogram,
         tau_min_s, tau_max_s, min_points=4,
         skip_initial_channels=skip_initial_channels,
     )
+    offset = _pinned_offset(baseline)
+    y = g2m1 - offset
+    dead_note = _dead_channel_note(int(np.count_nonzero(~alive)), int(g2m1.size))
+    # A SEED, not a result -- and it needs no guard of its own. The linear cumulant
+    # RETURNS a NaN-bearing result for a correlogram with no decay (a data property) and
+    # RAISES only for a baseline the caller set above the data (an input error the user
+    # must see). NaN is the withheld-seed signal `_seed_or_floor` was written for, so the
+    # first case degrades to each floor here and the second propagates, both without a
+    # `try`. An earlier form caught the refusal and re-derived that split at this call
+    # site; separating the two AT THE SOURCE deleted the need for it.
+
+    # It also keeps the ENGINE DEFAULT amplitude cutoff rather than the user's Settings
+    # value: a seed is an implementation detail of the method that owns it, so it must not
+    # move when a display-side control does. The one `analysis/` site that DOES read the
+    # user's value is the Gamma-vs-q2 cumulant in `angular.py` -- there it IS the user's
+    # own fit, on the measurement they just configured.
     seed_cumulant = fit_cumulants(measurement, order=2,
                                   tau_min_s=tau_min_s, tau_max_s=tau_max_s,
-                                  skip_initial_channels=skip_initial_channels)
+                                  skip_initial_channels=skip_initial_channels,
+                                  baseline=baseline)
+    beta_seed = seed_cumulant.beta
+    gamma_seed = seed_cumulant.gamma_s_inv
+    mu2_seed = seed_cumulant.mu2_s_inv2
 
     q = _measurement_q_m(measurement)
-    gamma0 = _seed_or_floor(seed_cumulant.gamma_s_inv, 1e-3)
-    spread = math.sqrt(_seed_or_floor(seed_cumulant.mu2_s_inv2, 0.0))
+    gamma0 = _seed_or_floor(gamma_seed, 1e-3)
+    spread = math.sqrt(_seed_or_floor(mu2_seed, 0.0))
     if spread <= 0:
         spread = 0.5 * gamma0   # fall back to a moderate split if monodisperse seed
     g1_guess = gamma0 + spread
     g2_guess = max(gamma0 - spread, gamma0 * 0.1)
-    p0 = [_seed_or_floor(seed_cumulant.beta, 1e-6), 0.5, g1_guess, g2_guess]
+    p0 = [_seed_or_floor(beta_seed, 1e-6), 0.5, g1_guess, g2_guess]
     bounds = ([0.0, 0.0, 0.0, 0.0], [np.inf, 1.0, np.inf, np.inf])
 
     success = True
     try:
         popt, _ = optimize.curve_fit(
-            _double_exp_model, tau, g2m1, p0=p0, bounds=bounds, maxfev=40000
+            _double_exp_model, tau[alive], y[alive], p0=p0, bounds=bounds, maxfev=40000
         )
         beta, f1, gamma1, gamma2 = (float(popt[0]), float(popt[1]),
                                     float(popt[2]), float(popt[3]))
@@ -369,7 +461,7 @@ def fit_double_exponential(
         success = False
         beta, f1, gamma1, gamma2 = (float('nan'),) * 4   # D2: NaN, not the seed p0
 
-    fitted = _double_exp_model(tau, beta, f1, gamma1, gamma2)
+    fitted = _double_exp_model(tau, beta, f1, gamma1, gamma2) + offset
     residuals = g2m1 - fitted
 
     try:
@@ -379,7 +471,7 @@ def fit_double_exponential(
         have_eta = False
         eta = None
 
-    tau_span = _tau_span_s(tau)
+    tau_span = _tau_span_s(tau[alive])     # the span the fit SAW, never a dead tail
 
     def make_mode(frac, gamma):
         # `gamma > 0` excludes NaN (a failed fit, D2) but ADMITS +inf, which would give a
@@ -411,11 +503,14 @@ def fit_double_exponential(
 
     rh_reliable, reliability_note = _result_flags(mode1.reliability_note,
                                                   mode2.reliability_note)
+    notes, note_targets = _keyed_notes(('', dead_note))
     return DoubleExponentialResult(
         beta=beta, mode1=mode1, mode2=mode2, q_m_inv=q, fit_tau_s=tau,
         fitted_g2m1=fitted, residuals=residuals,
-        rms_error=_rms_error(residuals), success=success,
+        rms_error=_rms_error(residuals[alive]), success=success,
         rh_reliable=rh_reliable, reliability_note=reliability_note,
+        baseline=offset,
+        notes=notes, note_targets=note_targets,
     )
 
 
@@ -436,15 +531,18 @@ def fit_kww(
     max_retained_acf_ratio: float = MAX_RETAINED_ACF_RATIO,
     max_rh_nm: float = CUMULANT_MAX_RH_NM,
     min_rh_nm: float = CUMULANT_MIN_RH_NM,
+    baseline: Optional[float] = None,
 ) -> KWWResult:
     """Fit a Kohlrausch-Williams-Watts (stretched-exponential) model.
 
         g1(tau) = exp(-(tau/tau_c)^stretch),  so
-        g2 - 1  = beta exp(-2 (tau/tau_c)^stretch)
+        g2 - 1  = baseline + beta exp(-2 (tau/tau_c)^stretch)
 
     The stretch exponent (0 < stretch <= 1) captures a continuous spread of
     relaxation times; stretch = 1 recovers a single exponential. The mean
-    relaxation time follows from the gamma function:
+    relaxation time follows from the gamma function (Lindsey & Patterson 1980,
+    Eq. 19 -- the first moment of the relaxation-time distribution the stretched
+    exponential implies):
 
         <tau> = (tau_c / stretch) * Gamma(1 / stretch)
 
@@ -469,38 +567,63 @@ def fit_kww(
         The size range DLS can establish, outside which a reported Rh is FLAGGED (not
         rejected); defaults CUMULANT_MAX_RH_NM / CUMULANT_MIN_RH_NM. Both Rh channels are
         checked and the one verdict covers both, as for the lag-window criterion.
+    baseline : float, optional
+        A flat offset, determined by the caller, subtracted from g2 - 1 before the fit
+        and recorded on the result. Default None subtracts nothing. The lag-window
+        verdict below is still asked of the MEASURED correlogram, not the offset one:
+        on a genuinely undecayed correlogram any tail-derived offset is still signal,
+        so subtracting it there would erase the flag on the very case it exists for.
 
     Returns
     -------
     KWWResult
     """
-    tau, g2m1 = _apply_tau_window(
+    tau, g2m1, alive = _apply_tau_window_live(
         measurement.delay_times_s, measurement.correlogram,
         tau_min_s, tau_max_s, min_points=3,
         skip_initial_channels=skip_initial_channels,
     )
+    offset = _pinned_offset(baseline)
+    y = g2m1 - offset
+    dead_note = _dead_channel_note(int(np.count_nonzero(~alive)), int(g2m1.size))
+    # A SEED, not a result -- and it needs no guard of its own. The linear cumulant
+    # RETURNS a NaN-bearing result for a correlogram with no decay (a data property) and
+    # RAISES only for a baseline the caller set above the data (an input error the user
+    # must see). NaN is the withheld-seed signal `_seed_or_floor` was written for, so the
+    # first case degrades to each floor here and the second propagates, both without a
+    # `try`. An earlier form caught the refusal and re-derived that split at this call
+    # site; separating the two AT THE SOURCE deleted the need for it.
+
+    # It also keeps the ENGINE DEFAULT amplitude cutoff rather than the user's Settings
+    # value: a seed is an implementation detail of the method that owns it, so it must not
+    # move when a display-side control does. The one `analysis/` site that DOES read the
+    # user's value is the Gamma-vs-q2 cumulant in `angular.py` -- there it IS the user's
+    # own fit, on the measurement they just configured.
     seed_cumulant = fit_cumulants(measurement, order=2,
                                   tau_min_s=tau_min_s, tau_max_s=tau_max_s,
-                                  skip_initial_channels=skip_initial_channels)
+                                  skip_initial_channels=skip_initial_channels,
+                                  baseline=baseline)
+    beta_seed = seed_cumulant.beta
+    gamma_seed = seed_cumulant.gamma_s_inv
 
     q = _measurement_q_m(measurement)
-    gamma0 = _seed_or_floor(seed_cumulant.gamma_s_inv, 1e-3)
+    gamma0 = _seed_or_floor(gamma_seed, 1e-3)
     tau_c0 = 1.0 / gamma0
-    p0 = [_seed_or_floor(seed_cumulant.beta, 1e-6), tau_c0, 1.0]
+    p0 = [_seed_or_floor(beta_seed, 1e-6), tau_c0, 1.0]
     # stretch strictly in (0, 1]; keep a tiny lower bound away from 0.
     bounds = ([0.0, 0.0, 1e-3], [np.inf, np.inf, 1.0])
 
     success = True
     try:
         popt, _ = optimize.curve_fit(
-            _kww_model, tau, g2m1, p0=p0, bounds=bounds, maxfev=40000
+            _kww_model, tau[alive], y[alive], p0=p0, bounds=bounds, maxfev=40000
         )
         beta, tau_c, stretch = float(popt[0]), float(popt[1]), float(popt[2])
     except (RuntimeError, ValueError, TypeError):
         success = False
         beta, tau_c, stretch = (float('nan'),) * 3       # D2: NaN, not the seed p0
 
-    fitted = _kww_model(tau, beta, tau_c, stretch)
+    fitted = _kww_model(tau, beta, tau_c, stretch) + offset
     residuals = g2m1 - fitted
 
     _mean_tau_raw = (tau_c / stretch) * special.gamma(1.0 / stretch)
@@ -533,7 +656,9 @@ def fit_kww(
     # correlograms that plainly never decayed). ISO's retained-range rule, in its data form,
     # asks the MEASURED `g2m1`, never `fitted + residuals` -- algebraically the same, but
     # NaN on a curve_fit failure, silencing the criterion exactly when the fit is worst.
-    decay_ratio = _lowest_observed_acf_ratio(g2m1)
+
+    # The LIVE channels only: a dead channel at -1 reads as the signal reaching its floor.
+    decay_ratio = _lowest_observed_acf_ratio(g2m1[alive])
     decay_ok, decay_note = _observed_decay_check(decay_ratio, max_retained_acf_ratio)
     # The size range is asked of BOTH channels and the verdict is one, like the decay
     # verdict: two readings of one decay. `_result_flags` collapses a note both share.
@@ -547,12 +672,15 @@ def fit_kww(
     rh_reliable, reliability_note = _result_flags(
         decay_note, size_note_c, size_note_m, visc_note)
 
+    notes, note_targets = _keyed_notes(('', dead_note))
     return KWWResult(
         beta=beta, tau_c_s=tau_c, stretch=stretch, mean_tau_s=mean_tau,
         gamma_from_tau_c_s_inv=gamma_tau_c, rh_from_tau_c_nm=rh_tau_c,
         gamma_from_mean_tau_s_inv=gamma_mean, rh_from_mean_tau_nm=rh_mean,
         q_m_inv=q, fit_tau_s=tau, fitted_g2m1=fitted, residuals=residuals,
-        rms_error=_rms_error(residuals), success=success,
+        rms_error=_rms_error(residuals[alive]), success=success,
         rh_reliable=rh_reliable, reliability_note=reliability_note,
         decay_incomplete=not decay_ok,
+        baseline=offset,
+        notes=notes, note_targets=note_targets,
     )

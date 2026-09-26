@@ -27,6 +27,19 @@ header parameter by position. Verified against two real exports.
                   contents are RAW correlator counts, not g2-1.
     Then        : a four-line trailer -- Sample ID, Operator ID, Date, Time.
 
+Items 27, 29 and 31 give the correlator's three sections -- high, middle and
+low speed -- as channel counts, and items 28 and 30 the middle- and low-speed
+sampling times (us). The TurboCorr de-couples the delay time from the sampling
+time (Chapter IV, p. IV-2): every channel of a section is accumulated over that
+SECTION's sampling time while its delays run at constant-ratio spacing, so the
+lag spacing is not the sample time. The high-speed section's delays are fixed
+and each carries its own sampling time, Table IV-1 A (pp. IV-3 to IV-4):
+25 ns for the delays 25-400 ns, 100 ns for 500 ns-2.4 us. From these the
+parser fills a per-channel sample-time array (``sample_times_s`` on the
+preview and the built measurement) for the cumulant fit's residual-variance
+model, which needs the sample time per channel; when any premise of that rule
+fails the array is left empty and the preview carries one note saying why.
+
 Header length is read from item 17, which the manual defines as "one less than
 the number of parameters preceding the x and y data" (currently 36, so 37
 parameters). Reading it rather than hard-coding 37 is what the field is for:
@@ -102,12 +115,15 @@ no consumer in this program and is not read at all.
 Change history
 --------------
 2026-08-03  Initial implementation. (brookhaven_dat.py v1)
+2026-09-10  Per-channel sample times from the correlator sections, items 27-31 and
+            Table IV-1 A, onto the preview's `sample_times_s`. (brookhaven_dat.py v2)
 """
 
 from __future__ import annotations
 
 import math
 import os
+import warnings
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -118,6 +134,7 @@ from parsers.base_parser import (
     MalformedDataError,
     ParseError,
     apply_data_form,
+    carried_run_duration,
     convert_delay_times,
     convert_viscosity,
 )
@@ -154,6 +171,13 @@ _ITEM_BASELINE_CALCULATED = 22
 _ITEM_BASELINE_MEASURED = 23
 _ITEM_LAST_DELAY_US = 24
 _ITEM_SAMPLING_TIME_US = 25
+# The correlator's section layout (Appendix A-2). Item 26, the first HS delay, is not
+# read: the HS sampling time keys on each delay itself (Table IV-1 A below).
+_ITEM_N_HS_CHANNELS = 27
+_ITEM_MS_SAMPLING_TIME_US = 28
+_ITEM_N_MS_CHANNELS = 29
+_ITEM_LS_SAMPLING_TIME_US = 30
+_ITEM_N_LS_CHANNELS = 31
 _ITEM_BASELINE_FIRST_CHANNEL = 35
 _ITEM_BASELINE_LAST_CHANNEL = 36
 
@@ -291,25 +315,139 @@ def _vendor_mean_count_rate_cps(header: Dict[int, float]) -> Optional[float]:
     the quotient unusable, so the result itself is what gets checked.
     """
     total = header.get(_ITEM_TOTAL_COUNTS_A)
-    n_samples = header.get(_ITEM_N_SAMPLES)
-    sampling_us = header.get(_ITEM_SAMPLING_TIME_US)
-    if total is None or n_samples is None or sampling_us is None:
+    if total is None or not np.isfinite(float(total)) or float(total) < 0.0:
         return None
-    values = (float(total), float(n_samples), float(sampling_us))
-    if not all(np.isfinite(v) for v in values):
+    # The denominator IS the run duration, so it is computed in one place and both
+    # callers read that: the rate below and the T carried onto the measurement can
+    # then never be derived from different arithmetic.
+    duration_s = _vendor_run_duration_s(header)
+    if duration_s is None:
         return None
-    if values[1] <= 0.0 or values[2] <= 0.0 or values[0] < 0.0:
-        return None
-    # Spelled as a product then a divide, and checked on the RESULT: `*` saturates
-    # to inf where `**` would raise, and a denominator that overflows to inf or
-    # underflows to 0.0 is only visible in the quotient.
-    duration_s = values[1] * values[2] * 1e-6
-    if not np.isfinite(duration_s) or duration_s <= 0.0:
-        return None
-    rate = values[0] / duration_s
+    rate = float(total) / duration_s
     if not np.isfinite(rate):
         return None
     return float(rate)
+
+
+def _vendor_run_duration_s(header: Dict[int, float]) -> Optional[float]:
+    """The run duration T the header implies, in seconds -- or None.
+
+    Items 4 and 25, both read from the file. The DEFINITIONAL locus is the TurboCorr
+    manual's own item table, Appendix A-2 (PDF p. 90), which names item 25 "Sampling
+    time used to generate number of samples (us)" -- the quantity this product needs,
+    identified by the index the code uses. Chapter VII (PDF p. 57, printed VII-2)
+    corroborates the product in prose, as one of four ways an operator may set the
+    duration ("2. As total samples, in which case the experiment duration is the number
+    of samples times the sampling time of the middle speed circuit (or low speed if that
+    is the only circuit enabled)"); note its prose names the MIDDLE SPEED circuit's
+    sampling time, which the same manual indexes as item 28, so the prose page is
+    corroboration and the item table is the citation.
+
+    Neither is taken on the manual's word alone: this product is the denominator
+    `_vendor_mean_count_rate_cps` has always divided by, and that rate agrees with the
+    committed count-rate traces to 0.9934-1.0016, which is the evidence that it is the
+    length of the acquisition.
+
+    Returns None rather than raising when a term is missing or the product is
+    unusable: an odd header costs the offer and nothing else. The guard is two-sided
+    and lands on the RESULT -- a product that saturates to inf and one that
+    underflows to 0.0 are both unusable, and neither is visible in the factors.
+    Spelled `*`, never `**`, which raises where `*` saturates.
+    """
+    n_samples = header.get(_ITEM_N_SAMPLES)
+    sampling_us = header.get(_ITEM_SAMPLING_TIME_US)
+    if n_samples is None or sampling_us is None:
+        return None
+    values = (float(n_samples), float(sampling_us))
+    if not all(np.isfinite(v) for v in values):
+        return None
+    if values[0] <= 0.0 or values[1] <= 0.0:
+        return None
+    duration_s = values[0] * values[1] * 1e-6
+    if not np.isfinite(duration_s) or duration_s <= 0.0:
+        return None
+    return float(duration_s)
+
+
+# Table IV-1 A of the TurboCorr manual (Chapter IV, pp. IV-3 to IV-4): the high-speed
+# section's FIXED delay times and the sampling time each is accumulated over -- 25 ns for
+# the delays 25-400 ns (twelve of them optional), 100 ns for 500 ns-2.4 us. Both in
+# microseconds, the unit the file writes delays in. There is no 1.8 us entry.
+_HS_SAMPLING_TIME_US: Dict[float, float] = {
+    **{ns * 1e-3: 0.025 for ns in (25, 50, 75, 100, 125, 150, 175, 200,
+                                   225, 250, 275, 300, 325, 350, 375, 400)},
+    **{ns * 1e-3: 0.100 for ns in (500, 600, 700, 800, 1000, 1200, 1400, 1600, 2000, 2400)},
+}
+# A file writes its delays as '%.9e', so a table delay is matched at this relative
+# tolerance rather than exactly.
+_HS_DELAY_RTOL = 1e-6
+
+
+def _section_sample_times(header: Dict[int, float],
+                          delay_us: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """Per-channel sample time (s) from the header's correlator sections, or (None, why).
+
+    The TurboCorr de-couples the delay time from the sampling time (manual, Chapter
+    IV p. IV-2): every channel of a section is accumulated over that SECTION's
+    sampling time while the delays run at constant-ratio spacing, so the lag spacing
+    is not the sample time and cannot stand in for it. The header states the layout
+    -- items 27, 29 and 31 are the high-, middle- and low-speed sections' channel
+    counts, items 28 and 30 the MS and LS sampling times (Appendix A-2) -- and the HS
+    section's sampling time is fixed per delay by Table IV-1 A (`_HS_SAMPLING_TIME_US`).
+
+    The array is filled ONLY when every premise holds: the three counts are whole
+    numbers summing to the number of data channels, each section that has channels
+    carries a finite positive sampling time, every HS delay is a Table IV-1 A entry
+    (matched at `_HS_DELAY_RTOL`), and every channel's delay is an integer multiple
+    (>= 1) of the sampling time assigned to it -- the manual's own constraint
+    (p. IV-5: "Channels have to be integer multiples of the sampling time"). That last
+    premise catches a channel shifted toward a COARSER section by a mis-stated count (its
+    delay is not a multiple of the coarser sampling time); it is one-sided, because a
+    coarser sampling time is itself a multiple of the finer one, so a shift toward a FINER
+    section fills silently with that channel's sampling time too small. The correlator
+    writes the counts itself and no committed file mis-states them, so the one-sided case
+    is disclosed here rather than guarded. Otherwise nothing is filled and the reason is
+    returned for the preview's note: the engine then derives a stand-in from the delay
+    axis and records that it did. Nothing here is guessed or repaired.
+    """
+    counts = []
+    for item in (_ITEM_N_HS_CHANNELS, _ITEM_N_MS_CHANNELS, _ITEM_N_LS_CHANNELS):
+        raw = header.get(item)
+        if raw is None or not np.isfinite(raw) or raw < 0 or raw != int(raw):
+            return None, f'header item {item} (a section channel count) is {raw!r}'
+        counts.append(int(raw))
+    n_hs, n_ms, n_ls = counts
+    if n_hs + n_ms + n_ls != delay_us.size:
+        return None, (f'the sections sum to {n_hs + n_ms + n_ls} channels (items '
+                      f'{_ITEM_N_HS_CHANNELS} + {_ITEM_N_MS_CHANNELS} + '
+                      f'{_ITEM_N_LS_CHANNELS}) against {delay_us.size} data channels')
+    dt_us = np.empty(delay_us.size, dtype=float)
+    for k in range(n_hs):
+        d = float(delay_us[k])
+        match = [v for key, v in _HS_SAMPLING_TIME_US.items()
+                 if abs(d - key) <= _HS_DELAY_RTOL * key]
+        if not match:
+            return None, (f'high-speed channel {k + 1} has delay {d!r} us, which is not a '
+                          f'Table IV-1 A delay')
+        dt_us[k] = match[0]
+    for item, n, start in ((_ITEM_MS_SAMPLING_TIME_US, n_ms, n_hs),
+                           (_ITEM_LS_SAMPLING_TIME_US, n_ls, n_hs + n_ms)):
+        if n == 0:
+            continue
+        val = header.get(item)
+        if val is None or not np.isfinite(val) or val <= 0.0:
+            return None, f'header item {item} (a section sampling time) is {val!r} us'
+        dt_us[start:start + n] = float(val)
+    # The premise every section shares, checked on the channel rather than the count.
+    k = np.asarray(delay_us, dtype=float) / dt_us
+    off = np.flatnonzero((np.abs(k - np.round(k)) > _HS_DELAY_RTOL * np.maximum(k, 1.0))
+                         | (k < 1.0 - _HS_DELAY_RTOL))
+    if off.size:
+        i = int(off[0])
+        return None, (f'channel {i + 1} has delay {float(delay_us[i])!r} us, which is not an '
+                      f'integer multiple of its section\'s sampling time {float(dt_us[i])!r} us '
+                      f'(the correlator\'s own constraint, manual p. IV-5)')
+    return dt_us * 1e-6, None
 
 
 def _sniff(lines: List[str]) -> None:
@@ -696,6 +834,31 @@ class BrookhavenDATParser(BaseDLSParser):
                     f"{expected!r} us, but the {which} data row has {actual!r} us."
                 )
 
+        # --- per-channel sample times from the correlator sections (items 27-31) ---
+        sample_times_s, no_sections = _section_sample_times(header, delay_us)
+        notes: Tuple[str, ...] = ()
+        if no_sections is not None:
+            notes = (
+                f'per-channel sample times were not taken from the header '
+                f'({no_sections}); the cumulant fit derives a stand-in from the delay '
+                f'axis and records that it did.',)
+            for note in notes:
+                warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+
+        # --- run duration (header items 4 and 25) ---
+        # The delay axis is converted once, here, and read by both the duration's
+        # live-lag test and the preview below.
+        delay_s = convert_delay_times(delay_us, _DELAY_TIME_UNIT)
+        vendor_duration_s = _vendor_run_duration_s(header)
+        # The live mask is spelled on the raw channel counts, the quantity THIS layer
+        # holds; `carried_run_duration` owns the rule both formats share.
+        duration_s, duration_note = carried_run_duration(
+            vendor_duration_s, delay_s, np.asarray(raw_counts, dtype=float) > 0.0,
+            'item 4 x item 25, the number of samples times the sampling time')
+        if duration_note:
+            notes = notes + (duration_note,)
+            warnings.warn(f"{file_path!r}: {duration_note}", UserWarning, stacklevel=2)
+
         # --- baseline ---
         baseline_calculated = header[_ITEM_BASELINE_CALCULATED]
         baseline_measured = header[_ITEM_BASELINE_MEASURED]
@@ -734,7 +897,7 @@ class BrookhavenDATParser(BaseDLSParser):
         preview = BrookhavenDATPreview(
             source_file=os.path.abspath(file_path),
             instrument_name=_INSTRUMENT_NAME,
-            delay_times_s=convert_delay_times(delay_us, _DELAY_TIME_UNIT),
+            delay_times_s=delay_s,
             sample_label=_trailer(_TRAILER_SAMPLE_ID),
             angle_deg=header[_ITEM_ANGLE_DEG],
             wavelength_nm=header[_ITEM_WAVELENGTH_NM],
@@ -755,6 +918,10 @@ class BrookhavenDATParser(BaseDLSParser):
             total_counts_b=header[_ITEM_TOTAL_COUNTS_B],
             n_samples=header[_ITEM_N_SAMPLES],
             vendor_mean_count_rate_cps=_vendor_mean_count_rate_cps(header),
+            vendor_duration_s=vendor_duration_s,
+            duration_s=duration_s,
+            sample_times_s=sample_times_s,
+            notes=notes,
             first_channel_used=_int_item(header, _ITEM_FIRST_CHANNEL_USED, file_path),
             operator=_trailer(_TRAILER_OPERATOR),
             acquired_date=_trailer(_TRAILER_DATE),

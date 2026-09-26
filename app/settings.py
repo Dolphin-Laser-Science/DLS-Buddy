@@ -32,6 +32,32 @@ from typing import Any, Dict, List, Optional, Tuple, get_type_hints
 
 SETTINGS_FILENAME = 'settings.json'
 
+# Fields whose TYPE is not their whole contract: the value must also lie in a range, or
+# its consumer refuses it. A value failing EITHER check reverts to the default WITH a
+# report, so a hand-edited settings.json cannot leave the program in a state where every
+# fit raises with nothing pointing back at Settings.
+# `(lo, hi, lo_open, hi_open)` -- the bounds, and whether each is exclusive.
+# Deliberately NOT a sweep of every numeric field: a range belongs here when its consumer
+# REFUSES out-of-range input, never when it merely produces a poor result, since reverting
+# that would override a deliberate choice. `fit_cumulants` refuses outside (0, 1).
+_FIELD_RANGES: Dict[str, Tuple[float, float, bool, bool]] = {
+    'cumulant_fit_cutoff': (0.0, 1.0, True, True),
+    # (0, 1]: `fit_contin` refuses a robustness parameter outside it, and a hand-edited
+    # settings.json reaches the replicate fit through the seed home, and the Mode Map
+    # through its field's exact seed, far from the setting -- the same criterion that
+    # put the cutoff above here.
+    'contin_gcv_gamma': (0.0, 1.0, True, False),
+    # [1, 4]: `fit_cumulants` refuses any other order, and the replicate average runs the
+    # Settings order with no per-run box in between to clamp it.
+    'cumulant_order': (1, 4, False, False),
+    # (0, inf): `fit_contin` refuses a non-positive α end, and the seed reaches the Mode
+    # Map's fields and the CONTIN replicate average with nothing between to catch it. The
+    # upper bound is open and unreachable (the float coercion above already refuses a
+    # non-finite value); the ORDER of the two ends is the fields' check, not this table's.
+    'lcurve_alpha_min': (0.0, math.inf, True, True),
+    'lcurve_alpha_max': (0.0, math.inf, True, True),
+}
+
 
 @dataclass
 class SettingsState:
@@ -39,18 +65,52 @@ class SettingsState:
 
     # --- DLS analysis defaults ---
     cumulant_method: str = 'nonlinear'      # 'nonlinear' (Frisken 2001) or 'linear' (Koppel 1972)
-    cumulant_order: int = 2                 # cumulant expansion order (1-3)
+    cumulant_order: int = 2                 # cumulant expansion order (1-4)
     skip_initial_channels: int = 0          # leading lag channels to drop (afterpulsing); 0 = keep all
+    cumulant_fit_cutoff: float = 0.1        # amplitude at which the linear cumulant's
+    #                                         retained RANGE stops, as a fraction of the
+    #                                         correlogram peak. Settings-seeded, no per-run
+    #                                         widget -- same category as cumulant_method /
+    #                                         skip_initial_channels. ISO 22412 Annex A.1.2
+    #                                         prescribes 0.01; 0.1 is a benchmarked
+    #                                         deviation after Mailer, Clegg & Pusey (2015)
+    #                                         Sec. 3. The engine refuses anything outside
+    #                                         (0, 1); see fit_cumulants.
+    cumulant_weighting: str = 'sourced'     # the cumulant residual-weighting POLICY:
+    #                                         'sourced' (each arm's own sourced default)
+    #                                         or 'uniform' (unweighted, a labelled opt-in).
+    #                                         A policy token, never the engine's request
+    #                                         token: the controller maps it
+    #                                         (`_cumulant_weighting_request`) and refuses
+    #                                         any other value. Settings-seeded, no per-run
+    #                                         widget, like the three fields above.
+    distribution_weighting: str = 'sourced' # the CONTIN/NNLS/lognormal residual-weighting
+    #                                         POLICY: 'sourced' (the arms' own sourced
+    #                                         default) or 'g1-squared' (the older
+    #                                         constant-variance form, a labelled opt-in
+    #                                         kept to reproduce a result reported under
+    #                                         it). A policy token, never an engine request
+    #                                         token: `distribution_weighting_request` maps
+    #                                         it and refuses any other value. Seeded here,
+    #                                         overridable per run on the DLS tab.
     rh_grid_min_nm: float = 1.0             # CONTIN/NNLS Rh grid lower bound
     rh_grid_max_nm: float = 1000.0          # CONTIN/NNLS Rh grid upper bound
     rh_grid_points: int = 100               # CONTIN/NNLS Rh grid resolution
     lcurve_alpha_min: float = 1.0e-4        # CONTIN alpha sweep floor; derivation on fit_contin
     lcurve_alpha_max: float = 1.0e2         # CONTIN L-curve alpha sweep upper bound
-    contin_alpha_method: str = 'gcv'        # CONTIN alpha selection: 'gcv' (Golub 1979,
-    #                                         default), 'lcurve' (Hansen max-curvature
+    contin_alpha_method: str = 'gcv'        # CONTIN alpha selection: 'gcv' (the GCV family,
+    #                                         default -- robust GCV at contin_gcv_gamma
+    #                                         below), 'lcurve' (Hansen max-curvature
     #                                         corner), or 'ftest' (Provencher F-test)
     contin_ftest_prob_reject: float = 0.5   # F-test probability-to-reject level
     #                                         (Provencher default 0.5); higher -> smoother
+    contin_gcv_gamma: float = 0.1           # robustness parameter of Lukas's robust GCV
+    #                                         (RGCV), on (0, 1]: 0.1 (the default, the
+    #                                         value its sources print) is robust GCV, the
+    #                                         default selector; 1 = classical GCV. The
+    #                                         ruling and its sources are in fit_contin's
+    #                                         docstring. Seeds the Distribution sub-tab's
+    #                                         per-run control.
 
     # --- file loading ---
     brookhaven_dat_baseline: str = 'calculated'   # which baseline normalizes a Brookhaven
@@ -73,7 +133,7 @@ class SettingsState:
     se_estimator: str = 'hc3'               # 'hc3' (robust, default; never under-reports)
     #                                         or 'ols' (classical s^2(X'X)^-1, opt-in for
     #                                         comparability; can under-report). See the
-    #                                         Theory-and-Equations-Guide 6.1.
+    #                                         Theory-and-Equations-Guide, "The Estimator: HC3 Heteroscedasticity-Consistent Standard Errors".
 
     # NOTE: the synthetic-generator (β/noise/points) and intensity-trace (outlier k,
     # baseline, block-variance, ADF) defaults used to live here. They were moved into
@@ -232,6 +292,22 @@ class SettingsState:
             if k not in known:
                 continue                                     # unknown key ignored (tolerant)
             coerced, ok, problem = cls._coerce_field(k, v, hints.get(k), defaults.get(k))
+            if ok and k in _FIELD_RANGES:
+                # The range half of the contract, checked AFTER coercion so "0.02" and
+                # 0.02 are judged alike. Reverting is the safe landing: the alternative
+                # is a value the consumer refuses, surfacing later as an unexplained
+                # failure far from the setting that caused it.
+                lo, hi, lo_open, hi_open = _FIELD_RANGES[k]
+                below = coerced <= lo if lo_open else coerced < lo
+                above = coerced >= hi if hi_open else coerced > hi
+                if below or above:
+                    ok = False
+                    upper = ('' if math.isinf(hi) else
+                             f" and {'below' if hi_open else 'at or below'} {hi:g}")
+                    problem = (
+                        f"{k}: expected a number "
+                        f"{'above' if lo_open else 'at or above'} {lo:g}{upper}, "
+                        f"got {v!r} — using default ({defaults.get(k)!r})")
             if ok:
                 accepted[k] = coerced
             elif problem:

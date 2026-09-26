@@ -67,6 +67,7 @@ from parsers.base_parser import (
     TraceFilePreview,
     MalformedDataError,
     ParseError,
+    carried_run_duration,
     convert_delay_times,
     convert_viscosity,
 )
@@ -112,6 +113,12 @@ class _ALVData:
     # The run's NOMINAL length from the header, in seconds. Not the trace's own
     # span: a file reporting 10 s carries a Count Rate section covering 9.88 s.
     duration_s: Optional[float] = None
+    # The same length as the correlogram's run duration T -- the input the exact-in-Gamma
+    # weight's 1/(M - k) reads -- but only for a ONE-run acquisition (`Runs : 1`). With
+    # several runs the header does not say whether `Duration` is
+    # one run's length or the total the averaged correlogram was built over, so nothing
+    # is carried and the weight takes its T -> infinity form, which the fit records.
+    run_duration_s: Optional[float] = None
     # Passive load-time notices (a data block cut short by a bad row), carried onto
     # every preview built from this file.
     notes: tuple = ()
@@ -330,6 +337,7 @@ def _parse_alv_file(file_path: str) -> _ALVData:
     duration_s = _to_float(_get(header, 'Duration'))
     if duration_s is not None and (not np.isfinite(duration_s) or duration_s <= 0):
         duration_s = None
+    run_duration_s = duration_s if _to_float(_get(header, 'Runs')) == 1.0 else None
 
     visc = _to_float(_get(header, 'Viscosity'))
     label = _get(header, 'Samplename')
@@ -358,6 +366,7 @@ def _parse_alv_file(file_path: str) -> _ALVData:
         channels=channels,
         source_file=os.path.abspath(file_path),
         duration_s=duration_s,
+        run_duration_s=run_duration_s,
         notes=notes,
     )
 
@@ -393,7 +402,8 @@ class ALVCorrelatorParser(BaseDLSParser):
 
     An ALV file carries the count-rate trace beside the correlogram, so each
     preview also carries ITS OWN channel's trace (``trace_preview``) and the
-    vendor's mean count rate and nominal duration. The loader links that trace to
+    vendor's mean count rate and nominal duration -- the duration also as the run
+    duration ``duration_s`` when the file records one run. The loader links that trace to
     the measurement it creates. Pairing is structural rather than positional --
     both halves come off one ``_ALVChannel``, so no zip across two independently
     filtered channel lists can attach one angle's trace to another angle's curve.
@@ -401,6 +411,24 @@ class ALVCorrelatorParser(BaseDLSParser):
 
     def parse(self, file_path: str) -> List[DLSFilePreview]:
         data = _parse_alv_file(file_path)
+        # The run duration is decided PER CHANNEL:
+        # the angles of one file share a `Duration` and a delay axis, but each carries its
+        # own correlogram, and the measurement is the unit the weight runs on. The rule is
+        # `base_parser.carried_run_duration`, the same one the Brookhaven reader applies --
+        # spelled here on `g2 - 1 > -1`, which is what this format ships.
+        durations, duration_notes = [], []
+        for ch in data.channels:
+            carried, note = carried_run_duration(
+                data.run_duration_s, data.delay_times_s,
+                np.asarray(ch.correlogram, dtype=float) > -1.0,
+                "the header's Duration for a one-run acquisition")
+            durations.append(carried)
+            duration_notes.append(note)          # '' where the duration was carried
+        # The note rides ONLY the previews that actually withheld a duration. The angles
+        # of one file share a `Duration` and an axis but not their liveness, so a
+        # file-wide note lands on angles whose duration WAS carried and tells them the
+        # opposite of what their own result records.
+        base_notes = tuple(data.notes)
         previews = [
             DLSFilePreview(
                 source_file=data.source_file,
@@ -415,10 +443,12 @@ class ALVCorrelatorParser(BaseDLSParser):
                 viscosity_Pa_s=data.viscosity_Pa_s,
                 vendor_mean_count_rate_cps=ch.mean_count_rate_cps,
                 vendor_duration_s=data.duration_s,
+                duration_s=carried,
                 trace_preview=_trace_preview_for(data, ch),
-                notes=data.notes,
+                notes=base_notes + ((note,) if note else ()),
             )
-            for ch in data.channels
+            for ch, carried, note in zip(data.channels, durations, duration_notes,
+                                         strict=True)
         ]
         return previews
 

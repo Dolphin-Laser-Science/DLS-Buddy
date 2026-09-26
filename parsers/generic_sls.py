@@ -61,9 +61,15 @@ from parsers.base_parser import (
     SLSFilePreview,
 )
 
-# Minimum number of angle/intensity data rows to accept.
-# One point is physically useless for any SLS analysis.
-_MIN_ROWS = 2
+# Minimum number of angle/intensity data rows to accept: ONE. A single-angle intensity
+# is a legitimate static point (six of them at six concentrations are a concentration
+# series at fixed q -- what the Derived Intensity route builds and the single-angle
+# Mw + A2 ladder consumes), so this parser accepts what the controller itself creates
+# and each analysis refuses on its own terms (Zimm/Berry need two angles and say so).
+# A floor of 2 counted ROWS where the requirement was distinct ANGLES. The generic DLS
+# parser keeps its floor deliberately: a one-row correlogram is not an input any
+# instrument produces, so that guard is unreachable and is left alone.
+_MIN_ROWS = 1
 
 # Maximum fraction of rows allowed to be malformed before raising.
 _MAX_BAD_ROW_FRACTION = 0.05
@@ -88,7 +94,7 @@ def _detect_delimiter(first_line: str) -> str:
 class GenericSLSParser(BaseSLSParser):
     """Parser for plain-text two-column SLS intensity files.
 
-    Each file represents one concentration at multiple angles. The parser
+    Each file represents one concentration at one or more angles. The parser
     reads angle (degrees) and intensity values and returns a single
     SLSFilePreview with all physical parameters left for the user to
     supply at the confirmation step.
@@ -170,8 +176,8 @@ class GenericSLSParser(BaseSLSParser):
 
         if len(lines) < _MIN_ROWS:
             raise ParseError(
-                f"{file_path!r} contains only {len(lines)} non-blank line(s); "
-                f"at least {_MIN_ROWS} data rows are required."
+                f"{file_path!r} contains no non-blank line; at least one "
+                f"angle/intensity data row is required."
             )
 
         delimiter = _detect_delimiter(lines[0])
@@ -206,9 +212,9 @@ class GenericSLSParser(BaseSLSParser):
 
         if len(angles) < _MIN_ROWS:
             raise ParseError(
-                f"Only {len(angles)} valid data rows found in {file_path!r} "
-                f"after skipping {n_bad} malformed rows. "
-                f"At least {_MIN_ROWS} are required."
+                f"No valid data row found in {file_path!r} after skipping "
+                f"{n_bad} malformed row(s); at least one angle/intensity row is "
+                f"required."
             )
 
         # Validate angle values before storing. Bad angles here mean the

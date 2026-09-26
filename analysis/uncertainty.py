@@ -4,7 +4,7 @@ analysis/uncertainty.py
 
 Statistical-uncertainty toolkit for the analysis layer.
 
-Scope and philosophy (see the Theory-and-Equations-Guide, "Uncertainty estimates"):
+Scope and philosophy (see the Theory-and-Equations-Guide, "Uncertainty"):
 we report the **statistical** (regression) uncertainty of a fit, and only where the
 fitted points are genuinely independent measurements (SLS angle/concentration series,
 Gamma-vs-q^2 over angles, D-vs-c over concentrations, the cross-sample scaling fit).
@@ -742,7 +742,7 @@ class LinearFit:
 def linear_fit(x: Sequence[float], y: Sequence[float], estimator: str = HC3,
                cond_limit: float = COND_LIMIT) -> LinearFit:
     """OLS y = a + b x with robust HC3 (default) or classical OLS standard errors.
-    (Theory-and-Equations-Guide §6.1, HC3/OLS covariance & slope-intercept SE)
+    (Theory-and-Equations-Guide, "The Estimator: HC3 Heteroscedasticity-Consistent Standard Errors": HC3/OLS covariance & slope-intercept SE)
 
     Also reports the design condition number `cond = cond([1, x])` and the numerical-health
     flag `well_conditioned = cond <= cond_limit` (see `COND_LIMIT`).
@@ -767,7 +767,7 @@ def linear_fit(x: Sequence[float], y: Sequence[float], estimator: str = HC3,
 
 def linear_fit_through_origin(x: Sequence[float], y: Sequence[float], estimator: str = HC3):
     """OLS slope of y = b x (no intercept) with robust HC3 (default) or classical OLS SE.
-    (Theory-and-Equations-Guide §6.1, through-origin slope SE)
+    (Theory-and-Equations-Guide, "The Estimator: HC3 Heteroscedasticity-Consistent Standard Errors": through-origin slope SE)
 
     b = sum(xy)/sum(x^2). Returns (slope, slope_se); with p = 1 fitted parameter,
     slope_se is NaN for n < 3 under HC3 (needs n - p >= 2) and n < 2 under classical
@@ -841,7 +841,7 @@ def multilinear_fit(X: np.ndarray, y: Sequence[float], estimator: str = HC3,
     estimator='ols' selects the classical form for comparability (invariant 8 clause A).
     Used for the Zimm/Berry global fit ordinate = a + b q^2 + d c (X = [1, q^2, c]).
     Also reports `cond = cond(X)` and `well_conditioned = cond <= cond_limit` (see `COND_LIMIT`).
-    (Theory-and-Equations-Guide §6.1, Zimm/Berry multilinear design)
+    (Theory-and-Equations-Guide, "The Estimator: HC3 Heteroscedasticity-Consistent Standard Errors": Zimm/Berry multilinear design)
     """
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -890,7 +890,7 @@ def se_or_none(x: Optional[float]) -> Optional[float]:
 
 def propagate(jac: Sequence[float], cov: np.ndarray) -> float:
     """Standard error of a scalar f(b): sqrt(J^T Cov J).
-    (Theory-and-Equations-Guide §6.2, delta-method propagation)
+    (Theory-and-Equations-Guide, "Propagating a Covariance to a Derived Quantity (Delta Method)": delta-method propagation)
 
     `jac` is the gradient of f w.r.t. the parameters; `cov` their covariance.
     Returns NaN if the covariance is not finite, or if the propagated variance is not
@@ -914,14 +914,14 @@ def propagate(jac: Sequence[float], cov: np.ndarray) -> float:
 def ratio_se(a: float, a_se: Optional[float],
              b: float, b_se: Optional[float]) -> Optional[float]:
     """SE of r = a/b for INDEPENDENT a, b: |a/b| sqrt((a_se/a)^2 + (b_se/b)^2).
-    (Theory-and-Equations-Guide §6.2, ratio propagation)
+    (Theory-and-Equations-Guide, "Propagating a Covariance to a Derived Quantity (Delta Method)": ratio propagation)
 
     Returns None unless both SEs are available and a, b are non-zero (so the
     fractional terms are defined). Used for rho = Rg/Rh (Rg from SLS, Rh from DLS —
     independent measurements) and rho_v = I_VH/I_VV (depolarization).
 
     Invariant-8 carve-out (Monte-Carlo-characterized; see tests/test_uncertainty
-    test_ratio_se_montecarlo_* and Theory-and-Equations-Guide §6.2). This first-order
+    test_ratio_se_montecarlo_* and the Theory-and-Equations-Guide, "Propagating a Covariance to a Derived Quantity (Delta Method)"). This first-order
     (delta-method) ratio SE tracks the sampling SD to within a few percent while the
     DENOMINATOR's fractional error is small, and is mildly ANTI-conservative (under-
     reports ~5-10%) once the denominator CV grows past ~0.15 — the heavy tail of 1/b as b
@@ -946,7 +946,7 @@ def ratio_se(a: float, a_se: Optional[float],
 def power_law_se(f_value: float, x_value: float, x_se: Optional[float],
                  exponent: float) -> Optional[float]:
     """SE of f = k * x^exponent from x's SE: |exponent| |f| (x_se/|x|).
-    (Theory-and-Equations-Guide §6.2, power-law propagation)
+    (Theory-and-Equations-Guide, "Propagating a Covariance to a Derived Quantity (Delta Method)": power-law propagation)
 
     For Rh = kT/(6 pi eta D) ~ D^-1, exponent = -1 gives sigma_Rh/Rh = sigma_D/D.
     Returns None if x_se is None/non-finite or x is zero.
@@ -958,7 +958,7 @@ def power_law_se(f_value: float, x_value: float, x_se: Optional[float],
     test_power_law_se_reciprocal_montecarlo). It tracks the sampling spread where a real
     multi-angle Gamma-q^2 fit lives (sigma_D/D <~ 0.05) and is mildly anti-conservative
     (~10% under) only once sigma_D/D reaches ~0.15, with the reciprocal tail dominating
-    beyond ~0.3 — see the ratio_se carve-out and Theory-and-Equations-Guide §6.2. The
+    beyond ~0.3 — see the ratio_se carve-out and the Theory-and-Equations-Guide, "Propagating a Covariance to a Derived Quantity (Delta Method)". The
     sphere radius R_rot ∝ D_r^(-1/3) (analysis.depolarization) is a second reciprocal-tail
     case, at one third the slope of the D^-1 case above; it carries its own Monte-Carlo
     gate (tests/test_depolarization.py test_sphere_radius_monte_carlo_se). Any new
@@ -988,17 +988,17 @@ class ReplicateStats:
     estimate is the spread of the per-replicate values from repeat measurements
     (ISO 22412): the standard error of the mean, sem = sd / sqrt(n), with the
     sample SD (ddof = 1). `sem` is None for n < 2, where no spread is defined,
-    and also when the spread is exactly zero -- see `replicate_mean_se`.
+    and also when the replicates agree exactly -- see `replicate_mean_se`.
     """
     mean: float
-    sd: Optional[float]              # sample SD (ddof=1); None for n < 2 or a zero spread
+    sd: Optional[float]              # sample SD (ddof=1); None for n < 2 or exact agreement
     sem: Optional[float]            # sd / sqrt(n); None wherever `sd` is
     n: int
 
 
 def replicate_mean_se(values: Sequence[float]) -> ReplicateStats:
     """Mean +/- standard error of a parameter across replicate measurements.
-    (Theory-and-Equations-Guide §6.4, replicate mean/SEM)
+    (Theory-and-Equations-Guide, "Repeat Measurements: a DLS Dynamic Uncertainty from Replicates": replicate mean/SEM)
 
     For n independent repeats x_1..x_n of one quantity (e.g. Rh fitted from each
     of an ALV 10-run replicate set):
@@ -1012,16 +1012,21 @@ def replicate_mean_se(values: Sequence[float]) -> ReplicateStats:
     repeat-measurement uncertainty, and the only place the platform reports a DLS
     dynamic ± -- it is deliberately NOT derived from one correlogram.
 
-    A spread of exactly ZERO is WITHHELD too (sd = sem = None), which reaches the user
-    as an empty ± cell rather than `0` (owner decision). The zero
+    Replicates that AGREE EXACTLY are WITHHELD too (sd = sem = None), which reaches the
+    user as an empty ± cell rather than `0` (owner decision; CLAUDE.md invariant 8). The
+    test is equality of the finite values themselves, not a computed SD compared with
+    zero, because floating-point rounding in the mean can leave identical replicates with
+    an SD of ~1e-15. The zero
     is real -- identical replicates are a genuine measurement that really did agree to
     the last bit, unlike an exact fit's residual-free covariance -- but reporting it
     would still be a claim of infinite precision, and 0.0 is the maximal under-report,
-    the one direction invariant 8 forbids in the default path. It also happens rarely for
-    the reason you would want to know about: a zero-noise synthetic set, or the same run
-    loaded twice. This aligns the platform's three zero-variance producers -- `_diag_se`,
-    `propagate` and this function -- which had silently disagreed; `n` is still reported,
-    so "how many repeats" is not lost with the ±.
+    the one direction invariant 8 forbids in the default path. It is rare on continuous fitted
+    values (a zero-noise synthetic set, the same run loaded twice) but routine on values fixed
+    to a grid: replicate distribution peak radii sit on grid nodes and often all agree. This
+    aligns the three zero-variance producers -- `_diag_se`, `propagate` and this function --
+    which had silently disagreed; `n` is still reported, so "how many repeats" is not lost
+    with the ±. Only this producer holds the values whose agreement is the condition: `_diag_se`
+    and `propagate` receive or form a variance, and exactly zero is itself their ruled condition.
     """
     arr = np.asarray([v for v in values if v is not None], dtype=float)
     arr = arr[np.isfinite(arr)]
@@ -1031,14 +1036,19 @@ def replicate_mean_se(values: Sequence[float]) -> ReplicateStats:
     mean = float(arr.mean())
     if n < 2:
         return ReplicateStats(mean=mean, sd=None, sem=None, n=n)
+    # Replicates that agree exactly carry no ± (owner-ruled; normative home CLAUDE.md
+    # invariant 8). The agreement is decided on the VALUES, never on the SD it should
+    # produce: for a value- and n-dependent share of doubles, `mean([x] * n)` is one ulp
+    # off x unless n is a power of two, and identical replicates then have an SD of ~1e-15.
+    agreed = bool(arr.min() == arr.max())
     sd = float(arr.std(ddof=1))
     sem = sd / math.sqrt(n) if math.isfinite(sd) else float('nan')
-    # Two-sided, and the predicate names BOTH quantities (rule 12): `sd` reaches zero from
-    # identical replicates at the ordinary scale, while `sem` can reach it on its own by
-    # UNDERFLOW -- a subnormal `sd` divided by sqrt(n) rounds to 0.0 with `sd` still
-    # positive. `math.isfinite(sd)` closes the other tail, where replicates ~1e300 apart
-    # saturate the SD to inf.
-    if not (math.isfinite(sd) and sd > 0 and math.isfinite(sem) and sem > 0):
+    # The numeric arms stay two-sided (rule 12). `sd > 0` withholds replicates that differ
+    # by so little that their squared deviations underflow (`[1e-162, 0.0]` gives sd = 0.0).
+    # `math.isfinite(sd)` closes the other tail, where replicates ~1e300 apart saturate the
+    # SD to inf. `sem > 0` is defence only: a nonzero sample SD is at least ~1e-162, so
+    # dividing it by sqrt(n) cannot underflow at any reachable n.
+    if agreed or not (math.isfinite(sd) and sd > 0 and math.isfinite(sem) and sem > 0):
         return ReplicateStats(mean=mean, sd=None, sem=None, n=n)
     return ReplicateStats(mean=mean, sd=se_or_none(sd), sem=se_or_none(sem), n=n)
 
@@ -1202,7 +1212,7 @@ def format_fixed_sig(value: Optional[float], sig: int = 3) -> str:
     number's honesty is carried by its apparent/±-omitted qualifier (invariant #7),
     the digit count by this rule.
 
-    Standing policy (see the Theory-and-Equations-Guide §6.6): a value that HAS an uncertainty is
+    Standing policy (the rounding sentence of the Theory-and-Equations-Guide, "Uncertainty" chapter opening): a value that HAS an uncertainty is
     set by that uncertainty and never comes here; a value WITHOUT one is set by ``sig``,
     which is user-configurable (Settings → the no-uncertainty precision knob, default 3).
     Because any sig-fig choice for an unquantified number is inherently arbitrary, that is

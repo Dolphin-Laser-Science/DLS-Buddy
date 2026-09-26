@@ -3,25 +3,30 @@ DLS Buddy — Synthetic Messy test data
 
 System: PEG in water, calibrated against a toluene standard.
 
-GLOBAL PARAMETERS (enter these at the Data-tab confirmation step):
-  Solvent                 : water
-  Solvent refractive index: 1.33
-  Viscosity               : 0.89 cP   (= 0.00089 Pa.s)
+GLOBAL PARAMETERS (the Data-tab confirmation step; the Quickstart Guide walks through it):
+  Solvent                 : water   (pick it from the Solvent name dropdown, under
+                                     "Measured properties")
+  Solvent refractive index: 1.3348  (proposed by the program when you pick water;
+                                     the set was generated with 1.33 -- either is fine)
+  Viscosity               : 0.891 mPa.s (proposed likewise; generated with 0.89 cP)
   Temperature             : 25.0 C  (298.15 K)
   Wavelength              : 532 nm
   dn/dc                   : 0.135 mL/g
 
 SLS CALIBRATION (enter in the SLS tab calibration panel):
   Standard                : toluene   (geometry VU)
-  Standard refractive index: 1.496
+  Standard refractive index: 1.49956   (the program proposes this from its solvent
+                                        library at 532 nm / 25 C -- accept it)
   Calibrant intensity     : 100000  at 90 deg
   Dark count rate         : 0
   (the program then computes k_c = 3.1496e-10)
 
 Notes:
   - DLS files are ALV .ASC: all angles + a count-rate trace are in one file.
-    Enter polymer name, solvent (water), and the concentration (in the file
-    name) for each. Temperature/viscosity/n/wavelength are read from the file.
+    Enter the polymer name and pick the solvent (water); temperature and
+    wavelength are read from the file, and picking the solvent proposes n and
+    the viscosity from the library. The concentration (in the file name) is
+    optional for a cumulant fit; enter it for the D-vs-c series.
   - SLS Zimm files are Brookhaven .csv (a full Zimm set: solvent reference at
     c=0 plus 5 concentrations x 12 angles). Enter polymer name + temperature.
   - The SLS Guinier file is the SAME data in Brookhaven's other .csv layout:

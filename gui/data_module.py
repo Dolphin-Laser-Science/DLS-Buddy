@@ -26,6 +26,7 @@ from typing import Optional, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from core.data_models import implausible_metadata_reasons
+from core.naming import measurement_display_name, measurement_hover_card
 from core.workspace import _DLS_PARAM_KEYS, _SLS_PARAM_KEYS, blank_label
 from app.controller import _SHARED_PARAM_KEYS
 from app import units as U
@@ -34,7 +35,8 @@ from gui.field_labels import PARAM_LABELS
 from gui.help import section_header
 from gui.solvent_picker import OTHER_DATA, index_of_solvent, populate_solvent_combo
 from gui.theme import ThemedLabel, set_flag, color as theme_color, token as theme_token
-from gui.widgets import SourcePicker, confirm_regroup_losses
+from gui.widgets import (SourcePicker, confirm_regroup_losses,
+                         sidebar_measurement_order)
 from gui.worker import busy_notice, runner
 
 
@@ -68,6 +70,11 @@ _CHAIN_TYPE_TO_DISPLAY = {'linear': 'Linear', 'branched': 'Branched'}  # stored 
 # made is computed on demand (Controller.solvent_blank_status) and shown in the combo's tooltip.
 _BLANK_KEY = 'solvent_blank_item_id'
 _BLANK_AUTO = 'auto'
+# The typed stand-in for a solvent blank that was never measured: the solvent's intensity
+# AT 90 DEGREES, in the loaded file's own units. Greyed out whenever the sample holds a
+# measured blank (which always wins), so the field can never look like it is in use when
+# it is not. A sample-shared SLS key, entered once, like dn/dc.
+_BLANK_I90_KEY = 'solvent_blank_intensity_90deg'
 # Solvent name: a CLOSED dropdown over all library solvents (gui/solvent_picker.py)
 # plus an "Other…" entry that reveals a text box for a solvent the library does not
 # carry. Picking one re-derives n and (for DLS) viscosity from the library; a name
@@ -84,7 +91,8 @@ _SOLVENT_SOURCE_KEYS = {
     'viscosity_Pa_s': 'viscosity_Pa_s_source',
 }
 # The mean count rate and the sidecar recording where it came from (mirrors
-# app.controller._MEAN_CR_KEY / _MEAN_CR_SOURCE_KEY): 'trace:*', 'vendor' or 'user'.
+# app.controller._MEAN_CR_KEY / _MEAN_CR_SOURCE_KEY): 'trace:*', 'vendor', 'generator'
+# (a synthetic draw's own rate) or 'user'.
 _MEAN_CR_KEY = 'mean_count_rate_cps'
 _MEAN_CR_SOURCE_KEY = 'mean_count_rate_cps_source'
 # Numeric params the user may enter in a choice of units (canonical value stored).
@@ -118,6 +126,12 @@ _FIXED_UNIT = {
 # Passive tooltips on specific parameter-row LABELS (calculation nuance, honouring the
 # global "Show tooltips" gate at render). Kept terse; how-to lives in the group ? badge.
 _ROW_TOOLTIPS = {
+    'label': (
+        'A short name for this measurement, shown wherever it appears — the sidebar, '
+        'the plot legends, the results tables and the warning lines. It ADDS to the '
+        'sample and the angle rather than replacing them, so “3” is enough. Left blank, '
+        'the source file name is used, without its extension. Not part of the sample '
+        'identity: it changes no grouping and no analysis.'),
     'solvent_blank_item_id': (
         'The c = 0 solvent measurement subtracted from this series to form its excess '
         'Rayleigh ratio. "auto" pairs the blank recorded in this series\' own file, else '
@@ -127,9 +141,24 @@ _ROW_TOOLTIPS = {
     'mean_count_rate_cps': (
         'Average photon count rate for this run, in the unit chosen beside it. Proposed '
         'from a linked count-rate trace (plain or outlier-clipped mean — the cell tooltip '
-        'says which) or from the instrument file\'s own value; yours as soon as you type '
-        'one, and then never re-derived away. Not used by the size or Mw fits — it feeds '
-        'the count-rate diagnostics. See the Theory-and-Equations-Guide.'),
+        'says which), from the instrument file\'s own value, or, for a synthetic run, from '
+        'the generator\'s own draw; yours as soon as you type '
+        'one, and then never re-derived away. Read by the nonlinear cumulant fit as the '
+        'photon count rate in its residual weighting (so it moves the size and PDI a '
+        'little; the fit records whether a rate was available) and by the count-rate '
+        'diagnostics; not by the Mw fits. See the Theory-and-Equations-Guide.'),
+    'solvent_blank_intensity_90deg': (
+        'Scattered intensity of the PURE SOLVENT at 90°, used only when this sample has '
+        'no measured c = 0 blank. Hand-entered only — never proposed or guessed. Enter it '
+        'in the units of the loaded intensity column, as the instrument shows it, BEFORE '
+        'dark-count subtraction (the convention of the SLS tab dark count rate); for a '
+        'trace-derived series that means cps. It is NOT subtracted uniformly: it is the 90° '
+        'value and is scaled by 1/sin θ at each angle, so the blank at 30° is twice as '
+        'large. That assumes vertically polarized incident light, a scattering volume going '
+        'as 1/sin θ, and a solvent scattering like a simple liquid — weakest at low angles, '
+        'where flare and dust live. A measured blank always wins; leave this blank (or zero) '
+        'to subtract no solvent at all. Every result from it is flagged unreliable, Rg '
+        'included. See the Theory-and-Equations-Guide.'),
     'dn_dc_mL_per_g': (
         'Refractive-index increment of THIS polymer in THIS solvent. Hand-entered '
         'only — never proposed or guessed, because the optical constant K goes as '
@@ -232,11 +261,27 @@ class DataModule(QtWidgets.QWidget):
                 'R<sub>g</sub> and the sizes are unaffected.',
                 'Identity &amp; optics are shared across the sample (enter once); '
                 'concentration and angle are per-measurement.',
+                '<b>Label:</b> a short name of your own, shown beside the angle and '
+                'concentration rather than instead of them — the file name is always '
+                'on hover. Highlight several measurements and type <b>one</b> label: '
+                'each gets that label plus a running number in sidebar order '
+                '(<b>batch</b> → <b>batch 1</b> … <b>batch 6</b>), zero-padded so twelve '
+                'sort correctly, so each run <i>in that selection</i> gets a distinct '
+                'name. Clear the label to go back to the file name. '
+                'Everything else you type with several highlighted applies to them all '
+                'unchanged.',
                 '<b>Solvent blank (SLS):</b> each series is referenced against the '
                 'c = 0 blank from its own file, else the sample\'s reference blank. '
                 'Pick a different one in the <b>Solvent blank</b> row when the file '
                 'carried none or the pairing is wrong; the dropdown tooltip says which '
                 'blank is in use.',
+                '<b>No blank at all?</b> Type the solvent\'s intensity at 90° in '
+                '<b>Solvent blank intensity at 90°</b> and the blank is computed from '
+                'it — <b>not</b> subtracted uniformly: it is the 90° value, scaled by '
+                '1/sin θ at each angle, so the blank at 30° is twice as large. Leave it '
+                'empty to subtract no solvent at all. The SLS tab asks before it runs, '
+                'and <b>every</b> result is flagged unreliable, R<sub>g</sub> included. '
+                'A measured blank always wins, and the field greys out when you have one.',
                 '<b>Solvent library:</b> pick a solvent under <b>Measured properties</b> '
                 'and the refractive index (and viscosity) auto-fill from temperature + '
                 'wavelength, rounded at the last digit the library can stand behind.',
@@ -247,12 +292,15 @@ class DataModule(QtWidgets.QWidget):
                 'Library values re-derive when you change temperature or wavelength; '
                 'a value you type by hand is never overwritten.',
                 'A teal dot marks a value the program proposed — from the solvent '
-                'library, a linked count-rate trace, or the file itself; no dot '
+                'library, a linked count-rate trace, the file itself, or the synthetic '
+                'generator; no dot '
                 'means your own value. dn/dc is never proposed — enter it yourself '
                 'or leave it blank.',
                 '<b>Mean count rate</b> (DLS): offered from a linked count-rate '
-                'trace or from the file\'s own value, each labelled — it reaches an '
-                'analysis only when you press <b>Update</b>. A value you type is '
+                'trace or from the file\'s own value, each labelled — and committed for '
+                'you at load when the file carries one, so the nonlinear cumulant can '
+                'weight its channels by it from the first Run; a value you type reaches '
+                'the fits when you press <b>Update</b>. A value you type is '
                 'never overwritten, and if it differs from the linked trace a note '
                 'below the table says so.',
                 'Values are used exactly as entered. If a temperature or refractive '
@@ -391,6 +439,9 @@ class DataModule(QtWidgets.QWidget):
             # say it) — just point at the next step.
             self.header.setText(
                 'No measurement selected — pick one in the Workspace list.')
+            # The identity card goes with the measurement: a header that says nothing is
+            # selected must not name a run on hover (it outlived a removal).
+            self.header.setToolTip('')
             self._set_enabled(False)
             self.pending.setText('')
             self.autofill_note.setText('')
@@ -406,9 +457,13 @@ class DataModule(QtWidgets.QWidget):
         self.legend.show()
         self._build_rows()
         self._populate()
+        # Named by the one builder, not by the internal id. The tab's own table
+        # shows every parameter, so the header's hover card is the identity card
+        # every other surface shows -- the id among its lines.
         self.header.setText(
-            f'<b>{item_id}</b> &mdash; {lm.kind.upper()} measurement '
-            f'({self._raw_summary(lm)})')
+            f'<b>{measurement_display_name(lm)}</b> &mdash; '
+            f'{lm.kind.upper()} measurement ({self._raw_summary(lm)})')
+        self.header.setToolTip(measurement_hover_card(lm))
         self._set_enabled(True)
         # A prior measurement's out-of-window hint must not linger on the next one
         # (autofill only re-runs on a solvent/T/λ edit, never on plain selection).
@@ -658,6 +713,8 @@ class DataModule(QtWidgets.QWidget):
                 continue
             self.table.item(r, 1).setText(
                 self._display_text(key, working.get(key), working))
+            if key == _BLANK_I90_KEY:
+                self._populate_blank_i90_cell(r, working)
         self._suppress = False
         self._refresh_dirty()
         self._refresh_provenance()
@@ -709,6 +766,20 @@ class DataModule(QtWidgets.QWidget):
                 'optical scale.')
             self._revert_cell(item.row(), key)
             return
+        # The typed 90° solvent blank, judged by the controller's ONE predicate rather
+        # than a second one here (rule 12: the boundary that refuses at commit and the
+        # boundary that refuses at construction must be the same computation). This is a
+        # courtesy only -- the binding guard runs where the blank is built, because the
+        # dark count it is compared against is a calibration field the user can edit on
+        # the SLS tab afterwards. Same shape as the dn/dc = 0 catch above.
+        if key == _BLANK_I90_KEY and value is not None:
+            sid = self.controller.workspace.sample_id_of(self.item_id)
+            problem = self.controller.validate_typed_blank(sid, value) if sid else ''
+            if problem:
+                QtWidgets.QMessageBox.warning(
+                    self, 'Solvent blank intensity cannot be used', problem)
+                self._revert_cell(item.row(), key)
+                return
         # A direct edit of n or viscosity claims that field as user-owned (sample-wide)
         # BEFORE the write, so library autofill never overwrites it. Only a real typed
         # value claims it. Clearing a library-filled cell instead drops its
@@ -803,6 +874,51 @@ class DataModule(QtWidgets.QWidget):
         idx = combo.findData(wanted) if wanted else 0
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         self._refresh_blank_tooltip(combo)
+
+    def _typed_blank_is_inert(self) -> bool:
+        """Is the typed-90° blank field greyed out -- i.e. does this sample hold a
+        MEASURED blank, which always wins? One predicate, read by the cell painter (for
+        the edit flag and the tooltip) and by `_refresh_dirty` (for the muted brush), so
+        a greyed cell can never be painted as live, or the reverse."""
+        if self.item_id is None:
+            return False
+        sid = self.controller.workspace.sample_id_of(self.item_id)
+        return bool(sid) and self.controller.sample_has_measured_blank(sid)
+
+    def _populate_blank_i90_cell(self, row: int, working: dict) -> None:
+        """Grey the typed-90°-blank cell whenever the sample holds a MEASURED blank.
+
+        A measured blank always wins (`Workspace.solvent_reference_for` is the normative
+        rule and is not edited by this feature), so an editable cell here would imply a
+        choice the user does not have. A value typed earlier is KEPT and still shown --
+        inert, and the tooltip says so -- because removing the sample's last blank makes
+        it the blank in use again with no further gesture.
+        """
+        item = self.table.item(row, 1)
+        if item is None:
+            return
+        has_blank = self._typed_blank_is_inert()
+        sid = self.controller.workspace.sample_id_of(self.item_id)
+        flags = item.flags()
+        if has_blank:
+            item.setFlags(flags & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+        else:
+            item.setFlags(flags | QtCore.Qt.ItemFlag.ItemIsEditable)
+        # The muted BRUSH is not set here: `_refresh_dirty` clears ForegroundRole on
+        # every clean cell and runs after this, so a brush painted here would be wiped.
+        # It owns the non-dirty foreground, so it paints this one too -- one owner.
+        if has_blank:
+            stored = working.get(_BLANK_I90_KEY)
+            tip = ('This sample has a measured c = 0 solvent blank, which always wins, '
+                   'so this field is not in use.')
+            if stored:
+                tip += (' The value shown is kept but inert; it would become the blank '
+                        "again only if the sample's last measured blank were removed.")
+            item.setToolTip(tip)
+        else:
+            problem = self.controller.validate_typed_blank(sid) if sid else ''
+            item.setToolTip(
+                problem or 'No measured blank in this sample: this value will be used.')
 
     def _refresh_blank_tooltip(self, combo) -> None:
         """Describe the WORKING selection (what is picked, committed or not), so
@@ -978,16 +1094,67 @@ class DataModule(QtWidgets.QWidget):
     # ---------------------------------------------------------- commit/undo ---
     def _apply_edits_to_selection(self) -> None:
         """Copy the focused measurement's pending edits to the other highlighted
-        measurements before committing. No-op unless several are
-        highlighted."""
+        measurements before committing. No-op unless several are highlighted.
+
+        Every key fans out VERBATIM except `label`, which is numbered -- see
+        `_fan_out_numbered_label`. The shared physical parameters are quantities that
+        SHOULD be identical across a selection; a label is the one key whose whole job
+        is to tell two runs apart.
+        """
         if self.item_id is None:
             return
-        others = [i for i in self._selected_ids if i != self.item_id]
+        # The FOCUSED run joins the numbered set even when it is not in the
+        # selection model: numbering only the others left it holding the bare typed
+        # label beside `batch 2`..`batch 6`, which this method's own docstring rules
+        # out and which a second identical gesture then duplicates. Same shape as
+        # `_sample_scope_ids` four screens down.
+        selected = list(self._selected_ids)
+        if self.item_id not in selected:
+            selected.append(self.item_id)
+        others = [i for i in selected if i != self.item_id]
         if not others:
             return
         working = self.controller.workspace.measurements[self.item_id].working_params
         for key in self.controller.dirty_keys(self.item_id):
-            self.controller.apply_value_to_items(others, key, working.get(key))
+            if key == 'label':
+                self._fan_out_numbered_label(selected, working.get(key))
+            else:
+                self.controller.apply_value_to_items(others, key, working.get(key))
+
+    def _fan_out_numbered_label(self, selected, typed) -> None:
+        """A label typed with SEVERAL measurements highlighted lands on each as that
+        label plus a running number, in sidebar order, zero-padded to the width of the
+        largest (`batch 02` before `batch 10`, so exported files sort in that order).
+
+        Owner-ruled: a bulk-rename dialog was considered and dropped, and this is the
+        gesture that replaces it -- so the numbering happens on the ordinary Update
+        path and there is no second way to rename a selection.
+
+        Verbatim fan-out was the defect: `label` is a per-measurement key, so one typed
+        label landed identically on all six highlighted runs -- six measurements with
+        one name, and under item 4's export scheme six files that collide on it, left
+        to be told apart by the internal ID the collision net appends. The ID as a
+        primary name is exactly what this sheet exists to remove.
+
+        The FOCUSED measurement is numbered too. Numbering only the others would leave
+        it holding the bare typed label beside `batch 2`..`batch 6`, which is both ugly
+        and not unique if a later gesture types the same text again.
+
+        An EMPTY label still fans out verbatim: clearing a selection's labels is a real
+        gesture, and an empty label is not a name to number -- every run then falls back
+        to its own file stem, which already differs.
+        """
+        text = (typed or '').strip()
+        if not text:
+            others = [i for i in selected if i != self.item_id]
+            self.controller.apply_value_to_items(others, 'label', typed)
+            return
+        order = sidebar_measurement_order(self.controller)
+        ids = sorted(selected, key=lambda i: order.get(i, len(order)))
+        width = len(str(len(ids)))
+        for n, iid in enumerate(ids, start=1):
+            self.controller.apply_value_to_items(
+                [iid], 'label', f'{text} {n:0{width}d}')
 
     def _on_update(self) -> None:
         # A background run reads COMMITTED params mid-flight — committing under
@@ -995,12 +1162,22 @@ class DataModule(QtWidgets.QWidget):
         if runner().is_busy:
             busy_notice(self.update_button)
             return
+        # The fan-out cannot simply move after the ask: `commit_regroup_losses` plans
+        # from the working params the commit is about to adopt, so a confirm that ran
+        # first would see the focused measurement's edits alone and miss every loss
+        # caused by fanning an identity key onto its siblings -- it would UNDER-report.
+
+        # So the gesture mutates in order to decide, and puts it all back on a no.
+        # Verbatim keys survived a declined confirm harmlessly (re-copying is a no-op);
+        # the numbered label is a TRANSFORM, so a retry committed `batch 1 1`.
+        snapshot = self.controller.snapshot_working_params()
         self._apply_edits_to_selection()
         # An identity edit can regroup samples and drop a stored hand-entered /
         # picked value with them — ask first, before anything commits (the one
         # shared confirm; Cancel leaves every edit pending, nothing applied).
         if not confirm_regroup_losses(self, self.controller,
                                       self.controller.commit_regroup_losses()):
+            self.controller.restore_working_params(snapshot)
             return
         self.controller.commit()
         self._populate()           # working == committed now -> highlights clear
@@ -1084,6 +1261,13 @@ class DataModule(QtWidgets.QWidget):
             if is_dirty:
                 cell.setBackground(bg)
                 cell.setForeground(fg)
+            elif key == _BLANK_I90_KEY and self._typed_blank_is_inert():
+                # A greyed-out field must LOOK greyed: non-editable alone is invisible,
+                # and the meaning may not ride on one channel (style guide 10 R10.1).
+                # Muted from a theme token, never a raw grey, so it survives a theme
+                # switch -- the unit-cell pattern. An edited cell still wins above.
+                cell.setData(QtCore.Qt.ItemDataRole.BackgroundRole, None)
+                cell.setForeground(theme_color(self, 'muted'))
             else:
                 cell.setData(QtCore.Qt.ItemDataRole.BackgroundRole, None)
                 cell.setData(QtCore.Qt.ItemDataRole.ForegroundRole, None)
@@ -1150,6 +1334,10 @@ class DataModule(QtWidgets.QWidget):
             return 'lib_primary', (
                 "From the instrument file's own mean count rate. Editable; a "
                 "value you type is never overwritten.")
+        if family == 'generator':
+            return 'lib_primary', (
+                "From the synthetic generator: the mean count rate its noise model drew "
+                "this correlogram at. Editable; a value you type is never overwritten.")
         return None, (f'Your value — used exactly as entered.{extra}'
                       if working.get(key) is not None else '')
 
@@ -1220,7 +1408,8 @@ class DataModule(QtWidgets.QWidget):
         teal = theme_token(self, 'lib_primary')
         self.legend.setText(
             f'<span style="color:{teal}">●</span> proposed value (the solvent '
-            'library, or a mean count rate from a linked trace or the file)'
+            'library, or a mean count rate from a linked trace, the file, or the '
+            'synthetic generator)'
             ' &nbsp;·&nbsp; no dot = your value &nbsp;·&nbsp; '
             'a value you type is never overwritten')
 
@@ -1379,6 +1568,11 @@ class DataModule(QtWidgets.QWidget):
             set_flag(self.trace_divergence_note, '', problem=False)
             return
         st = self.controller.mean_count_rate_status(self.item_id, use_working=True)
+        if st['usable'] is False:
+            # A committed value the fit never sees (a legacy 0.0, a typed 0): say what the
+            # fit does with it, rather than compare it against a trace as if it were used.
+            set_flag(self.trace_divergence_note, st['note'], problem=True)
+            return
         if not st['diverges']:
             set_flag(self.trace_divergence_note, '', problem=False)
             return

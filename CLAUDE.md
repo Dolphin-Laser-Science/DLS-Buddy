@@ -193,7 +193,8 @@ Python's standard-library `io` and breaks imports. Use `exporting/`.
 - Python 3.10+ source (uses `from __future__ import annotations`). The working venv is
   **Python 3.13** — PySide6 has no 3.14 wheels yet, so avoid 3.14 for now.
 - Runtime: `numpy`, `scipy` (optimize/nnls/curve_fit), `statsmodels` (ADF test in
-  utilities), `matplotlib`, `PySide6`. Pinned in `requirements.txt`.
+  utilities), `matplotlib`, `PySide6`, `openpyxl` (the Panta `.xlsx` loader — a hard
+  import-time dependency). Pinned in `requirements.txt`.
 - Recreate the venv with `py -3.13 -m venv .venv` then `pip install -r requirements.txt`;
   point your interpreter at `.venv\Scripts\python.exe` (Windows) or `.venv/bin/python`
   (macOS). (`.venv/` is gitignored.) The double-click launchers bootstrap the venv on
@@ -238,8 +239,10 @@ replicate averaging with the platform's first single-sample dynamic ±, and the
 Correlogram / Distribution / Γ vs q² / D vs c / Mode Map / DDLS / Summary sub-tabs — the Γ vs q²
 and D vs c views being the extrapolated, thermodynamic-tier paths). **SLS** (per-sample
 calibration panel → k_c; Zimm / Berry /
-Debye / Guinier / single-angle / calibration-free A₂ / Rayleigh; manual-Mw override; data
-masking; a Depolarization calculator). **Cross-Sample** (ρ = Rg/Rh table + an
+Debye / Guinier / single-angle / calibration-free A₂ / Rayleigh / Form factor P(q);
+manual-Mw override; data
+masking; a Depolarization calculator; Derived Intensity and Mode-Resolved sub-tabs —
+SLS points built from a sample's DLS runs, whole-run or per-mode). **Cross-Sample** (ρ = Rg/Rh table + an
 **Architecture** sub-tab — branching contraction factors g and h, chain type, and the
 random-branching index — + Rg–Mw / A₂–Mw
 log–log scaling; provenance-aware source pickers). **Utilities** (Traces store with

@@ -53,26 +53,33 @@ GROUND TRUTH
                  while carrying fewer independent samples
 
 
-WHAT THE PAIR ALREADY SHOWS (measured 2026-08-21, on these exact files)
-----------------------------------------------------------------------
-The two files are the same physics. They do NOT fit the same way.
+WHAT THE PAIR SHOWS (measured 2026-08-21 on these exact files; re-measured 2026-09-07)
+--------------------------------------------------------------------------------------
+The two files are the same physics. Whether they fit the same way depends on how the
+cumulant fit chooses its window, and this pair is where that was first measured.
 
-  fit_cumulants at the default cutoff 0.1
+  As first measured (2026-08-21), fit_cumulants at the default cutoff 0.1:
     uniform-log   Rh = 43.5 - 46.0 nm at all eight angles
     multi-tau     Rh = 44.0 - 45.5 nm at five angles, and 7934 / 13502 / 42422 nm
-                  at 75 / 120 / 135 deg
+                  at 75 / 120 / 135 deg -- each flagged `rh_reliable` False, with a
+                  note that the radius was beyond what the lag window could support
+    (and at cutoff 0.3 the multi-tau file gave 43.7 - 47.9 nm at all eight angles)
 
-  fit_cumulants at cutoff 0.3
-    multi-tau     Rh = 43.7 - 47.9 nm at all eight angles
+  The cause was the CUTOFF meeting a realistic lag axis, not the data. The multi-tau
+  axis runs to 0.79 s with densely-spaced channels in a tail where g2-1 has decayed
+  into noise; a per-channel amplitude cutoff re-admitted that tail, and at the
+  fast-decaying back angles the fit window became mostly noise. The uniform-log axis
+  has far fewer channels out there and never exposed it.
 
-So the blow-up is the CUTOFF meeting a realistic lag axis, not the data. The multi-tau
-axis runs to 0.79 s with densely-spaced channels in a tail where g2-1 has decayed into
-noise; an amplitude cutoff of 0.1 admits that tail, and at the fast-decaying back angles
-the fit window becomes mostly noise. The uniform-log axis has far fewer channels out
-there and never exposes it.
+  Since the fit's retained range was made CONTIGUOUS (it ends at the first channel
+  below the cutoff and never re-admits the tail) the blow-up is gone. Re-measured
+  2026-09-07 at the default cutoff, nonlinear arm, all reliable with no note:
+    multi-tau     Rh = 40.1 / 43.2 / 41.3 / 41.5 nm at 75 / 90 / 120 / 135 deg
+    uniform-log   Rh = 44.2 / 44.5 / 45.4 / 44.9 nm at the same angles
+  The multi-tau file still fits 4-11 % LOW where its uniform-log twin does not, and
+  that residual is what the pair measures now.
 
-The program is honest about all three: `rh_reliable` is False on each, with a note that
-the radius is beyond what the lag window can support. Nothing here is a defect. The point
-is that this sensitivity was **unreachable from committed synthetic data** until now,
-because every other file in the corpus has the easy axis -- which is what makes any fit
-quality figure measured on that corpus optimistic.
+Nothing here is a defect. The point is that this sensitivity was **unreachable from
+committed synthetic data** until this pair existed, because every other file in the
+corpus has the easy axis -- which is what makes any fit quality figure measured on
+that corpus optimistic.

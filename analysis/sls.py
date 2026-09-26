@@ -39,11 +39,23 @@ runs through ONE pipeline (compute_excess_rayleigh_ratio):
   The sin(theta) factor is the scattering-volume correction, paired with the one
      inside k_c (a k_c from a ~90 deg standard carries sin(90) = 1) -- it must
      never be applied a second time: forming k_c per angle as R_std/I_std(theta)
-     with the sin(theta) volume correction (Seery et al. 1989), exact for an
-     isotropic standard since I_std(theta) sin(theta) = I_std(90), and then
-     dividing per angle would double-count it, so there is no per-angle
-     standard-division route. compute_excess_rayleigh_ratio's docstring records
-     why the step is unconditional and why a switch for it was retired.
+     with the sin(theta) volume correction and then dividing per angle would
+     double-count it, so there is no per-angle standard-division route.
+     compute_excess_rayleigh_ratio's docstring records why the step is
+     unconditional and why a switch for it was retired.
+
+     Provenance of the two halves, kept apart deliberately. The volume
+     correction itself is Seery et al. 1989, which states it as PROSE and not
+     as an equation (p. 1198: "the detection optics define a scattering volume
+     which is inversely proportional to sine of the scattering angle. We
+     correct for this by multiplying the scattering intensity by sin theta").
+     The step above also leans on I_std(theta) sin(theta) = I_std(90), which
+     Seery does not print: that equality is this module's own consequence of
+     the correction plus the angle-independence of an optically isotropic
+     scatterer under vertical incident polarization. Angle-independence is
+     homed in Kerker 1969 (p. 34, p. 580) and Schaertl 2007 (p. 27), not in
+     Seery -- who in fact measured the solvent at every angle (his Eq. 2,
+     p. 1200, subtracts I_solvent(theta) angle by angle).
 
 IMPORTANT calibration conventions (enforced here)
 -------------------------------------------------
@@ -62,7 +74,8 @@ References (in project knowledge)
   Brookhaven BI-200SM manual, Section VIII (Rayleigh ratios / calibration)
   Brookhaven BIZPW (Zimm Plot) and Particle Explorer manuals (Zimm equation)
   Takahashi et al. 2019, Anal. Sci. 35, 1045 (Rayleigh ratio, Zimm/Berry)
-  Seery et al. 1989 (sin(theta) volume correction)
+  Seery et al. 1989 (sin(theta) volume correction, as prose, p. 1198)
+  Kerker 1969 / Schaertl 2007 (angle-independent isotropic scattering)
   Sivokhin & Kazantsev 2021 (toluene Rayleigh ratio; via constants.py)
 
 Design contract
@@ -116,6 +129,16 @@ def _ill_conditioned_note(cond: float) -> str:
     """
     return (f"ill-conditioned fit design (cond={cond:.1e}); Mw/A2 numerically "
             "unreliable — add concentrations/angles or widen their spread")
+
+
+def _non_positive_intercept_note(product: str) -> str:
+    """One wording for the two fits whose 2 A2 Mw = slope/intercept shares the
+    intercept's sign precondition with Mw = 1/intercept: a non-positive fitted
+    intercept means the line the data describe has no physical Mw, so the product
+    built on it is undefined too -- flagged, never withheld."""
+    return (f"non-positive fitted intercept: the line the data describe has 1/Mw <= 0, "
+            f"so {product} = slope/intercept is undefined (an over-corrected blank, or a "
+            f"ladder the linear model does not describe)")
 
 
 def _ordinate_scale(y: np.ndarray) -> float:
@@ -187,6 +210,35 @@ class RayleighRatioResult:
     calibration-free 2 A2 Mw product) remain valid -- the downstream results carry
     the corresponding flags. They can hold independently and are reported
     independently; neither subsumes the other.
+
+    A THIRD flag, `blank_measured`, and why Rg does NOT survive it
+    -------------------------------------------------------------
+    `blank_measured` is False when no c = 0 solvent measurement existed for this
+    series and the user confirmed the run anyway. It is deliberately NOT a third
+    scale flag, and it is the one absence that takes Rg down with it.
+
+    An unknown calibration constant, and an absent dn/dc, are MULTIPLICATIVE: they
+    scale every point by the same unknown factor, which cancels out of a slope/
+    intercept ratio. That is exactly why Rg, the form-factor sizes and the
+    calibration-free 2*A2*Mw product survive both.
+
+    A blank that was not measured is ADDITIVE, and that alone is enough. An additive
+    term does not divide out of a slope-to-intercept ratio the way a multiplicative one
+    does, so it corrupts the q^2 dependence -- Rg, not just Mw. Measured on a planted
+    Rg = 40.0 nm: a constant offset of 10 % of the signal reads back as 36.3 nm on the
+    Guinier route. Hence `blank_measured` is ANDed into EVERY reliability verdict
+    downstream, `rg_reliable` and `two_a2_mw_reliable` included.
+
+    Be precise about WHEN it also varies with angle, because the obvious statement is
+    wrong. With no subtraction at all the residue left in dR is exactly CONSTANT in
+    angle: the pipeline's sin(theta) volume correction cancels the solvent's own
+    1/sin(theta). The same holds for a typed value that is simply too big or too small.
+    Angle-dependence is the EXTRA damage done when the 1/sin(theta) assumption itself
+    fails -- a solvent that does not scatter like a simple liquid -- and it is not needed
+    for any of the reasoning above.
+
+    This docstring is the normative home of that ruling (owner-ruled). See CLAUDE.md's
+    flag-not-refuse clause for why the value is still reported rather than withheld.
     """
     # identity / context
     concentration_g_per_mL: float
@@ -229,6 +281,15 @@ class RayleighRatioResult:
     # field so the derivation reducers above never see it: their mixed-set sentence is
     # a claim about DLS-derived points and must stay one. Empty for the common case.
     blank_provenance: str = ''
+    # Was the solvent blank MEASURED at every angle, as the canonical method subtracts
+    # it (Seery et al. 1989 Eq. 2, p. 1200)? False when the series had no c = 0
+    # measurement and the user confirmed a run anyway. WHICH of the two blankless cases
+    # happened -- a blank computed from a typed 90 deg intensity, or no subtraction at
+    # all -- is carried by `blank_provenance`'s sentence, not by a third state here.
+    # Why it gates every verdict INCLUDING the sizes, unlike the two scale flags: see
+    # the class docstring. Defaulted True, so a direct engine caller that says nothing
+    # keeps today's behaviour (`dn_dc_supplied`'s not-a-verdict direction).
+    blank_measured: bool = True
 
 
 # ===========================================================================
@@ -309,6 +370,7 @@ def compute_excess_rayleigh_ratio(
     transmittance: Optional[Sequence[float]] = None,
     derived_provenance: str = '',
     blank_provenance: str = '',
+    blank_measured: bool = True,
 ) -> RayleighRatioResult:
     """Convert raw intensities to an excess Rayleigh ratio dR(theta).
 
@@ -586,6 +648,10 @@ def compute_excess_rayleigh_ratio(
         calibration_note=note,
         derived_provenance=str(derived_provenance or ''),
         blank_provenance=str(blank_provenance or ''),
+        # Copied through, never read here: this function's arithmetic is identical
+        # whichever way the blank was obtained, which is the point -- a typed blank
+        # arrives as an ordinary SLSMeasurement and the pipeline gains no branch.
+        blank_measured=bool(blank_measured),
     )
 
 
@@ -651,6 +717,11 @@ class DebyeResult:
     # it is not the sample reference; copied from the Rayleigh result(s) exactly as
     # derived_provenance is, and exported beside it. '' for the common case.
     blank_provenance: str = ''
+    # Carried from the Rayleigh result(s) this fit consumed: False -> the blank was not
+    # measured at every angle (typed 90 deg value, or no subtraction). ANDed into every
+    # reliability verdict on this result, because an additive blank does not cancel the
+    # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
+    blank_measured: bool = True
 
 
 @dataclass
@@ -690,6 +761,11 @@ class SingleAngleResult:
     # it is not the sample reference; copied from the Rayleigh result(s) exactly as
     # derived_provenance is, and exported beside it. '' for the common case.
     blank_provenance: str = ''
+    # Carried from the Rayleigh result(s) this fit consumed: False -> the blank was not
+    # measured at every angle (typed 90 deg value, or no subtraction). ANDed into every
+    # reliability verdict on this result, because an additive blank does not cancel the
+    # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
+    blank_measured: bool = True
 
 
 @dataclass
@@ -761,6 +837,11 @@ class GuinierResult:
     # it is not the sample reference; copied from the Rayleigh result(s) exactly as
     # derived_provenance is, and exported beside it. '' for the common case.
     blank_provenance: str = ''
+    # Carried from the Rayleigh result(s) this fit consumed: False -> the blank was not
+    # measured at every angle (typed 90 deg value, or no subtraction). ANDed into every
+    # reliability verdict on this result, because an additive blank does not cancel the
+    # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
+    blank_measured: bool = True
 
 
 def _nonpositive_ordinate_note(label: str, n_drop: int, ordinate: str) -> str:
@@ -933,6 +1014,9 @@ def debye_analysis(rayleigh_result: RayleighRatioResult,
                        "is not positive (the angular dependence is inside the noise, or "
                        "the blank is over-corrected), so no size is reported")
     note = '; '.join(reasons)
+    # The blank gate, read defensively like the provenance records beside it, so a
+    # hand-built RayleighRatioResult from before this field existed reads as measured.
+    blank_ok = bool(getattr(rayleigh_result, 'blank_measured', True))
 
     return DebyeResult(
         concentration_g_per_mL=rayleigh_result.concentration_g_per_mL,
@@ -944,21 +1028,25 @@ def debye_analysis(rayleigh_result: RayleighRatioResult,
         dn_dc_supplied=rayleigh_result.dn_dc_supplied,
         derived_provenance=str(getattr(rayleigh_result, 'derived_provenance', '') or ''),
         blank_provenance=str(getattr(rayleigh_result, 'blank_provenance', '') or ''),
+        blank_measured=blank_ok,
         # intercept > 0 as well as calibrated: mw_app was already NaN'd for a
         # non-positive intercept above, so it must not read reliable either (keeps
         # the sign guard and the reliability flag consistent). well_conditioned adds
         # the numerical-degeneracy gate (invariant 4: scale-invariant, not a magnitude);
         # math.isfinite closes the float-overflow edge (consistent with Guinier/Zimm).
         # dn_dc_supplied is the second SCALE gate beside `calibrated` -- with K = 1 the
-        # intercept 1/Mw_app is on an arbitrary optical scale. Rg is gated by neither:
-        # it is slope/intercept, where the scale cancels.
+        # intercept 1/Mw_app is on an arbitrary optical scale. Rg is gated by neither
+        # SCALE gate: it is slope/intercept, where a multiplicative scale cancels.
         mw_reliable=(rayleigh_result.calibrated
-                     and rayleigh_result.dn_dc_supplied
+                     and rayleigh_result.dn_dc_supplied and blank_ok
                      and bool(math.isfinite(intercept) and intercept > 0)
                      and fit.well_conditioned and math.isfinite(mw_app)),
         # The size shares the design's conditioning verdict (it is a ratio of the same
-        # two coefficients) but neither scale gate; NaN'd sizes are not reliable.
-        rg_reliable=bool(math.isfinite(rg_app) and rg_app > 0 and fit.well_conditioned),
+        # two coefficients) but neither scale gate; NaN'd sizes are not reliable. It
+        # DOES take the blank gate: an absent or assumed blank is ADDITIVE, so it
+        # survives the ratio the scales cancel in.
+        rg_reliable=bool(math.isfinite(rg_app) and rg_app > 0
+                         and fit.well_conditioned and blank_ok),
         mw_apparent_se=mw_se, rg_apparent_se=rg_se,
         se_estimator=estimator,
         well_conditioned=fit.well_conditioned, cond=fit.cond, reliability_note=note,
@@ -1031,12 +1119,174 @@ def single_angle_mw(rayleigh_result: RayleighRatioResult, angle_deg: float) -> S
         dn_dc_supplied=rayleigh_result.dn_dc_supplied,
         derived_provenance=str(getattr(rayleigh_result, 'derived_provenance', '') or ''),
         blank_provenance=str(getattr(rayleigh_result, 'blank_provenance', '') or ''),
+        blank_measured=bool(getattr(rayleigh_result, 'blank_measured', True)),
         # Mw_app = dR/(K c) here, so it is the one apparent quantity that consumes dn/dc
         # DIRECTLY rather than through a ratio -- there is no angular information for a
-        # scale to cancel in. Both scale gates apply.
+        # scale to cancel in. Both scale gates apply, and so does the blank gate: dR at
+        # this one angle still carries whatever the blank left behind.
         mw_reliable=(rayleigh_result.calibrated
-                     and rayleigh_result.dn_dc_supplied and well_cond),
+                     and rayleigh_result.dn_dc_supplied
+                     and bool(getattr(rayleigh_result, 'blank_measured', True))
+                     and well_cond),
         well_conditioned=well_cond, reliability_note=note,
+    )
+
+
+def single_angle_ladder(
+    rayleigh_results: Sequence[RayleighRatioResult],
+    angle_deg: float,
+    estimator: str = 'hc3',
+    cond_limit: float = unc.COND_LIMIT,
+) -> SingleAngleLadderResult:
+    """Apparent Mw and A2 from a concentration series at ONE angle.
+    (Theory-and-Equations-Guide, "One angle over a concentration series" -- the fixed-angle Debye plot)
+
+    The classical Debye plot at fixed angle [Debye 1947, Eq. (5)]: a straight line
+    Kc/dR_theta = 1/Mw_app + 2 A2_app c over the ladder, Mw from the intercept and
+    A2 from the slope. This is the analysis a single-angle instrument -- or the
+    Derived Intensity route, which materialises exactly one angle per
+    concentration -- can reach; `zimm_analysis` needs two angles and refuses.
+
+    Everything is APPARENT (invariant 7): there is no q -> 0 extrapolation, so the
+    intercept is 1/(Mw P(q)) and the slope is angle-contingent. The canonical method
+    is Debye's own (1947); the fit is the house `linear_fit` (HC3 by default), the
+    reciprocal-intercept SE the delta method through the fitted covariance -- a
+    deliberate house choice benchmarked conservative on a short ladder, never a
+    private estimator.
+
+    Parameters
+    ----------
+    rayleigh_results
+        One result per concentration (c = 0 entries are skipped); each must carry
+        `angle_deg` among its angles to contribute.
+    angle_deg
+        The one angle to read the ordinate at.
+
+    Raises
+    ------
+    ValueError
+        If fewer than two non-zero concentrations carry the angle, or dropping the
+        non-positive Kc/dR points leaves fewer than two.
+
+    Warns
+    -----
+    RuntimeWarning
+        When a non-positive Kc/dR point is dropped before the fit.
+    """
+    pts = []
+    for r in rayleigh_results:
+        c = r.concentration_g_per_mL
+        if c == 0:
+            continue
+        idx = np.where(np.isclose(r.angles_deg, angle_deg))[0]
+        if idx.size == 0:
+            continue
+        i = int(idx[0])
+        pts.append((float(c), float(r.kc_over_dR_mol_per_g[i]),
+                    float(r.q2_nm2[i]), r))
+    if len(pts) < 2:
+        raise ValueError(
+            f"A single-angle ladder needs at least two non-zero concentrations "
+            f"measured at {angle_deg} deg; found {len(pts)}."
+        )
+    pts.sort(key=lambda t: t[0])
+    conc = np.array([p[0] for p in pts])
+    y = np.array([p[1] for p in pts])
+    q2s = np.array([p[2] for p in pts])
+    sources = [p[3] for p in pts]
+
+    # Finite AND positive, the linear arms' rule: Kc/dR <= 0 is an over-subtracted
+    # blank and has no place on a 1/Mw + 2 A2 c line. Disclosed, never a refusal,
+    # unless nothing usable is left. A NON-finite point is the user's own mask
+    # (masked_rayleigh writes NaN) and is dropped silently, exactly as Debye and
+    # Guinier drop it: the note counts only the finite non-positive points, so it
+    # never tells a user their mask is an over-subtracted blank.
+    notes: list = []
+    finite = np.isfinite(y)
+    good = finite & (y > 0)
+    n_drop = int((finite & ~good).sum())
+    if n_drop:
+        msg = _nonpositive_ordinate_note('Single-angle ladder', n_drop, 'Kc/dR')
+        notes.append(msg)
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+    if not good.all():
+        conc, y, q2s = conc[good], y[good], q2s[good]
+        sources = [src for src, keep in zip(sources, good, strict=True) if keep]
+        if conc.size < 2:
+            raise ValueError(
+                "A single-angle ladder needs at least two concentrations with a "
+                f"finite, positive Kc/dR at {angle_deg} deg; after dropping the masked "
+                f"(non-finite) and non-positive points only {conc.size} remain. Check "
+                "the mask and the solvent blank."
+            )
+    # The angle's q^2 as the FITTED points carry it (read after the drop, so it never
+    # names a concentration that left the fit).
+    q2 = float(q2s[0])
+
+    fit = unc.linear_fit(conc, y, estimator, cond_limit)   # cov order [intercept, slope]
+    slope, intercept = fit.slope, fit.intercept
+
+    # Mw_app = 1/intercept needs a PHYSICAL (positive) intercept -- the same sign
+    # guard the Debye and Zimm intercepts carry; a noisy non-positive intercept gives
+    # a negative or infinite Mw, which is not a molar mass. NaN'd, and not reliable.
+    intercept_ok = bool(math.isfinite(intercept) and intercept > 0)
+    mw_app = 1.0 / intercept if intercept_ok else float('nan')
+    a2_app = slope / 2.0
+    two_a2_mw = (float(slope / intercept)
+                 if (math.isfinite(intercept) and intercept != 0) else float('nan'))
+
+    mw_se = a2_se = two_se = None
+    if math.isfinite(fit.intercept_se):
+        if intercept_ok:
+            # The reciprocal: d(1/a)/da = -1/a^2, through the covariance so the
+            # (zero) slope entry is explicit -- the delta method, first order.
+            mw_se = unc.se_or_none(unc.propagate(
+                [-1.0 / unc.power_or_nan(intercept, 2), 0.0], fit.cov))
+        # A2 = slope/2: linear in one coefficient, so its SE is the pass-through.
+        a2_se = unc.se_or_none(fit.slope_se / 2.0)
+        if intercept != 0:
+            jac = [-slope / unc.power_or_nan(intercept, 2), 1.0 / intercept]
+            two_se = unc.se_or_none(unc.propagate(jac, fit.cov))
+
+    reasons = []
+    if not fit.well_conditioned:
+        reasons.append(_ill_conditioned_note(fit.cond))
+    if not intercept_ok:
+        reasons.append(_non_positive_intercept_note('the product 2 A2 Mw'))
+    note = '; '.join(reasons)
+    all_calibrated = all(bool(getattr(r, 'calibrated', True)) for r in sources)
+    all_dn_dc = all(bool(getattr(r, 'dn_dc_supplied', True)) for r in sources)
+    all_blank = all(bool(getattr(r, 'blank_measured', True)) for r in sources)
+
+    return SingleAngleLadderResult(
+        angle_deg=float(angle_deg), q2_nm2=q2,
+        concentrations_g_per_mL=conc, kc_over_dR=y,
+        intercept_mol_per_g=float(intercept), slope=float(slope),
+        mw_apparent_g_per_mol=float(mw_app),
+        a2_apparent_mol_mL_per_g2=float(a2_app),
+        two_a2_mw=two_a2_mw, r_squared=float(fit.r_squared),
+        is_apparent=True, n_conc=int(conc.size),
+        calibrated=all_calibrated, dn_dc_supplied=all_dn_dc,
+        blank_measured=all_blank,
+        # Both SCALE gates (Kc/dR carries k_c through dR and K through dn/dc), the
+        # blank gate, the sign guard, the design's health and finiteness -- the
+        # ZimmBerryResult predicate, one angle down.
+        mw_reliable=(all_calibrated and all_dn_dc and all_blank and intercept_ok
+                     and fit.well_conditioned and math.isfinite(mw_app)),
+        a2_reliable=(all_calibrated and all_dn_dc and all_blank and intercept_ok
+                     and fit.well_conditioned and math.isfinite(a2_app)),
+        # The product cancels both scales, but it is slope/INTERCEPT: the intercept's
+        # sign is its precondition as much as Mw's (a negative intercept gave a
+        # wrong-signed product flagged reliable), beside the design's health. The
+        # blank gate DOES reach it -- an additive term survives the ratio.
+        two_a2_mw_reliable=(intercept_ok and fit.well_conditioned and all_blank
+                            and math.isfinite(two_a2_mw)),
+        mw_apparent_se=mw_se, a2_apparent_se=a2_se, two_a2_mw_se=two_se,
+        se_estimator=estimator,
+        well_conditioned=fit.well_conditioned, cond=fit.cond, reliability_note=note,
+        notes=tuple(notes),
+        derived_provenance=_shared_derived_provenance(sources),
+        blank_provenance=_shared_blank_provenance(sources),
     )
 
 
@@ -1180,6 +1430,7 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
     # fails `well_conditioned` first).
     regime_ok_for_mw = math.isnan(qrg_max) or bool(valid)
     note = '; '.join(reasons)
+    blank_ok = bool(getattr(rayleigh_result, 'blank_measured', True))
 
     return GuinierResult(
         concentration_g_per_mL=c, q2_nm2=q2g, ln_excess_rayleigh=y,
@@ -1190,18 +1441,21 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
         dn_dc_supplied=rayleigh_result.dn_dc_supplied,
         derived_provenance=str(getattr(rayleigh_result, 'derived_provenance', '') or ''),
         blank_provenance=str(getattr(rayleigh_result, 'blank_provenance', '') or ''),
+        blank_measured=blank_ok,
         # Rg here comes from the SLOPE of ln(dR) vs q^2 and never touches K at all, so it
         # is bit-identical whether or not dn/dc was supplied. Only the intercept-derived
         # Mw = exp(intercept)/(K c) rides on the optical scale -- hence the scale gates
         # on mw_reliable and none on rg_reliable. `rg_reliable` carries the regime verdict
         # whole; `mw_reliable` carries only its MEASURED half (see `regime_ok_for_mw`) --
         # a qRg past the limit is a failed precondition of the intercept, an unmeasurable
-        # qRg is not. Neither flag is a fit-quality score (invariant 4).
+        # qRg is not. Neither is a fit-quality score (invariant 4). `blank_ok` is the one
+        # absence BOTH take: it is additive, so it bends the slope too.
         mw_reliable=(rayleigh_result.calibrated and rayleigh_result.dn_dc_supplied
+                     and blank_ok
                      and math.isfinite(mw_app) and fit.well_conditioned
                      and regime_ok_for_mw),
         rg_reliable=bool(math.isfinite(rg) and rg > 0 and fit.well_conditioned
-                         and valid),
+                         and valid and blank_ok),
         qrg_max_valid=float(qrg_max_valid),
         rg_se=rg_se, mw_apparent_se=mw_se,
         se_estimator=estimator,
@@ -1284,6 +1538,11 @@ class ZimmBerryResult:
     # it is not the sample reference; copied from the Rayleigh result(s) exactly as
     # derived_provenance is, and exported beside it. '' for the common case.
     blank_provenance: str = ''
+    # Carried from the Rayleigh result(s) this fit consumed: False -> the blank was not
+    # measured at every angle (typed 90 deg value, or no subtraction). ANDed into every
+    # reliability verdict on this result, because an additive blank does not cancel the
+    # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
+    blank_measured: bool = True
 
 
 @dataclass
@@ -1334,6 +1593,14 @@ class CalibrationFreeA2Result:
     # way `zimm_analysis` aggregates them.
     calibrated: bool = True
     dn_dc_supplied: bool = True
+    # The THIRD absence, and the one that GATES `two_a2_mw_reliable` where the two above
+    # only record. An unknown k_c and an absent dn/dc are MULTIPLICATIVE, so they divide
+    # out of Y(c) = (Kc/dR)_ref / (Kc/dR) exactly -- that cancellation IS the estimator.
+    # An unmeasured blank leaves an ADDITIVE term in each dR instead, which does not
+    # cancel in a ratio: it biases slope and intercept differently, so the product is
+    # wrong by an amount nothing here can bound. Normative home:
+    # RayleighRatioResult.blank_measured.
+    blank_measured: bool = True
     # Where the intensities came from, and which solvent blank each concentration was
     # referenced against, when not an instrument reading against the sample reference.
     # These do NOT cancel in Y(c): a different blank moves every excess ratio, hence the
@@ -1341,6 +1608,72 @@ class CalibrationFreeA2Result:
     # case; reduced by `_shared_derived_provenance` / `_shared_blank_provenance`.
     derived_provenance: str = ''
     blank_provenance: str = ''
+
+
+@dataclass
+class SingleAngleLadderResult:
+    """Single-angle concentration series -- the classical Debye plot at one angle.
+
+    Kc/dR_theta = 1/Mw_app + 2 A2_app c over the ladder (Theory-and-Equations-Guide,
+    "One angle over a concentration series", the fixed-angle form of the Debye
+    intercept equation): Mw from the
+    intercept, A2 from the slope. APPARENT, always (invariant 7): at one angle the
+    q -> 0 extrapolation was never done, so the intercept is 1/(Mw P(q)) -- the
+    apparent Mw is Mw P(q) <= Mw -- and the slope carries the same angle
+    contingency (it is 2 A2 only where P(q) ~ 1). A Zimm or Berry set over several
+    angles is the route to the thermodynamic values.
+
+    The calibration-free product 2 A2 Mw = slope/intercept is carried as well: it
+    is what survives an uncalibrated run (CLAUDE.md, physics), exactly as in the
+    calibration-free construction, with the same reciprocal-tail caveat.
+    """
+    angle_deg: float
+    q2_nm2: float
+    concentrations_g_per_mL: np.ndarray
+    kc_over_dR: np.ndarray
+    # linear fit  Kc/dR = intercept + slope * c
+    intercept_mol_per_g: float        # = 1/Mw_app
+    slope: float                      # = 2 A2_app  (mol mL / g^2)
+    mw_apparent_g_per_mol: float      # 1 / intercept
+    a2_apparent_mol_mL_per_g2: float  # slope / 2
+    two_a2_mw: float                  # slope / intercept, calibration-free
+    r_squared: float
+    is_apparent: bool                 # always True here
+    n_conc: int
+    calibrated: bool                  # was the Rayleigh ratio calibrated?
+    mw_reliable: bool                 # False if uncalibrated / no dn/dc / degenerate
+    # The absolute A2 needs both scales too -- and the line's intercept sign: a
+    # non-positive 1/Mw is a failed model, A2's precondition as much as Mw's
+    # (ZimmBerryResult.a2_reliable's rule; A2 = slope/2 is that same line's slope).
+    a2_reliable: bool
+    two_a2_mw_reliable: bool          # the product needs neither; design health only
+    # Statistical (regression) SEs -- exclude calibration/dn-dc systematics. The Mw SE
+    # is a RECIPROCAL of the fitted intercept (Monte-Carlo-validated conservative on
+    # the short ladder: tests/test_uncertainty.py); the A2 SE is the linear
+    # pass-through slope_se/2 and inherits that validation; the product's SE is the
+    # RATIO slope/intercept through the same covariance, gated in the same end-to-end
+    # Monte-Carlo test (tests/test_sls.py) as the Mw SE.
+    mw_apparent_se: Optional[float] = None
+    a2_apparent_se: Optional[float] = None
+    two_a2_mw_se: Optional[float] = None
+    se_estimator: str = 'hc3'                 # covariance estimator behind the SEs
+    # numerical health of the [1, c] design: near-equal concentrations -> fragile
+    # 1/intercept -> mw_reliable / a2_reliable suppressed (value still shown).
+    well_conditioned: bool = True
+    cond: float = float('nan')                # condition number of the design
+    reliability_note: str = ''                # ill-conditioned reason, if any
+    # Passive, glyph-less notices for the GUI info tier (the non-positive Kc/dR drop).
+    notes: tuple = ()
+    # `calibrated`'s sibling for the OPTICAL scale (see RayleighRatioResult).
+    dn_dc_supplied: bool = True
+    # The provenance pair every fit built from RayleighRatioResults carries.
+    derived_provenance: str = ''
+    blank_provenance: str = ''
+    # Carried from the Rayleigh result(s) this fit consumed: False -> the blank was not
+    # measured at every angle (typed 90 deg value, or no subtraction). ANDed into every
+    # reliability verdict on this result, because an additive blank does not cancel the
+    # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
+    blank_measured: bool = True
 
 
 def _collect_zimm_points(rayleigh_results: Sequence[RayleighRatioResult]):
@@ -1430,6 +1763,12 @@ def zimm_analysis(
     # The dn/dc sibling of all_calibrated, aggregated identically (same c != 0 skip:
     # the solvent blank carries no dn/dc of its own and none is ever read from it).
     all_dn_dc_supplied = all(r.dn_dc_supplied for r in rayleigh_results
+                             if r.concentration_g_per_mL != 0)
+    # The blank sibling, aggregated over the SAME set: a series with no measured c = 0
+    # point contributes no r.concentration_g_per_mL == 0 entry at all, so the skip is
+    # what makes this an honest `all` rather than a vacuous one.
+    all_blank_measured = all(bool(getattr(r, 'blank_measured', True))
+                             for r in rayleigh_results
                              if r.concentration_g_per_mL != 0)
     n_conc = np.unique(c).size
     n_ang = np.unique(np.round(q2, 12)).size
@@ -1625,8 +1964,9 @@ def zimm_analysis(
         is_apparent=False,
         calibrated=all_calibrated,
         dn_dc_supplied=all_dn_dc_supplied,
+        blank_measured=all_blank_measured,
         derived_provenance=_shared_derived_provenance(rayleigh_results),
-            blank_provenance=_shared_blank_provenance(rayleigh_results),
+        blank_provenance=_shared_blank_provenance(rayleigh_results),
         # Two SCALE gates (all_calibrated; all_dn_dc_supplied -- K = 1 puts the intercept
         # a = 1/Mw on an arbitrary optical scale), and Rg is ungated by both. a > 0: a
         # non-positive ordinate intercept makes the whole extrapolation non-physical
@@ -1635,14 +1975,17 @@ def zimm_analysis(
         # gate; math.isfinite closes the float-overflow edge (a underflowing to 0 NaNs Mw).
         # None is a magnitude threshold on Mw itself (invariant 4): a finite-but-huge Mw
         # from inconsistent input is a GIGO concern elsewhere, not a conditioning defect.
-        mw_reliable=(all_calibrated and all_dn_dc_supplied
+        mw_reliable=(all_calibrated and all_dn_dc_supplied and all_blank_measured
                      and math.isfinite(a) and a > 0
                      and mf.well_conditioned and math.isfinite(mw)),
-        a2_reliable=(all_calibrated and all_dn_dc_supplied
+        a2_reliable=(all_calibrated and all_dn_dc_supplied and all_blank_measured
                      and math.isfinite(a) and a > 0
                      and mf.well_conditioned and math.isfinite(a2)),
-        # The size: ungated by scale, gated by the design it shares with Mw/A2.
-        rg_reliable=bool(math.isfinite(rg) and rg > 0 and mf.well_conditioned),
+        # The size: ungated by SCALE, gated by the design it shares with Mw/A2 and by
+        # all_blank_measured -- which gates all three, Rg included, because an unmeasured
+        # blank is ADDITIVE and survives the q^2-to-intercept ratio the scales cancel in.
+        rg_reliable=bool(math.isfinite(rg) and rg > 0 and mf.well_conditioned
+                         and all_blank_measured),
         concentrations_g_per_mL=conc_levels,
         intercept_per_concentration=np.array(inter_per_c),
         q2_nm2=q2_levels, intercept_per_angle=np.array(inter_per_q),
@@ -1668,7 +2011,7 @@ def zimm_analysis(
 # amplitude (Mw) and the zero location trade off, so Mw can be badly wrong even at R^2 = 1 --
 # and R^2 does not flag it. A sphere fit reaching past this has mw/a2 reliability suppressed.
 # A general, documented physics criterion (invariant 4), not a system-specific threshold.
-# Derivation and sources: Theory-and-Equations-Guide, "Sphere validity limit"
+# Derivation and sources: Theory-and-Equations-Guide, "The sphere's first minimum"
 # (Pedersen 1997 Eq. 55; Guinier & Fournet 1955 Fig. 6). The Debye coil P(q) is monotonic, so
 # it has no such limit.
 SPHERE_FIRST_MINIMUM_QRG = 4.49340945790906 * math.sqrt(3.0 / 5.0)   # ~= 3.4806
@@ -1812,6 +2155,11 @@ class FormFactorResult:
     # it is not the sample reference; copied from the Rayleigh result(s) exactly as
     # derived_provenance is, and exported beside it. '' for the common case.
     blank_provenance: str = ''
+    # Carried from the Rayleigh result(s) this fit consumed: False -> the blank was not
+    # measured at every angle (typed 90 deg value, or no subtraction). ANDed into every
+    # reliability verdict on this result, because an additive blank does not cancel the
+    # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
+    blank_measured: bool = True
     # Mie-model provenance (None for the analytic sphere/coil models). The relative index
     # m = n_solute/n_medium is a FIXED user-supplied input to the Mie fit (never fitted --
     # invariant 3), echoed here so it travels into display + export like the DLS reweighting.
@@ -2003,6 +2351,10 @@ def form_factor_analysis(
     # the solvent blank carries no dn/dc of its own and none is ever read from it).
     all_dn_dc_supplied = all(r.dn_dc_supplied for r in rayleigh_results
                              if r.concentration_g_per_mL != 0)
+    # The blank sibling, over the same set. Not a scale: it gates every verdict below.
+    all_blank_measured = all(bool(getattr(r, 'blank_measured', True))
+                             for r in rayleigh_results
+                             if r.concentration_g_per_mL != 0)
     # Optical context: the Mie P(q) needs it in the arithmetic (size parameter + angle),
     # and it is echoed on EVERY result so the plot layer can cap its model grid at
     # back-scatter q = 2k (spec-05 review response: previously Mie-only, which left the
@@ -2189,7 +2541,7 @@ def form_factor_analysis(
         n_points=int(q.size), n_concentrations=n_conc, n_angles=n_ang,
         qrg_max=qrg_max, r_squared=float(r2), form_factor_valid=form_factor_valid,
         calibrated=all_calibrated,
-        dn_dc_supplied=all_dn_dc_supplied,
+        dn_dc_supplied=all_dn_dc_supplied, blank_measured=all_blank_measured,
         derived_provenance=_shared_derived_provenance(rayleigh_results),
             blank_provenance=_shared_blank_provenance(rayleigh_results),
         # Rg/R survive uncalibrated AND dn/dc-absent runs alike (the ordinate scale cancels
@@ -2197,18 +2549,21 @@ def form_factor_analysis(
         # BOTH scales known, a physical (converged, inv_mw>0) fit, a well-conditioned
         # Jacobian (invariant 4/6), and a fit within the sphere form factor's first
         # minimum (past it Mw is ill-conditioned).
-        mw_reliable=(all_calibrated and all_dn_dc_supplied
+        # `blank_measured` joins them, and unlike the two scales it also gates the SIZE:
+        # an unmeasured blank is ADDITIVE, so it does not cancel in the ordinate
+        # normalization the sizes rely on (angle-dependence is an extra, not the reason).
+        mw_reliable=(all_calibrated and all_dn_dc_supplied and all_blank_measured
                      and converged and well_cond and form_factor_valid),
         # Absolute A2 (thermodynamic only) shares Mw's calibration/conditioning/validity gates
         # but carries its OWN finiteness check -- the unbounded virial parameter can diverge
         # while Mw stays finite (mirrors ZimmBerryResult.a2_reliable). Always False when
         # apparent (single c resolves no A2).
         a2_reliable=(thermodynamic and all_calibrated and all_dn_dc_supplied
-                     and converged and well_cond
+                     and all_blank_measured and converged and well_cond
                      and form_factor_valid and a2 is not None and math.isfinite(a2)),
         # The floor's tail is the one that condemns the SIZE, so it -- not the whole
         # form_factor_valid -- gates the Rg offer (finding 1, round 9c44).
-        rg_reliable=(converged and above_floor),
+        rg_reliable=(converged and above_floor and all_blank_measured),
         mw_se=mw_se, rg_se=rg_se, r_se=r_se, a2_se=a2_se, se_estimator=estimator,
         well_conditioned=well_cond, cond=cond, reliability_note=note,
         notes=tuple(notes),
@@ -2337,6 +2692,11 @@ class EllipsoidFormFactorResult:
     # it is not the sample reference; copied from the Rayleigh result(s) exactly as
     # derived_provenance is, and exported beside it. '' for the common case.
     blank_provenance: str = ''
+    # Carried from the Rayleigh result(s) this fit consumed: False -> the blank was not
+    # measured at every angle (typed 90 deg value, or no subtraction). ANDed into every
+    # reliability verdict on this result, because an additive blank does not cancel the
+    # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
+    blank_measured: bool = True
     # Optical context (fixed user inputs), echoed like the Mie/core-shell siblings so the
     # plot layer can form k = 2*pi*n/lambda and cap the model grid at back-scatter q = 2k
     # (spec engineering-05). Always populated by the fit (the ellipsoid has one model, so
@@ -2346,7 +2706,7 @@ class EllipsoidFormFactorResult:
 
 
 def _ellipsoid_no_fit(q, y, c, n_conc, n_ang, thermodynamic, calibrated, estimator,
-                      n_med, wl_nm, *, dn_dc_supplied, derived_provenance='',
+                      n_med, wl_nm, *, dn_dc_supplied, blank_measured=True, derived_provenance='',
         blank_provenance=''):
     """The single converged=False sentinel returned when no ellipsoid fits (never [])."""
     return EllipsoidFormFactorResult(
@@ -2362,6 +2722,7 @@ def _ellipsoid_no_fit(q, y, c, n_conc, n_ang, thermodynamic, calibrated, estimat
         n_points=int(q.size), n_concentrations=n_conc, n_angles=n_ang,
         qrg_max=float('nan'), r_squared=float('nan'), calibrated=calibrated,
         dn_dc_supplied=dn_dc_supplied,
+        blank_measured=blank_measured,
         derived_provenance=derived_provenance,
         blank_provenance=blank_provenance,
         mw_reliable=False, a2_reliable=False, axial_ratio_reliable=False,
@@ -2439,6 +2800,10 @@ def ellipsoid_form_factor_analysis(
     # the solvent blank carries no dn/dc of its own and none is ever read from it).
     all_dn_dc_supplied = all(r.dn_dc_supplied for r in rayleigh_results
                              if r.concentration_g_per_mL != 0)
+    # The blank sibling, over the same set. Not a scale: it gates every verdict below.
+    all_blank_measured = all(bool(getattr(r, 'blank_measured', True))
+                             for r in rayleigh_results
+                             if r.concentration_g_per_mL != 0)
     # Optical context for the result (display/plot provenance; the Pedersen P(q) itself
     # never needs it) — the cap-safe extraction shared with the Mie and core-shell paths.
     wl_nm, n_med = _echoed_optics(rayleigh_results)
@@ -2512,7 +2877,7 @@ def ellipsoid_form_factor_analysis(
             RuntimeWarning, stacklevel=2)
         return [_ellipsoid_no_fit(q, y, c, n_conc, n_ang, thermodynamic,
                                   all_calibrated, estimator, n_med, wl_nm,
-                                  dn_dc_supplied=all_dn_dc_supplied,
+                                  dn_dc_supplied=all_dn_dc_supplied, blank_measured=all_blank_measured,
             derived_provenance=_shared_derived_provenance(rayleigh_results),
             blank_provenance=_shared_blank_provenance(rayleigh_results))]
 
@@ -2552,7 +2917,7 @@ def ellipsoid_form_factor_analysis(
         results.append(_build_ellipsoid_result(
             res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_ang, n_pts,
             all_calibrated, estimator, cond_limit, eps_idx, degenerate, len(accepted),
-            n_med, wl_nm, dn_dc_supplied=all_dn_dc_supplied,
+            n_med, wl_nm, dn_dc_supplied=all_dn_dc_supplied, blank_measured=all_blank_measured,
             derived_provenance=_shared_derived_provenance(rayleigh_results),
             blank_provenance=_shared_blank_provenance(rayleigh_results), drop_notes=drop_notes))
     return results
@@ -2560,7 +2925,7 @@ def ellipsoid_form_factor_analysis(
 
 def _build_ellipsoid_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_ang,
                             n_pts, calibrated, estimator, cond_limit, eps_idx,
-                            degenerate, n_solutions, n_med, wl_nm, *, dn_dc_supplied, derived_provenance='',
+                            degenerate, n_solutions, n_med, wl_nm, *, dn_dc_supplied, blank_measured=True, derived_provenance='',
         blank_provenance='', drop_notes=()):
     """Assemble one EllipsoidFormFactorResult (params, SEs, flags) from a converged fit.
 
@@ -2717,19 +3082,31 @@ def _build_ellipsoid_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_
         n_points=n_pts, n_concentrations=n_conc, n_angles=n_ang,
         qrg_max=qrg_max, r_squared=float(r2), calibrated=calibrated,
         dn_dc_supplied=dn_dc_supplied,
+        blank_measured=blank_measured,
         derived_provenance=derived_provenance,
         blank_provenance=blank_provenance,
         # Rg/eps survive an uncalibrated OR dn/dc-absent run alike (the ordinate scale
         # cancels); Mw needs BOTH scales known, a physical fit,
         # a well-conditioned CORE (inv_Mw, Rg[, A2]) design, and a fit within the sphere
         # first-minimum proxy. Deliberately NOT gated on axial-ratio identifiability.
-        mw_reliable=(calibrated and dn_dc_supplied
+        # `blank_measured` joins them, and unlike the two scales it also gates the SIZE:
+        # an unmeasured blank is ADDITIVE, so it does not cancel in the ordinate
+        # normalization the sizes rely on (angle-dependence is an extra, not the reason).
+        mw_reliable=(calibrated and dn_dc_supplied and blank_measured
                      and converged and well_cond and form_factor_valid),
-        a2_reliable=(thermodynamic and calibrated and dn_dc_supplied
+        a2_reliable=(thermodynamic and calibrated and dn_dc_supplied and blank_measured
                      and converged and well_cond
                      and form_factor_valid and a2 is not None and math.isfinite(a2)),
-        axial_ratio_reliable=axial_ratio_reliable, form_factor_valid=form_factor_valid,
-        rg_reliable=(converged and above_floor),      # finding 1 -- see the field's comment
+        # NOT gated on the blank (owner-ruled 2026-09-17), unlike every other verdict on
+        # this result. This field is not a trust verdict: it answers "could the data tell
+        # the shapes apart", and three consumers read it as that literal claim -- one of
+        # them the only flag in the tree that withholds a +-. ANDing an input absence into
+        # it made a resolved axial ratio print "(unresolved)" with a real SE suppressed
+        # (invariant 4's proxy ban, and invariant 8's withhold rule). Rg and Mw on this
+        # same result DO take the gate, because they are trust verdicts.
+        axial_ratio_reliable=axial_ratio_reliable,
+        form_factor_valid=form_factor_valid,
+        rg_reliable=(converged and above_floor and blank_measured),  # finding 1 -- see the field's comment
         mw_se=mw_se, rg_se=rg_se, axial_ratio_se=axial_ratio_se, a2_se=a2_se,
         se_estimator=estimator, well_conditioned=well_cond, cond=cond,
         reliability_note=note, n_solutions=n_solutions, notes=tuple(notes),
@@ -2864,6 +3241,11 @@ class CoreShellFormFactorResult:
     # it is not the sample reference; copied from the Rayleigh result(s) exactly as
     # derived_provenance is, and exported beside it. '' for the common case.
     blank_provenance: str = ''
+    # Carried from the Rayleigh result(s) this fit consumed: False -> the blank was not
+    # measured at every angle (typed 90 deg value, or no subtraction). ANDed into every
+    # reliability verdict on this result, because an additive blank does not cancel the
+    # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
+    blank_measured: bool = True
     # Contrast provenance (fixed user inputs), echoed for display + export like the Mie fields.
     m1: Optional[float] = None        # core relative index n_core/n_medium
     m2: Optional[float] = None        # shell relative index n_shell/n_medium
@@ -2874,7 +3256,7 @@ class CoreShellFormFactorResult:
 
 
 def _core_shell_no_fit(q, y, c, n_conc, n_ang, thermodynamic, calibrated, estimator,
-                       m1, m2, n_core, n_shell, n_med, wl_nm, *, dn_dc_supplied, derived_provenance='',
+                       m1, m2, n_core, n_shell, n_med, wl_nm, *, dn_dc_supplied, blank_measured=True, derived_provenance='',
         blank_provenance=''):
     """The single converged=False sentinel returned when no coated sphere fits (never [])."""
     return CoreShellFormFactorResult(
@@ -2886,6 +3268,7 @@ def _core_shell_no_fit(q, y, c, n_conc, n_ang, thermodynamic, calibrated, estima
         n_points=int(q.size), n_concentrations=n_conc, n_angles=n_ang,
         qrg_max=float('nan'), r_squared=float('nan'), calibrated=calibrated,
         dn_dc_supplied=dn_dc_supplied,
+        blank_measured=blank_measured,
         derived_provenance=derived_provenance,
         blank_provenance=blank_provenance,
         # form_factor_valid stays True: nothing was fitted, so there is no size for the
@@ -3038,6 +3421,10 @@ def core_shell_form_factor_analysis(
     # the solvent blank carries no dn/dc of its own and none is ever read from it).
     all_dn_dc_supplied = all(r.dn_dc_supplied for r in rayleigh_results
                              if r.concentration_g_per_mL != 0)
+    # The blank sibling, over the same set. Not a scale: it gates every verdict below.
+    all_blank_measured = all(bool(getattr(r, 'blank_measured', True))
+                             for r in rayleigh_results
+                             if r.concentration_g_per_mL != 0)
     wl_nm, n_med = _echoed_optics(rayleigh_results)
     n_core = m1 * n_med
     n_shell = m2 * n_med
@@ -3106,7 +3493,7 @@ def core_shell_form_factor_analysis(
             RuntimeWarning, stacklevel=2)
         return [_core_shell_no_fit(q, y, c, n_conc, n_ang, thermodynamic, all_calibrated,
                                    estimator, m1, m2, n_core, n_shell, n_med, wl_nm,
-                                   dn_dc_supplied=all_dn_dc_supplied,
+                                   dn_dc_supplied=all_dn_dc_supplied, blank_measured=all_blank_measured,
             derived_provenance=_shared_derived_provenance(rayleigh_results),
             blank_provenance=_shared_blank_provenance(rayleigh_results))]
 
@@ -3142,7 +3529,7 @@ def core_shell_form_factor_analysis(
         _build_core_shell_result(
             res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_ang, n_pts, all_calibrated,
             estimator, cond_limit, degenerate, len(accepted), _P, m1, m2, n_core, n_shell,
-            n_med, wl_nm, dn_dc_supplied=all_dn_dc_supplied,
+            n_med, wl_nm, dn_dc_supplied=all_dn_dc_supplied, blank_measured=all_blank_measured,
             derived_provenance=_shared_derived_provenance(rayleigh_results),
             blank_provenance=_shared_blank_provenance(rayleigh_results), drop_notes=drop_notes)
         for _cost, res, _rc, _ro in accepted
@@ -3151,7 +3538,7 @@ def core_shell_form_factor_analysis(
 
 def _build_core_shell_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_ang, n_pts,
                              calibrated, estimator, cond_limit, degenerate, n_solutions, P_of,
-                             m1, m2, n_core, n_shell, n_med, wl_nm, *, dn_dc_supplied, derived_provenance='',
+                             m1, m2, n_core, n_shell, n_med, wl_nm, *, dn_dc_supplied, blank_measured=True, derived_provenance='',
         blank_provenance='', drop_notes=()):
     """Assemble one CoreShellFormFactorResult (params, SEs, flags) from a converged fit."""
     inv_mw = float(res.x[0]) * y_scale
@@ -3242,19 +3629,23 @@ def _build_core_shell_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n
         n_points=n_pts, n_concentrations=n_conc, n_angles=n_ang,
         qrg_max=qrg_max, r_squared=float(r2), calibrated=calibrated,
         dn_dc_supplied=dn_dc_supplied,
+        blank_measured=blank_measured,
         derived_provenance=derived_provenance,
         blank_provenance=blank_provenance,
         # Radii/Rg survive an uncalibrated OR dn/dc-absent run alike (the ordinate scale
         # cancels); Mw needs BOTH scales known, a physical fit, a
         # well-conditioned design, and a fit within a deep form-factor minimum.
-        mw_reliable=(calibrated and dn_dc_supplied
+        # `blank_measured` joins them, and unlike the two scales it also gates the SIZE:
+        # an unmeasured blank is ADDITIVE, so it does not cancel in the ordinate
+        # normalization the sizes rely on (angle-dependence is an extra, not the reason).
+        mw_reliable=(calibrated and dn_dc_supplied and blank_measured
                      and converged and well_cond and form_factor_valid),
-        a2_reliable=(thermodynamic and calibrated and dn_dc_supplied
+        a2_reliable=(thermodynamic and calibrated and dn_dc_supplied and blank_measured
                      and converged and well_cond
                      and form_factor_valid and a2 is not None and math.isfinite(a2)),
         # `above_floor` is on r_outer here (rg is a contrast-weighted moment, undefined by
         # design when the contrasts cancel), so a collapsed coated sphere withholds its Rg too.
-        rg_reliable=(converged and math.isfinite(rg) and above_floor),
+        rg_reliable=(converged and math.isfinite(rg) and above_floor and blank_measured),
         form_factor_valid=form_factor_valid,
         mw_se=mw_se, r_core_se=r_core_se, r_outer_se=r_outer_se, a2_se=a2_se, rg_se=None,
         se_estimator=estimator, well_conditioned=well_cond, cond=cond,
@@ -3419,7 +3810,17 @@ def calibration_free_a2(
     # near-collinear, so slope/intercept (= 2 A2 Mw) is fragile even though the intercept
     # is ~1 by construction (Y(c_ref)=1, not the a->0 failure mode of the other methods).
     # Suppress two_a2_mw_reliable and carry the reason; the value is still returned.
-    note = '' if fit.well_conditioned else _ill_conditioned_note(fit.cond)
+    # And the intercept's sign (the single-angle ladder's rule 10 sibling): Y(c_ref) = 1
+    # by construction, so a non-positive fitted intercept is a line the data do not
+    # describe, and the product built on it is undefined.
+    intercept_ok = bool(math.isfinite(intercept) and intercept > 0)
+    all_blank = all(bool(getattr(s, 'blank_measured', True)) for s in sources)
+    reasons = []
+    if not fit.well_conditioned:
+        reasons.append(_ill_conditioned_note(fit.cond))
+    if not intercept_ok:
+        reasons.append(_non_positive_intercept_note('2 A2 Mw'))
+    note = '; '.join(reasons)
 
     return CalibrationFreeA2Result(
         angle_deg=float(angle_deg), concentrations_g_per_mL=conc, Y=Y,
@@ -3433,7 +3834,10 @@ def calibration_free_a2(
         # concentration design alone, so a non-finite value would ride out flagged
         # reliable. This is the quantity CLAUDE.md singles out as surviving an
         # uncalibrated run, so it is the last one that should be able to (rule 10).
-        two_a2_mw_reliable=fit.well_conditioned and math.isfinite(two_a2_mw),
+        # `all_blank`: the one absence this estimator does NOT shrug off -- see the
+        # dataclass field for why an additive term survives the Y(c) ratio.
+        two_a2_mw_reliable=(intercept_ok and fit.well_conditioned and all_blank
+                            and math.isfinite(two_a2_mw)),
         notes=tuple(notes),
         is_apparent=True,
         # Records, not gates (see the dataclass): aggregated over the points that
@@ -3441,6 +3845,7 @@ def calibration_free_a2(
         # "known" default because the inputs are duck-typed (see `sample_results`).
         calibrated=all(bool(getattr(s, 'calibrated', True)) for s in sources),
         dn_dc_supplied=all(bool(getattr(s, 'dn_dc_supplied', True)) for s in sources),
+        blank_measured=all_blank,
         derived_provenance=_shared_derived_provenance(sources),
         blank_provenance=_shared_blank_provenance(sources),
     )

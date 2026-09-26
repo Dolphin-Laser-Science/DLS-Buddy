@@ -159,18 +159,33 @@ class ThemedLabel(QtWidgets.QLabel):
 
     `role` picks the token; `bold`/`size`/`extra` add the usual styling without losing
     the theme-following behavior. `size` is a px font-size; `extra` is raw extra QSS
-    (e.g. ``'margin-top:8px;'``)."""
+    (e.g. ``'margin-top:8px;'``). `hide_when_empty` hides the label while it has no
+    text, for a conditional hint that would otherwise leave an empty gap in its column."""
 
     def __init__(self, text: str = '', role: str = 'muted', *,
                  bold: bool = False, size: Optional[int] = None, extra: str = '',
+                 hide_when_empty: bool = False,
                  parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(text, parent)
         self._role = role
         self._bold = bold
         self._size = size
         self._extra = extra
+        self._hide_when_empty = hide_when_empty
         self._applying = False
         self._apply()
+        if hide_when_empty and not text:
+            self.setVisible(False)
+
+    def setText(self, text: str) -> None:
+        super().setText(text)
+        if self._hide_when_empty:
+            self.setVisible(bool(text))
+
+    def clear(self) -> None:
+        super().clear()
+        if self._hide_when_empty:
+            self.setVisible(False)
 
     def setRole(self, role: str) -> None:
         self._role = role

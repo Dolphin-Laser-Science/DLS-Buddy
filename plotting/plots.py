@@ -181,6 +181,23 @@ def linestyle_for(i: int):
     return _LINESTYLE_CYCLE[i % len(_LINESTYLE_CYCLE)]
 
 
+#: About how many markers a sparse curve marker places along one curve. A distribution
+#: is drawn on an inversion grid of 100+ points, so a marker per point paints a solid
+#: band and stops being a channel at all; a dozen reads as "this curve" at a glance.
+_CURVE_MARKERS = 12
+
+
+def _curve_markevery(x, marker, markevery):
+    """`markevery` for a sparse curve marker: the caller's, or a stride placing about
+    `_CURVE_MARKERS` markers along an `x` of this length. `None` when there is no
+    marker, so a marker-free curve is drawn exactly as before."""
+    if marker is None:
+        return None
+    if markevery is not None:
+        return markevery
+    return max(1, len(np.asarray(x)) // _CURVE_MARKERS)
+
+
 def marker_cycle() -> list:
     """Snapshot of the per-series marker cycle (index-aligned with `cycle()`).
 
@@ -271,8 +288,9 @@ def apply_figure_theme(fig, dark: bool) -> None:
                 t.set_color(p['chrome'])
 
 
-def save_figure_via(fig, do_save) -> None:
-    """Run `do_save()` with `fig` recoloured WHITE, then restore the on-screen theme.
+def save_figure_via(fig, do_save, dressing=None) -> None:
+    """Run `do_save()` with `fig` recoloured WHITE and optionally DRESSED, then
+    restore the on-screen figure exactly.
 
     THE single implementation of the locked export policy (style guide R10.3:
     exports must be clean/print-parity regardless of the on-screen theme). Both
@@ -280,11 +298,29 @@ def save_figure_via(fig, do_save) -> None:
     `save_figure_white` (the scripting API) and the GUI's Save-button toolbar
     (`gui.plot_controls._WhiteSaveToolbar` — the path a user actually hits).
     `do_save` is any callable that writes the figure (a savefig, or matplotlib's
-    own save dialog)."""
+    own save dialog).
+
+    `dressing` is an optional zero-argument callable returning an undo callable.
+    It runs INSIDE the recolour, so a caller can add to the written figure what the
+    screen does not need to carry — the one consumer is the DLS co-plot tabs, whose
+    on-screen legend is a compact method key while the SAVED figure carries every
+    measurement by name (a saved image reaches readers with no workspace beside
+    it). The undo runs in the `finally`, so a dressing that raises cannot leave the
+    on-screen figure altered.
+
+    Extending the locked policy rather than forking it is deliberate: this is the
+    same screen-versus-export split the recolour already is, and putting it here
+    keeps one restore path for both.
+    """
     apply_figure_theme(fig, dark=False)
+    undo = None
     try:
+        if dressing is not None:
+            undo = dressing()
         do_save()
     finally:
+        if undo is not None:
+            undo()
         apply_figure_theme(fig, dark=_ONSCREEN_DARK)
         if fig.canvas is not None:
             fig.canvas.draw_idle()
@@ -640,6 +676,51 @@ def mask_log_axes(x, y, *, xlog: bool, ylog: bool, floor: float = _LOG_FLOOR):
     return x[m], y[m]
 
 
+def plot_correlogram_fit_line(
+    fit_tau,
+    fit_g2m1,
+    ax: Optional[Any] = None,
+    *,
+    xscale: str = 'log',
+    yscale: str = 'linear',
+    color: Optional[str] = None,
+    linestyle: str = '-',
+    label: Optional[str] = None,
+    compact: bool = False,
+) -> PlotHandles:
+    """Draw ONE reconstructed correlogram (a fit's `fitted_g2m1` over its `fit_tau_s`)
+    on an existing correlogram axes.
+
+    Split out of `plot_correlogram_scaled` because a correlogram can now carry SEVERAL
+    fits -- a parametric one and a distribution one over the same data -- and the data
+    must be drawn once, not once per fit. Both callers share this body, so the
+    display-unit scaling, the log-axis masking and the line weight cannot drift apart.
+
+    Not to be confused with `plot_correlogram_fit` above, which takes a RESULT OBJECT
+    and builds a whole two-panel figure from it (the scripting API). This one draws one
+    line on an axes the caller already owns and has already scaled.
+
+    `color` defaults to the vermilion single-measurement fit colour; on an overlay the
+    caller passes the measurement's own colour so a measurement reads as one colour and
+    the line STYLE carries the method. `label` is `None` by default: where several fits
+    are overlaid the legend names measurements and methods separately, and a per-curve
+    label would multiply the entries by the number of methods shown.
+    """
+    fig, ax = _get_ax(ax)
+    tfac = display_factor('time')
+    fx, fy = mask_log_axes(np.asarray(fit_tau, dtype=float) * tfac,
+                           np.asarray(fit_g2m1, dtype=float),
+                           xlog=(xscale == 'log'), ylog=(yscale == 'log'))
+    # When an explicit color is given (multi-measurement overlay) the fit line
+    # matches its data color so each measurement reads as one color; with no
+    # color (single-measurement view) the fit keeps the vermilion default.
+    fit_c = color or PALETTE['vermilion']
+    line = ax.plot(fx, fy, color=fit_c, ls=linestyle,
+                   lw=(1.2 if compact else 1.8),
+                   label=(label if label else '_nolegend_'))[0]
+    return PlotHandles(fig, ax, {'fit': line})
+
+
 def plot_correlogram_scaled(
     tau,
     g2m1,
@@ -653,6 +734,8 @@ def plot_correlogram_scaled(
     label: Optional[str] = None,
     compact: bool = False,
     marker: str = 'o',
+    fit_linestyle: str = '-',
+    fit_label: Optional[str] = 'fit',
 ) -> PlotHandles:
     """Draw a correlogram (+ optional fit overlay) on one axes at given scales.
 
@@ -661,7 +744,9 @@ def plot_correlogram_scaled(
     ticks and drops axis labels for the small side views of the multi-scale panel.
     `color`/`label` let several correlograms be overlaid on one axes with a legend;
     `marker` varies the point SHAPE per overlaid series so they stay distinct without
-    colour (WCAG 1.4.1 / greyscale).
+    colour (WCAG 1.4.1 / greyscale). `fit_linestyle`/`fit_label` style and name the
+    single fit this call overlays -- pass the method's line style, and `None` as the
+    label where the legend names methods separately rather than once per curve.
     Used by the DLS tab's 4-view correlogram and the multi-measurement overlay.
     """
     fig, ax = _get_ax(ax)
@@ -678,15 +763,12 @@ def plot_correlogram_scaled(
                                  facecolors='none', edgecolors=c, alpha=0.7,
                                  label=(label or 'data'))
     if fit_tau is not None and fit_g2m1 is not None:
-        fx, fy = mask_log_axes(np.asarray(fit_tau, dtype=float) * tfac,
-                               np.asarray(fit_g2m1, dtype=float),
-                               xlog=xlog, ylog=ylog)
-        # When an explicit color is given (multi-measurement overlay) the fit line
-        # matches its data color so each measurement reads as one color; with no
-        # color (single-measurement view) the fit keeps the vermilion default.
-        fit_c = color or PALETTE['vermilion']
-        artists['fit'] = ax.plot(fx, fy, '-', color=fit_c,
-                                 lw=(1.2 if compact else 1.8), label='fit')[0]
+        # ONE fit-line path for the whole app: this overlay and the DLS tab's
+        # several-fits-per-correlogram draw go through `plot_correlogram_fit`, so the
+        # masking, the display-unit scaling and the line weight cannot fork.
+        artists['fit'] = plot_correlogram_fit_line(
+            fit_tau, fit_g2m1, ax=ax, xscale=xscale, yscale=yscale, color=color,
+            linestyle=fit_linestyle, label=fit_label, compact=compact).artists['fit']
     ax.set_xscale(xscale)
     ax.set_yscale(yscale)
     if compact:
@@ -697,6 +779,18 @@ def plot_correlogram_scaled(
     return PlotHandles(fig, ax, artists)
 
 
+def _legendable(label) -> bool:
+    """Whether a label should make a plotter build an axes legend of its own.
+
+    False for matplotlib's own hidden-label convention (a leading underscore), which is
+    how a caller that assembles its OWN legend -- the DLS Distribution tab, which draws
+    one entry per measurement rather than one per curve -- says "draw me, do not list
+    me". Without this such a caller gets an axes legend it must then remove, or a
+    "no artists with labels" warning when there is nothing left to list.
+    """
+    return bool(label) and not str(label).startswith('_')
+
+
 def plot_distribution(
     result,
     ax: Optional[Any] = None,
@@ -705,6 +799,8 @@ def plot_distribution(
     label: Optional[str] = None,
     fill: bool = True,
     linestyle: str = '-',
+    marker: Optional[str] = None,
+    markevery=None,
     series_index: Optional[int] = None,
 ) -> PlotHandles:
     """Plot an NNLS or CONTIN size/rate distribution.
@@ -721,6 +817,13 @@ def plot_distribution(
     color, label : optional styling.
     fill : bool
         Lightly fill under the curve.
+    marker, markevery : optional
+        A sparse point marker along the curve. The non-colour identity channel
+        (WCAG 1.4.1 / R10.1) when `linestyle` is carrying something else -- on the DLS
+        Distribution tab the style is the METHOD, so the marker is the measurement.
+        With a marker and no `markevery`, one is chosen to place about
+        `_CURVE_MARKERS` markers along the curve: a marker per grid point on a
+        100+-point inversion grid is a solid band, not a channel.
 
     Returns
     -------
@@ -741,13 +844,16 @@ def plot_distribution(
     lbl = label or (result.method.upper() if hasattr(result, 'method') else None)
 
     artists = {}
-    artists['line'] = ax.plot(x, weights, color=c, ls=linestyle, lw=1.8, label=lbl)[0]
+    artists['line'] = ax.plot(x, weights, color=c, ls=linestyle, lw=1.8, label=lbl,
+                              marker=marker,
+                              markevery=_curve_markevery(x, marker, markevery),
+                              markersize=5, markerfacecolor='none')[0]
     if fill:
         artists['fill'] = ax.fill_between(x, weights, color=c, alpha=0.15)
     ax.set_xscale('log')
     ax.set_xlabel(xlabel)
     ax.set_ylabel('Weight (intensity fraction)')
-    if lbl:
+    if _legendable(lbl):
         ax.legend(frameon=False, fontsize=9)
     return PlotHandles(fig, ax, artists)
 
@@ -759,6 +865,8 @@ def plot_weighted_distribution(
     label: Optional[str] = None,
     fill: bool = True,
     linestyle: str = '-',
+    marker: Optional[str] = None,
+    markevery=None,
     invalid_label: Optional[str] = 'outside model validity',
     series_index: Optional[int] = None,
 ) -> PlotHandles:
@@ -775,6 +883,8 @@ def plot_weighted_distribution(
     ----------
     result : WeightedDistributionResult
     ax, color, label, fill, linestyle : styling (overlay-capable, like plot_distribution).
+    marker, markevery : optional
+        A sparse point marker along the curve, exactly as `plot_distribution` takes it.
     invalid_label : str or None
         Legend label for the out-of-range markers. Pass None on all but the FIRST overlaid
         curve so the shared "outside model validity" entry isn't repeated in the legend
@@ -791,7 +901,10 @@ def plot_weighted_distribution(
     lbl = label or str(getattr(result, 'weighting', '')).capitalize()
 
     artists = {}
-    artists['line'] = ax.plot(x, w, color=c, ls=linestyle, lw=1.8, label=lbl)[0]
+    artists['line'] = ax.plot(x, w, color=c, ls=linestyle, lw=1.8, label=lbl,
+                              marker=marker,
+                              markevery=_curve_markevery(x, marker, markevery),
+                              markersize=5, markerfacecolor='none')[0]
     if fill:
         artists['fill'] = ax.fill_between(x, w, color=c, alpha=0.15)
     # Validity overlay: shade the out-of-range Rh region and dot the invalid bins.
@@ -808,21 +921,27 @@ def plot_weighted_distribution(
     ax.set_xscale('log')
     ax.set_xlabel(rf'$R_h$ ({display_unit("radius")})')
     ax.set_ylabel(f'Weight ({str(getattr(result, "weighting", "")).lower()} fraction)')
-    if lbl:
+    if _legendable(lbl):
         ax.legend(frameon=False, fontsize=9)
     return PlotHandles(fig, ax, artists)
 
 
 def plot_lcurve(lcurve, ax: Optional[Any] = None, method: str = 'lcurve',
                 color: Optional[str] = None, label: Optional[str] = None,
-                mark_ceiling: bool = False, mark_floor: bool = False) -> PlotHandles:
+                mark_ceiling: bool = False, mark_floor: bool = False,
+                gcv_gamma: Optional[float] = None) -> PlotHandles:
     """Plot a CONTIN alpha-selection sweep, marking the chosen alpha.
 
     Method-aware ordinate (the abscissa/ordinate that made the pick visible):
 
-      * ``'lcurve'`` — the classic L-curve: solution seminorm vs residual norm
-        (log-log), the corner ringed.
-      * ``'gcv'``    — the GCV score V(alpha) vs alpha (log-x), the minimum ringed.
+      * ``'lcurve'`` — the classic L-curve: solution norm ‖x‖² (``x_norms``) vs the
+        weighted residual norm ‖M^½(Ax − y)‖² (log-log), the corner ringed. A sweep without ``x_norms`` (saved
+        before the field existed, so selected on the seminorm) is drawn on the solution
+        seminorm ‖Lx‖² under that label — the plot shows what selected it.
+      * ``'gcv'``    — the GCV-family score vs alpha (log-x), the minimum ringed. The
+        sweep's ``gcv`` array is whichever score was minimized, so the ordinate is
+        labelled from ``gcv_gamma``: the classical V(alpha) at 1 (or when the caller
+        knows no gamma), Lukas's robust score below 1.
       * ``'ftest'``  — the cumulative F ("probability to reject") vs alpha (log-x),
         the chosen alpha ringed.
 
@@ -851,7 +970,10 @@ def plot_lcurve(lcurve, ax: Optional[Any] = None, method: str = 'lcurve',
             raise ValueError('no GCV score curve on this sweep')
         x = np.asarray(lcurve.alphas, dtype=float)
         y = np.asarray(score, dtype=float)
-        xlabel, ylabel = r'Regularization $\alpha$', r'GCV score $V(\alpha)$'
+        robust = gcv_gamma is not None and gcv_gamma < 1
+        xlabel = r'Regularization $\alpha$'
+        ylabel = (r'robust GCV score $\bar V(\alpha)$' if robust
+                  else r'GCV score $V(\alpha)$')
     elif method == 'ftest':
         fc = getattr(lcurve, 'ftest_fc', None)
         if fc is None:
@@ -861,14 +983,20 @@ def plot_lcurve(lcurve, ax: Optional[Any] = None, method: str = 'lcurve',
         xlabel, ylabel = r'Regularization $\alpha$', 'Cumulative F'
     else:                                             # 'lcurve' (default)
         x = np.asarray(lcurve.residual_norms, dtype=float)
-        y = np.asarray(lcurve.solution_norms, dtype=float)
-        xlabel = r'Residual norm $\|A x - y\|^2$'
-        ylabel = r'Solution seminorm $\|L x\|^2$'
+        x_norms = getattr(lcurve, 'x_norms', None)
+        if x_norms is not None:
+            y = np.asarray(x_norms, dtype=float)
+            ylabel = r'Solution norm $\|x\|^2$'
+        else:                       # no size axis on this sweep: show what selected it
+            y = np.asarray(lcurve.solution_norms, dtype=float)
+            ylabel = r'Solution seminorm $\|L x\|^2$'
+        # the sweep stores the WEIGHTED residual (M the fit's weight, the identity when unweighted)
+        xlabel = r'Residual norm $\|M^{1/2}(A x - y)\|^2$'
         ax.set_yscale('log')
     artists['curve'] = ax.plot(x, y, '-o', color=c, ms=4, lw=1.2, label=label)[0]
     artists['optimal'] = ax.plot(x[i], y[i], 'o', color=c, ms=11, mfc='none', mew=2,
                                  label=f'optimal alpha = {lcurve.optimal_alpha:.2e}')[0]
-    if mark_ceiling:                                  # over-regularization halo
+    if mark_ceiling:                                  # ceiling halo
         artists['ceiling'] = ax.plot(x[i], y[i], 'o', color=PALETTE['vermilion'],
                                      ms=17, mfc='none', mew=1.6, ls='none')[0]
     if mark_floor:                                    # floor-edge halo (same glyph:
@@ -1631,6 +1759,36 @@ def plot_calibration_free_a2(result, ax: Optional[Any] = None) -> PlotHandles:
     ax.set_ylabel(r'$Y(c) = [I(c_{ref})/c_{ref}]\,/\,[I(c)/c]$')
     ax.legend(frameon=False, fontsize=9,
               title=f'$2A_2M_w$ = {result.two_a2_mw:.3e}')
+    return PlotHandles(fig, ax, artists)
+
+
+def plot_single_angle_ladder(result, ax: Optional[Any] = None) -> PlotHandles:
+    """Plot the single-angle concentration ladder: Kc/dR_theta vs c with its line.
+
+    The Debye plot at one angle (SingleAngleLadderResult). The concentration axis
+    honours PLOT_UNITS exactly as the calibration-free construction's does -- the
+    fields are canonical g/mL, only the drawn x is scaled, and the fitted slope stays
+    per (g/mL)."""
+    fig, ax = _get_ax(ax)
+    c = np.asarray(result.concentrations_g_per_mL, dtype=float)
+    y = np.asarray(result.kc_over_dR, dtype=float)
+    cfac = display_factor('concentration')
+    artists = {}
+    artists['data'] = ax.scatter(c * cfac, y, s=36, color=PALETTE['blue'],
+                                 zorder=3, label='data')
+    xline = np.linspace(0.0, c.max() * _FIT_XMAX_PAD, _FIT_LINE_POINTS)
+    artists['fit'] = ax.plot(xline * cfac,
+                             result.slope * xline + result.intercept_mol_per_g, '-',
+                             color=PALETTE['vermilion'], lw=1.6)[0]
+    ax.set_xlabel(rf'Concentration ({display_unit("concentration")})')
+    ax.set_ylabel(r'$Kc/\Delta R_\theta$ (mol/g)')
+    # The scale gate every Mw-bearing plotter honours (plot_debye, plot_zimm): a
+    # figure travels without its results table, so an arbitrary-scale or unusable
+    # Mw is dashed here with its cause, never printed as an absolute number.
+    mw_txt = scaled_value(result, f'{result.mw_apparent_g_per_mol:.3e}',
+                          result.mw_apparent_g_per_mol)
+    ax.legend(frameon=False, fontsize=9,
+              title=rf'$M_{{w,app}}$ = {mw_txt} at {result.angle_deg:.0f}°')
     return PlotHandles(fig, ax, artists)
 
 

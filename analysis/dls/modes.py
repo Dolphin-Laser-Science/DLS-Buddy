@@ -94,15 +94,25 @@ class ModePoint:
     `item_id` is NEVER a pick key.
 
     `alpha`/`alpha_selection_method` record the CONTIN regularization the
-    amplitudes came from (None/'' for double/NNLS) — partition provenance for
-    mode-resolved static intensities, captured here because the inversion
-    result is dropped after extraction. `rh_min_nm`/`rh_max_nm`/`n_grid` record
+    amplitudes came from (None/'' for double/NNLS), and `gcv_gamma` the
+    robust-GCV parameter beside them (None unless the selector was GCV: 'gcv'
+    names a family, so the pair (method, γ) is the provenance) — partition
+    provenance for mode-resolved static intensities, captured here because the
+    inversion result is dropped after extraction. `rh_min_nm`/`rh_max_nm`/`n_grid` record
     the size grid that inversion ran on for the same reason: it is a user
     setting, so two runs of one measurement can resolve differently, and the
     grid that produced a mode is otherwise unrecoverable from the mode. They
     are read back off the grid the fit actually used, not the grid requested,
     so they describe the inversion rather than the intent (defaults for the
-    parametric source, which has no grid). `bounds_*` record the integration
+    parametric source, which has no grid).
+    `weighting`/`sample_time_provenance`/`run_duration_form` are captured for
+    exactly the same reason and in the same way — read OFF THE FIT, not off the
+    request — and carry the same meanings as on `DistributionResult`: which
+    residual weight built the inversion these amplitudes came from, and what
+    that weight read. A weight moves the recovered distribution, the selected
+    α and therefore every lobe area on this map, so a mode says which form
+    produced it. All three default to '' for the parametric source, which has
+    no inversion behind it. `bounds_*` record the integration
     lobe the amplitude was summed over (distribution sources; NaN/'' for the
     parametric double-exponential): 'auto' = the scan's own local-minimum
     lobes, 'manual' = user-set bounds. All additive with defaults — picks are
@@ -132,9 +142,14 @@ class ModePoint:
     polarization_state: Optional[str] = None   # 'VV' | 'VH' | None (unpolarized class)
     alpha: Optional[float] = None     # CONTIN regularization (None for double/NNLS)
     alpha_selection_method: str = ''  # 'gcv' | 'lcurve' | 'ftest' | 'user' | '' (non-CONTIN)
+    gcv_gamma: Optional[float] = None  # robust-GCV gamma beside 'gcv' (None otherwise)
     rh_min_nm: float = float('nan')   # the size grid the inversion ran on
     rh_max_nm: float = float('nan')   # (NaN/0 for the parametric double-exponential)
     n_grid: int = 0
+    weighting: str = ''               # the inversion's recorded residual-weighting form
+    sample_time_provenance: str = ''  # 'instrument' | 'axis' | '' (what that weight read)
+    run_duration_form: str = ''       # 'finite' | 'infinite' | '' ('' for the parametric
+    #                                   source, which runs no inversion at all)
     bounds_lo_rh_nm: float = float('nan')   # integration-lobe bounds (distribution sources)
     bounds_hi_rh_nm: float = float('nan')
     bounds_source: str = ''           # 'auto' | 'manual' | '' (parametric)
@@ -269,6 +284,7 @@ def extract_modes(
     skip_initial_channels: int = 0,
     manual_bounds_rh_nm: Optional[Sequence[Sequence[float]]] = None,
     min_decay_completeness: float = MIN_DECAY_COMPLETENESS,
+    baseline: Optional[float] = None,
     **dist_kw,
 ) -> ModeExtraction:
     """Extract every usable relaxation mode of one measurement.
@@ -276,7 +292,8 @@ def extract_modes(
     Reuses the shipped fitters -- nothing is recomputed here: 'double' takes
     the two `ExponentialMode`s of `fit_double_exponential`; 'contin'/'nnls'
     run the inversion and take its `find_distribution_peaks` populations
-    (`**dist_kw` forwards grid/alpha/beta/baseline options). Rh on each mode
+    (`**dist_kw` forwards grid/alpha/beta options; `baseline` below reaches every
+    source). Rh on each mode
     comes from those fitters' own Gamma->Rh conversion (the single home).
 
     `min_weight_fraction` is the distribution-peak noise threshold; its
@@ -298,6 +315,13 @@ def extract_modes(
     overlapping intervals raise (`integrate_between`'s contract -- a split
     that double-counts weight writes a false record).
 
+    `baseline` is a residual baseline offset the caller measured on this
+    correlogram, handed to whichever fitter the source names -- the double
+    exponential subtracts it as its pinned baseline, the inversions subtract it
+    before inverting -- exactly as each fitter takes it when called directly. It is
+    named here rather than left in `**dist_kw` because the 'double' branch forwards
+    none of those. None (the default) is each fitter's own default.
+
     `min_decay_completeness` is the lag-window criterion: a mode whose
     Gamma * (fitted lag span) falls below it never finished decaying inside the
     measured range, so its rate is an extrapolation rather than a measurement.
@@ -306,11 +330,18 @@ def extract_modes(
     'double' points therefore agree with `fit_double_exponential`'s own per-mode
     verdict by construction. It gates a note, never a refusal.
 
+    A distribution source's own PASSIVE notes are relayed verbatim onto the
+    extraction -- that its residual weight ran without a committed count rate,
+    or that the weight could not be formed and which input refused -- because
+    the inversion result is dropped here and a note left on it would reach no
+    surface. They are the notes that say why a point records the form it does.
+
     Failure-tolerant by contract: a fit failure OR an unfittable correlogram
     (the fitters' own ValueError) returns `success=False` with empty modes and
     the reason as a note -- one weird run must not kill a multi-angle map, and
     the controller relays the note. Only an invalid `source`, manual bounds on
-    'double', or bad manual bounds raise (caller bugs, not data conditions).
+    'double', bad manual bounds, or a `baseline_window` (which no source reads) raise
+    (caller bugs, not data conditions).
     """
     if source not in MODE_SOURCES:
         raise ValueError(
@@ -326,6 +357,14 @@ def extract_modes(
             "from integrating a spectrum. Use 'contin' or 'nnls', or the "
             "parametric route itself for genuinely overlapping modes."
         )
+    # No source here measures a floating baseline over a lag span: the double exponential
+    # would drop the key (its branch forwards none of `**dist_kw`) and CONTIN/NNLS would
+    # raise a TypeError. Refused by name, so a caller's region is never silently not applied.
+    if 'baseline_window' in dist_kw:
+        raise ValueError(
+            "extract_modes takes a baseline value (`baseline`); none of its sources "
+            "measures a floating baseline over a lag span, so `baseline_window` is "
+            "refused.")
 
     notes: List[str] = []
     q = _measurement_q_m(measurement)
@@ -354,8 +393,10 @@ def extract_modes(
     dist = None
     alpha: Optional[float] = None
     alpha_method = ''
+    gcv_gamma: Optional[float] = None
     rh_lo = rh_hi = float('nan')
     n_grid_used = 0
+    weighting = sample_time_provenance = run_duration_form = ''
     # The fitted lag SPAN, read off whichever fit produced the modes -- never off the
     # measurement, so a user's tau window and the skipped leading channels are already
     # in it (every fit result carries `fit_tau_s`, its window after both).
@@ -364,12 +405,19 @@ def extract_modes(
         if source == 'double':
             res = fit_double_exponential(
                 measurement, tau_min_s=tau_min_s, tau_max_s=tau_max_s,
-                skip_initial_channels=skip_initial_channels)
+                skip_initial_channels=skip_initial_channels, baseline=baseline)
             if not res.success:
                 return ModeExtraction(
                     modes=(), source_method=source, success=False,
                     notes=("Double-exponential fit failed; no modes extracted "
                            "from this measurement.",))
+            # NO all-modes-undecayed withhold here, owner-ruled 2026-09-06. One returned
+            # no modes at all when both were flagged `decay_incomplete`, contradicting
+            # flag-not-refuse -- and "both modes undecayed" is equally true of a genuinely
+            # slow sample, which is what this map is FOR. Both now travel, flagged, and
+            # every surface already tells them apart: the point carries
+            # `decay_completeness`, the map draws such modes as a labelled square, and the
+            # export caveats Gamma and D_app.
             tau_span = _fitted_tau_span(res.fit_tau_s)
             for m in (res.mode1, res.mode2):
                 raw.append((m.gamma_s_inv, m.amplitude_fraction, m.rh_nm,
@@ -377,7 +425,8 @@ def extract_modes(
         else:
             fitter = fit_contin if source == 'contin' else fit_nnls
             res = fitter(measurement, tau_min_s=tau_min_s, tau_max_s=tau_max_s,
-                         skip_initial_channels=skip_initial_channels, **dist_kw)
+                         skip_initial_channels=skip_initial_channels, baseline=baseline,
+                         **dist_kw)
             dist = res.distribution if source == 'contin' else res
             tau_span = _fitted_tau_span(dist.fit_tau_s)
             # Partition provenance: the regularization the amplitudes came
@@ -392,9 +441,22 @@ def extract_modes(
                 rh_lo = float(np.min(_grid))
                 rh_hi = float(np.max(_grid))
                 n_grid_used = int(_grid.size)
+            # Same reason again: which residual weight built this inversion, and what
+            # that weight read. Off the FIT, like alpha and the grid above -- a caller
+            # may have passed no `weighting` at all, and the engine's own default and
+            # its fallback are only visible on the result.
+            weighting = dist.weighting
+            sample_time_provenance = dist.sample_time_provenance
+            run_duration_form = dist.run_duration_form
+            # And its PASSIVE NOTES, relayed verbatim. The inversion result is dropped
+            # here, so a note left on it would never reach the map: the no-count-rate
+            # note and the note a weight that could not be formed carries are the two
+            # that say why a point records the form it does.
+            notes.extend(dist.notes)
             if source == 'contin':
                 alpha_method = ('user' if res.alpha_was_user_supplied
                                 else res.alpha_selection_method)
+                gcv_gamma = res.gcv_gamma       # None unless the selector was GCV
                 if res.reliability_note:
                     # The one sentence every surface shows (ContinResult carries it).
                     notes.append(res.reliability_note
@@ -485,8 +547,11 @@ def extract_modes(
             low_amplitude=bool(a < amplitude_floor),
             amplitude_floor=float(amplitude_floor),
             **_decay_fields(g),
-            alpha=alpha, alpha_selection_method=alpha_method,
+            alpha=alpha, alpha_selection_method=alpha_method, gcv_gamma=gcv_gamma,
             rh_min_nm=rh_lo, rh_max_nm=rh_hi, n_grid=n_grid_used,
+            weighting=weighting,
+            sample_time_provenance=sample_time_provenance,
+            run_duration_form=run_duration_form,
             bounds_lo_rh_nm=float(blo), bounds_hi_rh_nm=float(bhi),
             bounds_source=bsrc,
         )
@@ -601,7 +666,7 @@ def fit_mode_family(
         floor = max(p.min_decay_completeness for p in points)
         notes.append(
             f"{n_undecayed} of {len(points)} picked mode(s) did not finish "
-            f"decaying inside their lag window (Gamma * lag span below "
+            f"decaying inside their delay window (Gamma * lag span below "
             f"{floor:.3g}); their decay rates are extrapolations past the end "
             f"of the measurement, so the fitted D and Rh inherit that."
         )

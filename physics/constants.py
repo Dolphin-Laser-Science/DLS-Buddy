@@ -385,6 +385,12 @@ _WAVELENGTH_MATCH_TOLERANCE_NM: float = 2.0
 # size the disclosure of a within-tolerance
 # substitution; the value served is never scaled by it (the correlation's own scatter is
 # up to 6 % at 532 nm, so a scaled value would not be a sourced one).
+#
+# S&K 2021 Eqs. (10)-(11) [p. 9501] fold this same Wu exponent (their Eq. 2, cited
+# to Wu 2010 as ref [2]) into a direct R(lambda, T) formula anchored only at their
+# own 660 nm data. At 532 nm it evaluates to 2.068e-5 cm^-1 -- an 11.6% deviation
+# from the Takahashi 2019 metrology value this module uses -- which exceeds Wu's
+# own ~6% correlation scatter and is why Eqs. (10)-(11) are not used here either.
 _TOLUENE_RVV_WAVELENGTH_EXPONENT: float = -4.17
 
 # Temperature validity range for the R_VV(T), rho_v(T) corrections: the span of the

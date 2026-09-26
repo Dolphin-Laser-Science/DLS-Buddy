@@ -121,6 +121,7 @@ class RhoResult:
 def i_sin_theta(
     measurements: Sequence[SLSMeasurement],
     mode: str = 'absolute',
+    display_names: Optional[Sequence[str]] = None,
 ) -> ISinThetaResult:
     """Compute I*sin(theta) curves for one or more SLS measurements.
 
@@ -138,6 +139,13 @@ def i_sin_theta(
         'absolute' (default): raw I*sin(theta).
         'normalized': each curve divided by its own mean, so curves from
             different samples or scales can be overlaid for shape comparison.
+    display_names : sequence of str, optional
+        One name per measurement, in order -- what each curve is CALLED on the
+        plot's legend. Supplied by the caller because a pure analysis function may
+        not look anything up (invariant 1), and because the name a user recognises
+        is the one the rest of the program shows. Omitted (the default) the label
+        falls back to the measurement's own `sample_label`, then to
+        "{polymer} in {solvent}, c=...".
 
     Returns
     -------
@@ -154,9 +162,25 @@ def i_sin_theta(
         )
     if len(measurements) == 0:
         raise ValueError("measurements is empty; supply at least one.")
+    if display_names is not None and len(display_names) != len(measurements):
+        raise ValueError(
+            f"display_names has {len(display_names)} entries for "
+            f"{len(measurements)} measurements; they are positional."
+        )
 
     curves: List[ISinThetaCurve] = []
-    for m in measurements:
+    for i, m in enumerate(measurements):
+        # The name this curve is CALLED: the caller's, else the measurement's own
+        # sample label, else its identity. Resolved before it is needed, so the
+        # legend and the refusal below name the same curve the same way.
+        given = display_names[i] if display_names is not None else ''
+        if given:
+            label = given
+        elif m.sample_label:
+            label = m.sample_label
+        else:
+            label = (f"{m.polymer_name} in {m.solvent_name}, "
+                     f"c={m.concentration_g_per_mL:g} g/mL")
         sin_theta = np.sin(np.radians(m.angles_deg))
         values = m.intensities * sin_theta
         if mode == 'normalized':
@@ -164,15 +188,9 @@ def i_sin_theta(
             if mean_val == 0:
                 raise ValueError(
                     f"Cannot normalize: mean I*sin(theta) is zero for a "
-                    f"measurement (label={m.sample_label!r})."
+                    f"measurement ({label})."
                 )
             values = values / mean_val
-        # Build a human-readable label
-        if m.sample_label:
-            label = m.sample_label
-        else:
-            label = (f"{m.polymer_name} in {m.solvent_name}, "
-                     f"c={m.concentration_g_per_mL:g} g/mL")
         curves.append(ISinThetaCurve(
             label=label,
             angles_deg=m.angles_deg.copy(),
@@ -636,7 +654,7 @@ class ArchitectureResult:
     effective_arms: float                 # f_eff from g=(3f-2)/f^2; nan if g not in (0,1]
     interpretation: str
     g_se: Optional[float] = None          # replicate SEM of g; None for a single measurement
-    effective_arms_se: Optional[float] = None  # replicate SEM of f_eff; None if single/invalid
+    effective_arms_se: Optional[float] = None  # f_eff inherits g's uncertainty (shown on g)
     se_source: Optional[str] = None       # 'replicate' when a ± is reported, else None
     n_replicates: int = 1
     mw_branched: Optional[float] = None
@@ -674,7 +692,7 @@ def _g_fraction(n: float, functionality: int) -> float:
         f = 4:  g = [ (1 + n/6)^(1/2) + 4n/(3 pi) ]^(-1/2)
 
     Monotonically decreasing from g(0) = 1 toward 0 as n grows. Defined only for
-    f = 3 or 4 (the tabulated cases). See Theory-and-Equations-Guide §2.4.1."""
+    f = 3 or 4 (the tabulated cases). See the Theory-and-Equations-Guide, "Random branching: the branching index m_b"."""
     if functionality == 3:
         return ((1.0 + n / 7.0) ** 0.5 + 4.0 * n / (9.0 * math.pi)) ** -0.5
     if functionality == 4:
@@ -1346,6 +1364,96 @@ def multi_tau_lag_axis(dt0_s: float, channels_per_octave: int = 8,
     )
 
 
+def _schatzel_sd(tau: np.ndarray, sample_times: np.ndarray, gamma_bar: float,
+                 beta: float,
+                 mean_count_rate_cps: Optional[float] = None) -> np.ndarray:
+    """Relative per-channel SD of g2-1 from Schaetzel (1990) Eq. (49), ALL SIX groups.
+
+    Eq. (49) (printed p. 296) writes the variance of a photon-correlation estimate for
+    a single exponential as a prefactor `M_k^-1 beta^2` times six term groups. Four of
+    them depend only on the intercept beta, the decay per sample time
+    Gamma_k = gamma_bar * Delta_t_k, and the channel index k = tau_k / Delta_t_k. The
+    remaining two carry the mean counts per sample time n_bar -- the cross and
+    shot-noise contributions -- and sit inside the same braces:
+
+        + 2 beta^-1 n_bar^-1 [1 + e^(-4 Gamma_k k) + 2 beta e^(-2 Gamma_k k)]
+        + beta^-2 n_bar^-2 [1 + beta e^(-2 Gamma_k k)]
+
+    `mean_count_rate_cps=None` (the default) drops those two, which is the
+    infinite-count-rate CLASSICAL LIMIT that `_schatzel_classical_sd` exposes as its own
+    entry point. That function's docstring is the home for the shared approximations,
+    the citations, and how far the limit is from real data; this one is the computation
+    both go through, so the two forms cannot drift apart.
+
+    n_bar_k = mean_count_rate_cps * Delta_t_k -- mean counts per sample time, evaluated
+    per block, the multi-tau substitution of Biganzoli and Ferri (2018, p. 29381). The
+    run duration T still cancels with the shot groups present: it enters only through
+    the common 1/M_k = Delta_t_k / T prefactor, and neither new group carries an M of
+    its own. The return is therefore a RELATIVE shape in arbitrary units, exactly as in
+    the classical case -- only ratios between its entries mean anything.
+
+    The Theory-and-Equations-Guide, "The Noise on a Correlogram" carries the equation
+    for a reader who does not have this file.
+    """
+    dt = sample_times
+    gamma_dt = gamma_bar * dt
+    # Guarded on the COMPUTED product, not on gamma_bar or dt separately: coth(Gamma)
+    # is 1/tanh, so a Gamma that underflows to 0.0 divides by zero, and neither input
+    # alone can be blamed -- a small gamma_bar with a fine sample time is what gets
+    # there. The other tail is safe: a huge Gamma sends tanh to 1 and every
+    # exponential to 0.
+    if not (np.all(np.isfinite(gamma_dt)) and np.min(gamma_dt) > 0):
+        raise ValueError(
+            f"the Schaetzel noise model needs a positive finite decay-per-sample-time "
+            f"gamma_bar * Delta_t on every channel; the smallest is "
+            f"{float(np.min(gamma_dt))!r} for gamma_bar = {gamma_bar!r} s^-1. Check the "
+            f"population sizes and multitau_dt0_s."
+        )
+    k = tau / dt
+    coth_2g = 1.0 / np.tanh(2.0 * gamma_dt)
+    coth_g = 1.0 / np.tanh(gamma_dt)
+    e4 = np.exp(-4.0 * gamma_dt * k)
+    e2 = np.exp(-2.0 * gamma_dt * k)
+    braces = (
+        coth_2g
+        + e4 * (2.0 * k + coth_2g)
+        + 2.0 * beta * e4 * (-2.0 * k + coth_2g - 2.0 * coth_g)
+        + 4.0 * beta * e2 * coth_g
+    )
+    # 1/M_k = Delta_t_k / T, with the common 1/T dropped -- see the docstring.
+    if mean_count_rate_cps is None:
+        var = (beta * beta * dt) * braces
+    else:
+        # n_bar is COMPUTED from two inputs, so the guard is on it and on the variance
+        # it produces rather than on the count rate alone, and it is two-sided: a huge
+        # rate is harmless (the shot groups vanish, recovering the classical limit)
+        # while a tiny one sends 1/n_bar^2 to inf long before n_bar itself underflows
+        # to 0. Computing first and testing the result is what keeps the predicate and
+        # the operation the same expression. `nbar * nbar`, never `nbar ** 2`: on a
+        # Python float `**` RAISES OverflowError where `*` saturates to inf, which
+        # would beat the guard to the answer.
+        nbar = mean_count_rate_cps * dt
+        with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+            braces = braces + (
+                (2.0 / (beta * nbar)) * (1.0 + e4 + 2.0 * beta * e2)
+                + (1.0 / (beta * beta * nbar * nbar)) * (1.0 + beta * e2)
+            )
+            var = (beta * beta * dt) * braces
+        if not (np.all(np.isfinite(nbar)) and np.min(nbar) > 0
+                and np.all(np.isfinite(var))):
+            raise ValueError(
+                f"mean_count_rate_cps = {mean_count_rate_cps!r} gives mean counts per "
+                f"sample time that Eq. (49)'s shot-noise terms cannot use: the smallest "
+                f"n_bar over the channels is {float(np.min(nbar))!r}, and the terms in "
+                f"1/n_bar and 1/n_bar^2 must stay finite on every channel. Use a "
+                f"realistic photon count rate (a real file's is tens to hundreds of kHz)."
+            )
+    # The third group is negative-going, so floating cancellation can leave a variance
+    # a few ulp below zero where the true value is ~0; clamping keeps that from
+    # becoming a nan SD. It is a rounding floor, not a physical one.
+    return np.sqrt(np.maximum(var, 0.0))
+
+
 def _schatzel_classical_sd(tau: np.ndarray, sample_times: np.ndarray,
                            gamma_bar: float, beta: float) -> np.ndarray:
     """Relative per-channel SD of g2-1 from Schaetzel (1990) Eq. (49), CLASSICAL LIMIT.
@@ -1387,58 +1495,430 @@ def _schatzel_classical_sd(tau: np.ndarray, sample_times: np.ndarray,
 
     (3) Eq. (49) is a CLOSED FORM derived for Gamma = Delta_t / tau_c << 1 (Biganzoli
     and Ferri 2018, p. 29378). A multi-tau axis violates that in its coarsest blocks by
-    construction, which is where this shape is least trustworthy. Their Eqs. (8)-(9)
-    are the exact-in-Gamma generalisation and are the canonical replacement; they are
-    not used here because they must be re-read from the source (the printed forms carry
-    prefactor inconsistencies) and because an approximate SHAPE for generated test data
-    is a far weaker claim than a variance used to weight a real fit. Anything that
-    weights real data should start from the exact forms, not from this.
+    construction, which is where this shape is least trustworthy. Their Eq. (9) is the
+    exact-in-Gamma generalisation and the canonical replacement, implemented beside this
+    function as `_biganzoli_sd`; the generator offers that exact form as
+    noise_model='biganzoli_classical' / 'biganzoli_full' and keeps this closed form as
+    its 'schatzel_*' models. This closed form weights no real data: the nonlinear
+    cumulant's sourced weight evaluates the exact form, of which this is the Gamma << 1
+    limit -- kept as the generator's 'schatzel_*' models and as the limit oracle the
+    exact form is tested against, never as a user-selectable weighting.
+
+    (4) HOW WRONG THE CLASSICAL LIMIT IS, measured 2026-09-06 rather than left
+    qualitative. Dropping the two n_bar terms is not a small approximation over the
+    channels that carry fit weight: across the retained range this shape spans 1.9x
+    where real replicate groups span 2.5-22.6x (ALV) and 34-145x (Brookhaven). The
+    retained range IS the short-lag region, which is exactly where Peters (1993, p. 152)
+    says shot noise still matters, so the limit is at its worst precisely where the fit
+    looks. Scored as log10-RMS against the measured per-channel SD on the SIX scorable
+    ALV replicate groups, this shape reaches a median 0.180 where the full six-term
+    Eq. (49) reaches 0.101 -- and the sample-SD estimator's own noise floor at n = 10 is
+    0.107, so the full form is at the floor and this one is not. (The five Brookhaven
+    groups are n = 3, where the floor is 0.277 and the arms are 0.335 against 0.282:
+    same ordering, far less resolving power.) Those shot terms now EXIST, opt-in: they
+    take one new input, a photon count rate, which the ALV and Brookhaven headers
+    already carry, and `generate_synthetic_correlogram`'s `noise_model='schatzel_full'`
+    turns them on.
+    The Theory-and-Equations-Guide, "The Noise on a Correlogram" carries this limit
+    and its figures for the reader who does not have this file.
+
+    This function is the `mean_count_rate_cps=None` branch of `_schatzel_sd`, which
+    carries all six term groups. Both forms go through that one computation, so the
+    limit cannot drift from the equation it is a limit of.
     """
-    dt = sample_times
+    return _schatzel_sd(tau, sample_times, gamma_bar, beta,
+                        mean_count_rate_cps=None)
+
+
+#: Above this decay per sample time Gamma_k, `_biganzoli_sd` evaluates Eq. (9) in its
+#: large-Gamma asymptotic form rather than directly: sinh^6(Gamma) leaves float near
+#: Gamma ~ 120, and past 30 every factor the asymptote drops is 1 to below float
+#: resolution (6 e^(-60) ~ 5e-26). Measured 2026-09-11 on k = 1..30, beta in {1, 0.8,
+#: 0.5}, classical and n_bar in {1, 0.1}, with and without a run duration: the two forms
+#: agree on the variance to 1.0e-15 just below the switch and 6.7e-16 just above it, and
+#: each to 8.9e-16 of Eq. (9) in 250-digit arithmetic (never above 7e-15 on 15..100).
+_BIGANZOLI_ASYMPTOTE_GAMMA = 30.0
+
+#: Below this Gamma, Eq. (10)'s chi0^2 is summed from its Taylor series rather than
+#: formed as written, whose cancellation costs ~eps / Gamma. Measured 2026-09-11 on
+#: [0.05, 0.2] against 60-digit arithmetic: the series to 2.2e-16, the closed form to
+#: 3.6e-15, the two within 3.4e-15 of each other on either side of the switch.
+_BIGANZOLI_CHI0_SERIES_GAMMA = 0.1
+#: chi0^2 = 2 * sum_{n >= 0} (-2 Gamma)^n / (n + 2)!, coefficients of Gamma^n.
+_BIGANZOLI_CHI0_SERIES = tuple(2.0 * (-2.0) ** n / math.factorial(n + 2)
+                               for n in range(14))
+
+#: How far from an integer, relative to it, a lag index k = tau / Delta_t is still that
+#: integer in `_biganzoli_sd`: the tolerance the Brookhaven parser matches a delay written
+#: as '%.9e' to (`parsers.brookhaven_dat._HS_DELAY_RTOL`). Why it is needed: near k = 1
+#: Eq. (9)'s S5 group grows as (k - 1) e^Gamma, so k = 1 + ulp moves the SD by -15 % at
+#: Gamma = 48 and k = 1 - ulp inflates it x153 at Gamma = 60.
+_BIGANZOLI_LAG_INDEX_RTOL = 1e-6
+
+
+def _biganzoli_sd(tau: np.ndarray, sample_times: np.ndarray, gamma_bar: float,
+                  beta: float, mean_count_rate_cps: Optional[float] = None,
+                  duration_s: Optional[float] = None) -> np.ndarray:
+    """Relative per-channel SD of g2-1 from Biganzoli and Ferri (2018) Eq. (9), exact in Gamma.
+
+    The synthetic generator's two 'biganzoli_*' noise models draw through this same
+    function, so a planted correlogram's SD and a weight built from it are one
+    computation.
+
+    Eq. (9) with Eq. (10) (printed p. 29378) is the variance of a photon-correlation
+    estimate for a single exponential with triangular averaging carried to all orders,
+    so it holds for any decay per sample time Gamma = Delta_t / tau_c, not only
+    Gamma << 1. With k the lag index, M = T / Delta_t the number of sample times in the
+    run, n_bar the mean counts per sample time, and the shorthands
+    S_n = sinh^n(Gamma) / Gamma^n, E2 = e^(-2 Gamma k), E4 = e^(-4 Gamma k):
+
+        sigma^2(k) = beta^2 / (M - k) * {
+              2 S2 chi0^2 E4 + 4 beta S2 chi0^2 E2 + 8 beta S3 chi0 E4
+            + S4 [coth(2 Gamma) - 1 + 4 beta E2 (coth(Gamma) - 1)
+                  + E4 (a coth(2 Gamma) + c)]
+            + 4 beta S6 E4 (coth(Gamma) - 1) - 8 beta S5 E4 (k - 2 + coth(Gamma))
+            + chi0^4
+            + 2 beta^-1 n_bar^-1 [chi0^2 + S2 E2 (E2 + 2 beta chi0)
+                                  + 2 beta S3 E4 - 2 beta S4 E4]
+            + beta^-2 n_bar^-2 [1 + beta S2 E2] }
+
+    with, from Eq. (10), chi0^2 = (2 Gamma - 1 + e^(-2 Gamma)) / (2 Gamma^2),
+    a = 1 + 2 beta and c = 2k + 4 beta k - 2 - 8 beta + 4 beta chi0^2 - 16 beta chi0.
+    The same page states that Eq. (9) tends to Schaetzel (1990) Eq. (49), printed p. 296
+    (`_schatzel_sd`), as Gamma << 1; the sum converges at O(Gamma^2), though its term
+    groups do not map one to one onto Eq. (49)'s. The paper's own restatement of
+    Eq. (49), its printed Eq. (7), carries a misprint (-2 coth(2 Gamma) where Schaetzel
+    has -2 coth(Gamma)); the paper's Fig. 2 was computed with Schaetzel's form, so
+    Eq. (49) is the reference and Eq. (7) is not coded from.
+
+    THE RUN DURATION NO LONGER CANCELS. Eq. (9) replaces Eq. (49)'s 1/M by 1/(M - k),
+    the effective number of products at lag k (p. 29378), and on a channel of sample
+    time Delta_t_k that is Delta_t_k / (T - tau_k). The tau_k in it differs per channel,
+    so T drops out of the RELATIVE shape only when T >> tau_max. Given `duration_s`, the
+    prefactor is Delta_t_k / (T - tau_k); without one it is Delta_t_k, the T -> infinity
+    form with the common 1/T dropped, exactly the convention `_schatzel_sd` uses for its
+    1/M. Either way the return is a relative shape in arbitrary units. A lag at or past
+    the end of the run has no products and is refused, never returned as an infinite or
+    negative variance.
+
+    Per channel, Gamma_k = gamma_bar * Delta_t_k, k = tau_k / Delta_t_k and
+    n_bar_k = mean_count_rate_cps * Delta_t_k, with beta the same on every stage -- the
+    multi-tau substitution of Biganzoli and Ferri (2018, p. 29381). k enters Eq. (9) as
+    a whole lag index of at least 1 (tau_k = k Delta_t_k, their Eq. (2), p. 29376), which
+    a multi-tau axis satisfies, so a k within `_BIGANZOLI_LAG_INDEX_RTOL` of an integer --
+    the rounding a written delay carries -- is evaluated AT that integer. Any other k on a
+    channel with tau_k > 0 is REFUSED before anything is evaluated, naming the channel's
+    lag, sample time and index: off the integers the expression is not a variance (near
+    k = 1 its S5 group grows as (k - 1) e^Gamma, so a k below 1 can give an SD inflated
+    without limit, and one just above 1 a collapsed one, both finite and positive). A
+    sample time that does not divide its lag a whole number of times contradicts it. The
+    axis stand-in (`_channel_sample_times`) always gives a whole index, so only a stated
+    sample time can reach the refusal. A tau = 0 channel (k = 0 exactly) is evaluated as
+    it is. The estimator it describes
+    uses the symmetric normalization of their Eqs. (2)-(3) (p. 29376). That premise is
+    inherited from Eq. (49) and disclosed here, not chosen: no export records which
+    normalization the correlator applied.
+
+    CANONICAL-METHOD ANCHOR: the canonical form. Eq. (9) is the exact-in-Gamma variance
+    and supersedes Eq. (49) outside Gamma << 1. Three named practicality divergences,
+    each a limit or a rewriting of Eq. (9), none a different model:
+    (1) the CLASSICAL LIMIT when `mean_count_rate_cps` is None -- the two n_bar brackets
+        are dropped, as `_schatzel_sd` drops Eq. (49)'s;
+    (2) the T -> INFINITY FORM when `duration_s` is None -- 1/(M - k) taken as 1/M, the
+        common 1/T dropped;
+    (3) the LARGE-GAMMA ASYMPTOTIC BRANCH above `_BIGANZOLI_ASYMPTOTE_GAMMA`. Direct
+        evaluation leaves float range near Gamma ~ 120, where sinh^6(Gamma) overflows,
+        and a correlator's coarsest blocks reach past that on slow samples. Above the
+        switch every S_n is taken as e^(n Gamma) / (2 Gamma)^n and every coth as 1 plus
+        its leading exponential; the factors dropped are 1 to below float resolution
+        there. Each surviving exponential is merged with the E2 or E4 it multiplies into
+        one exp of an integer multiple of Gamma, and the classical braces are carried
+        scaled by Gamma^2, since they fall as chi0^4 ~ 1/Gamma^2 and the variance would
+        otherwise underflow past Gamma ~ 1e154 while the SD stays representable. The
+        switch sits at Gamma = 30; measured 2026-09-11, the two forms agree there with
+        each other and with Eq. (9) in 250-digit arithmetic to about 1e-15 relative on
+        the variance, on both sides (the constant's comment carries the figures).
+
+    Below `_BIGANZOLI_CHI0_SERIES_GAMMA`, chi0^2 is summed from its Taylor series,
+    1 - 2 Gamma / 3 + Gamma^2 / 3 - ..., because the closed form cancels to a relative
+    error ~ eps / Gamma and reaches zero or below near Gamma ~ 1e-16. Every coth - 1 is
+    formed as 2 / expm1(2 x), and k - 2 + coth(Gamma) as (k - 1) + (coth(Gamma) - 1), so
+    the k = 1 channel does not cancel.
+
+    Raises ValueError, naming the input to change, unless Gamma_k, n_bar_k (when a rate
+    is given) and T - tau_k (when a duration is given) are finite and positive on every
+    channel, every channel with tau_k > 0 has a whole lag index of at least 1, and the SD
+    returned is finite and positive on every channel.
+    """
+    tau, dt = np.broadcast_arrays(np.asarray(tau, dtype=float),
+                                  np.asarray(sample_times, dtype=float))
     gamma_dt = gamma_bar * dt
-    # Guarded on the COMPUTED product, not on gamma_bar or dt separately: coth(Gamma)
-    # is 1/tanh, so a Gamma that underflows to 0.0 divides by zero, and neither input
-    # alone can be blamed -- a small gamma_bar with a fine sample time is what gets
-    # there. The other tail is safe: a huge Gamma sends tanh to 1 and every
-    # exponential to 0.
+    # Guarded on the COMPUTED product, as in `_schatzel_sd`: an underflowed Gamma divides
+    # by zero in every coth, and no single input is to blame for the product.
     if not (np.all(np.isfinite(gamma_dt)) and np.min(gamma_dt) > 0):
         raise ValueError(
-            f"the Schaetzel noise model needs a positive finite decay-per-sample-time "
+            f"the Biganzoli-Ferri variance needs a positive finite decay-per-sample-time "
             f"gamma_bar * Delta_t on every channel; the smallest is "
-            f"{float(np.min(gamma_dt))!r} for gamma_bar = {gamma_bar!r} s^-1. Check the "
-            f"population sizes and multitau_dt0_s."
+            f"{float(np.min(gamma_dt))!r} for gamma_bar = {gamma_bar!r} s^-1."
         )
-    k = tau / dt
-    coth_2g = 1.0 / np.tanh(2.0 * gamma_dt)
-    coth_g = 1.0 / np.tanh(gamma_dt)
-    e4 = np.exp(-4.0 * gamma_dt * k)
-    e2 = np.exp(-2.0 * gamma_dt * k)
-    # 1/M_k = Delta_t_k / T, with the common 1/T dropped -- see the docstring.
-    var = (beta * beta * dt) * (
-        coth_2g
-        + e4 * (2.0 * k + coth_2g)
-        + 2.0 * beta * e4 * (-2.0 * k + coth_2g - 2.0 * coth_g)
-        + 4.0 * beta * e2 * coth_g
+    # Eq. (9) is a function of an INTEGER lag index, and k = tau / Delta_t comes from two
+    # floats a file or a layout wrote: a k one rounding from an integer IS that integer.
+    # Snapped here, where k is formed, so no second predicate stands beside it (owner-
+    # ruled 2026-09-11, this comment its normative home).
+    with np.errstate(over='ignore', invalid='ignore'):
+        k = tau / dt
+        k_int, whole = _whole_lag_index(k)
+    k = np.where(whole, k_int, k)
+    # What the snap leaves off the integers is refused before anything is evaluated: Eq. (9)
+    # is written on tau_k = k Delta_t with k a whole number of at least 1, and off that
+    # premise the expression is not a variance. A tau = 0 channel (k = 0 exactly) is exempt
+    # and evaluated as it always was: whether Eq. (9) should weight a zero lag at all is a
+    # separate question this refusal does not settle.
+    off_index = (tau > 0) & ~whole
+    if np.any(off_index):
+        bad = int(np.argmax(off_index))
+        raise ValueError(
+            f"Eq. (9) is written on a whole lag index k = tau / Delta_t of at least 1, and "
+            f"the channel at lag tau = {float(tau[bad])!r} s has sample time Delta_t = "
+            f"{float(dt[bad])!r} s, so k = {float(k[bad])!r}: the sample time contradicts "
+            f"its lag. Give each channel the sample time its correlator accumulated it over, "
+            f"which divides its lag a whole number of times."
+        )
+    if duration_s is None:
+        inv_products = dt
+    else:
+        # The guard names the prefactor the variance multiplies, not only T - tau_k: a
+        # positive but subnormal remainder still overflows dt / (T - tau_k).
+        with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+            remaining = duration_s - tau
+            inv_products = dt / remaining
+        usable = (np.isfinite(remaining) & (remaining > 0)
+                  & np.isfinite(inv_products))
+        if not (math.isfinite(duration_s) and duration_s > 0 and np.all(usable)):
+            bad = int(np.argmin(usable))
+            raise ValueError(
+                f"duration_s = {duration_s!r} s leaves no products at lag tau = "
+                f"{float(tau[bad])!r} s: Eq. (9)'s 1/(M - k) = Delta_t / (T - tau) needs a "
+                f"finite run duration longer than every lag. Give the measurement's run "
+                f"duration, or None for the T -> infinity form."
+            )
+    nbar = None if mean_count_rate_cps is None else mean_count_rate_cps * dt
+
+    asymptotic = gamma_dt > _BIGANZOLI_ASYMPTOTE_GAMMA
+    direct = ~asymptotic
+    root_braces = np.empty(gamma_dt.shape)
+    with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+        if np.any(direct):
+            root_braces[direct] = np.sqrt(_biganzoli_direct_braces(
+                k[direct], gamma_dt[direct], beta,
+                None if nbar is None else nbar[direct]))
+        if np.any(asymptotic):
+            root_braces[asymptotic] = _biganzoli_asymptotic_root_braces(
+                k[asymptotic], gamma_dt[asymptotic], beta,
+                None if nbar is None else nbar[asymptotic])
+        # The square roots are taken apart so neither product can underflow on the way.
+        sd = beta * np.sqrt(inv_products) * root_braces
+
+    if nbar is not None:
+        # Two-sided, as in `_schatzel_sd`: a huge rate is harmless (the shot brackets
+        # vanish), a tiny one sends 1/n_bar^2 to inf long before n_bar underflows. The
+        # predicate names the shot terms themselves, which is what the message blames: an
+        # SD left non-finite by anything else (a negative beta) is the guard below's.
+        with np.errstate(over='ignore', divide='ignore'):
+            inv_nbar2 = 1.0 / (nbar * nbar)
+        if not (np.all(np.isfinite(nbar)) and np.min(nbar) > 0
+                and np.all(np.isfinite(inv_nbar2))):
+            raise ValueError(
+                f"mean_count_rate_cps = {mean_count_rate_cps!r} gives mean counts per "
+                f"sample time that Eq. (9)'s shot-noise terms cannot use: the smallest "
+                f"n_bar over the channels is {float(np.min(nbar))!r}, and the terms in "
+                f"1/n_bar and 1/n_bar^2 must stay finite on every channel. Use a "
+                f"realistic photon count rate (a real file's is tens to hundreds of kHz)."
+            )
+    if not (np.all(np.isfinite(sd)) and np.min(sd) > 0):
+        bad = int(np.argmin(np.isfinite(sd) & (sd > 0)))
+        raise ValueError(
+            f"Eq. (9) gives no finite positive SD at lag tau = {float(tau[bad])!r} s "
+            f"(Gamma_k = {float(gamma_dt[bad])!r}, k = {float(k[bad])!r}) for "
+            f"gamma_bar = {gamma_bar!r} s^-1 and beta = {beta!r}. Check beta, the fitted "
+            f"intercept (0 < beta <= 1); that gamma_bar * Delta_t is not so small that "
+            f"1/Gamma_k overflows; and, with a count rate, that it is not so low that the "
+            f"1/n_bar^2 term overflows."
+        )
+    return sd
+
+
+def _whole_lag_index(k: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """The nearest whole lag index to k, at least 1, and where k already is that index.
+
+    "Already is" means within `_BIGANZOLI_LAG_INDEX_RTOL` of it, relative -- the rounding a
+    written delay carries. One computation for the two sites that ask the question:
+    `_biganzoli_sd` snaps such a k onto the integer and refuses the rest, and
+    `_channel_sample_times` keeps the forward spacing wherever it already gives such a k.
+    k = 0 is not whole (its nearest index is 1), and a non-finite k never is.
+    """
+    k_int = np.maximum(np.round(k), 1.0)
+    return k_int, np.abs(k - k_int) <= _BIGANZOLI_LAG_INDEX_RTOL * k_int
+
+
+def _biganzoli_direct_braces(k: np.ndarray, gamma: np.ndarray, beta: float,
+                             nbar: Optional[np.ndarray]) -> np.ndarray:
+    """The braces of Eq. (9), evaluated as printed, for `_biganzoli_sd` below its switch.
+
+    `nbar=None` drops the two shot-noise brackets. The closed forms are rearranged only
+    where float would cancel; the docstring of `_biganzoli_sd` says which and why.
+    """
+    series = gamma < _BIGANZOLI_CHI0_SERIES_GAMMA
+    g_closed = np.maximum(gamma, _BIGANZOLI_CHI0_SERIES_GAMMA)
+    chi2 = np.where(
+        series,
+        np.polynomial.polynomial.polyval(gamma, _BIGANZOLI_CHI0_SERIES),
+        (2.0 * g_closed + np.expm1(-2.0 * g_closed)) / (2.0 * g_closed * g_closed))
+    chi = np.sqrt(chi2)
+    s1 = np.sinh(gamma) / gamma
+    s2 = s1 * s1
+    s3 = s2 * s1
+    s4 = s2 * s2
+    s5 = s4 * s1
+    s6 = s4 * s2
+    e2 = np.exp(-2.0 * gamma * k)
+    e4 = np.exp(-4.0 * gamma * k)
+    coth_g_m1 = 2.0 / np.expm1(2.0 * gamma)           # coth(Gamma) - 1
+    coth_2g_m1 = 2.0 / np.expm1(4.0 * gamma)          # coth(2 Gamma) - 1
+    a = 1.0 + 2.0 * beta
+    c = (2.0 * k + 4.0 * beta * k - 2.0 - 8.0 * beta
+         + 4.0 * beta * chi2 - 16.0 * beta * chi)
+    braces = (
+        2.0 * s2 * chi2 * e4
+        + 4.0 * beta * s2 * chi2 * e2
+        + 8.0 * beta * s3 * chi * e4
+        + s4 * (coth_2g_m1 + 4.0 * beta * e2 * coth_g_m1
+                + e4 * (a * (1.0 + coth_2g_m1) + c))
+        + 4.0 * beta * s6 * e4 * coth_g_m1
+        - 8.0 * beta * s5 * e4 * ((k - 1.0) + coth_g_m1)
+        + chi2 * chi2
     )
-    # The third group is negative-going, so floating cancellation can leave a variance
-    # a few ulp below zero where the true value is ~0; clamping keeps that from
-    # becoming a nan SD. It is a rounding floor, not a physical one.
-    return np.sqrt(np.maximum(var, 0.0))
+    if nbar is not None:
+        braces = braces + (
+            (2.0 / (beta * nbar)) * (chi2 + s2 * e2 * (e2 + 2.0 * beta * chi)
+                                     + 2.0 * beta * s3 * e4 - 2.0 * beta * s4 * e4)
+            + (1.0 / (beta * beta * nbar * nbar)) * (1.0 + beta * s2 * e2)
+        )
+    return braces
+
+
+def _biganzoli_asymptotic_root_braces(k: np.ndarray, gamma: np.ndarray, beta: float,
+                                      nbar: Optional[np.ndarray]) -> np.ndarray:
+    """Square root of Eq. (9)'s braces in the large-Gamma form, for `_biganzoli_sd`.
+
+    With u = 1/Gamma: S_n -> e^(n Gamma) u^n / 2^n, coth(Gamma) - 1 -> 2 e^(-2 Gamma),
+    coth(2 Gamma) - 1 -> 2 e^(-4 Gamma), coth(2 Gamma) -> 1 inside a coth(2 Gamma) + c,
+    and Gamma chi0^2 -> 1 - u/2. Every exponential is merged with the E2 or E4 it
+    multiplies. The classical braces are formed times Gamma^2 and square-rooted before
+    the 1/Gamma is put back; the shot-noise brackets, which do not fall with Gamma, are
+    added in quadrature unscaled. `nbar=None` drops them.
+    """
+    u = 1.0 / gamma
+    u2 = u * u
+    q = 1.0 - 0.5 * u                                  # Gamma * chi0^2
+    chi = np.sqrt(u * q)
+    x24 = np.exp((2.0 - 4.0 * k) * gamma)              # S2 E4 without its u^2 / 4
+    x22 = np.exp((2.0 - 2.0 * k) * gamma)              # S2 E2, S4 E2 (coth(Gamma) - 1)
+    x34 = np.exp((3.0 - 4.0 * k) * gamma)              # S3 E4, S5 E4 (coth(Gamma) - 1)
+    x44 = np.exp((4.0 - 4.0 * k) * gamma)              # S4 E4, S6 E4 (coth(Gamma) - 1)
+    km1 = k - 1.0
+    # (k - 1) S5 E4: zero on k = 1 exactly, where exp(Gamma) alone would overflow.
+    x54 = np.where(km1 == 0.0, 0.0, km1 * np.exp((5.0 - 4.0 * k) * gamma))
+    a = 1.0 + 2.0 * beta
+    c = (2.0 * k + 4.0 * beta * k - 2.0 - 8.0 * beta
+         + 4.0 * beta * u * q - 16.0 * beta * chi)
+    classical_scaled = (
+        0.5 * u * q * x24
+        + beta * u * q * x22
+        + beta * u * chi * x34
+        + 0.125 * u2
+        + 0.5 * beta * u2 * x22
+        + 0.0625 * u2 * (a + c) * x44
+        + 0.125 * beta * u2 * u2 * x44
+        - 0.25 * beta * u2 * u * (x54 + 2.0 * x34)
+        + q * q
+    )
+    root = np.sqrt(classical_scaled) * u
+    if nbar is None:
+        return root
+    shot = (
+        (2.0 / (beta * nbar)) * (u * q + 0.25 * u2 * (x24 + 2.0 * beta * chi * x22)
+                                 + 0.25 * beta * u2 * u * x34
+                                 - 0.125 * beta * u2 * u2 * x44)
+        + (1.0 / (beta * beta * nbar * nbar)) * (1.0 + 0.25 * beta * u2 * x22)
+    )
+    return np.hypot(root, np.sqrt(shot))
+
+
+#: How far from a half-integer, relative to it, a lag-to-spacing ratio still counts as that
+#: half-integer in `_channel_sample_times`, so a tie rounds up on every channel. The written
+#: precision measured on the committed delay axes (2026-09-14: ALV rounding to 7.7e-5,
+#: Brookhaven CSV ties to 9.2e-5, the Panta's to 1.5e-6). Its own constant, not
+#: `_BIGANZOLI_LAG_INDEX_RTOL`, which is about evaluating Eq. (9) AT an integer (owner-ruled
+#: 2026-09-14). Wider than needed is harmless: a ratio that near a tie has no preferred
+#: direction, and above k = 1 / (2 * this), where it covers every ratio, rounding up moves
+#: Delta_t by at most 1 / k.
+_SAMPLE_TIME_HALF_SNAP_RTOL = 1e-4
 
 
 def _channel_sample_times(tau: np.ndarray) -> np.ndarray:
     """Per-channel sample time for an axis that does not carry one explicitly.
 
     On a multi-tau axis Delta_t_k is a property of the block and comes from
-    `MultiTauAxis`; on a plain log or linear grid the only sensible stand-in is the
-    local channel spacing, with the first channel borrowing the second's (there is no
-    preceding channel to difference against). Used by the 'schatzel_classical' noise
-    model so it stays orthogonal to the choice of axis.
+    `MultiTauAxis`; an axis that states none gets a stand-in read off its lags, which
+    Eq. (9) (`_biganzoli_sd`) then evaluates at the lag index k = tau_k / Delta_t_k. The
+    rule has two halves.
+
+    WHERE THE LAGS ARE WHOLE MULTIPLES, THE FORWARD SPACING. Each channel's step to the one
+    after it, the last channel borrowing the one before it, is kept wherever it already
+    gives a whole lag index (`_whole_lag_index`). That is the reading under which Schaetzel's printed
+    multi-tau layout (Sec. 3.2, p. 300; what `multi_tau_lag_axis` builds) comes back
+    exactly on every channel: block j spans the lags L*Delta_t_j ... (2L-1)*Delta_t_j, so
+    block j begins one fine step after block j-1 ends, at L*Delta_t_j = 2L*Delta_t_(j-1)
+    -- no lag is shared -- and that channel's forward step is its own block's sample time.
+    The backward spacing reads half of it there (owner-ruled 2026-09-08: follow the paper;
+    the engine's `analysis.dls._common.channel_sample_times` is the ruling's home).
+
+    ELSEWHERE, THE NEAREST SAMPLE TIME WITH A WHOLE LAG INDEX. On a plain log or linear
+    grid, or a real staircase whose written lags carry rounding or sit offset from their
+    block's multiples (most channels of every committed real axis), the forward spacing s_k
+    gives a fractional k, on which Eq. (9) is not a variance. There Delta_t_k =
+    tau_k / n_k, with n_k = tau_k / s_k rounded half up and at least 1: a lag shorter than
+    its spacing takes Delta_t_k = tau_k. A ratio within `_SAMPLE_TIME_HALF_SNAP_RTOL` of a
+    half-integer counts as that half-integer first, so a tie rounds up on every channel,
+    exact or carrying float noise either side; above k = 5000 that relative window covers
+    every ratio and the ratio simply rounds up. This is a stand-in with no source -- no
+    source evaluates the variance off the integers or says what sample time to use when
+    a file states none -- chosen so Eq. (9) stays on the premise it is written on, not as
+    a more accurate Delta_t (owner-ruled 2026-09-14; `channel_sample_times`'s docstring in
+    `analysis.dls._common` is the ruling's home).
+
+    A tau = 0 channel keeps its forward spacing, as does a channel whose ratio is not
+    finite. Only an infinite lag gets there, and the data model refuses one: on a strictly
+    increasing finite axis no step is zero (gradual underflow), and tau / step stays below
+    2^53. A one-channel axis returns Delta_t = tau (k = 1).
+    Used by the four per-channel noise models on non-staircase axes, and by the engine,
+    so a planted SD and the weight built from it are one computation.
     """
+    tau = np.asarray(tau, dtype=float)
     if tau.size < 2:
-        return np.full(tau.shape, 1.0)
+        return tau.copy()
     step = np.diff(tau)
-    return np.concatenate(([step[0]], step))
+    spacing = np.concatenate((step, [step[-1]]))
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        ratio = tau / spacing
+        _nearest, whole = _whole_lag_index(ratio)
+        half = np.floor(ratio) + 0.5
+        tied = np.abs(ratio - half) <= _SAMPLE_TIME_HALF_SNAP_RTOL * half
+        n = np.maximum(np.floor(np.where(tied, half, ratio) + 0.5), 1.0)
+        rounded = tau / n
+    replace = (tau > 0) & np.isfinite(ratio) & ~whole
+    return np.where(replace, rounded, spacing)
 
 
 @dataclass
@@ -1469,9 +1949,29 @@ class SyntheticPopulation:
 class SyntheticCorrelogramResult:
     """A generated correlogram plus the ground truth used to make it.
 
-    The ground-truth cumulant fields (gamma_bar, mu2, pdi) are what an ideal
-    cumulant analysis of this correlogram should recover, which makes this
-    object directly useful for validating the DLS analysis routines.
+    The ground-truth moment fields are exact amplitude-weighted moments of the
+    DISCRETISED decay-rate spectrum this curve was actually built from -- the
+    (gammas, amps) pairs summed into `signal` -- so they hold for any population
+    shape, and are never a closed form for one assumed distribution.
+
+    TWO THINGS THAT SENTENCE IS CAREFUL ABOUT, both of which have already bitten:
+
+    1. "the discretised spectrum", NOT the nominal distribution asked for. A
+       `spread_cv` population is sampled on a grid truncated at +/-3 sigma_ln (~99.7 %
+       of the mass); that truncation is negligible at order 2 and not above it.
+       Measured against the analytic lognormal over spread_cv 0.05..0.5: mu2 off by
+       2.4..5.0 %, mu3 by 12..22 %, mu4 by 10..36 %, and kappa4 -- a difference of two
+       nearly-equal quantities, so the error is amplified -- by 47..410 %, including a
+       SIGN FLIP below spread_cv ~ 0.15. None of that makes these fields wrong: an
+       ideal cumulant fit of THIS curve recovers THESE numbers, which is exactly what
+       an oracle needs. It does mean they must not be checked against a closed form for
+       the nominal distribution. For a fixture whose moments must match a named
+       distribution to high order, plant it explicitly as zero-width populations --
+       `tests/test_utilities.py::_schulz_populations` is the worked example.
+    2. Only the first three are recoverable by ANY cumulant fit. The fourth order is
+       ARM-SPECIFIC: a linear (`mailer2015` Eq. 12) fit's quartic coefficient gives
+       kappa4 and never mu4; a nonlinear (Eq. 13) fit gives mu4 and never kappa4. Both
+       are planted so each arm can be checked against the one it actually returns.
     """
     # the generated curve
     delay_times_s: np.ndarray
@@ -1495,16 +1995,39 @@ class SyntheticCorrelogramResult:
     gamma_bar_s_inv: float             # first cumulant: mean decay rate
     mu2_s_inv2: float                  # second cumulant: variance of decay rate
     pdi: float                         # mu2 / gamma_bar^2
+    # Third and fourth order. The block header says "as a cumulant fit sees it", so the
+    # moment-vs-cumulant split has to be spelled out rather than left to the reader:
+    # `mailer2015`'s terminology note (printed p. 6) states that the cumulants differ
+    # from the central moments only at ORDER 4 AND HIGHER. Hence mu3 is both, while the
+    # fourth order needs two fields because the two arms return different quantities --
+    # Mailer Eq. 13 (nonlinear) fits mu4, Eq. 12 (linear) gives its quartic coefficient
+    # as (mu4 - 3 mu2^2). Planting both is what lets each arm be checked against the
+    # quantity it actually produces instead of one standing in for the other.
+    mu3_s_inv3: float                  # third central moment == third cumulant
+    mu4_s_inv4: float                  # fourth CENTRAL MOMENT (Mailer Eq. 13's parameter)
+    kappa4_s_inv4: float               # fourth CUMULANT, mu4 - 3 mu2^2 (Mailer Eq. 12's c4)
     d_eff_m2_s: float                  # effective diffusion coefficient
     rh_eff_nm: float                   # effective (apparent) hydrodynamic radius
 
     # Multi-tau / per-channel-noise context. Defaulted so every existing caller and
     # every existing constructed instance is unaffected; the first two are what a
     # variance-weighting study reads back.
-    noise_model: str = 'constant'      # 'constant' | 'schatzel_classical'
+    noise_model: str = 'constant'      # 'constant' | 'schatzel_classical' | 'schatzel_full'
+    #                                    | 'biganzoli_classical' | 'biganzoli_full'
     sample_times_s: Optional[np.ndarray] = None    # per-channel Delta_t_k
     noise_sd: Optional[np.ndarray] = None          # per-channel sigma actually drawn
     duplicate_lag_indices: Optional[np.ndarray] = None
+    # The flat g2-1 offset planted in `signal` (0.0 = none). Ground truth for the
+    # floating-baseline fits: what they must recover is this number.
+    baseline: float = 0.0
+    # The opt-in noise knobs, echoed so a generated curve says how its noise was made:
+    # the count rate the shot-noise terms consumed (None unless noise_model is one of
+    # the full models), the run duration Eq. (9)'s 1/(M - k) consumed (None unless a
+    # 'biganzoli_*' model was given one), and the lag-1 channel-to-channel correlation
+    # planted in the draw (0.0 = independent channels, the historical behaviour).
+    mean_count_rate_cps: Optional[float] = None
+    duration_s: Optional[float] = None
+    noise_correlation: float = 0.0
 
 
 def generate_synthetic_correlogram(
@@ -1528,6 +2051,10 @@ def generate_synthetic_correlogram(
     multitau_channels_per_octave: int = 8,
     multitau_n_blocks: int = 22,
     multitau_duplicate_boundary_lag: bool = False,
+    baseline: float = 0.0,
+    mean_count_rate_cps: Optional[float] = None,
+    noise_correlation: float = 0.0,
+    duration_s: Optional[float] = None,
 ) -> SyntheticCorrelogramResult:
     """Generate an artificial DLS correlogram from specified size populations.
 
@@ -1558,6 +2085,36 @@ def generate_synthetic_correlogram(
         column. 0.0 (default) gives a clean correlogram. A realistic value for
         g2m1 data is around 0.002-0.01. The noise is applied on the scale of
         the chosen output_form.
+
+        TWO WAYS THIS NOISE IS NOT WHAT AN INSTRUMENT PRODUCES, EACH NOW
+        OPT-IN -- the defaults still produce neither, so read both before
+        drawing a correctness conclusion from generated data. Both were measured
+        against the committed real replicate groups.
+
+        (1) The draws are INDEPENDENT PER CHANNEL unless `noise_correlation` is
+        set. Real correlogram noise is correlated between neighbouring lag
+        channels: measured lag-1 correlation is +0.27 to +0.43, against -0.019
+        for an independent draw. The bracket's two ends are two
+        different nuisance corrections and neither is a point estimate -- the
+        lower end removes per-run amplitude AND per-run decay-rate drift, which
+        also removes some real noise, and at n = 3 it over-corrects; the clean
+        ALV-only figure is +0.304. Correlated noise is what breaks regularized
+        fits' smoothing-parameter selection -- Peters (1993, ch. 3) measured
+        exactly this and reported that synthetic photon noise reproduced NONE of
+        the pathology he saw on real data (his Fig. 3.20). At the default
+        `noise_correlation=0.0` this generator cannot exercise that failure mode
+        at all, and a validation run there runs under the one condition that
+        makes the pathology vanish.
+
+        (2) The per-channel SD SPAN is far too narrow over the channels that
+        carry fit weight unless `noise_model` is one of the full models: 1.9x for the
+        classical limit against 2.5-22.6x (ALV) and 34-145x (Brookhaven)
+        measured. The cause is the missing shot-noise terms -- see
+        `_schatzel_sd`, and `mean_count_rate_cps` for what turning them on buys.
+
+        The Theory-and-Equations-Guide, "The Noise on a Correlogram" states
+        both limits with their figures, for the reader who does not have this
+        file.
     delay_min_s, delay_max_s : float
         Range of delay times, in seconds. Default 1e-7 s to 1 s spans the
         typical DLS window. IGNORED when grid='multitau', whose axis is set by the
@@ -1590,6 +2147,20 @@ def generate_synthetic_correlogram(
         so that `noise_level` is the SD of the FIRST channel. See
         `_schatzel_classical_sd` for the formula, its two stated approximations, and
         why only the shape is taken.
+        'schatzel_full': the same shape with Eq. (49)'s two shot-noise term groups
+        restored. It REQUIRES `mean_count_rate_cps` -- there is no honest default for a
+        photon count rate -- and it is the arm that reproduces the per-channel SD span
+        real files show; the models without '_full' refuse that argument. See
+        `_schatzel_sd`.
+        'biganzoli_classical' / 'biganzoli_full': the per-channel SD with the SHAPE of
+        Biganzoli and Ferri (2018) Eq. (9), printed p. 29378, which is exact in
+        Gamma = Delta_t / tau_c where Eq. (49) is a closed form for Gamma << 1 -- the
+        difference that matters in a multi-tau axis's coarsest blocks. Anchored on the
+        first channel exactly as the Schaetzel models are, and evaluated by
+        `_biganzoli_sd`, the same function a fit weight built on Eq. (9) evaluates, so
+        the planted SD and such a weight are one computation. 'biganzoli_full' REQUIRES
+        `mean_count_rate_cps` as 'schatzel_full' does, and 'biganzoli_classical', its
+        classical limit, refuses it. Both consume `duration_s`.
 
         Why the shape matters: it is not monotonic. The per-channel noise falls
         through the correlogram's decay, then TURNS UP in the coarsest blocks where
@@ -1602,11 +2173,15 @@ def generate_synthetic_correlogram(
         monotonically by ~1400x and bury the longest lags in noise larger than the
         signal.
 
-        The run duration does not appear: it is common to every channel and cancels
-        out of the relative shape (see `_schatzel_classical_sd`).
+        Under the two Schaetzel models the run duration does not appear: it is common
+        to every channel and cancels out of the relative shape (see
+        `_schatzel_classical_sd`). Under the two exact models it does not cancel; see
+        `duration_s`.
 
-        Orthogonal to `grid`: on a 'log' or 'linear' axis Delta_t_k is the local
-        channel spacing.
+        Orthogonal to `grid`: on a 'log' or 'linear' axis Delta_t_k is the axis
+        stand-in `_channel_sample_times` gives, the nearest sample time with a whole lag
+        index (a lag shorter than its channel spacing takes its own lag), which is also
+        what the engine's weight reads off an axis that states no sample times.
     multitau_dt0_s : float
         Finest sample time Delta_t_0, in seconds (default 25 ns, an ALV's). grid='multitau' only.
     multitau_channels_per_octave : int
@@ -1618,6 +2193,72 @@ def generate_synthetic_correlogram(
         Emit each block-boundary lag twice, the Prometheus Panta's convention (default
         False). The resulting axis is NOT strictly increasing and so is not loadable
         until a parser discards the repeats; see `multi_tau_lag_axis`.
+    baseline : float
+        A FLAT offset B added to g2(tau)-1, i.e. the column becomes
+        ``B + beta*|g1|^2`` (default 0.0, which changes nothing). This is the residual
+        instrument baseline a real correlator leaves behind when its measured baseline
+        does not equal its calculated one -- the condition the floating-baseline
+        cumulant fit exists to absorb, and the one the KWW data-form decay criterion is
+        sensitive to. Named ``baseline`` (never ``offset``) to match the fixture it
+        replaces, ``tests/fixtures/synthetic_dls.py::monomodal``, and to stay clear of
+        ``build_count_rate_trace``'s ``offset_*`` family, which is a count-rate STEP on
+        a different builder.
+
+        Applied on the g2-1 scale BEFORE the output-form mapping, so ``'g2'`` carries it
+        too (``1 + B + beta|g1|^2``). ``output_form='g1'`` with a non-zero baseline is
+        REFUSED rather than silently ignored: a flat offset on the intensity correlation
+        has no field-correlation equivalent, and handing back a clean g1 curve labelled
+        as carrying an offset is the kind of quiet no-op a generator must not do.
+        The planted value is echoed on the result as ``baseline``, so a fit's recovered
+        B has a ground truth to be checked against.
+    mean_count_rate_cps : float, optional
+        Mean photon count rate in counts per second, the one extra measured input
+        Eq. (49)'s shot-noise groups need (per channel they consume
+        ``mean_count_rate_cps * Delta_t_k``, the mean counts per sample time). REQUIRED
+        by the two full models, ``noise_model='schatzel_full'`` and
+        ``'biganzoli_full'``, and REFUSED by the other three rather
+        than silently ignored -- the same refusal ``baseline`` carries against
+        ``output_form='g1'``, and for the same reason: a knob the generator accepts and
+        then does not use is a quiet no-op the caller has no way to notice.
+
+        What it buys: with a real file's vendor count rate the full model reproduces
+        that file's measured per-channel SD to within the sample-SD estimator's own
+        noise floor on every one of the twelve committed replicate groups -- seven
+        ALV angles at n = 10 and five Brookhaven fractions at n = 3, the dust-affected
+        ALV 44 degree run excluded by identity -- where the classical limit exceeds
+        that floor on seven of them -- four ALV angles and three Brookhaven fractions,
+        two of those by less than the floor estimator's own spread (measured
+        2026-09-07; the fidelity test in
+        `tests/test_utilities.py` is the record). Real files carry tens to hundreds of
+        kHz, and the shot terms dominate the span at the low end of that range.
+    noise_correlation : float
+        Lag-1 correlation coefficient rho of the noise between neighbouring channels,
+        strictly inside (-1, 1). 0.0 (default) draws every channel independently,
+        exactly as before. A non-zero value draws a stationary AR(1) sequence in CHANNEL
+        INDEX with unit variance per channel, so the per-channel SD is untouched and
+        only the neighbour correlation moves; the planted value is echoed on the result.
+
+        A FLAGGED CONVENIENCE SIMPLIFICATION, not the canonical model. An AR(1) in
+        channel index reproduces the measured lag-1 statistic (+0.27 to +0.43 on real
+        data; +0.30 is the clean ALV figure) and NOTHING ELSE about the covariance --
+        neither the multi-tau block structure nor the coherence-time correlation that
+        reaches beyond one channel. The canonical alternative is the full covariance:
+        Schaetzel (1990) Eq. (48), printed p. 296, generalised across multi-tau stages
+        by Peters (1993, sec. 3.3.1, Eqs. 3.9 and 3.11), drawn through a Cholesky factor
+        of that matrix. It is not done here for two reasons, both stated so the choice
+        is visible: those equations must be re-read from the source before they can be
+        implemented faithfully, and the noise a generator plants is a far weaker claim
+        than a variance used to weight or whiten a real fit. Anything that weights real
+        data starts from the full covariance, never from this.
+    duration_s : float, optional
+        The run duration T, in seconds, consumed only by the two exact models,
+        ``noise_model='biganzoli_classical'`` and ``'biganzoli_full'``. Eq. (9)'s
+        1/(M - k) = Delta_t_k / (T - tau_k) differs per channel, so T stays in the
+        relative shape unless T is much longer than the last lag. None (default) is
+        the T -> infinity form. REFUSED with every other model, as
+        ``mean_count_rate_cps`` is: Eq. (49)'s relative shape cancels T. A duration
+        that the axis's lags reach or pass leaves a channel with no products and is
+        refused by `_biganzoli_sd`, naming ``duration_s``.
 
     Returns
     -------
@@ -1658,13 +2299,62 @@ def generate_synthetic_correlogram(
     if grid not in ('log', 'linear', 'multitau'):
         raise ValueError(
             f"grid must be 'log', 'linear', or 'multitau', got {grid!r}.")
-    if noise_model not in ('constant', 'schatzel_classical'):
+    if noise_model not in ('constant', 'schatzel_classical', 'schatzel_full',
+                           'biganzoli_classical', 'biganzoli_full'):
         raise ValueError(
-            f"noise_model must be 'constant' or 'schatzel_classical', got "
-            f"{noise_model!r}.")
+            f"noise_model must be 'constant', 'schatzel_classical', 'schatzel_full', "
+            f"'biganzoli_classical' or 'biganzoli_full', got {noise_model!r}.")
     if output_form not in ('g2m1', 'g2', 'g1'):
         raise ValueError(
             f"output_form must be 'g2m1', 'g2', or 'g1', got {output_form!r}."
+        )
+    if not math.isfinite(baseline):
+        raise ValueError(f"baseline must be a finite number, got {baseline!r}.")
+    if baseline != 0.0 and output_form == 'g1':
+        raise ValueError(
+            f"baseline={baseline!r} is defined on the g2-1 scale and has no field-"
+            f"correlation equivalent, so it cannot be emitted with output_form='g1'; "
+            f"use 'g2m1' or 'g2', or leave baseline at 0.0."
+        )
+    if (noise_model in ('schatzel_full', 'biganzoli_full')
+            and not (mean_count_rate_cps is not None
+                     and math.isfinite(mean_count_rate_cps)
+                     and mean_count_rate_cps > 0)):
+        raise ValueError(
+            f"noise_model={noise_model!r} evaluates its equation's shot-noise terms, "
+            f"which need a positive finite mean_count_rate_cps (counts per second); got "
+            f"{mean_count_rate_cps!r}. There is no honest default for a photon count "
+            f"rate -- take it from the file you are imitating, or use noise_model="
+            f"{noise_model.replace('_full', '_classical')!r}, its infinite-count-rate "
+            f"limit."
+        )
+    if mean_count_rate_cps is not None and noise_model not in ('schatzel_full',
+                                                               'biganzoli_full'):
+        raise ValueError(
+            f"mean_count_rate_cps={mean_count_rate_cps!r} is consumed only by "
+            f"the full models ('schatzel_full', 'biganzoli_full'), so passing it with "
+            f"noise_model={noise_model!r} would leave it unused. Refused rather than "
+            f"silently ignored, exactly as a baseline is refused with output_form='g1': "
+            f"a knob the generator accepts and does not use is a quiet no-op the caller "
+            f"has no way to notice."
+        )
+    if not (math.isfinite(noise_correlation) and -1.0 < noise_correlation < 1.0):
+        raise ValueError(
+            f"noise_correlation is a lag-1 correlation coefficient and must be finite "
+            f"and strictly inside (-1, 1), got {noise_correlation!r}. The endpoints are "
+            f"excluded because the AR(1) innovation scale sqrt(1 - rho^2) collapses to "
+            f"zero there, leaving one draw repeated across every channel."
+        )
+    # Only presence is checked here: a duration the exact models cannot use is refused
+    # by `_biganzoli_sd`, the one computation that consumes it.
+    if duration_s is not None and noise_model not in ('biganzoli_classical',
+                                                      'biganzoli_full'):
+        raise ValueError(
+            f"duration_s={duration_s!r} is consumed only by the exact-in-Gamma models "
+            f"('biganzoli_classical', 'biganzoli_full'), so passing it with noise_model="
+            f"{noise_model!r} would leave it unused: Eq. (49)'s relative shape cancels "
+            f"the run duration. Refused rather than silently ignored, exactly as "
+            f"mean_count_rate_cps is refused with a model that does not consume it."
         )
 
     # Scattering vector (m^-1), using the same physics as the analysis code.
@@ -1745,7 +2435,10 @@ def generate_synthetic_correlogram(
     # exp_matrix[i, j] = exp(-gamma_j * tau_i)
     exp_matrix = np.exp(-np.outer(tau, gammas))
     g1 = exp_matrix @ amps
-    g2m1 = beta * g1 ** 2
+    # The flat instrument baseline rides on the INTENSITY correlation, so it is added
+    # here, on the g2-1 scale, before the output form is chosen -- which is why 'g2'
+    # carries it and 'g1' (refused above) cannot.
+    g2m1 = beta * g1 ** 2 + baseline
 
     if output_form == 'g2m1':
         signal = g2m1.copy()
@@ -1755,13 +2448,21 @@ def generate_synthetic_correlogram(
         signal = g1.copy()
 
     # Per-channel noise SD. 'constant' broadcasts one value (the historical
-    # behaviour); 'schatzel_classical' takes the per-channel SHAPE of Eq. (49)'s
-    # classical limit and rescales it so noise_level remains the first channel's SD --
-    # see the docstring for what that models and, just as importantly, what it does not.
-    if noise_model == 'schatzel_classical':
-        shape = _schatzel_classical_sd(tau, sample_times, gamma_bar, beta)
+    # behaviour); the two Schaetzel models take the per-channel SHAPE of Eq. (49) and
+    # the two Biganzoli models that of Eq. (9) -- each its classical limit, or with the
+    # shot-noise terms at the given count rate -- and all four rescale it so noise_level
+    # remains the first channel's SD. See the docstring for what that models and, just
+    # as importantly, what it does not.
+    if noise_model != 'constant':
+        if noise_model in ('biganzoli_classical', 'biganzoli_full'):
+            shape = _biganzoli_sd(tau, sample_times, gamma_bar, beta,
+                                  mean_count_rate_cps=mean_count_rate_cps,
+                                  duration_s=duration_s)
+        else:
+            shape = _schatzel_sd(tau, sample_times, gamma_bar, beta,
+                                 mean_count_rate_cps=mean_count_rate_cps)
         # Normalised on the FIRST channel, whose shape value is the largest of the
-        # short-lag plateau, so noise_level keeps one meaning across both models.
+        # short-lag plateau, so noise_level keeps one meaning across all four models.
         # Guarded because the reference is a computed quantity: an underflowed or
         # non-finite shape[0] would silently scale the whole field to 0 or nan.
         if not (math.isfinite(shape[0]) and shape[0] > 0):
@@ -1775,12 +2476,41 @@ def generate_synthetic_correlogram(
         sigma = np.full(tau.shape, float(noise_level))
     if noise_level > 0:
         rng = np.random.default_rng(seed)
-        # rng.normal broadcasts scale elementwise, so one draw covers both models.
-        signal = signal + rng.normal(0.0, sigma, size=signal.shape)
+        if noise_correlation != 0.0:
+            # Correlated channels: a stationary AR(1) in CHANNEL INDEX, unit variance
+            # per channel by construction (e[0] is a unit draw and the innovation is
+            # scaled by sqrt(1 - rho^2)), so sigma still sets the per-channel SD and
+            # only the neighbour correlation changes -- corr(e_k, e_k+1) = rho exactly.
+            # The recursion runs straight across multi-tau block boundaries: real
+            # correlation does not reset at a sample-time doubling, and modelling how it
+            # changes there needs the full covariance (see the noise_correlation docs).
+            rho = float(noise_correlation)
+            z = rng.standard_normal(signal.size)
+            e = np.empty_like(z)
+            e[0] = z[0]
+            innovation = math.sqrt(1.0 - rho * rho)
+            for ch in range(1, z.size):
+                e[ch] = rho * e[ch - 1] + innovation * z[ch]
+            signal = signal + sigma * e
+        else:
+            # rng.normal broadcasts scale elementwise, so one draw covers every model.
+            signal = signal + rng.normal(0.0, sigma, size=signal.shape)
 
     # Ground-truth cumulants (amplitude-weighted moments of the decay rate).
     # gamma_bar is computed above, before the noise draw.
     mu2 = float(np.sum(amps * (gammas - gamma_bar) ** 2))
+    # Same amplitude-weighted central-moment sum, two orders further. Computed from the
+    # planted distribution itself rather than from a Schulz closed form (`mailer2015`
+    # Eq. 18), because the generator plants ARBITRARY populations and that closed form
+    # holds only for a Schulz: an oracle built on it would be approximate exactly where
+    # the populations stop being Schulz-shaped. `tests/test_utilities.py` checks these
+    # sums AGAINST Eq. 18 on a deliberately Schulz-shaped case, which is the right way
+    # round -- the literature validates the computation, it does not define it.
+    mu3 = float(np.sum(amps * (gammas - gamma_bar) ** 3))
+    mu4 = float(np.sum(amps * (gammas - gamma_bar) ** 4))
+    # `mu2 * mu2`, never `mu2 ** 2`: a Python-float `**` RAISES OverflowError on the
+    # upper tail where `*` saturates to inf -- the same note as _gb2 just below.
+    kappa4 = mu4 - 3.0 * mu2 * mu2
     # The guard is on the SQUARE, not on gamma_bar: the division squares it, so an
     # extreme-but-finite decay rate underflows the denominator to 0.0 while
     # `gamma_bar != 0` still passes. Same mis-sizing as the q^2 guard above.
@@ -1806,9 +2536,17 @@ def generate_synthetic_correlogram(
         noise_level=noise_level,
         seed=seed,
         populations=pops,
+        baseline=float(baseline),
+        mean_count_rate_cps=(None if mean_count_rate_cps is None
+                             else float(mean_count_rate_cps)),
+        duration_s=None if duration_s is None else float(duration_s),
+        noise_correlation=float(noise_correlation),
         gamma_bar_s_inv=gamma_bar,
         mu2_s_inv2=mu2,
         pdi=pdi,
+        mu3_s_inv3=mu3,
+        mu4_s_inv4=mu4,
+        kappa4_s_inv4=kappa4,
         d_eff_m2_s=d_eff,
         rh_eff_nm=rh_eff_nm,
         noise_model=noise_model,

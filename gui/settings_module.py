@@ -17,9 +17,12 @@ module controls; Restore defaults resets to the factory `SettingsState` and appl
 
 from __future__ import annotations
 
+import math
+
 from PySide6 import QtCore, QtWidgets
 
 from app import units as U
+from app.controller import distribution_weighting_request
 from app.settings import SettingsState
 from gui.help import HelpBadge
 from gui.solvent_picker import index_of_solvent, populate_solvent_combo
@@ -53,6 +56,362 @@ _PLOT_UNIT_ROWS = [
     ('radius', 'Radius (R<sub>h</sub> / R<sub>g</sub>)'),
     ('molar_mass', 'Molar mass M<sub>w</sub>'),
 ]
+
+# The clear-and-warn prompt's words for the cumulant residual-weighting policy tokens; an
+# unrecognised (hand-edited) token is named as itself.
+_WEIGHTING_PROMPT_LABELS = {'sourced': 'sourced', 'uniform': 'unweighted'}
+
+
+def _weighting_label(token) -> str:
+    return _WEIGHTING_PROMPT_LABELS.get(token, str(token))
+
+
+# The residual-weighting forms the CONTIN / NNLS / lognormal distribution fits offer, as
+# (label, policy token) pairs. ONE roster: the seed combo below and the DLS Distribution
+# tab's per-run combo are both populated from it, so the same choice cannot be worded two
+# ways (style guide §9). The tokens are the keys of the controller's
+# DISTRIBUTION_WEIGHTING_POLICIES, which maps each to an engine request; a further form is
+# one row here plus one policy there, and nothing reads this roster by position or length.
+RESIDUAL_WEIGHTING_CHOICES = (
+    ('Sourced variance (default)', 'sourced'),
+    ('g₁² (older form)', 'g1-squared'),
+)
+
+# The calculation-nuance tooltip both those combos carry, in one place for the same reason
+# the roster is: two surfaces for one choice must say the same thing about it.
+RESIDUAL_WEIGHTING_TOOLTIP = (
+    'Which residual weight the distribution fits (CONTIN, NNLS, lognormal) measure their '
+    'fit error in.\n'
+    '• Sourced variance (default): weights each channel by the variance a correlator '
+    'actually has at that lag, and reads the weight’s signal factor from a first-pass '
+    'fit — so each fit runs twice and takes about twice as long.\n'
+    '• g₁² (older form): takes the noise as equal on every channel. Choose it to '
+    'reproduce a distribution reported before this version.\n'
+    'Without a committed mean count rate the sourced weight uses the '
+    'infinite-count-rate limit of its variance model; committing one adds the '
+    'photon-counting terms to the weight. See the Theory-and-Equations-Guide '
+    '(distribution methods).'
+)
+
+
+#: The distribution fits' seed fields, in `SettingsState`'s own names. `DistributionFitFields`
+#: carries values under these names on every surface, so a Settings collect, a reseed from
+#: Settings and a copy between two tabs are one operation with no renaming step between them.
+DISTRIBUTION_SEED_FIELDS = (
+    'rh_grid_min_nm', 'rh_grid_max_nm', 'rh_grid_points', 'distribution_weighting',
+    'lcurve_alpha_min', 'lcurve_alpha_max', 'contin_alpha_method',
+    'contin_ftest_prob_reject', 'contin_gcv_gamma')
+
+#: The CONTIN α selectors, as (label, token) pairs -- one roster for every surface that
+#: offers the choice.
+ALPHA_SELECTION_CHOICES = (
+    ('GCV (generalized cross-validation)', 'gcv'),
+    ('L-curve corner', 'lcurve'),
+    ('F-test (probability to reject)', 'ftest'),
+)
+
+
+class DistributionFitFields(QtCore.QObject):
+    """The distribution fits' input fields -- the Rh grid, the residual weighting, and
+    CONTIN's α selector, α range, robust-GCV γ and F-test level -- built in ONE place and
+    placed by each surface that holds them: the Settings tab (as the seeds), and the DLS
+    Distribution sub-tab and Mode Map (as per-run fields seeded from those seeds). One
+    set of widgets, ranges and tooltips, so the surfaces cannot drift apart.
+
+    Values travel under the `SettingsState` field names (`DISTRIBUTION_SEED_FIELDS`):
+    `values` reads them, `seed` writes them, and `fit_kwargs` maps them to the engine's
+    keywords for one method. Each numeric field keeps the exact value it was seeded with
+    until the user moves it -- a spin box clamps and rounds on `setValue`, and a seed
+    finer than its grid must run, and round-trip through Settings, unchanged (the Settings
+    tab's `_cumulant_cutoff_value` is the same rule).
+
+    ``seeds=True`` builds the Settings tab's copy: a value the roster does not offer (a
+    hand-edited settings.json) is kept as an extra entry so an untouched Update writes it
+    back, and every row stays shown, since each is a seed in its own right. A per-run copy
+    seeds such a token's first row instead -- the controller refuses the token by name on
+    any path this widget does not fill -- and shows only the selected α selector's own
+    control (owner: show/hide, not gray-out).
+    """
+
+    #: Any field moved -- by the user or by `seed`, which emits once per call.
+    changed = QtCore.Signal()
+
+    # key -> the default form-row label. `add_rows` places rows in this order.
+    _ROW_LABELS = {
+        'rh_grid': 'R<sub>h</sub> grid (min / max / pts):',
+        'weighting': 'Residual weighting:',
+        'alpha_method': 'CONTIN α selection:',
+        'alpha_range': 'CONTIN α (min / max):',
+        'gcv_gamma': 'GCV robustness γ:',
+        'ftest': 'F-test probability to reject:',
+    }
+    _CONTIN_ROWS = ('alpha_method', 'alpha_range', 'gcv_gamma', 'ftest')
+
+    def __init__(self, parent: QtWidgets.QWidget, *, seeds: bool = False) -> None:
+        super().__init__(parent)
+        self._seeds = seeds
+        self._seeding = False
+        self._contin_shown = True
+        self._loaded: dict = {}      # field -> the exact value last seeded
+        self._shown: dict = {}       # field -> what its widget showed right after seeding
+        self._rows: dict = {}        # key -> (label widget or None, field widget)
+
+        self.rh_min = QtWidgets.QDoubleSpinBox()
+        self.rh_min.setRange(0.01, 1.0e5); self.rh_min.setDecimals(2)
+        self.rh_max = QtWidgets.QDoubleSpinBox()
+        self.rh_max.setRange(0.01, 1.0e5); self.rh_max.setDecimals(1)
+        self.rh_points = QtWidgets.QSpinBox(); self.rh_points.setRange(10, 1000)
+        # A cost hint, not a cap: the range stays 10-1000 (owner-ruled 2026-08-26).
+        self.rh_points.setToolTip(
+            'Grid resolution of the inversion. CONTIN’s automatic α selection solves a '
+            'dense system of this size about 40 times, so the cost climbs steeply with '
+            'the point count — roughly half a second at 100 points, ~5 s at 300 and '
+            '~30 s at 1000 with the default GCV selector on a typical laptop (the '
+            'L-curve corner is cheaper but climbs the same way). The fit runs in the '
+            'background, so the window stays usable.')
+        self._grid_holder = QtWidgets.QWidget()
+        grow = QtWidgets.QHBoxLayout(self._grid_holder); grow.setContentsMargins(0, 0, 0, 0)
+        for w in (self.rh_min, self.rh_max, self.rh_points):
+            grow.addWidget(w)
+        # The residual weighting of the FIT: which noise model its error is measured in.
+        # All three methods take it, so it is never hidden with the CONTIN-only rows.
+        self.residual_weighting = QtWidgets.QComboBox()
+        for label, token in RESIDUAL_WEIGHTING_CHOICES:
+            self.residual_weighting.addItem(label, token)
+        self.residual_weighting.setToolTip(RESIDUAL_WEIGHTING_TOOLTIP)
+        self.alpha_method = QtWidgets.QComboBox()
+        for label, token in ALPHA_SELECTION_CHOICES:
+            self.alpha_method.addItem(label, token)
+        self.alpha_method.setToolTip(
+            'How CONTIN chooses its regularization α automatically.\n'
+            '• GCV (default): generalized cross-validation, robust by default (γ = 0.1, '
+            'built for correlated channel noise); γ = 1 is classical GCV.\n'
+            '• L-curve corner: the corner of the fit-vs-size trade-off curve, located by '
+            'adaptive pruning of the sampled sweep; insensitive to the α range as long '
+            'as the range spans the corner — the sweep-edge notes say when it does not.\n'
+            '• F-test: the smoothest solution whose fit is not significantly worse than '
+            'the best — for comparison against legacy CONTIN output.\n'
+            'See the Theory-and-Equations-Guide (CONTIN).')
+        self.alpha_min = QtWidgets.QLineEdit()
+        self.alpha_max = QtWidgets.QLineEdit()
+        self._alpha_range_holder = QtWidgets.QWidget()
+        arow = QtWidgets.QHBoxLayout(self._alpha_range_holder)
+        arow.setContentsMargins(0, 0, 0, 0)
+        for w in (self.alpha_min, self.alpha_max):
+            arow.addWidget(w)
+        # The range sits inside the engine's (0, 1] guard, so this control cannot ask for
+        # a refused γ.
+        self.gcv_gamma = QtWidgets.QDoubleSpinBox()
+        self.gcv_gamma.setRange(0.01, 1.00)
+        self.gcv_gamma.setSingleStep(0.01)
+        self.gcv_gamma.setDecimals(2)
+        self.gcv_gamma.setToolTip(
+            'Robustness parameter γ of robust GCV. 0.1, the default, is the value its '
+            'sources use; 1 is classical GCV. Below 1 the selector weighs the '
+            'solution’s variance and smooths more, the repair for correlated channel '
+            'noise. See the Theory-and-Equations-Guide (CONTIN, robust GCV).')
+        self.ftest_prob = QtWidgets.QDoubleSpinBox()
+        self.ftest_prob.setRange(0.01, 0.99)
+        self.ftest_prob.setSingleStep(0.05)
+        self.ftest_prob.setDecimals(2)
+        self.ftest_prob.setToolTip(
+            'F-test significance level (default 0.50). A HIGHER value '
+            'accepts more fit degradation and so selects a SMOOTHER, more parsimonious '
+            'distribution; a LOWER value keeps a rougher, more-detailed one.')
+        self._fields = {
+            'rh_grid': self._grid_holder, 'weighting': self.residual_weighting,
+            'alpha_method': self.alpha_method, 'alpha_range': self._alpha_range_holder,
+            'gcv_gamma': self.gcv_gamma, 'ftest': self.ftest_prob}
+
+        for box in (self.rh_min, self.rh_max, self.rh_points, self.gcv_gamma,
+                    self.ftest_prob):
+            box.valueChanged.connect(self._emit_changed)
+        for combo in (self.residual_weighting, self.alpha_method):
+            combo.currentIndexChanged.connect(self._emit_changed)
+        for edit in (self.alpha_min, self.alpha_max):
+            edit.textChanged.connect(self._emit_changed)
+            # Refused where it is typed: an α the engine would refuse reverts to the last
+            # accepted text when the edit finishes (the Correlogram region fields' house
+            # pattern), with the reason shown at the field.
+            edit.editingFinished.connect(lambda e=edit: self._check_alpha_edit(e))
+        self._accepted_alpha: dict = {}   # edit -> the last text it held that was valid
+        self.alpha_method.currentIndexChanged.connect(self._update_row_visibility)
+
+    # ---- placement ----
+    def add_rows(self, form: QtWidgets.QFormLayout, keys=None, labels=None) -> None:
+        """Add this group's rows for `keys` (default: all, in the group's order) to
+        `form`, each labelled from `labels` or the default. A surface may place its rows
+        in two batches, e.g. to set the weighting beside another row it reads against."""
+        labels = labels or {}
+        for key in (keys or self._ROW_LABELS):
+            form.addRow(labels.get(key, self._ROW_LABELS[key]), self._fields[key])
+            self._rows[key] = (form.labelForField(self._fields[key]), self._fields[key])
+        self._update_row_visibility()
+
+    def set_contin_rows_visible(self, visible: bool) -> None:
+        """Show or hide CONTIN's own rows -- for a surface running one method at a time,
+        where α means nothing to NNLS."""
+        self._contin_shown = bool(visible)
+        self._update_row_visibility()
+
+    def _set_row_visible(self, key: str, visible: bool) -> None:
+        label, field = self._rows.get(key, (None, None))
+        if field is not None:
+            field.setVisible(visible)
+        if label is not None:
+            label.setVisible(visible)
+
+    def _update_row_visibility(self) -> None:
+        """The α range stays visible under every selector: all three sweep it, and the
+        F-test's own reliability notes tell the user to move one of its ends. γ follows
+        GCV and the level follows the F-test, on a per-run copy; the Settings copy shows
+        both, since each seeds a per-run field whichever selector is the default."""
+        method = self.alpha_method.currentData()
+        for key in self._CONTIN_ROWS:
+            shown = self._contin_shown
+            if shown and not self._seeds:
+                if key == 'gcv_gamma':
+                    shown = method == 'gcv'
+                elif key == 'ftest':
+                    shown = method == 'ftest'
+            self._set_row_visible(key, shown)
+
+    def _emit_changed(self, *_args) -> None:
+        if not self._seeding:
+            self.changed.emit()
+
+    # ---- values ----
+    def _seed_token(self, combo: QtWidgets.QComboBox, token) -> None:
+        if self._seeds:
+            _seed_combo(combo, token, use_data=True)
+        else:
+            j = combo.findData(token)
+            combo.setCurrentIndex(j if j >= 0 else 0)
+
+    def seed(self, values: dict) -> None:
+        """Set every field from `values` (`DISTRIBUTION_SEED_FIELDS` names), remembering
+        each exact value so an untouched field reads back unchanged. Emits `changed` once."""
+        self._seeding = True
+        try:
+            for name, box in (('rh_grid_min_nm', self.rh_min),
+                              ('rh_grid_max_nm', self.rh_max),
+                              ('rh_grid_points', self.rh_points),
+                              ('contin_ftest_prob_reject', self.ftest_prob),
+                              ('contin_gcv_gamma', self.gcv_gamma)):
+                self._loaded[name] = values[name]
+                box.setValue(values[name])
+                self._shown[name] = box.value()
+            for name, edit in (('lcurve_alpha_min', self.alpha_min),
+                               ('lcurve_alpha_max', self.alpha_max)):
+                self._loaded[name] = float(values[name])
+                edit.setText(f'{float(values[name]):g}')
+                self._shown[name] = edit.text()
+                self._accepted_alpha[edit] = edit.text()
+            self._seed_token(self.residual_weighting, values['distribution_weighting'])
+            self._seed_token(self.alpha_method, values['contin_alpha_method'])
+        finally:
+            self._seeding = False
+        self._update_row_visibility()
+        self.changed.emit()
+
+    def seed_from_settings(self, settings) -> None:
+        self.seed({name: getattr(settings, name) for name in DISTRIBUTION_SEED_FIELDS})
+
+    def _number(self, name: str, box):
+        """The box's value, unless it still shows what the seed made it show -- then
+        the exact seed."""
+        if name in self._loaded and box.value() == self._shown.get(name):
+            return self._loaded[name]
+        return box.value()
+
+    def _alpha(self, name: str, edit: QtWidgets.QLineEdit) -> float:
+        """The typed α, or the exact seed while the text is what seeding wrote -- and
+        also when the text does not parse, so a half-typed entry never reaches a fit."""
+        loaded = self._loaded.get(name)
+        text = edit.text().strip()
+        if loaded is not None and text == self._shown.get(name):
+            return loaded
+        try:
+            return float(text)
+        except ValueError:
+            return loaded if loaded is not None else float('nan')
+
+    @staticmethod
+    def _alpha_text_problem(text: str) -> str:
+        """Why one typed α end cannot run, or '' -- `fit_contin`'s own refusal (finite and
+        above zero), stated in the field's words."""
+        try:
+            value = float(text.strip())
+        except ValueError:
+            return f'“{text.strip()}” is not a number'
+        if not (math.isfinite(value) and value > 0):
+            return 'α must be a finite number above zero'
+        return ''
+
+    def alpha_problem(self) -> str:
+        """Why the CONTIN α range as typed cannot run, or '' when it can: each end finite
+        and above zero, and the minimum not above the maximum -- the two refusals
+        `fit_contin` makes. ONE predicate for every surface holding this group, checked
+        before the Settings tab's Update and before a CONTIN Run, so a value the engine
+        refuses is never saved and never run. Read off the TEXT, not `values()`, which
+        falls back to the seed for an unparseable entry and would hide it."""
+        for label, edit in (('α min', self.alpha_min), ('α max', self.alpha_max)):
+            problem = self._alpha_text_problem(edit.text())
+            if problem:
+                return f'CONTIN {label}: {problem}.'
+        if float(self.alpha_min.text()) > float(self.alpha_max.text()):
+            return 'CONTIN α min is above α max; lower the minimum or raise the maximum.'
+        return ''
+
+    def _check_alpha_edit(self, edit: QtWidgets.QLineEdit) -> None:
+        """An α edit finished: keep it if the engine can run it, else put back the last
+        accepted text and say why at the field. The order of the two ends is left to the
+        Update / Run check, so a range can be widened one end at a time."""
+        problem = self._alpha_text_problem(edit.text())
+        if not problem:
+            self._accepted_alpha[edit] = edit.text()
+            return
+        previous = self._accepted_alpha.get(edit)
+        if previous is not None:
+            edit.setText(previous)
+        QtWidgets.QToolTip.showText(
+            edit.mapToGlobal(QtCore.QPoint(0, edit.height())),
+            f'{problem}; kept {previous or "the previous value"}.', edit)
+
+    def values(self) -> dict:
+        """Every field's current value under its `SettingsState` name."""
+        return {
+            'rh_grid_min_nm': float(self._number('rh_grid_min_nm', self.rh_min)),
+            'rh_grid_max_nm': float(self._number('rh_grid_max_nm', self.rh_max)),
+            'rh_grid_points': int(self._number('rh_grid_points', self.rh_points)),
+            'distribution_weighting': self.residual_weighting.currentData(),
+            'lcurve_alpha_min': self._alpha('lcurve_alpha_min', self.alpha_min),
+            'lcurve_alpha_max': self._alpha('lcurve_alpha_max', self.alpha_max),
+            'contin_alpha_method': self.alpha_method.currentData(),
+            'contin_ftest_prob_reject': float(
+                self._number('contin_ftest_prob_reject', self.ftest_prob)),
+            'contin_gcv_gamma': float(self._number('contin_gcv_gamma', self.gcv_gamma)),
+        }
+
+    def fit_kwargs(self, method: str) -> dict:
+        """The engine kwargs for one `method`: the Rh grid and the residual weighting for
+        every method, and for CONTIN its α range, selector, F-test level and γ.
+
+        The weighting is set for EVERY method, outside the CONTIN branch: all three arms
+        take it, and a weight that reached only CONTIN would give one measurement two
+        analyses depending on which method ran. It is mapped through the controller's own
+        policy-to-request function, so a widget and the Settings seed cannot disagree
+        about what a token means."""
+        v = self.values()
+        kw = dict(rh_min_nm=v['rh_grid_min_nm'], rh_max_nm=v['rh_grid_max_nm'],
+                  n_grid=v['rh_grid_points'],
+                  weighting=distribution_weighting_request(v['distribution_weighting']))
+        if method == 'contin':
+            kw.update(alpha_min=v['lcurve_alpha_min'], alpha_max=v['lcurve_alpha_max'],
+                      alpha_method=v['contin_alpha_method'],
+                      ftest_prob_reject=v['contin_ftest_prob_reject'],
+                      gcv_gamma=v['contin_gcv_gamma'])
+        return kw
 
 
 def _seed_combo(combo: QtWidgets.QComboBox, value, *, use_data: bool,
@@ -115,11 +474,11 @@ class SettingsModule(QtWidgets.QWidget):
         host = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(host)
 
-        # NB: the DLS cumulant-order and Rh-grid / CONTIN-α defaults used to live
-        # here. They now have per-run controls ON the DLS Correlogram and
-        # Distribution sub-tabs (where the fit happens), seeded from these same
-        # SettingsState fields. The fields are retained (and round-tripped through
-        # _collect) so Apply/Restore never silently zeroes them.
+        # The cumulant order and the distribution seeds (Rh grid, CONTIN α) also have
+        # per-run controls ON the DLS Correlogram and Distribution sub-tabs and the Mode
+        # Map, seeded from these same SettingsState fields. The widgets here edit the
+        # seeds, which are also what the paths with no per-run control run -- replicate
+        # averaging above all.
 
         form.addRow(self._header('DLS Analysis Defaults'))
         self.cumulant_method = QtWidgets.QComboBox()
@@ -134,13 +493,111 @@ class SettingsModule(QtWidgets.QWidget):
             'Switching this clears existing cumulant-based results (you will be asked '
             'to confirm).')
         form.addRow('Cumulant method:', self.cumulant_method)
+        self.cumulant_order = QtWidgets.QSpinBox()
+        self.cumulant_order.setRange(1, 4)
+        self.cumulant_order.setToolTip(
+            'Cumulant expansion order that replicate averaging fits at, and the starting '
+            'value of the Correlogram sub-tab’s own order box (which you can still '
+            'change per run). Order 1 fits a single decay rate and gives no PDI.\n'
+            'Changing it clears the results fitted at the old order — Γ vs q², D vs c, '
+            'DDLS and replicate averages (you will be asked to confirm); the Correlogram '
+            'sub-tab’s own fits ran at its own order and are kept.')
+        form.addRow('Cumulant order:', self.cumulant_order)
+        self.cumulant_weighting = QtWidgets.QComboBox()
+        self.cumulant_weighting.addItem('Sourced variance (default)', 'sourced')
+        self.cumulant_weighting.addItem('Unweighted', 'uniform')
+        self.cumulant_weighting.setToolTip(
+            'Residual weighting of every cumulant fit (per-measurement cumulant, Γ vs q², '
+            'D vs c, replicate averaging, DDLS and the Cross-Sample size candidates).\n'
+            '• Sourced variance (default): each method’s own sourced weight.\n'
+            '• Unweighted: plain least squares, for comparison with a fit made without a '
+            'noise model — it moves Rh and PDI wherever the noise is not uniform.\n'
+            'The choice is named in the correlogram-fit, Γ vs q² and D vs c exports (not in '
+            'the DDLS, replicate-average or summary results). Switching '
+            'clears existing cumulant-based results (you will be asked to confirm). See '
+            'the Theory-and-Equations-Guide §3.2.8.')
+        form.addRow('Cumulant residual weighting:', self.cumulant_weighting)
+        # The distribution seeds: the same field group the Distribution sub-tab and the
+        # Mode Map hold per run. Its residual weighting sits here, beside the cumulant
+        # family's, so the two labels are read against each other; the rest of the group
+        # has its own section below.
+        self.distribution_fields = DistributionFitFields(self, seeds=True)
+        self.distribution_fields.add_rows(
+            form, keys=('weighting',),
+            labels={'weighting': 'Distribution residual weighting:'})
         self.skip_channels = QtWidgets.QSpinBox()
         self.skip_channels.setRange(0, 50)
         self.skip_channels.setToolTip(
             'Drop this many leading correlator channels (shortest lags) from every DLS '
             'fit to remove afterpulsing / dead-time artifacts; keep it small so a real '
-            'small-particle mode is not erased. See the Theory-and-Equations-Guide.')
+            'small-particle mode is not erased. Changing it asks first, then clears every '
+            'DLS result — the per-measurement fits, Γ vs q², D vs c, DDLS, the Mode Map '
+            'with its mode-family fits, and replicate averages; recorded mode sets and '
+            'their results, and the mode families you picked, are kept. See the '
+            'Theory-and-Equations-Guide.')
         form.addRow('Skip initial lag channels:', self.skip_channels)
+        self.cumulant_cutoff = QtWidgets.QDoubleSpinBox()
+        # Widened to the ENGINE's contract, not a comfortable subset of it: `_FIELD_RANGES`
+        # and `fit_cumulants` accept any finite value in the OPEN interval (0, 1). A
+        # narrower box does not merely restrict typing -- `_load_from` calls setValue() on
+        # whatever settings.json holds and `_collect` reads it back, so a legal 0.0005 was
+        # clamped to 0.001 and PERSISTED, changing an analysis parameter because the user
+        # opened the tab. Anything finer than 1e-6 is preserved by `_cumulant_cutoff_value`.
+        self.cumulant_cutoff.setDecimals(6)
+        self.cumulant_cutoff.setRange(1e-6, 0.999999)
+        self.cumulant_cutoff.setSingleStep(0.01)
+        self.cumulant_cutoff.setToolTip(
+            'Amplitude at which the linear cumulant’s fitted range stops, as a '
+            'fraction of the correlogram peak. ISO 22412 prescribes 0.01; this program '
+            'defaults to 0.1, a benchmarked deviation — see the '
+            'Theory-and-Equations-Guide for the measurement and for which of the '
+            'standard’s companion clauses are implemented.')
+        cutoff_help = HelpBadge(
+            'The linear cumulant fits a contiguous run of channels around the '
+            'correlogram’s peak. This sets where that run stops — at the '
+            'first channel whose amplitude falls to this fraction of the peak.',
+            bullets=[
+                '<b>Lower</b> (towards ISO’s 0.01) fits further down the decay, '
+                'using more channels.',
+                '<b>Higher</b> keeps only the strongest part of the decay.',
+                'It applies to the <b>Linear</b> cumulant method. Under '
+                '<b>Nonlinear</b>, which fits every live channel in the window, it still sets the range '
+                'the reported RMS error is measured over and the starting guess the fit '
+                'departs from.',
+                'Lowering it can make a run look <i>less</i> polydisperse than it is: '
+                'the extra channels are the noisiest, the fitted curve flattens, and the '
+                'reported PDI falls. Since PDI is what the polydispersity warning reads, '
+                'a run that was flagged can come back unflagged at a lower cutoff. On '
+                'this program’s own test corpus that happened to 35 of 190 runs, '
+                'and never the other way round.',
+                'Changing it marks any cumulant fit already on screen as out of date.',
+            ])
+        cutoff_row = QtWidgets.QWidget()
+        cutoff_lay = QtWidgets.QHBoxLayout(cutoff_row)
+        cutoff_lay.setContentsMargins(0, 0, 0, 0)
+        cutoff_lay.addWidget(self.cumulant_cutoff, 1)   # stretch like a badge-less row
+        cutoff_lay.addWidget(cutoff_help)
+        form.addRow('Cumulant fit cutoff:', cutoff_row)
+
+        dist_head = QtWidgets.QWidget()
+        dist_head_lay = QtWidgets.QHBoxLayout(dist_head)
+        dist_head_lay.setContentsMargins(0, 0, 0, 0)
+        dist_head_lay.addWidget(self._header('DLS Distribution Defaults'))
+        dist_head_lay.addWidget(HelpBadge(
+            'The starting values of the distribution fits (CONTIN, NNLS, lognormal).',
+            bullets=[
+                'They seed the <b>Distribution</b> sub-tab’s and the <b>Mode Map</b>’s '
+                'own fields, which you can still change per run there.',
+                'Replicate averaging of a distribution method (the sidebar’s '
+                '<b>Average derived results…</b>) has no fields of its own and runs on '
+                'these values.',
+                'The Rh grid applies to every method; the α rows are CONTIN’s alone.',
+                'Changing a value here does not touch a result already computed.',
+            ]))
+        dist_head_lay.addStretch(1)
+        form.addRow(dist_head)
+        self.distribution_fields.add_rows(
+            form, keys=('rh_grid', 'alpha_method', 'alpha_range', 'gcv_gamma', 'ftest'))
 
         form.addRow(self._header('File Loading'))
         self.bh_dat_baseline = QtWidgets.QComboBox()
@@ -260,7 +717,7 @@ class SettingsModule(QtWidgets.QWidget):
         self.no_unc_sig_figs.setRange(1, 4)
         self.no_unc_sig_figs.setToolTip(
             'Significant figures for EVERY result that has no honest uncertainty — '
-            'a single correlogram, an NNLS/CONTIN distribution, a single-angle Mw, and '
+            'a single correlogram, an NNLS/CONTIN distribution, and '
             'derived numbers like Γ, PDI, R², and qRg. A value that HAS a ± is always '
             'rounded to the place its ± supports — this never changes that.')
         sig_help = HelpBadge(
@@ -271,7 +728,7 @@ class SettingsModule(QtWidgets.QWidget):
                 'imply confidence the data does not support). This setting does '
                 '<b>not</b> touch those.',
                 'A value with <b>no</b> uncertainty — a single-correlogram fit, an '
-                'NNLS/CONTIN peak, a single-angle Mw, and every derived number that '
+                'NNLS/CONTIN peak, and every derived number that '
                 'carries no ± (Γ, PDI, R², qRg, …) — has no uncertainty to set its '
                 'precision, so a fixed number of significant figures is used instead. '
                 'This one knob controls all of them, uniformly.',
@@ -358,7 +815,16 @@ class SettingsModule(QtWidgets.QWidget):
         confirm_lay.addStretch(1)
         form.addRow('Runs:', confirm_row)
 
-        outer.addWidget(host)
+        # The form scrolls and Update / Restore defaults are pinned under it, so the
+        # form's length can never carry them out of view (the pinned primary action of
+        # the GUI style guide's §3 column template).
+        form_scroll = QtWidgets.QScrollArea()
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        form_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        form_scroll.setWidget(host)
+        outer.addWidget(form_scroll, 1)
 
         btns = QtWidgets.QHBoxLayout()
         apply_btn = QtWidgets.QPushButton('Update')
@@ -369,7 +835,6 @@ class SettingsModule(QtWidgets.QWidget):
         btns.addWidget(reset_btn)
         btns.addStretch(1)
         outer.addLayout(btns)
-        outer.addStretch(1)
 
     @staticmethod
     def _header(text: str) -> QtWidgets.QLabel:
@@ -380,18 +845,18 @@ class SettingsModule(QtWidgets.QWidget):
 
     # ----------------------------------------------------------- transfer ---
     def _load_from(self, s: SettingsState) -> None:
-        # Relocated DLS seeds have no widget here anymore; retain their values so
-        # _collect can round-trip them. Loading SettingsState() on Restore therefore
-        # resets them to the factory defaults too.
-        self._retained_dls = dict(
-            cumulant_order=s.cumulant_order,
-            rh_grid_min_nm=s.rh_grid_min_nm, rh_grid_max_nm=s.rh_grid_max_nm,
-            rh_grid_points=s.rh_grid_points,
-            lcurve_alpha_min=s.lcurve_alpha_min, lcurve_alpha_max=s.lcurve_alpha_max,
-            contin_alpha_method=s.contin_alpha_method,
-            contin_ftest_prob_reject=s.contin_ftest_prob_reject)
         _seed_combo(self.cumulant_method, s.cumulant_method, use_data=True)
+        self.cumulant_order.setValue(s.cumulant_order)
+        _seed_combo(self.cumulant_weighting, s.cumulant_weighting, use_data=True)
+        # The group keeps each exact seed, so a value its widgets cannot show round-trips
+        # through an untouched Update unchanged.
+        self.distribution_fields.seed_from_settings(s)
         self.skip_channels.setValue(s.skip_initial_channels)
+        # Remember what was LOADED so `_collect` can tell "the user chose this" from "the
+        # spin box could not represent it". Without that, visiting the tab rewrites the
+        # setting to whatever the widget rounded it to.
+        self._loaded_cumulant_cutoff = float(s.cumulant_fit_cutoff)
+        self.cumulant_cutoff.setValue(s.cumulant_fit_cutoff)
         _seed_combo(self.bh_dat_baseline, s.brookhaven_dat_baseline, use_data=True)
         _seed_combo(self.geometry, s.standard_geometry, use_data=False)
         self.qrg_max.setValue(s.guinier_qrg_max)
@@ -423,13 +888,35 @@ class SettingsModule(QtWidgets.QWidget):
         self.reopen_last_session.setChecked(s.reopen_last_session)
         self.confirm_run_replaces_pick.setChecked(s.confirm_run_replaces_pick)
 
+    def _cumulant_cutoff_value(self) -> float:
+        """The cutoff to persist: the box's value, unless it never represented the load.
+
+        A `QDoubleSpinBox` clamps and rounds on `setValue`, so a legal settings.json value
+        outside the widget's grid (finer than its decimals, or outside its range) comes
+        back changed. Writing that back would edit an analysis parameter because the user
+        opened the tab. So: if the box still reads exactly what the load rounded it TO, the
+        user did not touch it and the ORIGINAL value is persisted unchanged; once they move
+        it, their choice wins. The engine's contract is the open interval (0, 1) and the
+        widget's grid is a subset of it -- this closes the gap rather than papering it.
+        """
+        loaded = getattr(self, '_loaded_cumulant_cutoff', None)
+        if loaded is None:
+            return float(self.cumulant_cutoff.value())
+        # What `setValue(loaded)` produced, recomputed the same way the widget did.
+        as_shown = float(self.cumulant_cutoff.valueFromText(
+            self.cumulant_cutoff.textFromValue(loaded)))
+        if float(self.cumulant_cutoff.value()) == as_shown:
+            return float(loaded)
+        return float(self.cumulant_cutoff.value())
+
     def _collect(self) -> SettingsState:
         return SettingsState(
-            # Relocated DLS seeds: carried through unchanged (edited via the DLS
-            # sub-tabs' per-run controls, not here).
-            **self._retained_dls,
+            **self.distribution_fields.values(),
             cumulant_method=self.cumulant_method.currentData(),
+            cumulant_order=self.cumulant_order.value(),
+            cumulant_weighting=self.cumulant_weighting.currentData(),
             skip_initial_channels=self.skip_channels.value(),
+            cumulant_fit_cutoff=self._cumulant_cutoff_value(),
             brookhaven_dat_baseline=self.bh_dat_baseline.currentData(),
             standard_geometry=self.geometry.currentText(),
             guinier_qrg_max=self.qrg_max.value(),
@@ -477,6 +964,15 @@ class SettingsModule(QtWidgets.QWidget):
         if runner().is_busy:
             busy_notice(self)
             return False
+        # A CONTIN α the engine would refuse is never saved: it would seed the per-run
+        # fields and the replicate average, which would then fail far from here.
+        problem = self.distribution_fields.alpha_problem()
+        if problem:
+            QtWidgets.QMessageBox.warning(
+                self, 'Settings not applied',
+                f'{problem}\n\nNothing was applied; correct the field and press Update '
+                f'again.')
+            return False
         new = self._collect()
         if not force and new == self.controller.settings:
             # Nothing changed: no persist, no `applied` cascade (the shell's re-theme,
@@ -491,36 +987,102 @@ class SettingsModule(QtWidgets.QWidget):
         # the second prompt would leave the first's clear already done (results gone) but
         # the Apply aborted, a dropdown/setting mismatch. Any Cancel reverts every dropdown
         # and applies nothing.
-        old_method = self.controller.settings.cumulant_method
-        old_estimator = self.controller.settings.se_estimator
+        old = self.controller.settings
+        old_method = old.cumulant_method
+        old_estimator = old.se_estimator
+        old_cutoff = old.cumulant_fit_cutoff
+        old_weighting = old.cumulant_weighting
         clear_cumulant = False
+        clear_skip = False
         clear_se = False
 
-        if new.cumulant_method != old_method:
-            n = self.controller.cumulant_dependent_result_count()
+        # The CUTOFF joins the method's arm rather than getting one of its own: both
+        # change which channels the fit regresses, both invalidate exactly the same result
+        # set, and a user who changes both at once should be asked once. It had no arm at
+        # all -- so the setting shipped able to move a promoted Rh while leaving it on the
+        # sample, still feeding rho = Rg/Rh in Cross-Sample.
+        cumulant_input_changed = (new.cumulant_method != old_method
+                                  or new.cumulant_fit_cutoff != old_cutoff
+                                  or new.cumulant_weighting != old_weighting)
+        # The ORDER is asked about in the same prompt but clears less: only the results
+        # that fit at the Settings order, never the Correlogram tab's own fits, which ran
+        # at its order box. One controller enumeration per scope, so the count asked about
+        # is the set cleared (owner-ruled 2026-09-23; the scopes' home is
+        # `Controller.clear_cumulant_dependent_results`).
+        order_changed = new.cumulant_order != old.cumulant_order
+        order_only = order_changed and not cumulant_input_changed
+        # The SKIPPED CHANNELS feed every DLS fit, so their scope is every DLS-derived
+        # result (owner-ruled 2026-09-23; its home is
+        # `Controller.clear_skip_dependent_results`). It contains the method and order
+        # scopes, so a skip change beside another cumulant input still asks once.
+        skip_changed = new.skip_initial_channels != old.skip_initial_channels
+
+        if skip_changed or cumulant_input_changed or order_changed:
             # The picked count gates the prompt too: a dangling pick can exist while
             # the row/cache counts are zero (its row removed by a declined re-run, or
             # the cache emptied by a reload), and a clear that destroys a pick must
             # never run unconfirmed (SampleResult docstring: proceed or back out).
-            p = self.controller.cumulant_dependent_picked_count()
+            if skip_changed:
+                n = self.controller.skip_dependent_result_count()
+                p = self.controller.skip_dependent_picked_count()
+            else:
+                n = self.controller.cumulant_dependent_result_count(order_only=order_only)
+                p = self.controller.cumulant_dependent_picked_count(order_only=order_only)
             if n > 0 or p > 0:
                 picked_clause = (f", plus {p} explicitly picked Rh value(s) that "
                                  f"came from them" if p else "")
+                # Name whichever input actually moved, so the prompt is about the change
+                # the user made rather than a generic one.
+                changed = []
+                if new.cumulant_method != old_method:
+                    changed.append('cumulant method')
+                if new.cumulant_fit_cutoff != old_cutoff:
+                    changed.append(f'fit cutoff ({old_cutoff:g} → '
+                                   f'{new.cumulant_fit_cutoff:g})')
+                if new.cumulant_weighting != old_weighting:
+                    changed.append(f'residual weighting ({_weighting_label(old_weighting)} '
+                                   f'→ {_weighting_label(new.cumulant_weighting)})')
+                if new.skip_initial_channels != old.skip_initial_channels:
+                    changed.append(f'skipped initial channels '
+                                   f'({old.skip_initial_channels} → '
+                                   f'{new.skip_initial_channels})')
+                if order_changed:
+                    changed.append(f'cumulant order ({old.cumulant_order} → '
+                                   f'{new.cumulant_order})')
+                kept = 'Distributions, SLS, and any hand-entered Rh are kept.'
+                if skip_changed:
+                    scope = (f"will clear {n} existing DLS result(s) (every "
+                             f"per-measurement fit, Γ vs q², D vs c, DDLS, the Mode Map "
+                             f"with its mode-family fits, and replicate averages)"
+                             f"{picked_clause}")
+                    kept = ('Recorded mode sets and their results, the mode families you '
+                            'picked on the Mode Map, SLS, and any hand-entered Rh are '
+                            'kept.')
+                elif order_only:
+                    scope = (f"will clear {n} existing result(s) fitted at the Settings "
+                             f"order (Γ vs q², D vs c, DDLS and replicate averages, "
+                             f"including an average run with the Correlogram tab’s order "
+                             f"copied in){picked_clause}. The Correlogram tab’s own "
+                             f"cumulant fits ran at its own order and are kept")
+                else:
+                    scope = (f"will clear {n} existing cumulant-based result(s) "
+                             f"(cumulant fits, Γ vs q², D vs c, DDLS and replicate "
+                             f"averages){picked_clause}")
                 resp = QtWidgets.QMessageBox.question(
-                    self, 'Switch cumulant method?',
-                    f"Switching the cumulant method will clear {n} existing "
-                    f"cumulant-based result(s) (cumulant fits, Γ vs q², D vs c, and "
-                    f"replicate averages){picked_clause}. A sample Rh taken from a "
-                    f"cleared result goes with it, so ρ = Rg/Rh is blank until you "
-                    f"re-run. Distributions, SLS, and any hand-entered Rh are "
-                    f"kept.\n\nContinue?",
+                    self, 'Change the cumulant fit inputs?',
+                    f"Changing the {' and '.join(changed)} {scope}. A sample Rh taken "
+                    f"from a cleared result goes with it, so ρ = Rg/Rh is blank until "
+                    f"you re-run. {kept}\n\nContinue?",
                     QtWidgets.QMessageBox.StandardButton.Yes
                     | QtWidgets.QMessageBox.StandardButton.Cancel,
                     QtWidgets.QMessageBox.StandardButton.Cancel)
                 if resp != QtWidgets.QMessageBox.StandardButton.Yes:
-                    self._revert_dropdowns(old_method, old_estimator)
+                    self._revert_dropdowns(old)
                     return False
-                clear_cumulant = True
+                if skip_changed:
+                    clear_skip = True
+                else:
+                    clear_cumulant = True
 
         if new.se_estimator != old_estimator:
             n = self.controller.se_dependent_result_count()
@@ -534,7 +1096,7 @@ class SettingsModule(QtWidgets.QWidget):
                     self, 'Switch uncertainty estimator?',
                     f"Switching to {label} will clear {n} existing result(s) that "
                     f"report a regression ± (Zimm/Berry, Debye, Guinier, "
-                    f"calibration-free A₂, Γ vs q², and D vs c){picked_clause}, so "
+                    f"calibration-free A₂, Γ vs q², D vs c and DDLS){picked_clause}, so "
                     f"they recompute under the new estimator. Computed point "
                     f"estimates (Mw, Rg, D, Rh) are unaffected; distributions, "
                     f"cumulants, and any hand-entered values are kept.\n\nContinue?",
@@ -542,26 +1104,40 @@ class SettingsModule(QtWidgets.QWidget):
                     | QtWidgets.QMessageBox.StandardButton.Cancel,
                     QtWidgets.QMessageBox.StandardButton.Cancel)
                 if resp != QtWidgets.QMessageBox.StandardButton.Yes:
-                    self._revert_dropdowns(old_method, old_estimator)
+                    self._revert_dropdowns(old)
                     return False
                 clear_se = True
 
         # All prompts confirmed — now it is safe to clear and apply.
+        if clear_skip:
+            self.controller.clear_skip_dependent_results()
         if clear_cumulant:
-            self.controller.clear_cumulant_dependent_results()
+            self.controller.clear_cumulant_dependent_results(order_only=order_only)
         if clear_se:
             self.controller.clear_se_dependent_results()
         self.controller.apply_settings(new)               # persists to settings.json
         self.applied.emit()
         return True
 
-    def _revert_dropdowns(self, cumulant_method: str, se_estimator: str) -> None:
-        """Restore both stale-guarded dropdowns to the still-current settings after a
-        canceled Apply, so no uncommitted choice lingers in the UI."""
-        j = self.cumulant_method.findData(cumulant_method)
+    def _revert_dropdowns(self, old: SettingsState) -> None:
+        """Restore every stale-guarded control to the still-current settings `old` after
+        a canceled Apply, so no uncommitted choice lingers in the UI.
+
+        The cutoff, order and skipped channels are spin boxes rather than dropdowns, but
+        they guard the same result set and revert with them: leaving one showing a value
+        the Apply refused is exactly the control/setting mismatch this helper exists to
+        prevent."""
+        j = self.cumulant_method.findData(old.cumulant_method)
         self.cumulant_method.setCurrentIndex(j if j >= 0 else 0)
-        k = self.se_estimator.findData(se_estimator)
+        # `_seed_combo`, not findData-or-0: a hand-edited value the list does not offer
+        # must revert to itself, not to 'sourced'.
+        _seed_combo(self.cumulant_weighting, old.cumulant_weighting, use_data=True)
+        k = self.se_estimator.findData(old.se_estimator)
         self.se_estimator.setCurrentIndex(k if k >= 0 else 0)
+        self._loaded_cumulant_cutoff = float(old.cumulant_fit_cutoff)
+        self.cumulant_cutoff.setValue(old.cumulant_fit_cutoff)
+        self.cumulant_order.setValue(old.cumulant_order)
+        self.skip_channels.setValue(old.skip_initial_channels)
 
     @QtCore.Slot()
     def _restore(self) -> None:

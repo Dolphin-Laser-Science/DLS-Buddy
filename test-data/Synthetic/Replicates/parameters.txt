@@ -1,0 +1,105 @@
+Replicates -- repeat acquisitions of one sample, and the zero-spread withhold
+============================================================================
+
+Why this set exists
+-------------------
+Replicate averaging is the platform's first and only Monte-Carlo-validated DLS dynamic
+uncertainty, and it is the route by which a +- reaches a size at all: invariant 8 forbids
+reporting one from a SINGLE correlogram, because its lag channels are correlated
+(Schaetzel 1990) so an OLS SE under-reports. ISO 22412 uses repeats instead, and this is
+the repeat set.
+
+Until now the path had no committed data and no census row that could report the gap --
+the census roster is controller `run_*` plus optional-`baseline` functions, and replicate
+averaging is reached from a controller method that is neither (it is not named `run_*`
+and takes no `baseline`), so it was invisible BY CONSTRUCTION.
+Measured 2026-09-05: every test driving it built its replicates in memory.
+
+TWO GROUPS, and the second is not more of the first
+---------------------------------------------------
+  "Repeat k of 5"      -- 5 genuine repeats, independent noise draws in
+                          their own seed band: file k draws from seed + 3e9 +
+                          (k-1)*1e5, the file names being 1-based while the
+                          generator's index is 0-based. This is what averaging
+                          is for.
+  "Identical k of 3"   -- 3 runs generated at noise 0, i.e. the SAME curve
+                          3 times. Not a realistic acquisition; it exists to reach
+                          the owner-ruled withhold below.
+
+HOW TO LOAD IT
+--------------
+Headerless two-column CSVs for the generic DLS parser: delay time in SECONDS, then
+g2(tau) - 1. At the confirmation step choose
+
+    delay_time_unit = 's'      data_form = 'g2m1'
+
+then load all files of one group as separate measurements of one sample, select them
+together in the sidebar and right-click. Two menu entries do two different things, and
+this file documents BOTH:
+
+    "Average derived results..."                      -- fits each run, then averages
+                                                         the fitted sizes. THIS is the
+                                                         Rh +- tabulated below.
+    "Average correlation functions -> new measurement" -- averages the curves channel by
+                                                         channel into one new
+                                                         measurement. This is the
+                                                         `average_replicate_correlograms`
+                                                         path, whose channel-wise sd is
+                                                         also tabulated below.
+
+The runs share one lag grid exactly, which `average_replicate_correlograms` requires.
+
+GROUND TRUTH
+------------
+  Planted Rh 45 nm with spread_cv 0.1, beta 0.9, angle 90 deg,
+  532 nm, n = 1.33, T = 298.15 K, eta = 0.00089 Pa s,
+  noise 0.01 (absolute SD on g2-1) for the "Repeat" group and 0 for the
+  "Identical" group, seed 7703, 200 points, uniform log lag axis 1e-7 .. 1 s.
+
+  The intensity-weighted truth the cumulant should return is 44.7821 nm --
+  NOT 45. The 0.1 spread makes the effective radius differ from the median one, and
+  reading the planted median as the target is the mistake this line exists to prevent.
+
+WHAT A FIT SHOULD RETURN (measured 2026-09-05)
+----------------------------------------------
+  Noisy group, linear cumulant per run:
+      43.7188, 45.0156, 45.4535, 44.7429, 44.5054 nm
+      mean 44.6872, sd 0.6459, sem 0.2889 (n = 5)
+      (re-measured 2026-09-07: run 3 read 44.7971 when first measured on 2026-09-05 and
+      reads 45.4535 now that the cumulant fit's retained range is contiguous; the other
+      four are unchanged to four decimals, and the mean moved from 0.5 % to 0.2 % below
+      the truth -- inside the sd either way)
+  The mean sits 0.5 % below the 44.7821 nm truth and the +- covers it. Read the sd as
+  a REGRESSION PIN: one realisation's replicate SE has ~1/sqrt(2(N-1)) relative spread,
+  about 35 % at N = 5, so a later value inside a few tenths of this is agreement, not
+  a discrepancy.
+
+  Channel-wise, `average_replicate_correlograms` returns max sd_g2m1 2.143e-02 and
+  max sem_g2m1 9.582e-03 over the 5 runs.
+
+  Identical group. The three files are byte-identical and all three fit to
+  Rh = 44.7825130424299 nm, BIT-identical. The owner-ruled behaviour is that replicates
+  which agree exactly WITHHOLD both sd and sem (returning None, never 0.0), because a +-
+  of exactly zero claims infinite precision, the under-report invariant 8 forbids.
+
+  Measured 2026-09-13: it withholds. `replicate_mean_se` returns sd = None, sem = None,
+  n = 3, so the averaged size carries no +-. Pinned by
+  `tests/test_synthetic_generator.py::test_identical_replicates_reach_the_zero_spread_withhold`,
+  which drives this group and a family of constructed values and counts.
+
+  History, kept because this group was built to expose it: until 2026-09-13 the guard
+  asked whether the computed sd was positive. `np.mean([x, x, x])` for this x returns one
+  ulp below x, so every deviation was +1 ulp and the program reported
+  44.7825 +- 0.0000000000000050 nm. The guard now tests the values for equality.
+
+  For contrast, the correlogram-level average is not where the problem is:
+  `average_replicate_correlograms` returns max sd_g2m1 = 1.360e-16 on this group, dust of
+  the same kind, and it is not a reported uncertainty.
+
+WHAT IS NOT PINNED HERE
+-----------------------
+  The `sem > 0` arm of the withhold: `sem` reaching zero by underflow while `sd` is still
+  positive. It is unreachable through numpy's `std(ddof=1)`, because a nonzero sample SD is
+  at least ~2.2e-162 (the square root of the smallest subnormal variance), so dividing it
+  by sqrt(N) cannot underflow at any reachable N (measured 2026-09-13). It is kept as
+  defence only, and neither data nor a test pins it.

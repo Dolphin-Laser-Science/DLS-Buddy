@@ -151,8 +151,12 @@ class AmplitudeGuinierResult:
     Fitted as 1/A vs q^2 (an exact rearrangement of A(0)/A(q) = 1 +
     Rg^2 q^2 / 3): the intercept is 1/A(0) -- the extrapolated normalization
     obtained from the fit itself, never from a hand-picked lowest angle --
-    and Rg^2 = 3 * slope / intercept, where every intensity scale cancels
-    (calibration and dn/dc do not enter). APPARENT + MODE-RESOLVED by
+    and Rg^2 = 3 * slope / intercept, where every intensity SCALE cancels
+    (calibration and dn/dc do not enter). What does NOT cancel is an ADDITIVE
+    term: a solvent blank that was not measured leaves a residue in the parent
+    dR which survives the partition and biases the slope, whether or not that
+    residue varies with angle -- hence `blank_measured` below, the one input
+    absence this Rg does not shrug off. APPARENT + MODE-RESOLVED by
     construction (invariant 7; Sedlak prints the 'apparent' caveat himself,
     2001 p. 42): the number tracks relative changes; its absolute value is
     resolution-limited.
@@ -190,9 +194,23 @@ class AmplitudeGuinierResult:
     # drops this flag with the reason in reliability_note -- the value still
     # reports (flag, don't NaN).
     rg_reliable: bool = True
+    # Was the parent series' solvent blank MEASURED at every angle? This fit takes bare
+    # arrays and no RayleighRatioResult, so the caller fills it from the Rayleigh
+    # results the amplitudes came from. It is the one input absence this Rg does not
+    # shrug off (the docstring says why), so it gates `rg_reliable`. Normative home:
+    # sls.RayleighRatioResult.blank_measured.
+    blank_measured: bool = True
     reliability_note: str = ''
     derived_provenance: str = ''           # partition record (export family)
     notes: tuple = ()
+
+
+#: The precondition sentence for a mode-resolved size fitted from a series whose solvent
+#: blank was never measured. A literal here rather than a copied record: this result carries
+#: no `blank_provenance` field to copy one into (see `amplitude_guinier`).
+_NO_BLANK_NOTE = ("solvent blank not measured for the parent series: the partitioned "
+                  "amplitudes inherit whatever the assumed blank left in dR, so this "
+                  "apparent size is not reliable")
 
 
 def _join_provenance(partition: str, existing: str) -> str:
@@ -320,7 +338,7 @@ def partition_rayleigh(
     if n_undecayed:
         notes.append(
             f"{n_undecayed} of the mode point(s) used never finished decaying "
-            f"inside their lag window; their amplitudes come from a decay the "
+            f"inside their delay window; their amplitudes come from a decay the "
             f"measurement did not observe, so the partitioned intensities "
             f"built on them are unreliable."
         )
@@ -423,6 +441,7 @@ def amplitude_guinier(
     qrg_max_valid: float = 1.3,
     cond_limit: float = unc.COND_LIMIT,
     derived_provenance: str = '',
+    blank_measured: bool = True,
 ) -> AmplitudeGuinierResult:
     """Sedlak Eq. 7 on one mode's amplitude series: apparent mode size.
 
@@ -552,6 +571,14 @@ def amplitude_guinier(
     # `rg_reliable` and names itself, rather than riding only in `notes`.
     if math.isfinite(qrg_max) and not valid:
         note = ' '.join(x for x in (note, notes[-1]) if x)
+    # The blank names itself HERE, not in a `blank_provenance` record, because this result
+    # has none: it takes bare arrays and no RayleighRatioResult, so there is no sentence to
+    # copy. Without this the flag went down with nothing to explain it, and the
+    # mode-partition exporter -- which composes its Comments from `reliability_note` --
+    # flagged a size and said why on no surface at all (round d0ce f1). Invariant 4
+    # clause 1: a False flag names its failed precondition.
+    if not blank_measured:
+        note = ' '.join(x for x in (note, _NO_BLANK_NOTE) if x)
 
     return AmplitudeGuinierResult(
         q2_nm2=q2k, inv_amplitude=y,
@@ -567,7 +594,8 @@ def amplitude_guinier(
         rg_se=rg_se, se_estimator=estimator,
         well_conditioned=fit.well_conditioned, cond=fit.cond,
         rg_reliable=bool(math.isfinite(rg) and rg > 0 and fit.well_conditioned
-                         and valid),
+                         and valid and blank_measured),
+        blank_measured=bool(blank_measured),
         reliability_note=note,
         derived_provenance=derived_provenance,
         notes=tuple(notes),

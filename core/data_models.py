@@ -77,6 +77,15 @@ So the refusing surfaces are wider than the two tags: check_replicate_identity
 compares eight fields, and every one of them is a field whose disagreement makes
 the AVERAGE describe no real condition.
 
+A replicate average is not a repeat, so it never enters another average
+(owner-ruled 2026-09-13). The replicate +/- is honest only because its inputs are
+independent repeats of one condition; an average counted beside its own sources adds
+no scatter but raises N, and beside other runs it counts as one repeat while carrying
+a fraction of one run's variance. Refused in every averaging action -- the replicate
+averages and the derived static point, where it is also listed ineligible -- on the item's
+own tag, whatever else is selected; fitted on its own it is an ordinary measurement.
+Reopen trigger, recorded: one real selection wrongly refused in ordinary use.
+
 Rule 2 (disclosure). Everything else combines, and anything surprising about
 the combination is stated where it travels: on the result itself when there is
 one (notes -> export Comments), on the row or label when it is eligibility
@@ -97,7 +106,8 @@ meaningful, so there is no ask-and-proceed on any fit or averaging path.
 
 Standing surfaces (a classification aid for the next site author, not policy):
 refuse (the replicate-identity check, the controller's mixed-polarization
-refusal, the DDLS cross-bucket check) is rule 1's backstop; warn-and-continue
+refusal, the DDLS cross-bucket check, an average offered to an average) is rule 1's
+backstop; warn-and-continue
 (the Gamma-vs-q2 identity note), filter-and-disclose (the DLS tab's grayed
 other-fraction rows) and the passive hint (the SLS pooling hint) are rule 2 at
 three surfaces; silent grouping is not a mode -- the sidebar IS the workspace
@@ -159,6 +169,24 @@ Change history
             two-rule doctrine above. Every identity-deciding consumer carries a
             one-line pointer naming the rule it implements instead of deriving
             its own; the doctrine text lives only here.
+2026-09-10  The fit's instrument inputs travel on the measurement. (data_models v7)
+            DLSMeasurement gains two optional fields: `sample_times_s`, the
+            per-channel sample time a parser records when its file states the
+            correlator's sampling structure (the Brookhaven .dat; None for every
+            format that states none), and `mean_count_rate_cps`, the run's mean
+            photon count rate, set by `LoadedMeasurement.build()` from the COMMITTED
+            parameter -- so the count rate reaches the engine exactly as viscosity
+            does, on the object, and no caller threads it. `usable_rate()` is the
+            one predicate for "is this a count rate", shared by every reader.
+2026-09-11  The run duration joins them. (data_models v8)
+            DLSMeasurement gains `duration_s`, the run duration T a parser records
+            when its file states one for the correlogram (the ALV `Duration` of a
+            one-run acquisition), in `raw` beside the sample times and never an
+            editable parameter. The exact-in-Gamma residual weight's 1/(M - k) reads
+            it; without one the weight takes its T -> infinity form.
+2026-09-13  Rule 1 gains the replicate average. (doctrine text only)
+            A replicate average never enters another average: it is not a repeat,
+            and counting it as one under-reports the replicate +/-. No field change.
 """
 
 from __future__ import annotations
@@ -519,6 +547,38 @@ def _require_non_negative_array(arr: np.ndarray, field_name: str) -> None:
         )
 
 
+def _require_positive_array(arr: np.ndarray, field_name: str) -> None:
+    """Reject an array holding any zero or negative value (e.g. a sample time)."""
+    if np.any(arr <= 0):
+        raise ValueError(
+            f"{field_name} must be strictly positive; found zero or negative value(s)."
+        )
+
+
+def usable_rate(value) -> Optional[float]:
+    """A mean photon count rate as the engine takes it, or None -- the ONE predicate.
+
+    The rule, in order: `bool`, `str` and `bytes` are refused by TYPE (``float(True)``
+    and ``float('1e5')`` are numbers a caller never meant); then ``float()`` admits every
+    real numeric type, numpy scalars and 0-d arrays included; then the value must be
+    finite and strictly positive. A zero is not a rate -- an all-zero trace produces
+    one, and the fit must fall to its classical limit and say so rather than weight
+    on a placeholder. Two-sided by construction: an underflowed 0.0 and a saturated
+    inf both come back None.
+
+    Every reader and writer of the committed count rate goes through here, so "is this
+    a usable rate" has one answer; the roster is pinned by
+    `tests/test_workspace.py::test_every_reader_of_the_committed_count_rate_agrees`.
+    """
+    if value is None or isinstance(value, (bool, str, bytes)):
+        return None
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        return None
+    return rate if math.isfinite(rate) and rate > 0.0 else None
+
+
 # Plausibility bands for auto-filled header metadata. These are DELIBERATELY wide,
 # general sanity bounds (not solvent- or instrument-specific tuning, cf. invariants
 # 3 & 4): a value outside them is almost certainly a unit slip or typo in the source
@@ -736,6 +796,34 @@ class DLSMeasurement:
         confirmation layer; the value is multiplied by 1e-3 before storage.
     sample_label, instrument_name, source_file
         Provenance carried from the source file where available.
+    sample_times_s
+        Per-channel sample time Delta_t_k, in seconds, same length as the delay
+        axis: the time the correlator accumulated each channel over, which the
+        nonlinear cumulant's sourced residual weight (Schaetzel 1990 Eq. 49) needs
+        per channel. Written by a parser whose file STATES the sampling structure
+        (the Brookhaven .dat: one sampling time per correlator section plus the
+        high-speed section's fixed table) and None otherwise, in which case the
+        engine derives a stand-in from the delay axis and records which was used.
+        An instrument fact like the lags themselves: never user-edited.
+    mean_count_rate_cps
+        The run's mean photon count rate, in counts per second -- the one header
+        value the same weight reads (its shot-noise groups, n_bar_k = <c.r.> *
+        Delta_t_k). User-owned and provenance-tagged like viscosity: it reaches
+        this object only from the COMMITTED parameters through
+        `LoadedMeasurement.build()`, None when nothing usable was committed (the
+        classical infinite-count-rate limit, which the fit result discloses).
+        Must be a usable rate when present -- see `usable_rate`.
+    duration_s
+        The run duration T, in seconds: how long the correlator accumulated this
+        correlogram. The exact-in-Gamma form of the same weight (Biganzoli & Ferri
+        2018 Eq. 9) averages lag k over M - k products, 1/(M_k - k) = Delta_t_k /
+        (T - tau_k), so T stays in the relative shape unless it is long against the
+        last lag. Written by a parser whose file STATES it for this correlogram (the
+        ALV `Duration` of a one-run acquisition; a Brookhaven header whose stated run
+        length covers every channel that collected counts) and None otherwise, in which case the
+        weight takes its T -> infinity form and the fit result records which. An
+        instrument fact like the sample times: never user-edited. Finite and positive
+        when present.
 
     A count-rate trace recorded beside this correlogram is NOT held here. Traces
     live in one place -- the workspace's own trace store, keyed by trace_id, with
@@ -785,6 +873,18 @@ class DLSMeasurement:
     sample_label: Optional[str] = None
     instrument_name: Optional[str] = None
     source_file: Optional[str] = None
+    # --- the fit's instrument inputs (the class docstring's "Optional" section) ---
+    # Per-channel sample time (s), parser-written when the file states its sampling
+    # structure; None means "derive a stand-in from the axis and say so". Kept in
+    # `LoadedMeasurement.raw` beside the lags, never in the editable parameters.
+    sample_times_s: Optional[np.ndarray] = None
+    # Mean count rate (cps) from the COMMITTED parameter via `LoadedMeasurement.build()`
+    # -- the one sanctioned path -- so every fit on this object reads the same rate.
+    mean_count_rate_cps: Optional[float] = None
+    # Run duration T (s), parser-written when the file states it for this correlogram;
+    # None means "the weight's T -> infinity form, and say so". Kept in
+    # `LoadedMeasurement.raw` beside the sample times, never in the editable parameters.
+    duration_s: Optional[float] = None
 
     def __post_init__(self) -> None:
         self.delay_times_s = _as_1d_float_array(self.delay_times_s, "delay_times_s")
@@ -810,6 +910,31 @@ class DLSMeasurement:
             _require_positive(self.solute_refractive_index, "solute_refractive_index")
         self.analyzer_geometry = _normalize_analyzer_geometry(
             self.analyzer_geometry, "analyzer_geometry")
+        if self.sample_times_s is not None:
+            # Validated like the axis it pairs with: one finite, strictly positive
+            # sample time per channel.
+            self.sample_times_s = _as_1d_float_array(self.sample_times_s, "sample_times_s")
+            _require_same_length(
+                self.delay_times_s, self.sample_times_s, "delay_times_s", "sample_times_s")
+            _require_finite_array(self.sample_times_s, "sample_times_s")
+            _require_positive_array(self.sample_times_s, "sample_times_s")
+        if self.mean_count_rate_cps is not None:
+            rate = usable_rate(self.mean_count_rate_cps)
+            if rate is None:
+                raise ValueError(
+                    f"mean_count_rate_cps must be a finite positive photon count rate in "
+                    f"counts per second, got {self.mean_count_rate_cps!r}; pass None for "
+                    f"the classical infinite-count-rate limit rather than a placeholder.")
+            self.mean_count_rate_cps = rate
+        if self.duration_s is not None:
+            # Refused rather than dropped: a duration the file states but Eq. (9) cannot
+            # use is an error in the file or the caller, never a silent T -> infinity.
+            duration = float(self.duration_s)
+            if not (math.isfinite(duration) and duration > 0.0):
+                raise ValueError(
+                    f"duration_s must be a finite positive run duration in seconds, got "
+                    f"{self.duration_s!r}; pass None when the file states none.")
+            self.duration_s = duration
         _warn_if_implausible_metadata(
             self.temperature_K, self.solvent_refractive_index)
 

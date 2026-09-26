@@ -1,0 +1,57 @@
+DLS Buddy -- Synthetic MULTI-FRACTION LADDER test data
+======================================================
+
+Why this set exists
+-------------------
+A molecular-weight FRACTION is a within-sample axis, like concentration and angle: two
+fractions of one polymer in one solvent at one temperature are ONE sample, and the fits
+filter by fraction rather than the workspace splitting on it. No other committed set
+carries two fractions, so that whole axis had no data behind it -- including the case
+where each fraction brings its own c = 0 blank, which is what puts two blanks at one
+concentration.
+
+
+HOW TO LOAD IT -- the fraction is NOT in the files
+--------------------------------------------------
+No vendor format carries a molecular-weight fraction and no parser reads one: it is a
+parameter you enter on the Data tab, so this set cannot ship it. Load both files, then at
+the confirmation step set
+
+  SLS F1 - PVP (100k).csv   ->  Mw fraction = F1
+  SLS F2 - PVP (1M).csv   ->  Mw fraction = F2
+
+leaving polymer (PVP), solvent (water) and
+temperature identical for both -- those three are what group a sample, so both ladders
+land in one. Entering a different polymer name for the second file instead is the mistake
+this set exists to make visible: it produces two samples and nothing to filter.
+
+
+SLS CALIBRATION (SLS tab calibration panel)
+-------------------------------------------
+  Standard toluene (VU); calibrant intensity 100000 at 90 deg
+
+WITHOUT it the run is uncalibrated, and the program is right to withhold: Mw and A2 come
+back on an arbitrary scale with `mw_reliable = False`, and only Rg survives (the unknown
+scale cancels out of a slope/intercept ratio). Measured 2026-09-03 with no calibration
+entered: Mw reads 3.15e14 and 3.17e15, i.e. the truth below divided by k_c. Enter the
+calibration and both fractions return the table.
+
+
+GROUND TRUTH
+------------
+  F1    Mw 1e+05 g/mol   Rg 14.0 nm   A2 0.00015 mol mL/g^2
+  F2    Mw 1e+06 g/mol   Rg 55.0 nm   A2 9.5e-05 mol mL/g^2
+
+  Angles           45, 60, 75, 90, 105, 120 deg
+  Concentrations   0, 0.3, 0.6, 1, 1.5 mg/mL
+                   (the 0.0 is each fraction's OWN solvent blank -- two blanks at one
+                   concentration, which is the collision this shape produces)
+  Solvent          water, n = 1.33, 0.89 cP
+  Temperature      25.0 C (298.15 K)
+  Wavelength       532 nm
+  dn/dc            0.135 mL/g
+  Noise            0.005 fractional on each ladder AND on each blank, the blanks drawn
+                   from their own independent streams -- a real blank is not exact
+
+Run Zimm on each fraction (the fraction selector filters the sample's series) and the
+recovered Mw / Rg / A2 should return the table above.

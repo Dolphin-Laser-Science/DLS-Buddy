@@ -26,12 +26,14 @@ Nothing here imports analysis/physics — pure Qt presentation (it does use the 
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Callable, Iterable, Optional, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from core.data_models import IDENTITY_FORM_BY_FIELD
+from core.naming import UNCONFIRMED_SAMPLE
 from gui.help import section_header
 
 
@@ -298,6 +300,49 @@ class RichTextDelegate(QtWidgets.QStyledItemDelegate):
         return QtCore.QSize(int(doc.idealWidth()) + 4, int(doc.size().height()))
 
 
+# The inset `RichTextHeaderView` paints its rich text at. It is spent on the LEFT
+# only -- `paintSection` translates by it and then clips in the translated frame, so
+# the paint budget is `rect.width() - 1 * inset`. The measurement below floors the
+# chrome at TWO insets anyway, which is one more than the paint step needs: that is
+# the safe direction (4 px of slack, measured), never an under-size.
+_RICH_HEADER_INSET_PX = 4
+
+# Width cap, in px, on a table column that holds a MEASUREMENT NAME, paired with
+# `Qt.ElideLeft` on the table. One home because it is one job on three tables -- the
+# Correlogram and Distribution glance tables and the SLS derived-run table -- all of
+# which sit in a narrow control column where an uncapped file stem pushes the values
+# it is meant to identify off the edge. Left-elision is the other half: a stem's TAIL
+# is what tells six replicates of one set apart, so the head is what may be dropped.
+NAME_COL_MAX_W = 150
+
+
+def sidebar_measurement_order(controller) -> dict:
+    """``{item_id: position}`` in the SIDEBAR's order.
+
+    The order `gui/main_window.MainWindow._refresh_sidebar` paints: samples in order,
+    then each
+    sample's DLS runs, then its solvent reference, its SLS series and any extra
+    blanks. Derived from the CONTROLLER rather than read off the tree widget, so a tab
+    can reproduce it without reaching into another widget -- and without a tree
+    existing at all, which is what makes it testable.
+
+    Two tabs need it for different jobs and must agree: the Summary table orders its
+    rows by it (they were sorted as TEXT, which put 100 deg before 50 deg) and the Data
+    tab numbers a fanned-out label by it, so a file exported from one matches the row
+    read in the other.
+    """
+    order: dict = {}
+    for sample in controller.samples():
+        ids = list(sample.dls_item_ids)
+        if sample.solvent_reference_item_id:
+            ids.append(sample.solvent_reference_item_id)
+        ids += list(sample.sls_item_ids)
+        ids += list(sample.extra_solvent_reference_item_ids)
+        for iid in ids:
+            order.setdefault(iid, len(order))
+    return order
+
+
 class RichTextHeaderView(QtWidgets.QHeaderView):
     """A horizontal table header that renders its section labels as HTML, so quantity
     names in a HEADER (R<sub>g</sub>, R<sub>h</sub>, ρ = R<sub>g</sub>/R<sub>h</sub>) show
@@ -311,13 +356,45 @@ class RichTextHeaderView(QtWidgets.QHeaderView):
         self.setSectionsClickable(True)
         self.setHighlightSections(True)
 
+    def _section_html(self, logical_index) -> str:
+        """The section's DisplayRole string, '' when there is no model."""
+        model = self.model()
+        return '' if model is None else str(
+            model.headerData(logical_index, QtCore.Qt.Orientation.Horizontal,
+                             QtCore.Qt.ItemDataRole.DisplayRole) or '')
+
+    def sectionSizeFromContents(self, logical_index):
+        """Size a section from its RENDERED text, not from its markup.
+
+        QHeaderView measures this hint by handing the section's DisplayRole string to
+        the style as PLAIN text, so a label of 'ρ = R<sub>g</sub>/R<sub>h</sub>
+        (± statistical)' asks for the width of the tags it never draws — roughly twice
+        what it paints. Every column sized to its contents then demands far more room
+        than the table has, which is what the header row cost the tables using this
+        view. Measured here with the same QTextDocument `paintSection` draws with.
+
+        The style's own chrome (the header margins, and the sort indicator when one is
+        shown) is kept by subtracting what Qt measured the string as — its hint bolds
+        the metrics — from the base hint, floored at the inset the paint step spends so
+        an unfamiliar style cannot leave the rendered text clipped."""
+        base = super().sectionSizeFromContents(logical_index)
+        text = self._section_html(logical_index)
+        if not _HTML_TAG.search(text):
+            return base
+        doc = QtGui.QTextDocument()
+        doc.setDefaultFont(self.font())
+        doc.setHtml(text)
+        bold = QtGui.QFont(self.font())
+        bold.setBold(True)
+        as_plain = QtGui.QFontMetrics(bold).size(0, text).width()
+        chrome = max(2 * _RICH_HEADER_INSET_PX, base.width() - as_plain)
+        return QtCore.QSize(math.ceil(doc.idealWidth()) + chrome,
+                            max(base.height(), math.ceil(doc.size().height())))
+
     def paintSection(self, painter, rect, logical_index) -> None:
         if not rect.isValid():
             return
-        model = self.model()
-        text = '' if model is None else str(
-            model.headerData(logical_index, QtCore.Qt.Orientation.Horizontal,
-                             QtCore.Qt.ItemDataRole.DisplayRole) or '')
+        text = self._section_html(logical_index)
         if not _HTML_TAG.search(text):
             super().paintSection(painter, rect, logical_index)
             return
@@ -339,9 +416,9 @@ class RichTextHeaderView(QtWidgets.QHeaderView):
             QtGui.QPalette.ColorRole.Text,
             self.palette().color(QtGui.QPalette.ColorRole.ButtonText))
         painter.save()
-        painter.translate(rect.left() + 4,
+        painter.translate(rect.left() + _RICH_HEADER_INSET_PX,
                           rect.top() + max(0.0, (rect.height() - doc.size().height()) / 2.0))
-        painter.setClipRect(0, 0, rect.width() - 4, rect.height())
+        painter.setClipRect(0, 0, rect.width() - _RICH_HEADER_INSET_PX, rect.height())
         doc.documentLayout().draw(painter, ctx)
         painter.restore()
 
@@ -354,6 +431,55 @@ class RichTextHeaderView(QtWidgets.QHeaderView):
 # The model is GUI-side only and not persisted -- the controller stays Qt-free and stateless
 # about selection, analysis calls taking the ticked ids inline via `include_ids`. The picker
 # is a thin view; two pickers sharing one model stay in lock-step via its `changed` signal.
+
+# Matplotlib's marker codes (`plotting.plots.marker_cycle`) as painted Qt shapes. The
+# plot's non-colour channel is the SHAPE, so a swatch that showed colour alone would
+# lose exactly what a colour-blind reader relies on (WCAG 1.4.1).
+_SWATCH_POLYGONS = {
+    's': ((-1, -1), (1, -1), (1, 1), (-1, 1)),
+    '^': ((0, -1), (1, 0.8), (-1, 0.8)),
+    'v': ((0, 1), (1, -0.8), (-1, -0.8)),
+    'D': ((0, -1), (1, 0), (0, 1), (-1, 0)),
+    'P': ((-1, -.38), (-.38, -.38), (-.38, -1), (.38, -1), (.38, -.38), (1, -.38),
+          (1, .38), (.38, .38), (.38, 1), (-.38, 1), (-.38, .38), (-1, .38)),
+}
+
+
+def marker_swatch(color_hex: Optional[str], marker: Optional[str],
+                  size: int = 12) -> QtGui.QIcon:
+    """The icon that carries a co-plotted series' identity: its plot COLOUR and its
+    plot MARKER SHAPE, so the row beside a name means the same thing as the curve.
+
+    An empty icon when the COLOUR is missing -- an UNTICKED measurement has no colour
+    of its own (`SelectionModel.color_for` keys on position in the ticked list), so it
+    must not be given one here. A missing or unmapped marker falls to the disc.
+    """
+    if not color_hex:
+        return QtGui.QIcon()
+    pm = QtGui.QPixmap(size, size)
+    pm.fill(QtCore.Qt.GlobalColor.transparent)
+    painter = QtGui.QPainter(pm)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    qc = QtGui.QColor(color_hex)
+    painter.setBrush(QtGui.QBrush(qc))
+    painter.setPen(QtGui.QPen(qc))
+    r = (size - 3) / 2.0
+    cx = cy = size / 2.0
+    poly = _SWATCH_POLYGONS.get(marker or 'o')
+    if marker == 'X':
+        # A rotated filled plus: one shape definition, two markers.
+        painter.translate(cx, cy)
+        painter.rotate(45)
+        painter.translate(-cx, -cy)
+        poly = _SWATCH_POLYGONS['P']
+    if poly is None:                          # 'o' and anything unmapped: a disc
+        painter.drawEllipse(QtCore.QRectF(cx - r, cy - r, 2 * r, 2 * r))
+    else:
+        painter.drawPolygon(QtGui.QPolygonF(
+            [QtCore.QPointF(cx + x * r, cy + y * r) for x, y in poly]))
+    painter.end()
+    return QtGui.QIcon(pm)
+
 
 class SelectionModel(QtCore.QObject):
     """An ordered, unique set of measurement ``item_id`` strings currently ticked for
@@ -548,11 +674,16 @@ class MeasurementPicker(QtWidgets.QWidget):
     checkboxes** (`Qt.ItemIsUserCheckable`, include-semantics) backed by a
     :class:`SelectionModel`, with a "?" help badge and Select all / none.
 
-    Physics-free: the caller injects ``label_fn(lm) -> str`` and ``header_fn(sample) ->
-    str`` so DLS/SLS/Utilities each supply their own row/group labels. ``kinds`` filters
-    which measurement kinds are eligible. ``single=True`` gives radio behavior (ticking
-    one unticks the rest) for the sample-scoped tabs. Emits ``selectionChanged`` whenever
-    the ticked set changes (a re-emit of the model's ``changed``)."""
+    Physics-free: the caller injects ``label_fn(lm) -> str``, ``header_fn(sample) ->
+    str`` and (optionally) ``tooltip_fn(lm) -> str`` so the row text, the group text
+    and the hover card are the caller's, never this widget's. ``kinds`` filters which
+    measurement kinds are eligible. ``single=True`` gives radio behavior (ticking one
+    unticks the rest) for the sample-scoped tabs. Emits ``selectionChanged`` whenever
+    the ticked set changes (a re-emit of the model's ``changed``).
+
+    A TICKED row carries its plot swatch (:func:`marker_swatch`) -- the colour and
+    marker shape that measurement has in the co-plot -- so the list and the plot can
+    be read against each other. An unticked row gets none: it has no colour yet."""
 
     selectionChanged = QtCore.Signal()
 
@@ -560,6 +691,7 @@ class MeasurementPicker(QtWidgets.QWidget):
                  kinds: Sequence[str] = ('dls',),
                  label_fn: Callable[[object], str],
                  header_fn: Callable[[object], str],
+                 tooltip_fn: Optional[Callable[[object], str]] = None,
                  title: str = 'Measurements to Plot',
                  help_text: str = '', help_bullets: Optional[Sequence[str]] = None,
                  single: bool = False,
@@ -571,6 +703,7 @@ class MeasurementPicker(QtWidgets.QWidget):
         self._kinds = tuple(kinds)
         self._label_fn = label_fn
         self._header_fn = header_fn
+        self._tooltip_fn = tooltip_fn
         self._single = single
         self._group_fields = tuple(group_fields)
         self._leaf_by_id: dict = {}          # item_id -> QListWidgetItem (checkable leaves)
@@ -626,14 +759,19 @@ class MeasurementPicker(QtWidgets.QWidget):
             groups.setdefault(sid, []).append(lm)
         for sid, ms in groups.items():
             sample = self._controller.workspace.samples.get(sid)
+            # One string for it, whether the sample is unconfirmed or missing
+            # entirely: to the reader both mean "this run's identity is not set",
+            # and `core.naming` is where that wording lives.
             hdr = QtWidgets.QListWidgetItem(
-                self._header_fn(sample) if sample else '(unconfirmed)')
+                self._header_fn(sample) if sample else UNCONFIRMED_SAMPLE)
             hdr.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)   # header, not checkable
             font = hdr.font(); font.setBold(True); hdr.setFont(font)
             hdr.setForeground(color(self._list, 'marker_group'))
             self._list.addItem(hdr)
             for lm in ms:
                 it = QtWidgets.QListWidgetItem('  ' + self._label_fn(lm))
+                if self._tooltip_fn is not None:
+                    it.setToolTip(self._tooltip_fn(lm))
                 it.setData(QtCore.Qt.ItemDataRole.UserRole, lm.item_id)
                 it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
                 it.setCheckState(QtCore.Qt.CheckState.Checked
@@ -714,9 +852,11 @@ class MeasurementPicker(QtWidgets.QWidget):
 
     # -- theme --------------------------------------------------------------
     def _apply_palette(self) -> None:
-        """Recolor group headers and tint the ticked rows with `marker_selected` for the
-        current theme. Named `_apply_palette` so `gui.theme.retheme` re-runs it on a theme
-        switch (alongside the per-widget PaletteChange below)."""
+        """Recolor group headers, tint the ticked rows with `marker_selected` for the
+        current theme, and put each ticked row's plot swatch beside its name. Named
+        `_apply_palette` so `gui.theme.retheme` re-runs it on a theme switch (alongside
+        the per-widget PaletteChange below) -- which is also what re-draws the swatches
+        after a plot-palette switch."""
         for i in range(self._list.count()):
             it = self._list.item(i)
             iid = it.data(QtCore.Qt.ItemDataRole.UserRole)
@@ -724,8 +864,11 @@ class MeasurementPicker(QtWidgets.QWidget):
                 it.setForeground(color(self._list, 'marker_group'))
             elif it.checkState() == QtCore.Qt.CheckState.Checked:
                 it.setForeground(color(self._list, 'marker_selected'))
+                it.setIcon(marker_swatch(self._model.color_for(iid),
+                                         self._model.marker_for(iid)))
             else:
                 it.setForeground(QtGui.QBrush())   # reset → follow palette text color
+                it.setIcon(QtGui.QIcon())          # unticked: no colour of its own
 
     def changeEvent(self, ev: QtCore.QEvent) -> None:
         if ev.type() == QtCore.QEvent.Type.PaletteChange:

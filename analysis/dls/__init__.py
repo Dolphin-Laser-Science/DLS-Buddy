@@ -8,7 +8,7 @@ This package recovers particle dynamics from a measured intensity autocorrelatio
 function g2(tau) - 1. It provides six analysis methods in two families:
 
   Parametric models (fit a fixed functional form):
-    - fit_cumulants            1st / 2nd / 3rd order cumulant expansion
+    - fit_cumulants            cumulant expansion, orders 1-4 (linear or nonlinear)
     - fit_single_exponential   single decay mode
     - fit_double_exponential   two discrete decay modes
     - fit_kww                  Kohlrausch-Williams-Watts (stretched exponential)

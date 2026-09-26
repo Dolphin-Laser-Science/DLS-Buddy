@@ -1,0 +1,75 @@
+Cutoff-Boundary -- six cells anchoring the cutoff x condition grid's verdict
+===========================================================================
+
+Why this set exists
+-------------------
+09-04-spec-01 package 1 swept the linear cumulant's amplitude cutoff
+(`fit_cutoff`) against generator ground truth across five conditions, to give
+09-03-spec-01's default-constant fork a TRUTH oracle in place of the 190-run
+real-corpus sweep, which could only measure how far Rh MOVED between cutoffs and
+never how far it was WRONG.
+
+The grid runs into tmp_path and is not committed -- 7,776 fits, and the result is
+a number in a document. These six cells are the ones the conclusions rest on, so
+a later change to the cutoff, to the channel selection or to the baseline
+handling has something to be measured against.
+
+The verdict, in one line: the cutoff's harm is concentrated where the decay
+FINISHED, not where it did not. An undecayed correlogram never falls to a
+hundredth of its peak, so the cutoff is never reached and every channel is kept
+whatever it is set to. A fully decayed one does fall that far, and at 1/100 the
+retained range reaches into tail noise -- or into an unsubtracted baseline
+offset -- and the log-linear regression fits that instead of the decay.
+
+HOW TO LOAD IT
+--------------
+Each file is a headerless two-column CSV for the generic DLS parser:
+delay time in SECONDS, then g2(tau) - 1. Load with
+    delay_time_unit = 's'      data_form = 'g2m1'
+No baseline and no beta are needed at load: the data form is already g2-1.
+
+GROUND TRUTH
+------------
+  Angle 90 deg, beta 0.9, 532 nm,
+  n = 1.33, T = 298.15 K,
+  eta = 0.00089 Pa s, seed 4517 for every cell.
+
+  Gamma of the 50 nm reference at this geometry: 2421.7 s^-1.
+  "decay" below is whole-axis Gamma_slow * (lag span) -- keyed on the SLOW mode,
+  never Gamma_bar, so the polydispersity of cell 6 cannot move it.
+
+  file                                                      rh_eff      pdi    eps/b    noise       decay
+  1 - undecayed, decay 2.5 (the real corpus minimum).csv      49.460   0.0219    0e+00    0.005         2.5
+  2 - decayed, full window.csv                                49.460   0.0219    0e+00    0.005        2422
+  3 - decayed, one percent baseline offset.csv                49.460   0.0219    1e-02    0.001        2422
+  4 - decayed, high noise tail.csv                            49.460   0.0219    0e+00    0.020        2422
+  5 - decayed, multi-tau staircase.csv                        49.460   0.0219    0e+00    0.005        1905
+  6 - decayed, PDI above two.csv                              65.067   2.1916    0e+00    0.005       60.54
+
+  rh_eff is `SyntheticCorrelogramResult.rh_eff_nm`, the intensity-weighted radius
+  an ideal cumulant analysis should return -- the denominator of the grid's
+  |Rh - truth|/truth headline.
+
+WHAT EACH CELL ANCHORS
+----------------------
+  1 - undecayed, decay 2.5 (the real corpus minimum).csv
+      -> the cutoff is nearly inert here: it is never reached
+  2 - decayed, full window.csv
+      -> the reference decayed cell; 1/100 reaches the tail
+  3 - decayed, one percent baseline offset.csv
+      -> the offset sits at exactly the 1/100 threshold
+  4 - decayed, high noise tail.csv
+      -> tail noise is what a small cutoff regresses
+  5 - decayed, multi-tau staircase.csv
+      -> the axis every real instrument emits
+  6 - decayed, PDI above two.csv
+      -> beyond the cumulant validity limit at every cutoff
+
+WHERE THE REAL CORPUS SITS (measured 2026-09-05)
+------------------------------------------------
+Whole-axis Gamma*span over every committed real DLS file the shipped parsers
+accept: min 2.55, p5 78.7, median 2.9e3, max 4.7e7. So cell 1's 2.5 is the real
+corpus's floor -- the aggregating extreme -- and cells 2-6 sit near its bulk.
+Lag-axis ratios over the same corpus: 1.0001 .. 9.9965, median 1.0708, and NONE
+of 123,006 channel steps is the uniform-log constant this generator's 'log' grid
+emits. That is why cell 5 exists.

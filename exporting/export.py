@@ -27,6 +27,19 @@ Design notes
   length-1 columns with their own Long Name and Units, so they import alongside
   the data with full labeling rather than as an opaque comment block.
 - NaN/None are written as empty cells (Origin's missing-value convention).
+- **One source, one column.** An export whose content traces to exactly ONE
+  measurement carries a one-cell `Source file` column holding that measurement's
+  bare file name (never a path, never the internal id) -- so a file pulled out of
+  a batch still says which measurement it is. An export built from SEVERAL
+  measurements (a Zimm set, a Gamma-q^2 fit, a replicate average) carries no such
+  column: its sources are named in the Comments cells instead, leaving the data
+  block's shape untouched. A per-measurement export OF a replicate average is a
+  many-source export by that rule: the cell is empty and the contributors ride the
+  Comments. `_source_file_column` is where the cell is built and the roster of
+  which exporter is which is pinned in `tests/test_export_source_column_family.py`.
+- Files are UTF-8 **with a byte-order mark**, so Excel decodes the degree sign
+  and the Greek a Comments cell carries instead of reading them in the system
+  code page. Read one back with `utf-8-sig`.
 
 Change history
 --------------
@@ -44,6 +57,15 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
+
+# The ONE named home for the cumulant's default amplitude cutoff. Imported rather than
+# repeated as a literal: this module is otherwise dependency-free by design, and the cost
+# of one constant import is smaller than the cost of a fourth copy of a number three
+# modules already agree on. No cycle -- `analysis/` never imports `exporting/`.
+from analysis.dls.cumulants import CUMULANT_FIT_CUTOFF_DEFAULT, DEFAULT_RECORDED_WEIGHTINGS
+# The distribution family's silent set, imported for the same reason: which recorded
+# forms the default request resolves to is the engine's to say, never restated here.
+from analysis.dls.distributions import DEFAULT_RECORDED_DISTRIBUTION_WEIGHTINGS
 
 
 # ===========================================================================
@@ -127,9 +149,14 @@ def write_origin_csv(
 
     n_rows = max(len(c.data) for c in columns)
     # UTF-8 so non-ASCII cell content (e.g. "Γ vs q²", "°") writes on any platform
-    # -- on Windows the default codec is cp1252 and would raise. Pure-ASCII exports
-    # are byte-identical (UTF-8 is a superset), so existing files are unaffected.
-    with open(file_path, 'w', newline='', encoding='utf-8') as fh:
+    # -- on Windows the default codec is cp1252 and would raise. WITH the byte-order
+    # mark ('utf-8-sig'): Excel reads a mark-less CSV in the system code page, so a
+    # degree sign or a Greek letter opened straight from disk came out as mojibake.
+    # Origin is EXPECTED to skip the mark; that half is unverified, so it is stated as
+    # an expectation. A reader that decodes as UTF-8 without expecting the mark sees a
+    # stray U+FEFF on the first cell only -- read such a file back with 'utf-8-sig',
+    # which also handles a file written before the mark.
+    with open(file_path, 'w', newline='', encoding='utf-8-sig') as fh:
         w = csv.writer(fh, delimiter=delimiter)
         w.writerow([c.long_name for c in columns])
         w.writerow([c.units for c in columns])
@@ -147,6 +174,35 @@ def _scalar_column(long_name: str, units: str, value: Any,
                    comments: str = '') -> OriginColumn:
     """A length-1 column carrying a single scalar result."""
     return OriginColumn(long_name, units, comments, [value])
+
+
+def _bare_file_name(value: Any) -> str:
+    """A path's last component, whichever separator wrote it; '' for nothing.
+
+    Both separators, because a session written on one platform is opened on
+    another and `os.path.basename` splits only the one its host uses. Applied
+    where the cell is WRITTEN, so the no-directory contract holds however the
+    caller spelled the path it handed over.
+    """
+    return str(value or '').replace('\\', '/').rsplit('/', 1)[-1]
+
+
+def _source_file_column(source_file: Any, note: str = '') -> OriginColumn:
+    """The one-cell `Source file` column a single-measurement export carries.
+
+    The bare file NAME, never a path and never the internal id: a reader holding
+    one file out of a batch needs to know which measurement it is, and a path
+    buries that in the part every sibling file shares.
+
+    The cell is EMPTY when the measurement has no file of its own -- a replicate
+    average is computed FROM measurements, not loaded -- and its contributors ride
+    the Comments cell instead, the locked convention for provenance that has no
+    column of its own (no extra rows, so the Origin import is unaffected).
+    """
+    bare = _bare_file_name(source_file)
+    base = ('data file this export was computed from' if bare else
+            'computed measurement: no source file of its own')
+    return OriginColumn('Source file', '', _join_comments(base, note), [bare])
 
 
 # ===========================================================================
@@ -189,7 +245,7 @@ def export_dls_summary(records: Sequence[Dict[str, Any]], file_path: str,
 
     columns = [
         OriginColumn('Sample', '', 'sample identity', col('sample')),
-        OriginColumn('Measurement', '', 'angle / concentration / fraction (blank '
+        OriginColumn('Measurement', '', 'name, with angle / concentration / fraction (blank '
                      'for sample-level rows)', col('measurement')),
         OriginColumn('Method', '', 'fit method or sample-level source', col('method')),
         OriginColumn('Rh', 'nm', rh_comment, col('rh')),
@@ -212,11 +268,20 @@ def export_dls_summary(records: Sequence[Dict[str, Any]], file_path: str,
         OriginColumn('is_average', '', 'replicate-averaged sample Rh',
                      col('is_average')),
         OriginColumn('From', '', 'contributing measurements / method', col('from')),
+        # Beside `From`, the two provenance columns together: which file a
+        # per-measurement row came from, and which measurements a sample-level row
+        # was built from. Blank on every row that is not one loaded measurement --
+        # a sample-level row, and a replicate average, which has no file of its own.
+        OriginColumn('Source file', '',
+                     'data file this row was loaded from (blank for sample-level '
+                     'and computed rows -- see From)',
+                     [_bare_file_name(r.get('source_file')) for r in records]),
     ]
     return write_origin_csv(file_path, columns, delimiter)
 
 def export_correlogram_fit(measurement, result, file_path: str,
-                           delimiter: str = ',') -> str:
+                           delimiter: str = ',', *, source_file: str = '',
+                           source_note: str = '') -> str:
     """Export a parametric DLS fit (cumulant / single / double / KWW).
 
     Writes the fitted delay times, the measured g2-1 over that window, the model
@@ -228,10 +293,17 @@ def export_correlogram_fit(measurement, result, file_path: str,
     ----------
     measurement : DLSMeasurement
         The source measurement (used to recover the measured g2-1 over the fit
-        window).
+        window). It carries no provenance -- the engine object is built from the
+        committed parameters alone -- so the two `source_*` fields below are what
+        the controller hands over.
     result : CumulantResult | SingleExponentialResult | DoubleExponentialResult |
              KWWResult
     file_path : str
+    source_file : str
+        The measurement's file name for the one-source `Source file` column.
+    source_note : str
+        What to say in that column's Comments cell when there is no file (a
+        replicate average's contributors).
 
     Returns
     -------
@@ -261,6 +333,22 @@ def export_correlogram_fit(measurement, result, file_path: str,
         return (getattr(mode, 'reliability_note', '')
                 if getattr(mode, 'decay_incomplete', False) else '')
 
+    def _baseline_comment(result) -> str:
+        """What the baseline column holds: the nonlinear cumulant's FITTED floating B,
+        or the offset the caller pinned and the fit subtracted. A zero pinned offset is
+        the silent default, like 'calibrated' -- the Comments cell speaks only when a
+        baseline actually changed the numbers."""
+        if getattr(result, 'method', None) == 'nonlinear':
+            return ('fitted floating baseline (Frisken 2001)'
+                    if getattr(result, 'success', True) else '')
+        return ('pinned offset from the baseline region, subtracted before the fit'
+                if getattr(result, 'baseline', 0.0) else '')
+
+    # The fit's own passive `notes` tier (dead channels, a floating baseline resting on
+    # its bound). Relayed, never interpreted -- `_analysis_notes`' rule -- onto the cells
+    # the fit rests on, so a note that changes how a number is read cannot be separated
+    # from the number on the way out.
+    fit_note = _analysis_notes(result)
     tau = np.asarray(result.fit_tau_s, dtype=float)
     fit = np.asarray(result.fitted_g2m1, dtype=float)
     resid = np.asarray(result.residuals, dtype=float)
@@ -275,44 +363,136 @@ def export_correlogram_fit(measurement, result, file_path: str,
 
     # Scalar outputs, dispatched by the fields each result type carries.
     cls = type(result).__name__
-    columns.append(_scalar_column('RMS error', '', result.rms_error))
+    # The amplitude cutoff became user-settable, so it is an analysis CHOICE that moved a
+    # shipped number -- the `se_estimator` obligation of invariant 8 clause A in another
+    # material. Silent at the default, like 'calibrated', so the cell speaks only when the
+    # value is not the one a reader would assume. Built HERE rather than inside the
+    # cumulant branch because `RMS error` is shared with the exponential arms and is the
+    # number this parameter moves MOST (188 of 190 committed runs).
+    cutoff_comment = (
+        '' if getattr(result, 'fit_cutoff', CUMULANT_FIT_CUTOFF_DEFAULT)
+        == CUMULANT_FIT_CUTOFF_DEFAULT or cls != 'CumulantResult' else
+        f'non-default fit cutoff {result.fit_cutoff:g} '
+        f'(default {CUMULANT_FIT_CUTOFF_DEFAULT:g})')
+    # Which residual weighting built the fit: the other analysis choice that moves every
+    # scalar below, so it rides the cutoff's cells and is gated the same way (silent on
+    # the sourced default -- `_weighting_note`).
+    weighting_comment = (_join_comments(_weighting_note(result), _sample_time_note(result))
+                         if cls == 'CumulantResult' else '')
+    # `fit_note` rides this one too, like every other scalar the fit produced. It was the
+    # single omission in the block: a dead-channel or bound-active-baseline note is most
+    # material on the number the cutoff moves most, and on the number decision D3's shared
+    # support exists to make comparable between the two arms.
+    columns.append(_scalar_column('RMS error', '', result.rms_error,
+                                  _join_comments(fit_note, cutoff_comment,
+                                                 weighting_comment)))
     if cls == 'CumulantResult':
-        # An order-1 cumulant has no mu2 term, so PDI is UNMEASURED (NaN), not zero
-        # at all. Mark that in the Comments so the blank/NaN PDI cell is never
-        # misread on import as a failed fit -- the Rh is fully reliable.
-        pdi_comment = ('unmeasured: order-1 cumulant has no mu2 term'
-                       if result.order < 2 else '')
+        def _moment(value, name: str, needed_order: int):
+            """An order-gated moment as `(value, comment)` for its scalar column.
+
+            Below the order that fits it the value is WITHHELD as well as commented --
+            `_fmt` writes None and NaN alike as the empty cell -- so the blank is never
+            misread on import as a failed fit or a measured zero. The order-1 PDI is the
+            original case (no mu2 term, the Rh fully reliable) and mu3/mu4 follow it.
+
+            The withholding is not redundant with the callers' own values: mu3 and mu4
+            come back None below their order and so blank themselves, but mu2 comes back
+            a real 0.0 -- structurally absent, not fitted -- so without this it exported a
+            confident zero beside a PDI cell that correctly said "unmeasured", and a
+            consumer reading the CSV has only those two columns to go on.
+            """
+            if result.order < needed_order:
+                return None, (f'unmeasured: order-{result.order} cumulant has no '
+                              f'{name} term')
+            return value, ''
+        pdi_comment = _moment(result.pdi, 'mu2', 2)[1]
+        mu2_val, mu2_comment = _moment(result.mu2_s_inv2, 'mu2', 2)
         # An out-of-range size travels WITH the number, in the affected column's Comments
         # cell only -- the same treatment an uncalibrated result gets, and for the same
         # reason: a flag that can change how a value is read must never be separable from
         # the value on the way out.
         rh_comment = ('' if getattr(result, 'rh_reliable', True)
                       else getattr(result, 'reliability_note', ''))
+
+        # mu3 / mu4 travel BARE -- a value column and no companion verdict column (the
+        # ruling and its reason are on `CumulantResult`). A failed fit carries None and
+        # exports the empty cell with no reason, like every other NaN of that row. Row
+        # count is unchanged (a new scalar column, per the locked export decision).
+        mu3_val, mu3_comment = _moment(result.mu3_s_inv3, 'mu3', 3)
+        mu4_val, mu4_comment = _moment(result.mu4_s_inv4, 'mu4', 4)
         columns += [
             _scalar_column('Cumulant order', '', result.order),
             _scalar_column('Cumulant method', '', getattr(result, 'method', 'linear')),
-            _scalar_column('Gamma', '1/s', result.gamma_s_inv,
-                           _rate_comment(result)),
-            _scalar_column('Rh', 'nm', result.rh_nm, rh_comment),
+            _scalar_column('Fit cutoff', '', result.fit_cutoff, cutoff_comment),
+            _scalar_column('Gamma', '1/s',
+                           result.gamma_s_inv,
+                           _join_comments(_rate_comment(result), fit_note,
+                                          cutoff_comment, weighting_comment)),
+            _scalar_column('Rh', 'nm', result.rh_nm,
+                           _join_comments(rh_comment, fit_note, cutoff_comment,
+                                          weighting_comment)),
             _scalar_column('D', 'm^2/s', result.d_m2_s,
-                           _rate_comment(result)),
-            _scalar_column('PDI', '', result.pdi, pdi_comment),
-            _scalar_column('PDI valid', '', result.pdi_valid, pdi_comment),
-            _scalar_column('mu2', '1/s^2', result.mu2_s_inv2),
-            _scalar_column('beta', '', result.beta),
-            _scalar_column('baseline B', '', getattr(result, 'baseline', 0.0)),
+                           _join_comments(_rate_comment(result), fit_note,
+                                          cutoff_comment, weighting_comment)),
+            # The fit-wide note rides EVERY scalar the fit produced, not only the four
+            # the size is read from: on the nonlinear arm B, beta, gamma, mu2, mu3 and mu4
+            # come out of ONE `curve_fit` over one channel set, and on the linear arm out of one
+            # log-polynomial regression, so a dead channel or a bound-active baseline bears
+            # on the PDI exactly as it bears on Gamma. PDI is the more consequential of the
+            # two: it is the cell a reader uses to judge whether the size is usable at all.
+
+            # The cutoff and the weighting ride every scalar the fit PRODUCED, derived
+            # from the column list rather than from the quantities a change happens to be
+            # about. Not every column in this block: `Cumulant order` and `Cumulant
+            # method` record what was ASKED FOR rather than what was measured, so they
+            # carry no comment -- the user manual says so too. PDI needs it most: a deeper
+            # cutoff flattens the parabola and can turn `PDI valid` False -> True on a
+            # size moving further from the truth.
+            _scalar_column('PDI', '', result.pdi,
+                           _join_comments(pdi_comment, fit_note, cutoff_comment,
+                                          weighting_comment)),
+            _scalar_column('PDI valid', '', result.pdi_valid,
+                           _join_comments(pdi_comment, fit_note, cutoff_comment,
+                                          weighting_comment)),
+            _scalar_column('mu2', '1/s^2', mu2_val,
+                           _join_comments(mu2_comment, fit_note, cutoff_comment,
+                                          weighting_comment)),
+            _scalar_column('mu3', '1/s^3', mu3_val,
+                           _join_comments(mu3_comment, fit_note, cutoff_comment,
+                                          weighting_comment)),
+            _scalar_column('mu4', '1/s^4', mu4_val,
+                           _join_comments(mu4_comment, fit_note, cutoff_comment,
+                                          weighting_comment)),
+            _scalar_column('beta', '', result.beta,
+                           _join_comments(fit_note, cutoff_comment, weighting_comment)),
+            _scalar_column('baseline B', '', getattr(result, 'baseline', 0.0),
+                           _join_comments(_baseline_comment(result), fit_note,
+                                          cutoff_comment, weighting_comment)),
+            # The residual weighting the fit RAN UNDER, as a value -- 'biganzoli-full' when a
+            # committed count rate entered the variance, 'biganzoli-classical' when none did,
+            # or the opted-in form -- the same request-provenance shape as `Cumulant method`
+            # above, and the one surface on which a run fitted without its instrument's
+            # count rate says so, since the Comments cells stay silent on the default
+            # (owner-ruled 2026-09-08, round 4 finding 41: a per-run fact, never a
+            # warning). Last in the block, so no earlier column's position moves.
+            _scalar_column('Cumulant weighting', '', getattr(result, 'weighting', '')),
         ]
     elif cls == 'SingleExponentialResult':
         # Same treatment as the cumulant Rh above, read off the MODE: the verdict belongs
         # to the mode, and a fit's modes can disagree (see the double branch below).
         rh_comment = _mode_comment(result.mode)
+        # `fit_note` (the fit-wide passive tier: today the dead-channel note) rides every
+        # scalar this fit produced, exactly as on the cumulant branch above.
         columns += [
             _scalar_column('Gamma', '1/s', result.mode.gamma_s_inv,
-                           _rate_comment(result.mode)),
-            _scalar_column('Rh', 'nm', result.mode.rh_nm, rh_comment),
+                           _join_comments(_rate_comment(result.mode), fit_note)),
+            _scalar_column('Rh', 'nm', result.mode.rh_nm,
+                           _join_comments(rh_comment, fit_note)),
             _scalar_column('D', 'm^2/s', result.mode.d_m2_s,
-                           _rate_comment(result.mode)),
-            _scalar_column('beta', '', result.beta),
+                           _join_comments(_rate_comment(result.mode), fit_note)),
+            _scalar_column('beta', '', result.beta, fit_note),
+            _scalar_column('baseline', '', getattr(result, 'baseline', 0.0),
+                           _join_comments(_baseline_comment(result), fit_note)),
         ]
     elif cls == 'DoubleExponentialResult':
         # PER MODE, not one comment across both. The routine real case is a measured fast
@@ -321,33 +501,43 @@ def export_correlogram_fit(measurement, result, file_path: str,
         # must never be separable from -- or misattached to -- the value on the way out.
         fast_comment = _mode_comment(result.mode1)
         slow_comment = _mode_comment(result.mode2)
+        # The per-mode verdict stays per mode; the fit-wide `fit_note` rides every scalar.
         columns += [
             _scalar_column('Gamma (fast)', '1/s', result.mode1.gamma_s_inv,
-                           _rate_comment(result.mode1)),
-            _scalar_column('Rh (fast)', 'nm', result.mode1.rh_nm, fast_comment),
-            _scalar_column('Amplitude (fast)', '', result.mode1.amplitude_fraction),
+                           _join_comments(_rate_comment(result.mode1), fit_note)),
+            _scalar_column('Rh (fast)', 'nm', result.mode1.rh_nm,
+                           _join_comments(fast_comment, fit_note)),
+            _scalar_column('Amplitude (fast)', '', result.mode1.amplitude_fraction,
+                           fit_note),
             _scalar_column('Gamma (slow)', '1/s', result.mode2.gamma_s_inv,
-                           _rate_comment(result.mode2)),
-            _scalar_column('Rh (slow)', 'nm', result.mode2.rh_nm, slow_comment),
-            _scalar_column('Amplitude (slow)', '', result.mode2.amplitude_fraction),
-            _scalar_column('beta', '', result.beta),
+                           _join_comments(_rate_comment(result.mode2), fit_note)),
+            _scalar_column('Rh (slow)', 'nm', result.mode2.rh_nm,
+                           _join_comments(slow_comment, fit_note)),
+            _scalar_column('Amplitude (slow)', '', result.mode2.amplitude_fraction,
+                           fit_note),
+            _scalar_column('beta', '', result.beta, fit_note),
+            _scalar_column('baseline', '', getattr(result, 'baseline', 0.0),
+                           _join_comments(_baseline_comment(result), fit_note)),
         ]
     elif cls == 'KWWResult':
         # One flag covers both Rh channels: a KWW has one decay, reported two ways. The
         # relaxation times take the caveat only when the DECAY is what failed -- see
         # _rate_comment; a missing viscosity leaves tau_c and <tau> exact.
-        rh_comment = _mode_comment(result)
-        rate_comment = _rate_comment(result)
+        rh_comment = _join_comments(_mode_comment(result), fit_note)
+        rate_comment = _join_comments(_rate_comment(result), fit_note)
         columns += [
             _scalar_column('tau_c', 's', result.tau_c_s, rate_comment),
-            _scalar_column('Stretch', '', result.stretch),
+            _scalar_column('Stretch', '', result.stretch, fit_note),
             _scalar_column('mean tau', 's', result.mean_tau_s, rate_comment),
             _scalar_column('Rh (from <tau>)', 'nm', result.rh_from_mean_tau_nm,
                            rh_comment),
             _scalar_column('Rh (from tau_c)', 'nm', result.rh_from_tau_c_nm,
                            rh_comment),
-            _scalar_column('beta', '', result.beta),
+            _scalar_column('beta', '', result.beta, fit_note),
+            _scalar_column('baseline', '', getattr(result, 'baseline', 0.0),
+                           _join_comments(_baseline_comment(result), fit_note)),
         ]
+    columns.append(_source_file_column(source_file, source_note))
     return write_origin_csv(file_path, columns, delimiter)
 
 
@@ -363,8 +553,19 @@ _ALPHA_SELECTOR_NAMES = {
     'lcurve': 'L-curve corner',
     'user': 'user-supplied',
 }
+def gcv_gamma_tag(gcv_gamma: float) -> str:
+    """The one spelling of a GCV result's robustness parameter on the record-side
+    surfaces -- the distribution CSV's alpha comment, the alpha-sweep export's score
+    column and a recorded mode set's provenance line: 'gamma=<value>', with
+    ' (classical)' at exactly 1. `.15g`, never `:g`: a six-figure format prints a gamma
+    within 1e-6 of 1 as 'gamma=1' beside the words 'robust GCV'. 15 significant figures
+    keep every digit a double carries, so the record IS the value that ran."""
+    return f'gamma={gcv_gamma:.15g}' + (' (classical)' if gcv_gamma == 1 else '')
+
+
 def alpha_selection_note(selection_method: Optional[str],
                          ftest_prob_reject: Optional[float] = None, *,
+                         gcv_gamma: Optional[float] = None,
                          edge_note: str = '', style: str = 'export') -> str:
     """Human string describing how a CONTIN alpha was chosen, for the given surface.
 
@@ -376,25 +577,41 @@ def alpha_selection_note(selection_method: Optional[str],
     Selector wording is kept verbatim to what each surface already shipped; the edge
     suffix follows the result's note (changed from an ASCII phrase to the shared
     constant when the note moved onto `ContinResult`):
-      - export: "alpha by GCV", "alpha by F-test, p_reject=0.50", "alpha user-supplied";
+      - export: "alpha by GCV, gamma=1 (classical)", "alpha by robust GCV, gamma=0.1",
+                "alpha by F-test, p_reject=0.50", "alpha user-supplied";
                 appends " (<edge_note>)" when the result carried a sweep-edge
                 reliability note (`ContinResult.reliability_note`, the one wording every
                 surface shows -- so the export can never again forget the caution).
-      - gui:    "CONTIN α by GCV", "CONTIN α by F-test (p=0.50)". The GUI shows a
+      - gui:    "CONTIN α by GCV (γ = 1, classical)", "CONTIN α by robust GCV (γ = 0.1)",
+                "CONTIN α by F-test (p=0.50)". The GUI shows a
                 user-supplied alpha in its input control and the edge caution on its
                 own flag label, so neither is repeated here (returns '' for 'user';
                 `edge_note` is ignored under `style='gui'`).
+
+    Robust GCV is not a second selector: the recorded token stays 'gcv' and its gamma
+    (`ContinResult.gcv_gamma`) is named beside it -- 'robust GCV' below 1, 'GCV' with
+    the classical tag at 1. With no gamma (a GCV result recorded before it existed, or
+    any other selector) the strings are the older "alpha by GCV" / "CONTIN α by GCV".
     """
     name = _ALPHA_SELECTOR_NAMES.get(selection_method)
     if name is None:
         return ''
     if style == 'gui' and selection_method == 'user':
         return ''
+    has_gamma = selection_method == 'gcv' and gcv_gamma is not None
+    if has_gamma and gcv_gamma < 1:
+        name = 'robust GCV'
     lead = 'CONTIN α ' if style == 'gui' else 'alpha '
     note = lead + (name if selection_method == 'user' else 'by ' + name)
     if selection_method == 'ftest' and ftest_prob_reject is not None:
         note += (f' (p={ftest_prob_reject:.2f})' if style == 'gui'
                  else f', p_reject={ftest_prob_reject:.2f}')
+    if has_gamma:
+        classical = gcv_gamma == 1
+        if style == 'gui':
+            note += f' (γ = {gcv_gamma:.15g}' + (', classical)' if classical else ')')
+        else:
+            note += ', ' + gcv_gamma_tag(gcv_gamma)
     if style == 'export' and edge_note:
         note += f' ({edge_note})'
     return note
@@ -402,76 +619,121 @@ def alpha_selection_note(selection_method: Optional[str],
 
 def export_distribution(result, file_path: str, axis: str = 'rh',
                         delimiter: str = ',', *,
-                        alpha_selection_method: Optional[str] = None,
-                        ftest_prob_reject: Optional[float] = None,
-                        alpha_edge_note: str = '') -> str:
-    """Export an NNLS or CONTIN distribution (DistributionResult).
+                        source_file: str = '', source_note: str = '') -> str:
+    """Export an NNLS, CONTIN or lognormal distribution.
 
-    Writes the size/rate grid and the normalized weights. With axis='rh' the
-    grid is hydrodynamic radius (nm); with axis='gamma' it is decay rate (1/s).
-    Both grids are always included so either can be plotted. The reconstructed
+    Accepts a `ContinResult` or a bare `DistributionResult` and unwraps the
+    distribution itself. Writes the size/rate grid and the normalized weights. With
+    axis='rh' the grid is hydrodynamic radius (nm); with axis='gamma' it is decay rate
+    (1/s). Both grids are always included so either can be plotted. The reconstructed
     correlogram fit and residuals are written alongside, plus scalar summaries.
+
+    How CONTIN's alpha was chosen (`alpha_selection_method`, `ftest_prob_reject`,
+    `gcv_gamma`) and the sweep-edge reliability note (`reliability_note`) are read OFF
+    THE RESULT, so every caller writes the same alpha Comments cell and none can drop
+    the note. A bare DistributionResult carries none of them and writes an empty alpha
+    note.
+
+    The residual weighting the fit ran under, the per-channel sample time that weight
+    read and the form of its run duration are read OFF THE RESULT and written as three
+    value columns. A weighting other than the program's default, and a sourced variance
+    evaluated on the axis-derived sample time, are also named in the Comments of the
+    Weight column and of every scalar the fit produced.
 
     Parameters
     ----------
-    result : DistributionResult
+    result : ContinResult | DistributionResult
     file_path : str
     axis : str
         'rh' (default) or 'gamma' -- controls only the column order/labels; both
         grids are written regardless.
+    source_file, source_note : str
+        The one-source `Source file` cell and its Comments note (see
+        `_source_file_column`).
 
     Returns
     -------
     str
     """
-    rh = np.asarray(result.rh_grid_nm, dtype=float)
-    gamma = np.asarray(result.gamma_grid_s_inv, dtype=float)
-    w = np.asarray(result.weights, dtype=float)
+    dist = getattr(result, 'distribution', result)
+    rh = np.asarray(dist.rh_grid_nm, dtype=float)
+    gamma = np.asarray(dist.gamma_grid_s_inv, dtype=float)
+    w = np.asarray(dist.weights, dtype=float)
     order = np.argsort(rh if axis == 'rh' else gamma)
 
     # A failed nonlinear fit (success=False, lognormal only) means the weights ARE the
     # seed estimate -- the caveat must ride the Weight column a user actually plots,
     # not only the scalar summaries below (same fail_note on both).
-    fail_note = ('' if getattr(result, 'success', True)
+    fail_note = ('' if getattr(dist, 'success', True)
                  else 'fit did not converge; values describe the seed estimate, not a fit')
+    # The distribution's own passive tier (today the dead-channel note: channels dropped
+    # from the inversion) rides the same cells the convergence caveat does -- the Weight
+    # column a user plots and the scalar summaries -- relayed, never interpreted.
+    dist_note = _join_comments(fail_note, _analysis_notes(dist))
+    # Which residual weighting built the inversion, and whether its variance was
+    # evaluated on a stand-in sample time: both move the weights and every summary below,
+    # so they ride the same cells, read off the result and silent on the program's
+    # default (`_distribution_weighting_note`, `_sample_time_note`).
+    weighting_comment = _join_comments(_distribution_weighting_note(dist),
+                                       _sample_time_note(dist))
     columns = [
         OriginColumn('Rh', 'nm', 'hydrodynamic radius', rh[order]),
         OriginColumn('Gamma', '1/s', 'decay rate', gamma[order]),
         OriginColumn('Weight', '',
-                     _join_comments('intensity fraction', fail_note), w[order]),
+                     _join_comments('intensity fraction', dist_note, weighting_comment),
+                     w[order]),
     ]
     # Correlogram reconstruction (separate length from the grid).
     columns += [
-        OriginColumn('Delay time', 's', 'tau', np.asarray(result.fit_tau_s, dtype=float)),
-        OriginColumn('g2-1 (fit)', '', 'reconstruction', np.asarray(result.fitted_g2m1, dtype=float)),
-        OriginColumn('Residual', '', 'data - fit', np.asarray(result.residuals, dtype=float)),
+        OriginColumn('Delay time', 's', 'tau', np.asarray(dist.fit_tau_s, dtype=float)),
+        OriginColumn('g2-1 (fit)', '', 'reconstruction', np.asarray(dist.fitted_g2m1, dtype=float)),
+        OriginColumn('Residual', '', 'data - fit', np.asarray(dist.residuals, dtype=float)),
     ]
     # CONTIN records how alpha was chosen in the alpha column's Comments cell, so a
     # distribution is never ambiguous about its regularization (mirrors the SLS
-    # provenance-in-Comments convention). The wording -- and the sweep-ceiling
-    # over-regularization caution -- come from the shared `alpha_selection_note`
-    # helper the GUI status note also uses, so the two can't drift.
-    # NNLS/lognormal pass no selection method -> ''.
+    # provenance-in-Comments convention). The selector, its level or γ and the
+    # sweep-edge caution are read off the ContinResult here, not handed in by the
+    # caller, so no caller can drop the caution; the wording comes from the shared
+    # `alpha_selection_note` helper the GUI status note also uses, so the two can't
+    # drift. A bare DistributionResult (NNLS/lognormal) carries no selector -> ''.
     alpha_note = alpha_selection_note(
-        alpha_selection_method, ftest_prob_reject,
-        edge_note=alpha_edge_note, style='export')
+        getattr(result, 'alpha_selection_method', None),
+        getattr(result, 'ftest_prob_reject', None),
+        gcv_gamma=getattr(result, 'gcv_gamma', None),
+        edge_note=getattr(result, 'reliability_note', ''), style='export')
+    summary_note = _join_comments(dist_note, weighting_comment)
     columns += [
-        _scalar_column('Method', '', result.method, fail_note),
-        _scalar_column('alpha', '', result.alpha, comments=alpha_note),
-        _scalar_column('Peak Rh', 'nm', result.peak_rh_nm, fail_note),
-        _scalar_column('Mean Rh', 'nm', result.mean_rh_nm, fail_note),
-        _scalar_column('Mean Gamma', '1/s', result.mean_gamma_s_inv, fail_note),
-        _scalar_column('beta', '', result.beta),
-        _scalar_column('beta estimated', '', result.beta_estimated),
-        _scalar_column('baseline', '', result.baseline),
-        _scalar_column('baseline estimated', '', result.baseline_estimated),
-        _scalar_column('RMS error', '', result.rms_error),
+        _scalar_column('Method', '', dist.method, summary_note),
+        _scalar_column('alpha', '', dist.alpha,
+                       comments=_join_comments(alpha_note, weighting_comment)),
+        _scalar_column('Peak Rh', 'nm', dist.peak_rh_nm, summary_note),
+        _scalar_column('Mean Rh', 'nm', dist.mean_rh_nm, summary_note),
+        _scalar_column('Mean Gamma', '1/s', dist.mean_gamma_s_inv, summary_note),
+        _scalar_column('beta', '', dist.beta),
+        _scalar_column('beta estimated', '', dist.beta_estimated),
+        _scalar_column('baseline', '', dist.baseline),
+        _scalar_column('baseline estimated', '', dist.baseline_estimated),
+        _scalar_column('RMS error', '', dist.rms_error),
+        # What the residual weight WAS and what it READ, as values: the recorded form
+        # ('biganzoli-full' with a committed count rate, 'biganzoli-classical' without,
+        # 'g1-squared' asked for or fallen back to), the per-channel sample time
+        # ('instrument' | 'axis') and the form of the variance's run duration ('finite' |
+        # 'infinite'); the last two are empty where the weight read neither. The one
+        # surface that says which default form ran, since the Comments cells stay silent
+        # on the default. Last in the block, so no earlier column's position moves.
+        _scalar_column('Residual weighting', '', getattr(dist, 'weighting', '')),
+        _scalar_column('Sample time provenance', '',
+                       getattr(dist, 'sample_time_provenance', '')),
+        _scalar_column('Run duration form', '', getattr(dist, 'run_duration_form', '')),
+        _source_file_column(source_file, source_note),
     ]
     return write_origin_csv(file_path, columns, delimiter)
 
 
 def export_weighted_distribution(result, file_path: str,
-                                 delimiter: str = ',') -> str:
+                                 delimiter: str = ',', *,
+                                 source_file: str = '',
+                                 source_note: str = '') -> str:
     """Export a reweighted (volume/surface/number) distribution (WeightedDistributionResult).
 
     Writes the Rh grid, the reweighted weights, and a per-bin validity flag. The
@@ -511,20 +773,31 @@ def export_weighted_distribution(result, file_path: str,
         _scalar_column('Bins out of range', '', result.n_invalid_bins,
                        comments=('some size bins fall outside the model validity range'
                                  if not result.all_valid else '')),
+        _source_file_column(source_file, source_note),
     ]
     return write_origin_csv(file_path, columns, delimiter)
 
 
-def export_lcurve(lcurve, file_path: str, delimiter: str = ',') -> str:
-    """Export a CONTIN alpha-sweep (LCurveResult) for inspection.
+def export_lcurve(result, file_path: str, delimiter: str = ',', *,
+                  source_file: str = '', source_note: str = '') -> str:
+    """Export a CONTIN alpha-sweep for inspection.
 
-    Always writes the L-curve axes (alpha, weighted residual norm, solution
-    seminorm) plus the chosen alpha/index. The method-specific score curves --
-    the GCV score, the F-test cumulative F, and the Tikhonov effective DOF -- are
-    appended only when the sweep carries them (they are populated per selection
-    method: `gcv` for GCV, `ftest_fc` for the F-test, `dof_eff` for both), so the
-    CSV matches whichever ordinate the diagnostic view showed.
+    Accepts a `ContinResult` or a bare `LCurveResult` and unwraps the sweep itself (the
+    shape `export_distribution` has). Always writes alpha, the weighted residual norm and
+    the solution seminorm plus the chosen alpha/index; the solution norm ||x||^2
+    (`x_norms`, the L-curve's size axis) follows the seminorm when the sweep carries it.
+    The method-specific score curves -- the GCV-family score, the F-test cumulative F,
+    and the Tikhonov effective DOF -- are appended only when the sweep carries them (they
+    are populated per selection method: `gcv` for GCV, `ftest_fc` for the F-test,
+    `dof_eff` for both), so the CSV matches whichever ordinate the diagnostic view showed.
+
+    `LCurveResult.gcv` holds whichever GCV-family score was MINIMIZED -- the classical
+    V(alpha) at gamma = 1, Lukas's robust score (RGCV) below it -- so the column's
+    Comments cell names which, with the gamma, read off the ContinResult; a bare sweep
+    carries no gamma and keeps the classical wording.
     """
+    lcurve = getattr(result, 'lcurve', result)
+    gcv_gamma = getattr(result, 'gcv_gamma', None)
     columns = [
         OriginColumn('alpha', '', 'regularization parameter',
                      np.asarray(lcurve.alphas, dtype=float)),
@@ -533,9 +806,25 @@ def export_lcurve(lcurve, file_path: str, delimiter: str = ',') -> str:
         OriginColumn('Solution seminorm', '', '||L x||^2',
                      np.asarray(lcurve.solution_norms, dtype=float)),
     ]
+    # The L-curve's size axis, ||x||^2 per alpha, beside the penalty seminorm; a sweep
+    # saved before the field existed was selected on the seminorm and carries none.
+    x_norms = getattr(lcurve, 'x_norms', None)
+    if x_norms is not None:
+        columns.append(OriginColumn('Solution norm', '', '||x||^2',
+                                    np.asarray(x_norms, dtype=float)))
     # Method-specific score curves, present only for the method that ran.
     if getattr(lcurve, 'gcv', None) is not None:
-        columns.append(OriginColumn('GCV score', '', 'V(alpha) (minimized)',
+        # The column keeps its header (an Origin import keys on it); WHICH score it holds
+        # travels in the Comments cell, with the gamma at the same precision the
+        # distribution export records it.
+        if gcv_gamma is not None and gcv_gamma < 1:
+            score_note = ('robust GCV score Vbar(alpha) = [gamma + (1 - gamma) mu2] '
+                          f'V(alpha) (minimized), {gcv_gamma_tag(gcv_gamma)}')
+        elif gcv_gamma is not None:
+            score_note = f'V(alpha) (minimized), {gcv_gamma_tag(gcv_gamma)}'
+        else:
+            score_note = 'V(alpha) (minimized)'
+        columns.append(OriginColumn('GCV score', '', score_note,
                                     np.asarray(lcurve.gcv, dtype=float)))
     if getattr(lcurve, 'ftest_fc', None) is not None:
         columns.append(OriginColumn('Cumulative F', '',
@@ -548,6 +837,7 @@ def export_lcurve(lcurve, file_path: str, delimiter: str = ',') -> str:
     columns += [
         _scalar_column('Optimal alpha', '', lcurve.optimal_alpha),
         _scalar_column('Optimal index', '', lcurve.optimal_index),
+        _source_file_column(source_file, source_note),
     ]
     return write_origin_csv(file_path, columns, delimiter)
 
@@ -865,6 +1155,15 @@ def export_running_average(result, file_path: str, *, provenance: str = '',
     return write_origin_csv(file_path, columns, delimiter)
 
 
+def _blank_if_none(value):
+    """A scalar cell that is EMPTY when the field does not apply, never 0 or 'None'.
+
+    `cumulant_fit_cutoff` is None whenever the rates did not come from a cumulant, and a
+    numeric default there would assert a setting the fit never read.
+    """
+    return '' if value is None else value
+
+
 def export_gamma_q2(result, file_path: str, delimiter: str = ',') -> str:
     """Export a Gamma-vs-q^2 multi-angle analysis (GammaQ2Result).
 
@@ -928,8 +1227,77 @@ def export_gamma_q2(result, file_path: str, delimiter: str = ',') -> str:
         _scalar_column('Intercept (relative)', '', result.intercept_relative),
         _scalar_column('D_app trend (relative)', '', result.d_app_trend_rel),
         _scalar_column('Is diffusive', '', result.is_diffusive, verdict_note),
+        # The INPUTS the pooled D was fitted from, not just its outputs. A promotable Rh
+        # must not travel without them (invariant 8 clause A's se_estimator obligation in
+        # another material): two exports of the same angles at different cumulant cutoffs
+        # were otherwise byte-identical in provenance. `gamma_source` gates the pair --
+        # a single-exponential source reads no cumulant setting, so a value there would
+        # claim one it never used.
+        _scalar_column('Gamma source', '', getattr(result, 'gamma_source', '') or ''),
+        _scalar_column('Cumulant method', '',
+                       getattr(result, 'cumulant_method', None) or ''),
+        _scalar_column('Cumulant fit cutoff', '',
+                       _blank_if_none(getattr(result, 'cumulant_fit_cutoff', None))),
+        _cumulant_weighting_row(result, ' deg'),
+        *_cumulant_record_rows(result, ' deg'),
     ]
     return write_origin_csv(file_path, columns, delimiter)
+
+
+def _cumulant_weighting_row(result, unit: str):
+    """The `Cumulant weighting (requested)` provenance row of a pooled DLS export, beside
+    `Cumulant method` and `Cumulant fit cutoff` and gated by the same `gamma_source` (blank
+    under a single-exponential source, which reads no cumulant setting): the weighting the
+    per-point cumulants were ASKED for, a request token. Named apart from the per-fit
+    export's `Cumulant weighting` column, which records the form a fit ran under, so one
+    column name never holds two vocabularies. Its Comments cell names the points whose default
+    weight could not be formed and fell back to 'uniform' (`cumulant_weighting_fallbacks`),
+    so a pooled number built partly from unweighted points never travels unlabelled.
+    One helper for both pooled exporters (rule 10: the two carry the row symmetrically)."""
+    fallbacks = tuple(getattr(result, 'cumulant_weighting_fallbacks', ()) or ())
+    comment = ('' if not fallbacks else
+               f'fell back to uniform at {", ".join(f"{x:.4g}" for x in fallbacks)}{unit}: '
+               f'the sourced weight could not be formed there')
+    return _scalar_column('Cumulant weighting (requested)', '',
+                          getattr(result, 'cumulant_weighting', None) or '', comment)
+
+
+def _cumulant_record_rows(result, unit: str) -> list:
+    """The two provenance rows a pooled DLS export closes on, after the request row:
+
+    - `Cumulant order` -- the order every per-point cumulant ran at (the Settings order),
+      beside the method, cutoff and weighting it moves the promotable Rh with; blank under
+      a single-exponential source, which fits no cumulant;
+    - `Cumulant weighting (recorded)` -- the weighting each per-point fit actually ran
+      under (`point_weightings`), its distinct forms as the value, and in its Comments the
+      points of each form when they differ and the points whose sourced weight was
+      evaluated on a sample time derived from the delay axis -- the facts the per-fit
+      export names on every scalar (`_sample_time_note`), relayed here so a pooled number
+      weighted on a stand-in never travels unlabelled.
+
+    Appended after the existing rows, so every column an Origin template already reads
+    keeps its place. One helper for both pooled exporters (rule 10)."""
+    forms = tuple(getattr(result, 'point_weightings', ()) or ())
+    provenance = tuple(getattr(result, 'point_sample_time_provenance', ()) or ())
+    points = np.asarray(getattr(result, 'angles_deg', None)
+                        if getattr(result, 'angles_deg', None) is not None
+                        else getattr(result, 'concentrations_g_per_mL', ()), dtype=float)
+    distinct = [f for f in dict.fromkeys(forms) if f]
+    comments = []
+    if len(distinct) > 1:
+        comments.append('; '.join(
+            f'{form} at ' + ', '.join(f'{x:.4g}' for x, f in zip(points, forms, strict=True)
+                                      if f == form) + unit
+            for form in distinct))
+    axis = [f'{x:.4g}' for x, p in zip(points, provenance, strict=True) if p == 'axis']
+    if axis:
+        comments.append(f'{_AXIS_SAMPLE_TIME_LABEL} (at {", ".join(axis)}{unit})')
+    return [
+        _scalar_column('Cumulant order', '',
+                       _blank_if_none(getattr(result, 'cumulant_order', None))),
+        _scalar_column('Cumulant weighting (recorded)', '', ', '.join(distinct),
+                       _join_comments(*comments)),
+    ]
 
 
 def export_mode_map(map_run, family_fits, amplitude, file_path: str, *,
@@ -943,7 +1311,10 @@ def export_mode_map(map_run, family_fits, amplitude, file_path: str, *,
       * per-point arrays -- every extracted mode of every run (`map_run`, a
         ModeMapRun), with `point_families` (an aligned sequence of family
         labels, '' = unassigned, supplied by the caller from the user's picks)
-        as the Family column;
+        as the Family column, then six per-point columns read off each point:
+        the residual weighting its inversion ran under, the sample time and
+        run-duration form that weight read, and the CONTIN alpha, its selector
+        and the GCV gamma the amplitudes came from;
       * per-family scalars -- one labeled block per ModeFamilyFitResult in
         `family_fits` ({label: fit}, insertion-ordered). Every Rh is APPARENT
         and MODE-RESOLVED, and the through-origin verdict travels WITH its
@@ -978,7 +1349,7 @@ def export_mode_map(map_run, family_fits, amplitude, file_path: str, *,
     if n_undecayed:
         floor = max(getattr(p, 'min_decay_completeness', float('nan')) for p in pts)
         decay_note = (
-            f'{n_undecayed} mode(s) did not finish decaying inside their lag window '
+            f'{n_undecayed} mode(s) did not finish decaying inside their delay window '
             f'(Gamma * lag span below {floor:.3g}, ISO 22412:2017 A.1.2): those rates '
             f'are extrapolations past the end of the measurement')
     columns = [
@@ -1002,6 +1373,42 @@ def export_mode_map(map_run, family_fits, amplitude, file_path: str, *,
                      [p.source_method for p in pts]),
         OriginColumn('Family', '', "user-picked mode family ('' = unassigned)",
                      fams),
+        # What built each point's amplitude, read OFF THE POINT and written per point:
+        # the runs of one map can differ (one file states its sample times, the next
+        # does not), and a per-column Comments cell cannot say which row is which.
+        # `getattr` with an empty default: a point object without a field writes an
+        # empty cell. They close the per-point block, so no earlier column moves.
+        OriginColumn('Residual weighting', '',
+                     "recorded form of the inversion's residual weight "
+                     "('' = parametric source: no inversion)",
+                     [getattr(p, 'weighting', '') for p in pts]),
+        OriginColumn('Sample time provenance', '',
+                     "per-channel sample time that weight read: instrument | axis "
+                     "('' = it read none)",
+                     [getattr(p, 'sample_time_provenance', '') for p in pts]),
+        OriginColumn('Run duration form', '',
+                     "form of that weight's run duration: finite | infinite "
+                     "('' = it read none)",
+                     [getattr(p, 'run_duration_form', '') for p in pts]),
+        # The regularization each point's amplitudes came from, per point for the same
+        # reason: the map's runs can land on different alphas, and the selector's own
+        # parameter is named beside it. After the weighting block, so no earlier column
+        # moves. The sweep's range and an F-test level are map-wide and ride the Angle
+        # column's notes.
+        OriginColumn('Alpha', '',
+                     "CONTIN regularization alpha ('' = NNLS or parametric source: "
+                     "no alpha)",
+                     np.array([np.nan if getattr(p, 'alpha', None) is None
+                               else float(p.alpha) for p in pts], dtype=float)),
+        OriginColumn('Alpha selection', '',
+                     "how CONTIN chose that alpha: gcv | lcurve | ftest | user "
+                     "('' = no alpha)",
+                     [getattr(p, 'alpha_selection_method', '') for p in pts]),
+        OriginColumn('GCV gamma', '',
+                     "robustness parameter of the GCV selector; 1 = classical GCV "
+                     "('' = another selector or no alpha)",
+                     np.array([np.nan if getattr(p, 'gcv_gamma', None) is None
+                               else float(p.gcv_gamma) for p in pts], dtype=float)),
     ]
 
     for label, fit in family_fits.items():
@@ -1211,13 +1618,19 @@ def export_ddls(result, file_path: str, *, shapes=None,
     # All three SEs are withheld together on a single-angle run (invariant 8).
     se_withheld = (_DDLS_SINGLE_ANGLE_NO_SE
                    if getattr(result, 'method', '') == 'single-angle' else '')
+    # The notes ride the two decay-rate columns, the values they qualify: which runs were
+    # fitted under the Correlogram tab's region, which were left out of an angle's average.
+    # Never the D_t family, which a D_r verdict inside the same notes must not reach.
+    rate_note = _analysis_notes(result)
     columns = [
         OriginColumn('Angle', 'deg', '', np.asarray(result.angles_deg, dtype=float)),
         OriginColumn('q^2', 'm^-2', 'scattering vector squared',
                      np.asarray(result.q2_m2, dtype=float)),
-        OriginColumn('Gamma_VV', '1/s', 'polarized field decay rate',
+        OriginColumn('Gamma_VV', '1/s',
+                     _join_comments('polarized field decay rate', rate_note),
                      np.asarray(result.gamma_vv_s_inv, dtype=float)),
-        OriginColumn('Gamma_VH', '1/s', 'depolarized field decay rate',
+        OriginColumn('Gamma_VH', '1/s',
+                     _join_comments('depolarized field decay rate', rate_note),
                      np.asarray(result.gamma_vh_s_inv, dtype=float)),
         OriginColumn('D_r (per angle)', 'rad^2/s',
                      d_r_comment or '(Gamma_VH - Gamma_VV)/6',
@@ -1396,6 +1809,16 @@ def export_concentration_extrapolation(result, file_path: str,
                                                'statistical (over concentrations)')),
         _scalar_column('Slope', 'm^2/s/(g/mL)', result.slope),
         _scalar_column('R^2', '', result.r_squared),
+        # The same provenance pair its Gamma-vs-q^2 sibling carries -- both results hold
+        # the fields, so exporting them from one exporter and not the other would leave
+        # exactly the asymmetry rule 10 exists to close.
+        _scalar_column('Gamma source', '', getattr(result, 'gamma_source', '') or ''),
+        _scalar_column('Cumulant method', '',
+                       getattr(result, 'cumulant_method', None) or ''),
+        _scalar_column('Cumulant fit cutoff', '',
+                       _blank_if_none(getattr(result, 'cumulant_fit_cutoff', None))),
+        _cumulant_weighting_row(result, ' g/mL'),
+        *_cumulant_record_rows(result, ' g/mL'),
     ]
     return write_origin_csv(file_path, columns, delimiter)
 
@@ -1496,13 +1919,123 @@ def _optical_scale_note(dn_dc_supplied: bool) -> str:
 def _se_note(result) -> str:
     """Comments-cell label for a ± column: names the estimator only when it is the
     non-default classical OLS (silent for HC3, matching the 'calibrated is the silent
-    default' convention). See the Theory-and-Equations-Guide §6.1.
+    default' convention). See the Theory-and-Equations-Guide, "The Estimator: HC3 Heteroscedasticity-Consistent Standard Errors".
 
     Join it with the column's other facts (`_join_comments`), never `or` it against
     them: the statistical label and the value's own marker hold whichever estimator
     ran, and an `or` would drop them exactly on the estimator that can under-report.
     """
     return 'SE: classical OLS' if getattr(result, 'se_estimator', 'hc3') == 'ols' else ''
+
+
+# The Comments-cell label for EVERY recorded cumulant weighting (identity-pinned against
+# `RECORDED_WEIGHTINGS` in the export tests); which of them stay silent is decided by
+# `DEFAULT_RECORDED_WEIGHTINGS`, not here. `_weighting_note` relays a value outside this
+# table verbatim.
+_WEIGHTING_LABELS = {
+    'biganzoli-full': ('residual weighting: biganzoli-full (Biganzoli & Ferri Eq. 9 with '
+                       'its shot-noise groups, from the committed mean count rate)'),
+    'biganzoli-classical': ('residual weighting: biganzoli-classical (Biganzoli & Ferri '
+                            'Eq. 9 in its infinite-count-rate limit: no mean count rate '
+                            'was committed for this run)'),
+    'instrument': ('residual weighting: instrument (caller-supplied per-channel '
+                   'standard deviations)'),
+    'iso-a18': ('residual weighting: iso-a18 (ISO 22412 Annex A.1.2, w = y, the linear '
+                'method)'),
+    # Arm-neutral: one token on both methods. The tail names both routes to it, since a
+    # nonlinear default whose sourced weight could not be formed records it too (the fit's
+    # own note then says so).
+    'uniform': ('residual weighting: uniform (unweighted least squares on the method\'s own '
+                'residual — g2-1 for the nonlinear method, ln(g2-1) for the linear; chosen '
+                'in Settings, or the fallback where the sourced weight could not be formed)'),
+}
+
+
+def _weighting_note(result) -> str:
+    """Comments-cell label for a cumulant scalar: names the residual weighting that built
+    the fit only when it is NOT one the program's default request resolves to
+    (`analysis.dls.cumulants.DEFAULT_RECORDED_WEIGHTINGS` -- silent like 'calibrated' and
+    like HC3; owner-ruled 2026-09-08, that constant's comment is the ruling's home). The
+    vocabulary is `RECORDED_WEIGHTINGS`; what each weight is lives on `fit_cumulants`'
+    `weighting` parameter, and the Theory-and-Equations-Guide describes the default.
+
+    A weighting the user opted into is named on every scalar it produced -- the
+    `se_estimator` obligation of invariant 8 clause A in another material: a number
+    weighted differently from the program's default never travels unlabelled. Any value
+    outside the label table is relayed verbatim: the exporter names provenance, it does
+    not police it. An older result object with no `weighting` field is read as the
+    default.
+
+    Join it with the column's other facts (`_join_comments`), never `or` it against
+    them: the fit note and the cutoff hold whichever weighting ran.
+    """
+    weighting = getattr(result, 'weighting', None)
+    if weighting is None or weighting in DEFAULT_RECORDED_WEIGHTINGS:
+        return ''
+    return _WEIGHTING_LABELS.get(weighting, f'residual weighting: {weighting}')
+
+
+# The Comments-cell label for every recorded DISTRIBUTION weighting outside the default's
+# forms (identity-pinned against `RECORDED_DISTRIBUTION_WEIGHTINGS` minus
+# `DEFAULT_RECORDED_DISTRIBUTION_WEIGHTINGS` in the export tests). Its own table, apart
+# from `_WEIGHTING_LABELS`: the two families record different vocabularies, and each
+# table is pinned against its own roster.
+_DISTRIBUTION_WEIGHTING_LABELS = {
+    'g1-squared': ('residual weighting: g1-squared (w = g1^2, the older form that takes '
+                   'the g2-1 noise as constant across channels; chosen per run or in '
+                   'Settings, or the fallback where the sourced weight could not be '
+                   'formed)'),
+}
+
+
+def _distribution_weighting_note(result) -> str:
+    """Comments-cell label for a distribution's weights and scalars: `_weighting_note`'s
+    sibling for the NNLS / CONTIN / lognormal family.
+
+    Names the residual weighting that built the inversion only when it is NOT one the
+    program's default request resolves to
+    (`analysis.dls.distributions.DEFAULT_RECORDED_DISTRIBUTION_WEIGHTINGS`, whose comment
+    is the home of the silent-default rule for this family). The vocabulary is
+    `RECORDED_DISTRIBUTION_WEIGHTINGS`; what each weight is lives with that constant and
+    in the Theory-and-Equations-Guide. A value outside the label table is relayed
+    verbatim, and an object with no `weighting` field, or an empty one, is silent: there
+    is no form to name.
+
+    Join it with the column's other facts (`_join_comments`), never `or` it against
+    them: the convergence caveat and the fit's notes hold whichever weighting ran.
+    """
+    weighting = getattr(result, 'weighting', None)
+    if not weighting or weighting in DEFAULT_RECORDED_DISTRIBUTION_WEIGHTINGS:
+        return ''
+    return _DISTRIBUTION_WEIGHTING_LABELS.get(weighting,
+                                              f'residual weighting: {weighting}')
+
+
+# The Comments-cell label for a sourced weighting evaluated on a STAND-IN sample time.
+_AXIS_SAMPLE_TIME_LABEL = ('per-channel sample time: derived from the delay axis (none '
+                           'usable from the file); the sourced variance is evaluated on '
+                           'that stand-in')
+
+
+def _sample_time_note(result) -> str:
+    """Comments-cell label naming the AXIS-DERIVED sample time, for a cumulant scalar
+    and for a distribution's weights and scalars alike (both result families record the
+    field in one vocabulary).
+
+    The sourced residual weighting needs the sample time each channel was accumulated
+    over; when the file states none -- or states a layout the parser declined and noted
+    at load, or the run is an average of replicates whose layouts disagreed -- the engine
+    derives a stand-in from the delay axis and records it as
+    `sample_time_provenance == 'axis'`, so the label asserts no cause, and that case is named on
+    every scalar the fit produced -- the same obligation `_weighting_note` discharges
+    for an opted-into weight: a number weighted on an inferred quantity never travels
+    unlabelled. Silent for 'instrument' (the correlator's own sampling times), for a
+    fit that read none ('' -- the linear arm and the other weightings), and for an
+    older result object without the field. Joined with the column's other facts
+    (`_join_comments`), never `or`-ed against them.
+    """
+    provenance = getattr(result, 'sample_time_provenance', '')
+    return _AXIS_SAMPLE_TIME_LABEL if provenance == 'axis' else ''
 
 
 def _mc_note(shape) -> str:
@@ -1577,6 +2110,18 @@ def _join_comments(*parts: str) -> str:
     return '; '.join(p for p in parts if p)
 
 
+def _blank_comment(result) -> str:
+    """The Comments-cell sentence for a fit whose solvent blank was NOT MEASURED, or ''.
+
+    Reads the result's own `blank_provenance` record, so the export, the SLS tab and the
+    guide cannot drift apart on what the blank case was.
+    """
+    if getattr(result, 'blank_measured', True):
+        return ''
+    return (str(getattr(result, 'blank_provenance', '') or '').strip()
+            or 'solvent blank not measured')
+
+
 def _size_comment(result) -> str:
     """Comments-cell note for a SIZE column (Rg / R) whose `rg_reliable` flag is False.
 
@@ -1585,8 +2130,18 @@ def _size_comment(result) -> str:
     wrong here and would mask the real reason. Empty whenever the size stands -- including
     on every result type that carries no such flag.
     """
+    blank = _blank_comment(result)
     if getattr(result, 'rg_reliable', True):
-        return ''
+        return blank
+    # THREE cases, and the middle one is why the fallback is conditional. An unmeasured
+    # blank drops `rg_reliable` on a fit that converged perfectly, so the old
+    # unconditional fallback exported "the fitted size is not physically meaningful"
+    # about a healthy size -- a proxy, which invariant 4 forbids. With the blank
+    # sentence carrying the reason the fallback is withheld; a REAL fault (which always
+    # writes `reliability_note`) still travels beside it. A measured-blank result takes
+    # the last line and is byte-identical to before.
+    if blank:
+        return _join_comments(blank, getattr(result, 'reliability_note', ''))
     return (getattr(result, 'reliability_note', '')
             or 'the fitted size is not physically meaningful')
 
@@ -1608,23 +2163,32 @@ def _reliability_comment(result, reliable: bool = True, scale_free: bool = False
     # `scale_free`: the column's quantity cancels the optical scale (the calibration-
     # free 2 A2 Mw), so the two scale branches must not fire even though the result
     # RECORDS `calibrated` / `dn_dc_supplied` as provenance.
+    # Composed FIRST and carried into every branch below: the two scale branches used to
+    # `return` before the blank was computed, so an uncalibrated or dn/dc-absent run --
+    # the ordinary state of a blankless quick look -- named only the scale. Two
+    # independent absences are two sentences, not a race.
+    blank = _blank_comment(result)
     if not scale_free and not getattr(result, 'calibrated', True):
-        return _join_comments(_UNCALIBRATED_SCALE_NOTE,
+        return _join_comments(blank, _UNCALIBRATED_SCALE_NOTE,
                               _optical_scale_note(
                                   getattr(result, 'dn_dc_supplied', True)))
     if not scale_free and not getattr(result, 'dn_dc_supplied', True):
-        return _NO_DN_DC_SCALE_NOTE
+        return _join_comments(blank, _NO_DN_DC_SCALE_NOTE)
     note = getattr(result, 'reliability_note', '') or ''
+    # `blank` is carried into every branch below, including the reliable one: the reader
+    # of a Mw cell needs to know the blank was assumed whatever the flag says.
+    #
     # Gated on the COLUMN's own flag (round 2 f7 / the 2026-08-27 review): a note is the
     # reason THIS column is unreliable, so a reason that leaves the column reliable -- an
     # Rg-only cause on an Mw cell -- must not travel here. Every cause that does gate
     # Mw/A2 (ill-conditioned, subnormal, non-positive divisor) also drops the flag, so
     # nothing that belongs on this cell is lost.
     if note and not reliable:
-        return note
+        return _join_comments(blank, note)
     if not reliable:
-        return 'unreliable (non-physical or non-finite fit)'
-    return ''
+        # The fallback fires only when the blank does NOT explain the flag.
+        return blank or 'unreliable (non-physical or non-finite fit)'
+    return blank
 
 
 def export_debye(result, file_path: str, delimiter: str = ',') -> str:
@@ -1728,6 +2292,59 @@ def export_single_angle(result, file_path: str, delimiter: str = ',') -> str:
         _scalar_column('Concentration', 'g/mL', result.concentration_g_per_mL),
         _scalar_column('Mw (apparent)', 'g/mol', result.mw_apparent_g_per_mol,
                        comments=mw_comment),
+        _scalar_column('Is apparent', '', result.is_apparent),
+    ]
+    return write_origin_csv(file_path, columns, delimiter)
+
+
+def export_single_angle_ladder(result, file_path: str, delimiter: str = ',') -> str:
+    """Export a single-angle concentration-ladder fit (SingleAngleLadderResult, apparent).
+
+    The Debye-plot-at-one-angle sibling of `export_debye`: the ordinate column carries
+    both scale markers and the points' provenance (`_ordinate_scale_note`), the Mw and
+    A2 columns carry the uncalibrated / no-dn/dc / ill-conditioned marker off their OWN
+    flags (`_reliability_comment`) else the APPARENT default, and the SE beneath each
+    inherits that marker. The 2 A2 Mw product is scale-free (the calibration-free
+    construction's quantity, read here off slope/intercept), so its cells carry only the
+    design-health marker, never a scale one.
+    """
+    mw_comment = _reliability_comment(result, result.mw_reliable)
+    a2_comment = _reliability_comment(result, result.a2_reliable)
+    product_note = _reliability_comment(result, result.two_a2_mw_reliable,
+                                        scale_free=True)
+    apparent = 'APPARENT, single angle (contains P(q); not extrapolated to q -> 0)'
+    # The non-positive-Kc/dR drop: the arrays held on the result are POST-drop, so the
+    # cell is the file's only trace that a concentration was removed.
+    fit_note = _analysis_notes(result)
+    columns = [
+        OriginColumn('Concentration', 'g/mL', fit_note,
+                     np.asarray(result.concentrations_g_per_mL, dtype=float)),
+        OriginColumn('Kc/dR', 'mol/g',
+                     _join_comments(fit_note, _ordinate_scale_note(
+                         result, 'single-angle ordinate')),
+                     np.asarray(result.kc_over_dR, dtype=float)),
+        _scalar_column('Angle', 'deg', result.angle_deg),
+        _scalar_column('q^2', 'nm^-2', result.q2_nm2),
+        _scalar_column('Mw (apparent)', 'g/mol', result.mw_apparent_g_per_mol,
+                       comments=mw_comment or apparent),
+        _scalar_column('Mw SE', 'g/mol', result.mw_apparent_se,
+                       comments=_join_comments(mw_comment, _se_note(result),
+                                               'statistical (excl. calibration/dn-dc)')),
+        _scalar_column('A2 (apparent)', 'mol mL/g^2', result.a2_apparent_mol_mL_per_g2,
+                       comments=a2_comment or apparent),
+        _scalar_column('A2 SE', 'mol mL/g^2', result.a2_apparent_se,
+                       comments=_join_comments(a2_comment, _se_note(result),
+                                               'statistical (excl. calibration/dn-dc)')),
+        _scalar_column('2 A2 Mw', '', result.two_a2_mw,
+                       _join_comments(fit_note, product_note)
+                       or 'slope / intercept (calibration-free)'),
+        _scalar_column('2 A2 Mw SE', '', result.two_a2_mw_se,
+                       comments=_join_comments(fit_note, product_note, _se_note(result),
+                                               'statistical (excl. calibration/dn-dc)',
+                                               'the product cancels both scales')),
+        _scalar_column('Intercept', 'mol/g', result.intercept_mol_per_g),
+        _scalar_column('Slope', 'mol mL/g^2', result.slope),
+        _scalar_column('R^2', '', result.r_squared),
         _scalar_column('Is apparent', '', result.is_apparent),
     ]
     return write_origin_csv(file_path, columns, delimiter)
@@ -2077,8 +2694,12 @@ def export_ellipsoid_form_factor(results, file_path: str, delimiter: str = ',') 
         regime = 'APPARENT, single concentration' if r.is_apparent else 'thermodynamic'
         model_note = (f'ellipsoid; degenerate ({r.n_solutions} solutions)'
                       if r.degenerate else 'ellipsoid')
+        # The blank drops `axial_ratio_reliable` too, and the qRg sentence would then
+        # assert an identifiability failure that did not happen (round 0e15 f1's class,
+        # third site). Same three-case split as `_size_comment`.
         ax_note = ('' if r.axial_ratio_reliable
-                   else 'axial ratio unresolved (qRg too small to distinguish shape)')
+                   else _blank_comment(r)
+                   or 'axial ratio unresolved (qRg too small to distinguish shape)')
         a2_note = '' if r.is_apparent else _reliability_comment(r, r.a2_reliable)
         columns += [
             _scalar_column(p + 'Model', '', r.model, comments=model_note),
@@ -2210,7 +2831,7 @@ def export_scaling(quantity: str, labels, mw, y, fit, file_path: str,
                    delimiter: str = ',', model_dependent: bool = False,
                    arbitrary_scale: bool = False, degenerate: bool = False,
                    branched_labels=(), branched_mw=(), branched_y=(),
-                   n_excluded: int = 0) -> str:
+                   n_excluded: int = 0, sources=(), branched_sources=()) -> str:
     """Export a cross-sample scaling plot (Rg-Mw / Rh-Mw / A2-Mw) and its power-law fit.
 
     Parameters
@@ -2245,6 +2866,13 @@ def export_scaling(quantity: str, labels, mw, y, fit, file_path: str,
     degenerate : bool
         A plotted value rests on a user-selected DEGENERATE form-factor solution (the data can't
         distinguish the shape) -- a stronger qualifier than model_dependent alone (review-01).
+    sources, branched_sources : sequences of str
+        Per-point provenance, parallel to the fitted and branched blocks: where each point's Mw
+        came from, and where its plotted y value came from ("Mw: Zimm extrapolation ...;
+        Rg: ..."). The `export_architecture` Rg source / Rh source pattern on the axes this file
+        plots -- so an APPARENT value names the condition it was measured at (a single-angle
+        ladder names its angle) rather than sitting in the file as a bare number. Optional: a
+        caller that passes none writes the same columns it always did.
     """
     y_label, y_units = {
         'rg': ('Rg', 'nm'), 'rh': ('Rh', 'nm'),
@@ -2258,6 +2886,13 @@ def export_scaling(quantity: str, labels, mw, y, fit, file_path: str,
         OriginColumn('Mw', 'g/mol', 'effective (user Mw wins)',
                      np.asarray(mw, dtype=float)),
         OriginColumn(y_label, y_units, '', np.asarray(y, dtype=float)),
+    ]
+    if len(sources):
+        columns.append(OriginColumn(
+            'Source', '',
+            'per-point provenance of the Mw and of the plotted value; an apparent value names '
+            'its condition (a single-angle ladder names its angle)', list(sources)))
+    columns += [
         _scalar_column('Quantity', '', quantity),
         _scalar_column(f'Exponent ({exp_name})', '', fit.exponent),
         _scalar_column('Exponent SE', '', fit.exponent_se,
@@ -2277,6 +2912,10 @@ def export_scaling(quantity: str, labels, mw, y, fit, file_path: str,
             OriginColumn(f'{y_label} (branched)', y_units, 'excluded from the fit',
                          np.asarray(branched_y, dtype=float)),
         ]
+        if len(branched_sources):
+            columns.append(OriginColumn(
+                'Source (branched)', '', 'per-point provenance, as the fitted block',
+                list(branched_sources)))
     if n_excluded:
         columns.append(_scalar_column(
             'Excluded', '', int(n_excluded),

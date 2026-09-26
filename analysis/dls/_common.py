@@ -23,6 +23,14 @@ import numpy as np
 from core.data_models import DLSMeasurement
 from physics.constants import scattering_vector_q_m, stokes_einstein_rh
 from analysis import uncertainty as unc
+# The exact-in-Gamma noise model (Biganzoli & Ferri 2018 Eq. (9)) and the axis-derived
+# sample time live with the synthetic generator and are IMPORTED here, not
+# re-implemented: the engine's residual weight and the generator's noise draw must be
+# one computation, so a planted draw is an oracle for the weight built from it -- exact
+# on every channel of the multi-tau builder's layout (the paper's;
+# `channel_sample_times` has the rule).
+from analysis.utilities import (  # noqa: F401
+    _biganzoli_sd, _channel_sample_times, _schatzel_sd)
 
 
 def _measurement_q_m(measurement: DLSMeasurement) -> float:
@@ -139,8 +147,11 @@ def _lowest_observed_acf_ratio(g2m1) -> float:
     reads as an incomplete decay. Measured: no false flag on the 160 healthy committed runs
     (typical margin ~100x), reproduced at ~2 % of beta on a constructed one. Subtracting a
     tail-estimated baseline is NOT the fix -- on a genuinely undecayed correlogram the tail
-    is still signal, so it would erase the flag on the case this exists for; the fix is a
-    floating baseline on the fit (a recorded follow-up, not yet built).
+    is still signal, so it would erase the flag on the case this exists for. Nor is a
+    FLOATING baseline on the fit: measured on synthetic KWW, its fitted B is recovered only
+    where the correlogram has already decayed and drifts as the window shortens, which is
+    the regime this flag exists for. Only the SHAPE of the tail (flat noise against a
+    decay still descending) separates the two cases; no slope criterion is built.
     """
     y = np.asarray(g2m1, dtype=float)
     y = y[np.isfinite(y)]
@@ -178,7 +189,7 @@ def _observed_decay_check(
     if math.isnan(ratio) or ratio <= max_ratio:
         return True, ''
     return False, (
-        f'This correlogram did not finish decaying inside its lag window: at no measured lag '
+        f'This correlogram did not finish decaying inside its delay window: at no measured lag '
         f'does it fall below {ratio:.3g} of its starting amplitude, against the '
         f'{max_ratio:.3g} that ISO 22412:2017 (Annex A.1.2) requires a retained fit range '
         f'to reach. The relaxation time, and any size derived from '
@@ -258,7 +269,7 @@ def _decay_completeness_check(
     if not math.isfinite(completeness) or completeness >= min_completeness:
         return True, ''
     return False, (
-        f'This decay did not finish inside the lag window: the measured lag range '
+        f'This decay did not finish inside the delay window: the measured lag range '
         f'spans only {completeness:.3g} of its relaxation time 1/Gamma, against the '
         f'{min_completeness:.3g} that ISO 22412:2017 (Annex A.1.2) requires of a retained '
         f'fit range -- its rule that the range must reach 1/{_ISO_RETAINED_RANGE_DECAY_FACTOR:.0f} '
@@ -295,6 +306,46 @@ def _result_flags(*notes: str) -> tuple:
     """
     live = [n for n in notes if n]
     return (not live), ' '.join(dict.fromkeys(live))
+
+
+def _keyed_notes(*pairs) -> Tuple[tuple, tuple]:
+    """``(notes, note_targets)`` from ``(target, text)`` pairs, dropping empty texts.
+
+    The passive-note twin of ``_result_flags`` above: that one rolls precondition
+    verdicts up to a single flag, this one keeps passive notices apart and says what
+    each is ABOUT, so a display surface can put a note on the cell it explains instead
+    of on the fit as a whole.
+
+    ``target`` names the RESULT ATTRIBUTE the note concerns -- ``'baseline'``,
+    ``'pdi'``, ``'mu4_s_inv4'`` -- or is ``''`` for a note about the whole fit. The
+    dead-channel note is the standing ``''`` case and not an oversight: a sixth of the
+    delay window collecting no coincidence is not a statement about one fitted number.
+    Attribute names, never display strings, so no GUI vocabulary reaches an analysis
+    function (architecture invariant 1); the join from attribute to on-screen column is
+    the Summary table's column spec, one hop away and testable.
+
+    ONE computation builds both tuples, which is the whole reason this is a helper and
+    not two comprehensions at each call site: readers index ``notes`` and
+    ``note_targets`` together, and a second comprehension is free to drop a note,
+    reorder one, or forget an arm (the one-computation shape CLAUDE.md rule 12
+    prescribes for exactly this pairing). A caller cannot produce a misaligned pair
+    through this function.
+
+    ``notes`` is unchanged by any of it -- same field, same tuple of plain sentences,
+    same pairing with the ``warnings.warn`` at the sites that warn. The targets ride
+    alongside. That is deliberate and owner-ruled (2026-09-19, this docstring being the
+    ruling's home): ``notes`` is a contract shared by every note-bearing result class
+    across ``analysis/`` and ``parsers/``, held to one shape by a reflection family gate
+    in the suite, so reshaping it to carry keys would be a change to all of them for a
+    benefit two of the families want.
+
+    Results whose producer has not been taught targets keep the empty default, and a
+    reader that finds the two tuples unequal in length must treat every note as
+    fit-level rather than guess: an unkeyed note on the wrong cell is worse than an
+    unkeyed note on the fit.
+    """
+    kept = [(target, text) for target, text in pairs if text]
+    return tuple(text for _target, text in kept), tuple(target for target, _text in kept)
 
 
 def _d_from_gamma(gamma_s_inv: float, q_m_inv: float) -> float:
@@ -509,9 +560,153 @@ def _apply_tau_window(
     return t, y
 
 
+def _live_channels(g2m1) -> np.ndarray:
+    """Boolean mask of the channels that collected coincidence: `g2 - 1 > -1`.
+
+    An intensity autocorrelation cannot be negative, so `g2 <= 0` (stored as `g2 - 1 <=
+    -1`) is not a small number: it is a channel that recorded nothing at all, with no
+    estimate and no variance. ONE predicate for every DLS fitter (owner-ruled 2026-09-08:
+    "there is no reason to fit anything to g2-1 = -1") -- the
+    cumulant arms, the single/double/KWW fits and the NNLS/CONTIN/lognormal preparation all
+    read this mask, so no fitter, tail statistic or goodness-of-fit sees a dead channel.
+    The physical reason the predicate is `g2 <= 0` and not "non-positive" is on
+    `cumulants._dead_channel_note`, which every fitter attaches when the mask drops a
+    channel. Measured before the rule was applied to the family: on the committed dead-tail
+    correlogram (8 of 48 channels dead) NNLS reported a mean Rh of 865 nm against 83 nm on
+    the live channels, green and unannotated, and the single-exponential rms read 0.41 on a
+    perfect fit.
+    """
+    return np.asarray(g2m1, dtype=float) > -1.0
+
+
+def _apply_tau_window_live(
+    tau: np.ndarray,
+    g2m1: np.ndarray,
+    tau_min_s: Optional[float],
+    tau_max_s: Optional[float],
+    min_points: int,
+    skip_initial_channels: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """`_apply_tau_window`, then the live-channel mask over the windowed arrays.
+
+    Returns `(tau, g2m1, alive)` -- the WINDOWED arrays (so a caller can still draw its
+    curve across a dead tail) and the mask it fits on. The minimum-points guard is sized
+    to the operation (rule 12): it counts LIVE channels, since those are what the fit
+    receives, and refuses naming the dead-channel cause. The cumulant arms do not use this
+    wrapper -- they own a withheld-result shape for the same shortfall (owner decision D2)
+    -- but they read the same `_live_channels` mask.
+    """
+    tau, g2m1 = _apply_tau_window(tau, g2m1, tau_min_s, tau_max_s, min_points,
+                                  skip_initial_channels=skip_initial_channels)
+    alive = _live_channels(g2m1)
+    n_live = int(np.count_nonzero(alive))
+    if n_live < min_points:
+        raise ValueError(
+            f"Only {n_live} of the {tau.size} channels in the delay window collected any "
+            f"coincidence (g2 = 0 on the rest), fewer than the {min_points} this fit "
+            f"needs. Widen the delay window past the dead channels, or use a longer run."
+        )
+    return tau, g2m1, alive
+
+
+def channel_sample_times(delay_times_s: np.ndarray) -> np.ndarray:
+    """Per-channel sample time Delta_t_k, derived from a measurement's FULL delay axis.
+
+    The photon-correlation noise model (Schaetzel 1990 Eq. (49), printed p. 296, through
+    `_schatzel_sd`) needs the sample time each channel was accumulated over. A parser
+    whose file states the correlator's sampling structure records it on the measurement
+    (`DLSMeasurement.sample_times_s` -- the Brookhaven .dat, one sampling time per
+    section) and the engine prefers that; this is the FALLBACK for every other format,
+    which writes only the lag itself: on a multi-tau correlator the sample time is a
+    property of the channel's block, so Delta_t_k is READ OFF THE AXIS. On a staircase it
+    is each channel's FORWARD step to the one after it, the last channel borrowing the one
+    before it; elsewhere it is the nearest sample time that gives a whole lag index (below).
+    That is the generator's own rule (`analysis.utilities._channel_sample_times`), called
+    here rather than copied, so a synthetic draw and the weight later built from it agree
+    by construction.
+
+    WHY THE FORWARD SPACING -- the paper's layout, owner-ruled 2026-09-08 (this docstring
+    is the ruling's normative home). Schaetzel's Sec. 3.2 (printed p. 300) has block j
+    span the lags L*Delta_t_j ... (2L-1)*Delta_t_j, so block j-1 ends at
+    (2L-1)*Delta_t_(j-1) and block j begins one fine step later at L*Delta_t_j =
+    2L*Delta_t_(j-1): NO lag is shared between blocks in that layout (the library index's
+    extraction says so in as many words), the boundary channel is the COARSER block's
+    first, and its forward step is that block's sample time. So the forward rule
+    reproduces the printed layout -- and `multi_tau_lag_axis`, which builds it -- exactly
+    on every channel, while the backward spacing reads half on the first channel of every
+    block. A real correlator whose axis carries a lag at that position may have computed
+    it in either block, which the axis alone cannot reveal, so the paper's convention is
+    taken for every staircase axis rather than a guess per instrument. The ONE layout on
+    which the program KNOWS the finer block computed the boundary lag is the Prometheus
+    Panta's duplicated boundary (the lag reported twice, once per block;
+    `parsers.panta_xlsx` keeps the finer block's member and discards the coarser's, after
+    Magatti & Ferri 2001): there the kept channel's forward step is the coarser block's
+    sample time, a factor of 2 on one channel per block boundary -- a counted exception,
+    pinned by identity in the test suite, never silently absorbed.
+
+    OFF A STAIRCASE, THE NEAREST SAMPLE TIME WITH A WHOLE LAG INDEX -- owner-ruled
+    2026-09-14 (this docstring is the ruling's normative home). The nonlinear cumulant's
+    weight is Biganzoli & Ferri (2018) Eq. (9), written on tau_k = k Delta_t with k a
+    whole number (their Eq. (2), p. 29376), and `_biganzoli_sd` refuses a channel whose k
+    is not one. Wherever the forward spacing s_k already gives a whole k (within
+    `_BIGANZOLI_LAG_INDEX_RTOL`: the printed multi-tau layout, whose lags are whole
+    multiples of their block's sample time) it is kept; elsewhere the forward spacing gives
+    a fractional k, and Delta_t_k = tau_k / n_k instead, with n_k = tau_k / s_k rounded half
+    up and at least 1, so a lag shorter than its spacing takes its own lag as sample time.
+    "Elsewhere" includes most channels of every committed real axis (measured 2026-09-14):
+    an ALV staircase whose written lags carry rounding (Delta_t moves by at most 7.7e-5),
+    the BI-9000's user-set sections, a Malvern or Panta block whose lags sit offset from its
+    spacing's multiples, and a uniform log or linear grid (k = 1 / (r - 1) for a ratio r).
+    A ratio within `_SAMPLE_TIME_HALF_SNAP_RTOL` (1e-4 relative, the written precision
+    measured on the committed delay axes) of a half-integer counts as that half-integer, so
+    ties round up on every channel whether exact or carrying float noise; above k = 5000 the
+    relative window covers every ratio, so there the ratio simply rounds up, moving Delta_t by
+    at most 1 / k. No source evaluates Eq. (9) off the integers or
+    says what sample time an axis that states none should use: this is a flagged stand-in
+    that keeps the variance on its own premise, not a more accurate Delta_t. The canonical
+    input is the correlator's own sample time, which a parser records when its file states
+    it. A tau = 0 channel keeps the forward spacing, as would a channel whose
+    lag-to-spacing ratio is not finite, which only an infinite lag can give.
+
+    RUN THIS ON THE FULL `DLSMeasurement.delay_times_s`, never on a windowed axis, and
+    cut the result to the fitted channels with the same `_apply_tau_window` call the
+    data goes through. Deriving after windowing hands the LAST windowed channel its
+    backward neighbour's spacing, which is the wrong block's sample time whenever the
+    window ends on a block's first channel (half, on the printed layout). The axis is
+    strictly increasing by construction (`core.data_models._require_increasing_lag_axis`),
+    so no refusal is added here; a one-channel axis returns Delta_t = tau (k = 1), as the
+    generator's rule does.
+    """
+    return _channel_sample_times(np.asarray(delay_times_s, dtype=float))
+
+
 # ---------------------------------------------------------------------------
 # beta / baseline estimation (distribution methods)
 # ---------------------------------------------------------------------------
+
+def _pinned_offset(baseline: Optional[float]) -> float:
+    """The flat offset a parametric fit subtracts from g2 - 1 before fitting: 0.0 when the
+    caller supplied none, else the caller's value as a float.
+
+    `None` means "subtract nothing", never "estimate one": the engine subtracts only a
+    baseline its caller supplied -- in the program the Correlogram tab's VISIBLE baseline
+    region (seeded on load, editable), for an API caller its own number -- so a fit run
+    without one reproduces the un-offset numbers exactly. That is
+    the opposite default from the distribution inversions, which must normalize by SOME
+    baseline to form |g1|^2 and so estimate one from the tail when none is given.
+
+    A non-finite value is refused rather than propagated: subtracted from the data it
+    would NaN every fitted point and every derived number without a word, and the
+    optimizer's own failure would then be reported as a non-converged fit -- the wrong
+    reason.
+    """
+    if baseline is None:
+        return 0.0
+    offset = float(baseline)
+    if not math.isfinite(offset):
+        raise ValueError(f"baseline must be a finite number or None, got {baseline!r}.")
+    return offset
+
 
 def _estimate_baseline(tau: np.ndarray, g2m1: np.ndarray,
                        tail_fraction: float = 0.25) -> float:

@@ -63,7 +63,8 @@ class _WhiteSaveToolbar(NavigationToolbar2QT):
             before = export_start_dir(self._controller)
             mpl.rcParams['savefig.directory'] = before
         parent_save = super().save_figure       # bind here; a lambda has no __class__ cell
-        save_figure_via(self.canvas.figure, lambda: parent_save(*args))
+        save_figure_via(self.canvas.figure, lambda: parent_save(*args),
+                        dressing=getattr(self.canvas, '_export_dressing', None))
         if self._controller is not None:
             after = mpl.rcParams['savefig.directory']
             if after and after != before:
@@ -91,6 +92,21 @@ def set_plot_export_name(canvas, stem: str) -> None:
         lambda: f'{bare}.{canvas.get_default_filetype()}'
 
 
+def set_plot_export_dressing(canvas, dressing) -> None:
+    """Give this canvas's Save button extra content to put on the WRITTEN figure.
+
+    `dressing` is a zero-argument callable returning an undo callable; it runs
+    inside the locked recolour in `plotting.plots.save_figure_via`, which is where
+    the screen-versus-export split already lives. `None` clears it.
+
+    Sibling of `set_plot_export_name`, and set at the same moment: figure-refresh
+    time, with the analysis on screen. The one consumer is the DLS co-plot tabs,
+    whose on-screen legend is a compact method key while the saved figure carries
+    every measurement by name.
+    """
+    canvas._export_dressing = dressing
+
+
 def make_canvas_expanding(canvas, min_height: int = 170,
                           max_height: Optional[int] = None):
     """Let a matplotlib FigureCanvas grow/shrink vertically with its container so
@@ -105,6 +121,11 @@ def make_canvas_expanding(canvas, min_height: int = 170,
     if max_height is not None:
         canvas.setMaximumHeight(max_height)
     return canvas
+
+
+# Object name of the control column's scroll area, the one scroll area a column's
+# primary action may sit in (`pin_under_column` keeps the rest outside it).
+CONTROL_COLUMN_SCROLL = 'control_column_scroll'
 
 
 def make_split_panels(parent, left_min_width: Optional[int] = None,
@@ -129,6 +150,7 @@ def make_split_panels(parent, left_min_width: Optional[int] = None,
     # overflow is what made the plot pane balloon and the page scroll.
     # Horizontal scrolling is off (forms wrap instead).
     left_scroll = QtWidgets.QScrollArea()
+    left_scroll.setObjectName(CONTROL_COLUMN_SCROLL)
     left_scroll.setWidgetResizable(True)
     left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
     # Horizontal bar only when a panel is genuinely wider than its column, so an
@@ -149,10 +171,66 @@ def make_split_panels(parent, left_min_width: Optional[int] = None,
     splitter.setStretchFactor(0, 0)            # control panel keeps its width
     splitter.setStretchFactor(1, 1)            # plot takes the extra space
     splitter.setSizes(list(sizes))
+    splitter._initial_sizes = list(sizes)      # re-applied by `pin_under_column`
     return splitter, left, right
 
 
-def make_vertical_plot_stack(widgets, sizes=None, min_heights=None):
+def pin_under_column(splitter, *widgets):
+    """Pin `widgets` under the control column's scroll area, outside it, so they never
+    scroll out of view: a tab's primary action, its Export, its status line and its
+    reliability flag (style guide R7.1, R8.6 and the §3 column template).
+
+    `splitter` is the one `make_split_panels` returned. The column scroll area is
+    re-parented into a new pane with the widgets stacked below it, in order, and that
+    pane takes the scroll area's place in the splitter. Call it once per tab, after the
+    column's contents are built. Returns the pane's layout, so a caller can pin more
+    later.
+    """
+    pane = QtWidgets.QWidget()
+    pane_layout = QtWidgets.QVBoxLayout(pane)
+    pane_layout.setContentsMargins(0, 0, 0, 0)
+    pane_layout.addWidget(splitter.widget(0), 1)   # re-parents the column scroll area
+    for w in widgets:
+        pane_layout.addWidget(w)
+    splitter.insertWidget(0, pane)
+    splitter.setStretchFactor(0, 0)                # the control pane keeps its width
+    splitter.setStretchFactor(1, 1)
+    splitter.setSizes(getattr(splitter, '_initial_sizes', splitter.sizes()))
+    return pane_layout
+
+
+def scrolling_notes(*labels, min_height: int = 40):
+    """Stack word-wrapping flag/notes labels in a frameless scroll area for a results
+    pane, and return it.
+
+    A splitter pane's floor ignores a wrapped label's real height, so notes that name
+    every ticked run would be clipped at the pane's bottom edge. In here they scroll
+    instead, and the bar shows only when the notes are longer than the space the pane
+    gives them. `min_height` keeps two lines in view.
+    """
+    box = QtWidgets.QWidget()
+    lay = QtWidgets.QVBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 0)
+    for label in labels:
+        lay.addWidget(label)
+    lay.addStretch(1)
+    sa = QtWidgets.QScrollArea()
+    sa.setWidgetResizable(True)
+    sa.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+    sa.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    sa.setWidget(box)
+    sa.setMinimumHeight(min_height)
+    return sa
+
+
+# Stretch factors for a control column's three-pane stack (picker, settings, results;
+# the §3 column template in the GUI style guide): extra window height goes mostly to the
+# settings form, which scrolls until it fits, rather than to a results pane that stays
+# empty until a Run.
+COLUMN_STACK_STRETCH = (1, 2, 1)
+
+
+def make_vertical_plot_stack(widgets, sizes=None, min_heights=None, stretch=None):
     """Stack several widgets in a draggable vertical QSplitter (with a visible grip
     handle) so each can be resized independently.
 
@@ -160,7 +238,8 @@ def make_vertical_plot_stack(widgets, sizes=None, min_heights=None):
     trace vs its histogram diagnostic) — NOT a fit + its residual, which stay on one
     canvas via `attach_residual_resizer` so they keep their shared-x alignment; and (2)
     the stacked sections of a control column, so the user can resize the checklist /
-    results table / etc. against each other. `min_heights` keeps each pane usable.
+    results table / etc. against each other. `min_heights` keeps each pane usable;
+    `stretch` sets how extra height is shared out (one factor per pane).
     Returns the splitter."""
     splitter = GripSplitter(QtCore.Qt.Orientation.Vertical)     # visible drag grip
     for i, w in enumerate(widgets):
@@ -171,6 +250,9 @@ def make_vertical_plot_stack(widgets, sizes=None, min_heights=None):
             # children (which made the Distribution picker's bulk-select rows overlap the
             # checklist — style guide R3.2).
             w.setMinimumHeight(max(min_heights[i], w.minimumSizeHint().height()))
+    if stretch is not None:
+        for i, factor in enumerate(stretch):
+            splitter.setStretchFactor(i, factor)
     if sizes is not None:
         splitter.setSizes(list(sizes))
     return splitter
@@ -259,7 +341,7 @@ class _ResidualResizer:
         try:
             mpos = self.main_ax.get_position()
             rpos = self.resid_ax.get_position()
-        except Exception:
+        except Exception:  # noqa: BLE001 — geometry guard, no grip
             return None
         h = self.fig.bbox.height
         w = self.fig.bbox.width
@@ -271,7 +353,7 @@ class _ResidualResizer:
             renderer = self.canvas.get_renderer()
             bb = (self.main_ax.xaxis.get_tightbbox(renderer)
                   if renderer is not None else None)
-        except Exception:
+        except Exception:  # noqa: BLE001 — geometry guard, axes edge used
             bb = None
         if bb is not None and bb.y0 < top_px:
             top_px = bb.y0
@@ -404,7 +486,7 @@ class AxisControlBar(QtWidgets.QWidget):
         try:
             (self._ax.set_xscale if axis == 'x' else self._ax.set_yscale)(scale)
             self._canvas.draw_idle()
-        except Exception:
+        except Exception:  # noqa: BLE001 — surfaced in the note
             self.note.setText(f'cannot set {axis} {scale}')
             self.sync(clear_note=False)
             return

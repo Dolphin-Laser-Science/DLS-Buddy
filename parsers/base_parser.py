@@ -87,7 +87,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -537,6 +537,53 @@ G1_PEAK_FLOOR = 1.0e-2
 # undecidable case is PREVENTION -- the tooltip on the load dialog's "Column 2 is" control.
 
 
+def carried_run_duration(vendor_duration_s: Optional[float],
+                         delay_s: np.ndarray,
+                         live: np.ndarray,
+                         source_phrase: str) -> Tuple[Optional[float], str]:
+    """`(duration_s, note)` -- the run duration T to carry onto a measurement, or why not.
+
+    ONE rule for every format that states a run length, because there is one reason it
+    can be used: Biganzoli & Ferri Eq. (9)'s `1/(M - k) = Delta_t / (T - tau)` needs a T
+    longer than every lag the fit will reach, and the engine refuses the weight outright
+    when it is not. A file whose header disagrees with its own data is not a guess this
+    layer is entitled to resolve, so T is withheld, the weight takes its documented
+    `T -> infinity` form, and a passive note says what was seen.
+
+    The test is on the LIVE lags, not the declared delay range. A layout whose channels
+    run past the end of the acquisition is ordinary: those channels collect nothing,
+    arrive as `g2 - 1 = -1` exactly, and every DLS fitter drops them before it fits
+    (`analysis.dls._common._live_channels`), so no lag past T ever reaches the weight;
+    that property is pinned over the committed corpus by
+    `tests/test_parsers.py::test_every_committed_brookhaven_dat_fills_its_run_duration_or_says_why`
+    rather than restated as a count here.
+
+    `live` is the caller's liveness mask, computed in whichever layer holds the data --
+    a raw channel count above zero, or `g2 - 1 > -1` where a format ships that directly.
+    The two spellings are the same predicate (`g2 - 1 = (raw - B)/B` with `B > 0`), and
+    their agreement is asserted on the committed corpus in `tests/test_parsers.py` rather
+    than argued here. `source_phrase` names, for the note, where the header stated T.
+
+    The predicate is the quantifier "every live lag lies inside T", so a correlogram with
+    no live channel at all satisfies it vacuously and T is carried. Such a file has no fit
+    either way -- the live-channel mask refuses it first -- so the vacuous branch decides
+    nothing a user sees.
+    """
+    if vendor_duration_s is None:
+        return None, ''
+    live = np.asarray(live, dtype=bool)
+    if not live.any():
+        return float(vendor_duration_s), ''
+    last_live_s = float(np.asarray(delay_s, dtype=float)[live].max())
+    if last_live_s < vendor_duration_s:
+        return float(vendor_duration_s), ''
+    return None, (
+        f'the header states a run duration of {vendor_duration_s:.4g} s '
+        f'({source_phrase}), but channels out to {last_live_s:.4g} s collected '
+        f'coincidences, so the two disagree; no run duration is carried and the cumulant '
+        f'fit takes its T -> infinity form.')
+
+
 def apply_data_form(
     raw_col2: np.ndarray,
     data_form: str,
@@ -714,7 +761,7 @@ class DLSFilePreview:
     # roster rather than checked inline so a generic scan can assert every preview
     # publishes one (rule 11) -- a preview that grows a third column and forgets to list
     # it here turns the drift guard red instead of quietly opting out.
-    _DATA_ARRAY_FIELDS = ('delay_times_s', 'correlogram')
+    _DATA_ARRAY_FIELDS = ('delay_times_s', 'correlogram', 'sample_times_s')
 
     def __post_init__(self) -> None:
         for name in self._DATA_ARRAY_FIELDS:
@@ -737,10 +784,22 @@ class DLSFilePreview:
 
     # --- what the instrument file itself recorded (records, not knobs) ---
     # The vendor's own mean count rate for this measurement (cps) and the nominal
-    # run length (s), where the format carries them. Offered to the user like any
-    # other header value the parser proposes; they never reach DLSMeasurement.
+    # run length (s), where the format carries them, kept verbatim. Offered to the user
+    # like any other header value the parser proposes; the records themselves never reach
+    # DLSMeasurement (the run duration does, separately, as `duration_s` below).
     vendor_mean_count_rate_cps: Optional[float] = None
     vendor_duration_s: Optional[float] = None
+    # Per-channel sample time (s) when the FILE states its sampling structure -- the
+    # Brookhaven .dat's correlator sections. None for every format that states none;
+    # the engine then derives a stand-in from the delay axis and records which it used.
+    # Carried onto DLSMeasurement: an instrument fact like the lags, not a knob.
+    sample_times_s: Optional[np.ndarray] = None
+    # The run duration T (s) of THIS correlogram when the file states it unambiguously
+    # (the ALV `Duration` of a one-run acquisition; the Brookhaven header's run length
+    # where it covers every live channel -- see `carried_run_duration`); None otherwise,
+    # and the weight then
+    # takes its T -> infinity form. Carried onto DLSMeasurement like the sample times.
+    duration_s: Optional[float] = None
     # The count-rate trace this file recorded BESIDE this correlogram, for the
     # formats that ship both in one file (currently ALV .ASC). The loader stores it
     # in the workspace's trace collection with a link back to the measurement it
@@ -811,6 +870,13 @@ class DLSFilePreview:
             sample_label=self.sample_label,
             instrument_name=self.instrument_name,
             source_file=self.source_file,
+            sample_times_s=self.sample_times_s,
+            duration_s=self.duration_s,
+            # Deliberately none: the vendor's mean count rate is an OFFER
+            # (`vendor_mean_count_rate_cps`) that reaches the engine only through the
+            # user's commit, in `LoadedMeasurement.build()`. Named so the omission is
+            # visible at the one other place a DLSMeasurement is constructed.
+            mean_count_rate_cps=None,
         )
 
     def __repr__(self) -> str:

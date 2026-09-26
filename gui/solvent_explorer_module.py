@@ -42,6 +42,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import shiboken6
 from PySide6 import QtCore, QtWidgets
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -92,7 +93,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
                 'including an allowance for disagreement between published '
                 'sources (narrowest where the sources are strongest).',
                 'The band is <b>shown, never propagated</b> into any reported ± '
-                '(see Theory-and-Equations-Guide §5).',
+                '(see Theory-and-Equations-Guide §1.1.2).',
             ]))
 
         # ---- top: form (left) + numeric readout (right) ----
@@ -171,7 +172,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
 
         self.band_note = ThemedLabel(
             'Shaded band = conservative bound at each condition, including an '
-            'inter-laboratory allowance (Theory-and-Equations-Guide §5) — shown, '
+            'inter-laboratory allowance (Theory-and-Equations-Guide §1.1.2) — shown, '
             'never propagated into an analysis SE. '
             'Curves stop where the library’s validity ends.',
             role='hint', size=11)
@@ -260,6 +261,13 @@ class SolventExplorerModule(QtWidgets.QWidget):
 
     def _recompute(self, *args) -> None:
         """Recompute the numeric readout and both plots for the current inputs."""
+        # The temperature and wavelength boxes call this on `editingFinished`, which Qt
+        # also emits when a box loses focus -- including while the window is being
+        # destroyed, after the axis bars' C++ objects are gone. There is nothing to draw
+        # into then.
+        if not all(shiboken6.isValid(bar)
+                   for bar in (self.a_bar_eta, self.a_bar_ri, self.b_bar)):
+            return
         name = self._current_solvent()
         if name is None:
             self.n_readout.setText('')

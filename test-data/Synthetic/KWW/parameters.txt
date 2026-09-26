@@ -1,0 +1,66 @@
+KWW -- stretched-exponential correlograms with their ground truth
+=================================================================
+
+Why this set exists
+-------------------
+The KWW path shipped in 2026-06 with no synthetic ground truth at all: the correlogram
+kernel emits sums of exponentials and log-normal-broadened populations only, so there
+was no stretch exponent anywhere in the generator. `build_kww_correlogram` closed the
+GENERATOR half on 2026-09-02 (08-21-spec-01 package 5b). This closes the committed-data
+half, so `run_kww` is reachable from a file on disk rather than only from memory.
+
+The model, which is exactly the model `analysis.dls.exponentials.fit_kww` fits:
+
+    g1(tau) = exp(-(tau/tau_c)^s)        g2(tau) - 1 = B + beta * g1(tau)^2
+
+with B = 0 in every file here (see "What is NOT pinned" below).
+
+HOW TO LOAD IT
+--------------
+Each file is a headerless two-column CSV for the generic DLS parser:
+delay time in SECONDS, then g2(tau) - 1. At the confirmation step choose
+
+    delay_time_unit = 's'      data_form = 'g2m1'
+
+and enter the optics below. No beta and no baseline are needed at load: the data form
+is already g2-1, so nothing has to be reconstructed.
+
+GROUND TRUTH
+------------
+  Angle 90 deg, beta 0.9, wavelength 532 nm,
+  n = 1.33, T = 298.15 K,
+  eta = 0.00089 Pa s, noise 0.005 (absolute SD on g2-1),
+  seed 8821, 200 points, uniform log lag axis 1e-7 .. 1 s.
+
+  file                                                s       tau_c/s     <tau>/s      Rh(tau_c)    Rh(<tau>)
+  KWW s=0.5 - stretched exponential.csv            0.50  2.0000e-04  4.00000e-04      24.217       48.435
+  KWW s=0.7 - stretched exponential.csv            0.70  2.0000e-04  2.53165e-04      24.217       30.655
+  KWW s=1.0 - stretched exponential.csv            1.00  2.0000e-04  2.00000e-04      24.217       24.217
+
+  <tau> = (tau_c/s) * Gamma(1/s) -- the same closed form the fit reports. The two Rh
+  channels are the Stokes radii of Gamma = 1/tau_c and Gamma = 1/<tau>; `fit_kww`
+  reports both because for s < 1 they are genuinely different sizes, and at s = 1 they
+  must coincide.
+
+WHAT A FIT SHOULD RETURN (measured 2026-09-05)
+----------------------------------------------
+  s = 0.5   s -> 0.5012, tau_c -> 2.0129e-04 (+0.65 %), Rh 24.373 / 48.532 nm
+  s = 0.7   s -> 0.7018, tau_c -> 2.0083e-04 (+0.42 %), Rh 24.318 / 30.709 nm
+  s = 1.0   s -> 1.0000, tau_c -> 2.0103e-04 (+0.52 %), Rh 24.343 / 24.343 nm
+
+  beta recovers to 0.897-0.899 against a planted 0.9, and `rh_reliable` is True on all
+  three -- the decay finishes inside the lag window at every stretch.
+
+  THE CONTROL. At s = 1.0 the stretched exponential IS a single exponential, so the KWW
+  path must agree with `fit_single_exponential` on the same file. Measured: both return
+  24.3425 nm, to every digit reported. That is the check that says the KWW machinery is
+  not quietly its own thing.
+
+WHAT IS NOT PINNED HERE, AND WHY
+--------------------------------
+  A NON-ZERO baseline. `_kww_model` carries no B term, so an offset is absorbed into the
+  shape rather than fitted: measured at tau_c = 2e-4, s = 0.7, B = 0.04, the fit returns
+  tau_c 2.51e-4, s 0.640 and Rh 30.4 nm against a planted 24.2 nm (+26 %), and flips
+  `rh_reliable` to False. That is not a defect in either half -- it is the condition the
+  generator's baseline knob exists to make reachable -- but it means "recovery" is only
+  a meaningful word at B = 0, which is why every file here is at B = 0.

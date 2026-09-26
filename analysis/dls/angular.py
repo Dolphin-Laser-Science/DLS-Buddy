@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Mapping, NamedTuple, Optional, Sequence
 
 import numpy as np
 
@@ -31,7 +31,8 @@ from analysis.dls._common import (
     _d_from_gamma, _decay_rate_to_rh_nm, _measurement_q_m, _result_flags,
     DIFFUSIVE_INTERCEPT_REL_MAX, DIFFUSIVE_R2_MIN, NO_VISCOSITY_NOTE)
 from analysis.dls.cumulants import (
-    CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM, _size_range_check, fit_cumulants)
+    CUMULANT_FIT_CUTOFF_DEFAULT, CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM,
+    _resolve_weighting, _size_range_check, fit_cumulants)
 from analysis.dls.exponentials import fit_single_exponential
 
 
@@ -71,6 +72,32 @@ class GammaQ2Result:
     d_se: Optional[float] = None
     rh_se: Optional[float] = None
     se_estimator: str = 'hc3'             # covariance estimator behind the SEs
+    # The cumulant inputs that produced the per-point Gamma, echoed for the same reason
+    # `gamma_source` is: this Rh is promotable, and both of these move it. Optional with
+    # defaults, unlike `gamma_source`, because a 'single'-sourced fit reads neither and a
+    # required field would force every such site to pass a value it did not use.
+    cumulant_method: Optional[str] = None
+    cumulant_fit_cutoff: Optional[float] = None
+    # The residual weighting the per-point cumulants were ASKED for, resolved to the arm's
+    # request token ('uniform', or the arm's default when none was named), for the same
+    # reason as the pair above; None under a 'single' source. And the points -- angles in
+    # deg, or concentrations in g/mL -- whose default weight could not be formed and so
+    # fell back to 'uniform' on their own (`_fit_cumulants_nonlinear`), so a pooled number
+    # built partly from unweighted points never travels without saying which.
+    cumulant_weighting: Optional[str] = None
+    cumulant_weighting_fallbacks: tuple = ()
+    # The cumulant ORDER every per-point fit ran at, echoed with the three inputs above for
+    # their reason: it moves the per-point Gamma, so it moves this promotable Rh. None
+    # under a 'single' source, which fits no cumulant.
+    cumulant_order: Optional[int] = None
+    # What each per-point cumulant RECORDED -- the residual weighting that actually ran
+    # (`CumulantResult.weighting`) and the sample time its sourced weight was evaluated on
+    # (`CumulantResult.sample_time_provenance`) -- aligned with the sorted per-point arrays,
+    # '' under a 'single' source. The request above says what was asked for; these say
+    # what ran, so a pooled export can name an axis-derived stand-in as the per-fit export
+    # does (the `cumulant_weighting_fallbacks` shape, one level wider).
+    point_weightings: tuple = ()
+    point_sample_time_provenance: tuple = ()
     # every eligible measurement's per-point Γ/q²/D_app + quality tag, attached by the
     # controller run so the GUI table/graying come from the run.
     all_points: Optional[list] = None
@@ -114,6 +141,25 @@ class ConcentrationExtrapolationResult:
     rh0_se: Optional[float] = None
     kd_se: Optional[float] = None
     se_estimator: str = 'hc3'             # covariance estimator behind the SEs
+    # The cumulant inputs that produced the per-point Gamma, echoed for the same reason
+    # `gamma_source` is: this Rh is promotable, and both of these move it. Optional with
+    # defaults, unlike `gamma_source`, because a 'single'-sourced fit reads neither and a
+    # required field would force every such site to pass a value it did not use.
+    cumulant_method: Optional[str] = None
+    cumulant_fit_cutoff: Optional[float] = None
+    # The residual weighting the per-point cumulants were ASKED for, resolved to the arm's
+    # request token ('uniform', or the arm's default when none was named), for the same
+    # reason as the pair above; None under a 'single' source. And the points -- angles in
+    # deg, or concentrations in g/mL -- whose default weight could not be formed and so
+    # fell back to 'uniform' on their own (`_fit_cumulants_nonlinear`), so a pooled number
+    # built partly from unweighted points never travels without saying which.
+    cumulant_weighting: Optional[str] = None
+    cumulant_weighting_fallbacks: tuple = ()
+    # The cumulant ORDER every per-point fit ran at; see `GammaQ2Result.cumulant_order`.
+    cumulant_order: Optional[int] = None
+    # What each per-point cumulant recorded; see `GammaQ2Result.point_weightings`.
+    point_weightings: tuple = ()
+    point_sample_time_provenance: tuple = ()
     # Reliability of the 1/coefficient kD = slope/D0 (the DLS sibling of the SLS
     # Mw = 1/intercept family; rule 10). kD sign-flips when D0 <= 0 -- a WELL-conditioned
     # fit (a steep +slope extrapolating D0 below zero) can still produce a finite,
@@ -174,30 +220,171 @@ def rh_nm_to_gamma(rh_nm, q_m_inv, temperature_K, viscosity_Pa_s):
 # Gamma vs q^2 (multi-angle)
 # ---------------------------------------------------------------------------
 
+#: The per-measurement fit inputs `analyze_gamma_q2` and
+#: `extrapolate_diffusion_vs_concentration` forward to one measurement's own fit: the
+#: delay window, and the baseline the caller measured on THAT correlogram -- a value to
+#: subtract (`baseline`), or, for the nonlinear cumulant, the lag span its floating
+#: baseline is measured over (`baseline_window`). Any other key is refused, so a
+#: per-measurement dict cannot quietly override an input the whole pool shares.
+PER_MEASUREMENT_FIT_KEYS = frozenset({'tau_min_s', 'tau_max_s', 'baseline',
+                                      'baseline_window'})
+
+
+def _per_measurement_fit_kwargs(measurements, fit_kwargs, gamma_source,
+                                cumulant_method='linear') -> list:
+    """One dict of fit inputs per measurement (empty when none were given), refusing a
+    list that does not align with the measurements or a key outside
+    `PER_MEASUREMENT_FIT_KEYS`.
+
+    Each fit is sent only the baseline input it reads, the GUI's own rule for the same
+    fits (`_AnalysisRegion.parametric_fit_kwargs`): the nonlinear cumulant takes the span
+    its floating baseline is measured over (`baseline_window`), never a value, which would
+    only steer its starting point; the linear cumulant and the single exponential take a
+    value (`baseline`), never a span, which `fit_cumulants` would silently ignore on the
+    linear arm. A pairing a fit does not read is refused rather than dropped, so a caller
+    that routes one method's input to another fails loudly instead of fitting without
+    the baseline the user placed. Aligned by position, as `measurements` is the one order
+    the caller and this module share."""
+    reads_window = gamma_source == 'cumulant' and cumulant_method == 'nonlinear'
+    if fit_kwargs is None:
+        return [{} for _ in measurements]
+    fit_kwargs = list(fit_kwargs)
+    if len(fit_kwargs) != len(measurements):
+        raise ValueError(
+            f"fit_kwargs has {len(fit_kwargs)} entries for {len(measurements)} "
+            f"measurements; give one (possibly empty) dict per measurement.")
+    out = []
+    for kw in fit_kwargs:
+        kw = dict(kw or {})
+        unknown = set(kw) - PER_MEASUREMENT_FIT_KEYS
+        if unknown:
+            raise ValueError(
+                f"fit_kwargs may carry only {sorted(PER_MEASUREMENT_FIT_KEYS)} per "
+                f"measurement, got {sorted(unknown)}.")
+        if 'baseline_window' in kw and not reads_window:
+            raise ValueError(
+                "baseline_window is the nonlinear cumulant's input -- the lag span its "
+                "floating baseline is measured over; this fit takes a baseline value "
+                "(`baseline`) instead.")
+        if 'baseline' in kw and reads_window:
+            raise ValueError(
+                "the nonlinear cumulant takes the lag span its floating baseline is "
+                "measured over (`baseline_window`), not a baseline value, which would "
+                "only steer its starting point.")
+        out.append(kw)
+    return out
+
+
+class _PointFit(NamedTuple):
+    """One measurement's per-point fit, as the pooled engines read it: the rate, its
+    verdict, whether the default weight fell back, and the per-fit RECORD the pooled
+    result relays -- the fit's passive notes, the weighting that ran and the sample time
+    it was evaluated on ('' for each under a single-exponential source, which records no
+    weighting)."""
+    gamma: float
+    rh_reliable: bool
+    reliability_note: str
+    fell_back: bool
+    notes: tuple = ()
+    weighting: str = ''
+    sample_time_provenance: str = ''
+
+
 def _gamma_for_measurement(measurement, gamma_source, tau_min_s, tau_max_s,
-                           skip_initial_channels=0, cumulant_method='linear'):
-    """(Gamma, rh_reliable, reliability_note) from one measurement's per-point fit.
+                           skip_initial_channels=0, cumulant_method='linear',
+                           cumulant_fit_cutoff=CUMULANT_FIT_CUTOFF_DEFAULT,
+                           cumulant_weighting=None, cumulant_order=2, fit_kw=None):
+    """A `_PointFit` -- (Gamma, rh_reliable, reliability_note, fell_back) and the fit's
+    record -- from one measurement's per-point fit.
+
+    `fit_kw` is this measurement's own inputs (`PER_MEASUREMENT_FIT_KEYS`), laid over the
+    shared window: a window key in it wins for this measurement, and a baseline key is
+    handed to the fit as it stands. `cumulant_order` is the order of a cumulant fit.
+
+    `fell_back` is True when the cumulant was asked for a weighting other than 'uniform'
+    and recorded 'uniform': the default's sourced weight could not be formed on this run
+    and the fit fell back on its own. The vocabulary block of `cumulants.py`
+    (`RECORDED_WEIGHTINGS`) names the two routes to a recorded 'uniform' -- asked for, or
+    fallen back to -- and this test excludes the first. Always False under a 'single' source.
 
     The verdict travels with the rate: reading `.gamma_s_inv` alone dropped every
     per-point precondition verdict (undecayed window, size range, PDI, no viscosity)
     on the way to the pooled fit, so a multi-angle Rh built from fits every one of which
     was flagged reached the caller clean. Both sources carry the pair on the same names.
+
+    Every place that shows or uses a cumulant fit uses the same weighting and the same
+    instrument inputs (owner-ruled 2026-09-08; this docstring is the rule's home). The
+    inputs the nonlinear cumulant's default residual weight reads -- the committed mean
+    count rate and the parser's per-channel sample times -- travel ON the measurement
+    (`DLSMeasurement.mean_count_rate_cps` / `.sample_times_s`, set by
+    `LoadedMeasurement.build()`), so a per-point cumulant here reads the SAME weight inputs
+    as the DLS tab's fit of that run by construction: nothing is threaded for them, and no
+    caller can drop one. The WEIGHTING is threaded (`cumulant_weighting`, the user's
+    Settings choice, as the method and cutoff are), and so are the order, the window and
+    the baseline (`cumulant_order`, `fit_kw`): the per-point fit is the tab's own fit of
+    that run only when the caller passes the tab's values for those.
     """
+    kw = dict(tau_min_s=tau_min_s, tau_max_s=tau_max_s)
+    kw.update(fit_kw or {})
     if gamma_source == 'cumulant':
-        fit = fit_cumulants(measurement, order=2,
-                            tau_min_s=tau_min_s, tau_max_s=tau_max_s,
+        # This site READS THE USER'S CUTOFF AND WEIGHTING, unlike the four seed sites
+        # elsewhere in `analysis/`. The reason is not the call's shape but whose fit it is:
+        # this is the same cumulant the user just configured, run on the same
+        # measurement, and its Gamma is reported to them. A seed inside another method
+        # is an implementation detail of that method and must not move when a
+        # display-side setting does; a user-facing cumulant must.
+        fit = fit_cumulants(measurement, order=cumulant_order,
                             skip_initial_channels=skip_initial_channels,
-                            method=cumulant_method)
-        return fit.gamma_s_inv, fit.rh_reliable, fit.reliability_note
+                            method=cumulant_method,
+                            fit_cutoff=cumulant_fit_cutoff,
+                            weighting=cumulant_weighting, **kw)
+        fell_back = fit.weighting == 'uniform' and cumulant_weighting != 'uniform'
+        return _PointFit(fit.gamma_s_inv, fit.rh_reliable, fit.reliability_note, fell_back,
+                         tuple(fit.notes), fit.weighting, fit.sample_time_provenance)
     elif gamma_source == 'single':
         fit = fit_single_exponential(
-            measurement, tau_min_s=tau_min_s, tau_max_s=tau_max_s,
-            skip_initial_channels=skip_initial_channels)
-        return fit.mode.gamma_s_inv, fit.mode.rh_reliable, fit.mode.reliability_note
+            measurement, skip_initial_channels=skip_initial_channels, **kw)
+        return _PointFit(fit.mode.gamma_s_inv, fit.mode.rh_reliable,
+                         fit.mode.reliability_note, False, tuple(fit.notes))
     else:
         raise ValueError(
             f"gamma_source must be 'cumulant' or 'single', got {gamma_source!r}."
         )
+
+
+def _fit_every_point(measurements, per_kw, where, gamma_source, tau_min_s, tau_max_s,
+                     *args) -> List[_PointFit]:
+    """`_gamma_for_measurement` over the pooled set, naming the point when a fit REFUSES
+    its inputs: a per-measurement input the fit cannot take (a baseline span holding too
+    few of its live channels, a window that leaves too few points) would otherwise abort
+    the whole pooled fit with a message that names no run. The refusal still aborts it --
+    the inputs are the caller's, and a pool fitted around a silently dropped run is not
+    what was asked for -- but it says which run. `where(m)` names a point ("at 30 deg")."""
+    fits = []
+    for m, kw in zip(measurements, per_kw, strict=True):
+        try:
+            fits.append(_gamma_for_measurement(m, gamma_source, tau_min_s, tau_max_s,
+                                               *args, kw))
+        except ValueError as exc:
+            raise ValueError(f'The fit {where(m)} refused its inputs: {exc}') from exc
+    return fits
+
+
+def _relayed_point_notes(points: Sequence[float], fits: Sequence[_PointFit],
+                         unit: str) -> List[str]:
+    """Each per-point fit's PASSIVE notes, once per distinct note with the points that
+    carried it named in front -- the shape `run_mode_map` relays a run's notes in and
+    `extract_modes` an inversion's. A pooled result is the only surface that shows its
+    Rh, so a note about how a point was fitted (a floating baseline resting on its bound,
+    µ₂ at its bound, dead channels) must reach it; word-for-word repeats are named once.
+    `points` and `fits` are aligned (the caller's sorted order)."""
+    noted: dict = {}
+    for x, fit in zip(points, fits, strict=True):
+        for note in fit.notes:
+            if note:
+                noted.setdefault(note, []).append(f'{x:.4g}')
+    return [f"{', '.join(dict.fromkeys(where))}{unit}: {note}"
+            for note, where in noted.items()]
 
 
 def _pooled_point_note(angles_or_concs: np.ndarray, notes: List[str], axis: str,
@@ -222,6 +409,18 @@ def _pooled_point_note(angles_or_concs: np.ndarray, notes: List[str], axis: str,
             f'({where}); at {flagged[0][0]:.4g}{unit}: {flagged[0][1]}')
 
 
+def _fallback_note(fallbacks: tuple, unit: str) -> str:
+    """The passive sentence naming the points whose default weight fell back to 'uniform'
+    (`_gamma_for_measurement`), or '' when none did. Each such point's own fit note names
+    the input Eq. (9) refused; this says only where, so the pooled result states it once."""
+    if not fallbacks:
+        return ''
+    where = ', '.join(f'{x:.4g}' for x in fallbacks)
+    return (f'The sourced residual weight could not be formed at {where}{unit}, so '
+            f'{"that point" if len(fallbacks) == 1 else "those points"} fell back to the '
+            f'unweighted (uniform) cumulant fit; each run\'s own fit note names the refusal.')
+
+
 def analyze_gamma_q2(
     measurements: List[DLSMeasurement],
     gamma_source: str = 'cumulant',
@@ -231,7 +430,11 @@ def analyze_gamma_q2(
     intercept_rel_threshold: float = DIFFUSIVE_INTERCEPT_REL_MAX,
     skip_initial_channels: int = 0,
     cumulant_method: str = 'linear',
+    cumulant_fit_cutoff: float = CUMULANT_FIT_CUTOFF_DEFAULT,
     estimator: str = 'hc3',
+    cumulant_weighting: Optional[str] = None,
+    cumulant_order: int = 2,
+    fit_kwargs: Optional[Sequence[Optional[Mapping]]] = None,
 ) -> GammaQ2Result:
     """Analyze Gamma vs q^2 across angles for one sample.
 
@@ -257,6 +460,21 @@ def analyze_gamma_q2(
     intercept_rel_threshold : float
         Maximum |intercept|/mean(Gamma) for the is_diffusive flag (default
         DIFFUSIVE_INTERCEPT_REL_MAX, 0.1).
+    cumulant_weighting : str, optional
+        The residual weighting of every per-angle cumulant, passed to `fit_cumulants` as
+        `cumulant_method` and `cumulant_fit_cutoff` are; None is the arm's default. An angle
+        whose default weight cannot be formed falls back to 'uniform' on its own, and the
+        result records which (`cumulant_weighting_fallbacks`, and a sentence on `notes`).
+    cumulant_order : int
+        The order of every per-angle cumulant fit (default 2), echoed on the result as
+        `cumulant_order`. Unused under a 'single' source.
+    fit_kwargs : sequence of dict, optional
+        One dict per measurement, aligned with `measurements`, of that measurement's OWN
+        fit inputs (`PER_MEASUREMENT_FIT_KEYS`): each angle's baseline is measured on its
+        own correlogram, and the nonlinear cumulant takes the span itself, so no single
+        value could stand for all of them. A window key in a dict overrides
+        `tau_min_s`/`tau_max_s` for that measurement. None (the default) is every
+        measurement's fit on the shared inputs alone, exactly as before this parameter.
 
     Returns
     -------
@@ -309,16 +527,30 @@ def analyze_gamma_q2(
             "Gamma vs q^2 cannot be fit. q = 4*pi*n/lambda*sin(theta/2) -- check the "
             "solvent refractive index and the wavelength on these measurements."
         )
-    fits = [_gamma_for_measurement(m, gamma_source, tau_min_s, tau_max_s,
-                                   skip_initial_channels, cumulant_method)
-            for m in measurements]
-    gamma = np.array([f[0] for f in fits], dtype=float)
-    point_notes = [f[2] if not f[1] else '' for f in fits]
+    weighting_echo = (_resolve_weighting(cumulant_method, cumulant_weighting)
+                      if gamma_source == 'cumulant' else None)
+    order_echo = int(cumulant_order) if gamma_source == 'cumulant' else None
+    per_kw = _per_measurement_fit_kwargs(measurements, fit_kwargs, gamma_source,
+                                         cumulant_method)
+    fits = _fit_every_point(measurements, per_kw, lambda m: f'at {m.angle_deg:g} deg',
+                            gamma_source, tau_min_s, tau_max_s, skip_initial_channels,
+                            cumulant_method, cumulant_fit_cutoff, cumulant_weighting,
+                            cumulant_order)
+    gamma = np.array([f.gamma for f in fits], dtype=float)
+    point_notes = [f.reliability_note if not f.rh_reliable else '' for f in fits]
 
     # sort by q^2 ascending for clean output
     order = np.argsort(q2)
     angles, q, q2, gamma = angles[order], q[order], q2[order], gamma[order]
     point_notes = [point_notes[i] for i in order]
+    sorted_fits = [fits[i] for i in order]
+    fallbacks = tuple(float(angles[k]) for k, f in enumerate(sorted_fits) if f.fell_back)
+    if fallbacks:
+        notes.append(_fallback_note(fallbacks, ' deg'))
+    notes.extend(_relayed_point_notes(angles, sorted_fits, ' deg'))
+    record = dict(point_weightings=tuple(f.weighting for f in sorted_fits),
+                  point_sample_time_provenance=tuple(
+                      f.sample_time_provenance for f in sorted_fits))
 
     # A measurement whose decay rate is unusable -- non-positive (a weak, noisy or
     # rising correlogram) or non-finite (a failed fit) -- is DROPPED from the line and
@@ -357,6 +589,11 @@ def analyze_gamma_q2(
             gamma_source=gamma_source, temperature_K=temperature_K,
             r2_threshold=r2_threshold, intercept_rel_threshold=intercept_rel_threshold,
             d_se=None, rh_se=None, se_estimator=estimator, notes=tuple(notes),
+            cumulant_method=(cumulant_method if gamma_source == 'cumulant' else None),
+            cumulant_fit_cutoff=(cumulant_fit_cutoff if gamma_source == 'cumulant'
+                                 else None),
+            cumulant_weighting=weighting_echo, cumulant_weighting_fallbacks=fallbacks,
+            cumulant_order=order_echo, **record,
             rh_reliable=False,
             reliability_note=(
                 "D and Rh could not be computed: fewer than two measurements yielded a "
@@ -428,6 +665,11 @@ def analyze_gamma_q2(
         r2_threshold=r2_threshold, intercept_rel_threshold=intercept_rel_threshold,
         d_se=unc.se_or_none(d_se), rh_se=unc.se_or_none(rh_se),
         se_estimator=estimator,
+        cumulant_method=(cumulant_method if gamma_source == 'cumulant' else None),
+        cumulant_fit_cutoff=(cumulant_fit_cutoff if gamma_source == 'cumulant'
+                             else None),
+        cumulant_weighting=weighting_echo, cumulant_weighting_fallbacks=fallbacks,
+        cumulant_order=order_echo, **record,
         notes=tuple(notes),
         rh_reliable=rh_reliable, reliability_note=reliability_note,
     )
@@ -444,8 +686,12 @@ def extrapolate_diffusion_vs_concentration(
     tau_max_s: Optional[float] = None,
     skip_initial_channels: int = 0,
     cumulant_method: str = 'linear',
+    cumulant_fit_cutoff: float = CUMULANT_FIT_CUTOFF_DEFAULT,
     estimator: str = 'hc3',
     cond_limit: float = unc.COND_LIMIT,
+    cumulant_weighting: Optional[str] = None,
+    cumulant_order: int = 2,
+    fit_kwargs: Optional[Sequence[Optional[Mapping]]] = None,
 ) -> ConcentrationExtrapolationResult:
     """Extrapolate the apparent diffusion coefficient to infinite dilution.
 
@@ -481,6 +727,12 @@ def extrapolate_diffusion_vs_concentration(
         'cumulant' (default) or 'single'.
     tau_min_s, tau_max_s : float, optional
         Delay-time window passed to the per-measurement fits.
+    cumulant_weighting : str, optional
+        The residual weighting of every per-concentration cumulant; see
+        `analyze_gamma_q2`, whose parameter this mirrors, fallback record included.
+    cumulant_order, fit_kwargs
+        The per-point cumulant order and each measurement's own fit inputs; see
+        `analyze_gamma_q2`, whose parameters these mirror.
 
     Returns
     -------
@@ -528,18 +780,37 @@ def extrapolate_diffusion_vs_concentration(
     # OverflowError at q ~ 1e155, and the square underflows to 0.0 at q ~ 1e-170 for a
     # ZeroDivisionError. (The helper is not yet the quotient's single home;
     # `analyze_gamma_q2` above still computes it inline.)
-    fits = [_gamma_for_measurement(m, gamma_source, tau_min_s, tau_max_s,
-                                   skip_initial_channels, cumulant_method)
-            for m in measurements]
-    d_app = np.array([_d_from_gamma(f[0], _measurement_q_m(m))
+    weighting_echo = (_resolve_weighting(cumulant_method, cumulant_weighting)
+                      if gamma_source == 'cumulant' else None)
+    order_echo = int(cumulant_order) if gamma_source == 'cumulant' else None
+    per_kw = _per_measurement_fit_kwargs(measurements, fit_kwargs, gamma_source,
+                                         cumulant_method)
+    fits = _fit_every_point(
+        measurements, per_kw,
+        # A run with no concentration is named "n/a" (the measurement's own repr), so its
+        # refusal still surfaces as the named ValueError rather than a format TypeError.
+        lambda m: (f'at {m.concentration_g_per_mL:.4g} g/mL'
+                   if m.concentration_g_per_mL is not None else 'at c = n/a')
+                  + f', {m.angle_deg:g} deg',
+        gamma_source, tau_min_s, tau_max_s, skip_initial_channels, cumulant_method,
+        cumulant_fit_cutoff, cumulant_weighting, cumulant_order)
+    d_app = np.array([_d_from_gamma(f.gamma, _measurement_q_m(m))
                       for f, m in zip(fits, measurements, strict=True)])
     # The per-point verdict rides beside its D (see `_gamma_for_measurement`); it is
     # rolled up over the FITTED points below, once the drop has decided which those are.
-    point_notes = [f[2] if not f[1] else '' for f in fits]
+    point_notes = [f.reliability_note if not f.rh_reliable else '' for f in fits]
 
     order = np.argsort(conc)
     conc, d_app = conc[order], d_app[order]
     point_notes = [point_notes[i] for i in order]
+    sorted_fits = [fits[i] for i in order]
+    fallbacks = tuple(float(conc[k]) for k, f in enumerate(sorted_fits) if f.fell_back)
+    if fallbacks:
+        notes.append(_fallback_note(fallbacks, ' g/mL'))
+    notes.extend(_relayed_point_notes(conc, sorted_fits, ' g/mL'))
+    record = dict(point_weightings=tuple(f.weighting for f in sorted_fits),
+                  point_sample_time_provenance=tuple(
+                      f.sample_time_provenance for f in sorted_fits))
 
     # A measurement whose D_app is unanswerable is DROPPED from the fit, not allowed to NaN
     # the whole extrapolation. `_d_from_gamma` returns NaN for a non-positive or non-finite
@@ -584,6 +855,11 @@ def extrapolate_diffusion_vs_concentration(
             # that did not occur.
             n_concentrations=0, gamma_source=gamma_source,
             d0_se=None, rh0_se=None, kd_se=None, se_estimator=estimator,
+            cumulant_method=(cumulant_method if gamma_source == 'cumulant' else None),
+            cumulant_fit_cutoff=(cumulant_fit_cutoff if gamma_source == 'cumulant'
+                                 else None),
+            cumulant_weighting=weighting_echo, cumulant_weighting_fallbacks=fallbacks,
+            cumulant_order=order_echo, **record,
             kd_reliable=False, well_conditioned=False, cond=float('inf'),
             reliability_note=(
                 "D0 could not be computed: fewer than two measurements yielded a usable "
@@ -679,6 +955,11 @@ def extrapolate_diffusion_vs_concentration(
         gamma_source=gamma_source,
         d0_se=d0_se, rh0_se=unc.se_or_none(rh0_se), kd_se=kd_se,
         se_estimator=estimator,
+        cumulant_method=(cumulant_method if gamma_source == 'cumulant' else None),
+        cumulant_fit_cutoff=(cumulant_fit_cutoff if gamma_source == 'cumulant'
+                             else None),
+        cumulant_weighting=weighting_echo, cumulant_weighting_fallbacks=fallbacks,
+        cumulant_order=order_echo, **record,
         kd_reliable=kd_reliable, well_conditioned=lf.well_conditioned,
         cond=lf.cond, reliability_note=reliability_note,
         rh_reliable=rh_reliable,

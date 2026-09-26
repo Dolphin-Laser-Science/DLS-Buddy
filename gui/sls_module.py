@@ -9,8 +9,9 @@ measurement in the sidebar makes this tab operate on its whole sample.
 
 It contains the visible **calibration panel** (manual entry of one calibrant point
 → k_c, geometry-aware toluene Rayleigh) and an analysis section (Zimm / Berry /
-Debye / single-angle / calibration-free A₂ / excess Rayleigh ratio). Everything is
-routed through the controller; no analysis or physics here.
+Debye / Guinier / single-angle ladder / calibration-free A₂ / excess Rayleigh ratio,
+plus the form-factor P(q) fits). Everything is routed through the controller; no
+analysis or physics here.
 
 Commit model: calibration and parameters are session/working state. "Update"
 commits them (and recomputes k_c); "Run" uses the COMMITTED state. Soft flags
@@ -19,6 +20,7 @@ commits them (and recomputes k_c); "Run" uses the COMMITTED state. Soft flags
 
 from __future__ import annotations
 
+import html
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,22 +30,24 @@ from PySide6 import QtCore, QtWidgets
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+from core.naming import measurement_hover_card, sample_display_name
 from plotting.plots import (
     plot_zimm, plot_debye, plot_guinier, plot_rayleigh_ratio,
     scale_causes, scaled_value,
-    plot_calibration_free_a2, plot_form_factor, plot_ellipsoid_form_factor,
+    plot_calibration_free_a2, plot_single_angle_ladder, plot_form_factor,
+    plot_ellipsoid_form_factor,
     plot_core_shell_form_factor, conc_mg_ml_label, display_factor_from,
     zimm_spacing,
 )
 from analysis import form_factor as ff
 from gui.plot_controls import (
     AxisControlBar, make_split_panels, make_canvas_expanding, make_vertical_plot_stack,
-    set_plot_export_name, themed_navtoolbar)
+    pin_under_column, set_plot_export_name, themed_navtoolbar)
 from gui.export_helper import export_to_csv, sample_suggested_name
 from gui.field_labels import humanize_field_names
 from gui.help import add_help_to_groupbox, section_header
 from gui.plot_overlays import reissue_legend_preserving_title, show_plot_placeholder
-from gui.widgets import (GripSplitter, RichTextDelegate, SampleSelector,
+from gui.widgets import (GripSplitter, NAME_COL_MAX_W, RichTextDelegate, SampleSelector,
                          confirm_regroup_losses, roomy_tabs)
 from gui.theme import ThemedLabel, set_flag, span, token as theme_token
 from gui.worker import (
@@ -134,7 +138,50 @@ _WITHHELD_A2_TOOLTIP = (
     'arbitrary scale (no calibration, or no usable dn/dc) is not a molar mass, and '
     'dividing by '
     'it gives a number that is not an A₂. A hand-entered Mw (Data tab) is treated as a '
-    'trusted external value and does yield A₂. See the Theory-and-Equations-Guide §4.4.')
+    'trusted external value and does yield A₂. See the Theory-and-Equations-Guide §4.5.')
+
+
+# The user-facing caution for a fit whose solvent blank was not MEASURED. It is not a
+# scale cause, so it deliberately sits outside `_scale_causes` (the same reasoning
+# `_rg_unreliable_caution` records for the size floor: a cause that has nothing to do
+# with scale must not be swallowed by the scale wording, or it reaches the user nowhere).
+# The sentence itself comes from the result's own `blank_provenance` record, so the tab,
+# the export Comments cell and the guide cannot drift apart.
+_BLANK_CAUTION_FALLBACK = (
+    'The solvent blank was not measured for this series, so every value here is '
+    'flagged. Enter the solvent intensity at 90° on the Data tab, or measure a c = 0 '
+    'blank.')
+
+
+def _blank_flagged(res) -> bool:
+    """Was this result computed without a MEASURED solvent blank? The fact BOTH cautions
+    consult -- kept separate from `_blank_caution`, which decides which of the two PRINTS
+    the sentence. Conflating the two is a real defect: the caution that does not print it
+    must still suppress its numerical-fault fallback, or it asserts a fault that did not
+    happen on every blankless run (invariant 4's proxy ban)."""
+    return not getattr(res, 'blank_measured', True)
+
+
+def _blank_caution(res, *, for_size: bool) -> str:
+    """'' when the blank was measured (the silent default), else the sentence naming
+    which blank case this fit is in -- a computed 90° blank, or no subtraction at all.
+
+    Per invariant 4 the sentence names the FAILED PRECONDITION and never a proxy: it
+    says what was not measured and what stood in for it, not "the fit is bad".
+
+    EXACTLY ONE of the two cautions carries it, because every display site that shows
+    one shows the other, and the fact is a property of the RESULT rather than of either
+    quantity -- so prepending it to both printed it twice. The SIZE caution carries it
+    whenever the result reports a size verdict at all; the Mw caution carries it for the
+    results that have no size (the single-angle Mw, the single-angle ladder, the
+    calibration-free A2). `tests/test_gui_smoke.py` pins the once-only property over the
+    whole result family by reflection, so a new result type cannot reintroduce it."""
+    if getattr(res, 'blank_measured', True):
+        return ''
+    if for_size != hasattr(res, 'rg_reliable'):
+        return ''
+    note = str(getattr(res, 'blank_provenance', '') or '').strip()
+    return note or _BLANK_CAUTION_FALLBACK
 
 
 def _mw_unreliable_caution(res) -> str:
@@ -156,10 +203,22 @@ def _mw_unreliable_caution(res) -> str:
     is never left with a neutral "apparent" flag next to an 'n/a'. Prefers the result's
     specific `reliability_note`; the condition-number tooltip is attached separately, only
     for the genuine ill-conditioning case (`not well_conditioned`)."""
+    blank = _blank_caution(res, for_size=False)
+    numerical = ''
     if not _scale_causes(res) and not getattr(res, 'mw_reliable', True):
-        return (getattr(res, 'reliability_note', '')
-                or 'Mw is unreliable (non-physical or degenerate fit).')
-    return ''
+        # THREE cases, and the middle one is why the fallback is conditional. On a
+        # blankless run `mw_reliable` is False because of the blank, so the old
+        # unconditional fallback asserted a "non-physical or degenerate fit" that did
+        # not happen -- a proxy, which invariant 4 forbids. With the blank sentence
+        # already carrying the reason, the fallback is withheld and only a REAL
+        # numerical fault (which always writes `reliability_note`) is added beside it.
+        # A measured-blank result takes the `else` and is byte-identical to before.
+        if _blank_flagged(res):
+            numerical = getattr(res, 'reliability_note', '')
+        else:
+            numerical = (getattr(res, 'reliability_note', '')
+                         or 'Mw is unreliable (non-physical or degenerate fit).')
+    return ' '.join(x for x in (blank, numerical) if x)
 
 
 def _rg_unreliable_caution(res) -> str:
@@ -176,10 +235,97 @@ def _rg_unreliable_caution(res) -> str:
     Red ⚠ `error` tier, matching the Mw caution and the DLS `rh_reliable` glyph
     (ui_style_guide §5 R5.2: one condition, one tier, across surfaces).
     """
+    blank = _blank_caution(res, for_size=True)
     if getattr(res, 'rg_reliable', True):
-        return ''
+        return blank              # a measured-blank result returns '' exactly as before
+    if _blank_flagged(res):
+        # Same three-case split as the Mw caution above: the blank explains the flag, so
+        # the "not physically meaningful" fallback -- which would assert a collapsed fit
+        # that did not happen -- is withheld, while a real fault still rides beside it.
+        return ' '.join(x for x in (blank, getattr(res, 'reliability_note', '')) if x)
     return (getattr(res, 'reliability_note', '')
             or 'The fitted size is not physically meaningful.')
+
+
+def _confirm_unmeasured_blank(parent, controller, sid: str, *, reuse: bool) -> bool:
+    """Ask before analysing a sample with NO measured c = 0 solvent blank.
+
+    MODULE-level, not a method, because TWO tabs reach the same blankless path and a gate
+    on one of them is not a gate: `_ModeResolvedTab` runs `run_mode_partition` through the
+    same `masked_rayleigh`, so before this it raised the old flat refusal on a fresh
+    session and computed SILENTLY once the Analysis tab had been confirmed -- the
+    acknowledgement is controller-wide (round d0ce f12).
+
+    True = go ahead (the controller has been told); False = the caller returns and
+    the tab is left exactly as it was.
+
+    This replaced a flat refusal, and it is deliberately the LOUD part of the
+    feature. Every other convenience the program offers rests on a published method;
+    a blank computed from one 90° value rests on an inference no opened source
+    endorses, so a flag on the result alone is too quiet -- the user is told what
+    will happen, in the words of the case they are actually in, before any number
+    appears.
+
+    Cancel is the DEFAULT button (the house pattern is
+    `gui.export_helper.confirm_overwrite`), so Return or Escape declines.
+
+    It fires on EVERY press of Run while the sample has no measured blank -- the
+    answer is not remembered across presses. `reuse=True` is the exception the two
+    live-refit callers pass: a mask edit after a confirmed Run reuses that answer
+    rather than interrupting the user mid-curation.
+    """
+    if reuse and controller.has_unmeasured_blank_acknowledgement(sid):
+        return True
+    typed = controller.committed_typed_blank(sid)
+    if typed:
+        what = (
+            f'The solvent blank will be <b>computed from the typed 90° '
+            f'intensity</b> ({typed:.10g}), scaled by 1/sinθ at each '
+            f'angle — it assumes the solvent scatters like a simple liquid '
+            f'and that the scattering volume goes as 1/sinθ.')
+    else:
+        what = ('<b>No solvent subtraction</b> will be applied — the solvent '
+                'blank intensity at 90° on the Data tab is empty. The dark '
+                'count is still removed.')
+    resp = QtWidgets.QMessageBox.question(
+        parent, 'No solvent blank measured',
+        f'<p>This sample has no c = 0 solvent measurement.</p><p>{what}</p>'
+        f'<p><b>Every result will be flagged unreliable</b>, the radius of '
+        f'gyration included — an unmeasured blank is <b>additive</b>, so unlike '
+        f'an unknown calibration scale it does not cancel out of a slope.</p>'
+        f'<p>The fit will <b>not</b> update this sample\'s Cross-Sample values '
+        f'(M<sub>w</sub>, R<sub>g</sub>, A₂) — a blankless fit is not offered '
+        f'there. Enter a value by hand on the Cross-Sample tab if you need it in a '
+        f'scaling plot.</p>'
+        f'<p>Set or clear the value in <i>Solvent blank intensity at 90°</i> '
+        f'on the Data tab.</p><p>Continue?</p>',
+        QtWidgets.QMessageBox.StandardButton.Yes
+        | QtWidgets.QMessageBox.StandardButton.Cancel,
+        QtWidgets.QMessageBox.StandardButton.Cancel)
+    if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+        return False
+    controller.acknowledge_unmeasured_blank(sid)
+    return True
+
+
+def _append_caution(flag: str, piece: str, note: str, prefix: str = '  ') -> str:
+    """Append a caution to a flag label without repeating the engine's own note.
+
+    `reliability_note` reaches one label by up to three routes: the arm prints it, and
+    BOTH cautions carry it beside the blank sentence. Round 0e15 f3 made the arms
+    accumulate rather than rank -- correct, and it turned that latent duplication into a
+    visible one (the Guinier label printed the note three times, the ladder twice; round
+    d0ce f9). So a caution contributes only what the label does not already say: its own
+    copy of the note is stripped when the note is already there, and an
+    entirely-duplicate piece is dropped.
+    """
+    piece = (piece or '').strip()
+    note = (note or '').strip()
+    if note and note in piece and note in flag:
+        piece = piece.replace(note, '').strip()
+    if not piece or piece in flag:
+        return flag
+    return flag + prefix + piece
 
 
 def _rg_cell(cell: str, res) -> str:
@@ -206,23 +352,20 @@ def _adapt_form(form: QtWidgets.QFormLayout) -> None:
     form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
 
 
-def _sample_label(sample) -> str:
-    """Human-readable sample name for the SLS header — the same 'polymer / solvent @
-    T' form the sidebar shows, instead of the raw 'poly|solv|temp' sample_id key whose
-    unconfirmed parts render as '?'."""
-    poly, solv, temp = sample.polymer_name, sample.solvent_name, sample.temperature_K
-    if poly and solv and temp is not None and not math.isnan(temp):
-        return f'{poly} / {solv} @ {temp:g} K'
-    return '(unconfirmed sample)'
-
-
+# Method dropdown entries: (label, engine key), in menu order. The single-angle Mw at ONE
+# concentration ('single') is deliberately UNLISTED rather than removed: the engine and
+# controller paths behind it are kept, so re-listing it is one line here plus 'single'
+# back in tests/test_gui_smoke.py's _SWEEP_METHODS, whose equality gate reads this list. One angle
+# at one concentration is a single datum -- no Rg, and no honest uncertainty (CLAUDE.md
+# invariant 8) -- while the single-angle LADDER below covers the realistic case, a
+# concentration series read at one angle.
 _SLS_METHODS: List[Tuple[str, str]] = [
     ('Zimm', 'zimm'),
     ('Berry', 'berry'),
     ('Form factor P(q)', 'form_factor'),
     ('Debye (single c, apparent)', 'debye'),
     ('Guinier (single c, apparent)', 'guinier'),
-    ('Single-angle Mw (apparent)', 'single'),
+    ('Single-angle Mw + A₂ (ladder, apparent)', 'ladder'),
     ('Calibration-free A₂', 'calfree'),
     ('Excess Rayleigh ratio', 'rayleigh'),
 ]
@@ -352,7 +495,7 @@ class _AnalysisTab(QtWidgets.QWidget):
     def _build_ui(self) -> None:
         # Control panel | plot split is draggable. The control column
         # has long calibration labels and a wide button, so it keeps a minimum width.
-        _, left, right = make_split_panels(self, left_min_width=340)
+        splitter, left, right = make_split_panels(self, left_min_width=340)
 
         # The SLS dropdown is a mirror/override of the shell's single active sample
         # picking here sets the active sample everywhere; clicking a sample
@@ -360,7 +503,7 @@ class _AnalysisTab(QtWidgets.QWidget):
         # series) is analyzed per sample.
         self.sls_selector = SampleSelector(
             self.controller, predicate=lambda s: s.has_sls,
-            label_fn=_sample_label, title='SLS Sample',
+            label_fn=sample_display_name, title='SLS Sample',
             help_text='Choose which sample to analyze (its whole Zimm set).',
             help_bullets=['Only samples that have SLS intensity data appear.',
                           'Picking here — or clicking a sample in the Workspace — sets '
@@ -384,22 +527,24 @@ class _AnalysisTab(QtWidgets.QWidget):
         left.addWidget(cal)
         left.addWidget(ana)
 
-        # Warnings stay at the bottom of the control column — the shared house convention
-        # across every tab (results → red ⚠ flag → neutral ⓘ notes). With Results + Mask
-        # now under the plot, they sit above the fold anyway.
-        self.status = QtWidgets.QLabel('')        # one-line notes (e.g. Rayleigh series)
-        self.status.setWordWrap(True)
-        left.addWidget(self.status)
-        self.flag_label = ThemedLabel('', role='error', bold=True)
-        self.flag_label.setWordWrap(True)
-        left.addWidget(self.flag_label)
         # Passive ⓘ notices carried on the result (e.g. dropped non-positive points) —
-        # a neutral qualifier tier, separate from the severity-tracking flag_label above.
-        # The analysis emits the same text via warnings.warn (keep-both).
+        # a neutral qualifier tier, separate from the severity-tracking flag_label below.
+        # The analysis emits the same text via warnings.warn (keep-both). They follow
+        # the Analysis group at natural height, inside the scroll area.
         self.notes_label = ThemedLabel('', size=11)
         self.notes_label.setWordWrap(True)
         left.addWidget(self.notes_label)
         left.addStretch(1)      # keep the controls top-aligned; scroll area handles overflow
+
+        # Run, Export, the status line and the ⚠ flag are pinned under the scroll area
+        # (the §3 column template), so the Calibration group above the Analysis group
+        # can never carry them out of view.
+        self.status = QtWidgets.QLabel('')        # one-line notes (e.g. Rayleigh series)
+        self.status.setWordWrap(True)
+        self.flag_label = ThemedLabel('', role='error', bold=True)
+        self.flag_label.setWordWrap(True)
+        pin_under_column(splitter, self.run_button, self.export_button, self.status,
+                         self.flag_label)
 
         # Right column: the plot over a draggable Results | Mask strip. Keeping the
         # results table next to the plot it describes (and the mask near the points you
@@ -660,8 +805,8 @@ class _AnalysisTab(QtWidgets.QWidget):
         add_help_to_groupbox(box, 'Get Mw, Rg and A₂ from the intensities.', bullets=[
             '<b>Thermodynamic</b> (Zimm/Berry): extrapolated to zero angle <i>and</i> '
             'zero concentration — the true Mw, Rg, A₂.',
-            '<b>Apparent</b> (Debye/Guinier/single-angle): one concentration or angle '
-            'only — a quick estimate, not extrapolated.',
+            '<b>Apparent</b> (Debye, Guinier, the single-angle ladder): one '
+            'concentration or one angle only — a quick estimate, not extrapolated.',
             'Zimm fits the standard plot; <b>Berry</b> (square-root axis) is better for '
             'larger or higher-Mw particles where Zimm curves.',
             '<b>Form factor P(q)</b>: fits the full angular form factor (choose '
@@ -683,7 +828,22 @@ class _AnalysisTab(QtWidgets.QWidget):
             'Degenerate solutions are listed smallest shape first (ellipsoid: by axial '
             'ratio; core–shell: by outer radius) — a fixed listing convention, not a '
             'ranking: the solutions fit equally.',
-            'Flags under the plot come in two tiers: a calm <b>ⓘ</b> note is a neutral, '
+            '<b>Debye</b>: one concentration across angle — apparent Mw and Rg; pick the '
+            'concentration in the <b>Concentration</b> box. <b>Guinier</b>: the same '
+            'concentration read as log ΔR against q² — Rg only, and it survives an '
+            'uncalibrated run.',
+            '<b>Single-angle Mw + A₂ (ladder)</b>: the concentration series at the picked '
+            '<b>Angle</b> — apparent Mw from the intercept, apparent A₂ from the slope, '
+            'with the calibration-free 2·A₂·Mw product beside them. The route for a '
+            'single-angle series, such as one built on the <b>Derived Intensity</b> '
+            'sub-tab.',
+            '<b>Calibration-free A₂</b>: the 2·A₂·Mw product from ratios of excess '
+            'intensity across concentration at the picked <b>Angle</b>, with no '
+            'calibration at all. The absolute A₂ beneath it divides by Mw, so it appears '
+            'only where that Mw is on an absolute scale (calibrated, or hand-entered).',
+            '<b>Excess Rayleigh ratio</b>: ΔR against angle for each concentration — the '
+            'measured scattering itself, with no Mw or Rg fitted.',
+            'Flags at the foot of the column come in two tiers: a calm <b>ⓘ</b> note is a neutral, '
             'expected qualifier (e.g. “apparent”, “± statistical only”) — not a problem; '
             'a bold red <b>⚠</b> is a genuine data-quality issue (uncalibrated; an '
             '<b>ill-conditioned design</b> — clustered angles or near-equal '
@@ -710,16 +870,12 @@ class _AnalysisTab(QtWidgets.QWidget):
         for label, key in _SLS_METHODS:
             self.method_combo.addItem(label, key)
         self.method_combo.setToolTip(
-            'Zimm / Berry: thermodynamic Mw, Rg and A₂ (extrapolated to zero angle and '
-            'zero concentration). Form factor P(q): fits the full angular form factor '
-            '(sphere / Gaussian coil / ellipsoid), valid to larger qRg than the Zimm/Guinier '
-            'expansion. Debye / Guinier / single-angle: apparent (one '
-            'condition). Calibration-free 2·A₂·Mw needs no calibration; the absolute A₂ '
-            'beneath it divides by Mw, so it is shown only when that Mw is on an absolute '
-            'scale (calibrated, or hand-entered) and withheld otherwise. '
-            'Excess Rayleigh ratio: ΔR vs angle for each concentration (arbitrary '
-            'scale if uncalibrated) — the measured scattering itself, not a fitted '
-            'Mw/Rg.')
+            'An apparent Mw is Mw·P(q) ≤ Mw at a finite angle, and at one concentration '
+            'the intercept still carries the 2A₂c term — which is why only the '
+            'double extrapolation is thermodynamic. Rg and the 2·A₂·Mw product are ratios '
+            'of fitted coefficients, so the optical scale cancels in them and they survive '
+            'an uncalibrated run, where an absolute Mw or A₂ does not; see the '
+            'Theory-and-Equations-Guide for each construction.')
         self.method_combo.currentIndexChanged.connect(self._on_method_changed)
         form.addRow('Method:', self.method_combo)
 
@@ -797,11 +953,10 @@ class _AnalysisTab(QtWidgets.QWidget):
         self.run_button = QtWidgets.QPushButton('Run')
         self.run_button.setToolTip(BACKGROUND_RUN_TOOLTIP)
         self.run_button.clicked.connect(self._on_run)
-        form.addRow(self.run_button)
+        # Run and Export are pinned under the column in `_build_ui`, not form rows.
         self.export_button = QtWidgets.QPushButton('Export CSV…')
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._on_export)
-        form.addRow(self.export_button)
 
         self._on_method_changed()
         return box
@@ -1005,12 +1160,14 @@ class _AnalysisTab(QtWidgets.QWidget):
             elif not sample.has_sls:
                 # Named empty-state for an active sample with no SLS data (replaces the
                 # old keep-last; nothing is lost, state is controller-backed).
-                header = (f'No SLS data for <b>{_sample_label(sample)}</b> — load an SLS '
-                          'intensity file, or pick another sample.')
+                header = (f'No SLS data for '
+                          f'<b>{html.escape(sample_display_name(sample))}</b> — '
+                          'load an SLS intensity file, or pick another sample.')
             else:
                 self.sample_id = sid
                 runnable = True
-                header = f'SLS sample: <b>{_sample_label(sample)}</b>'
+                header = (f'SLS sample: '
+                          f'<b>{html.escape(sample_display_name(sample))}</b>')
         self._ran = False
         self._set_state(header, runnable)
         if runnable:
@@ -1123,7 +1280,7 @@ class _AnalysisTab(QtWidgets.QWidget):
         """Re-run the current analysis after a mask change (only once something
         has already been plotted, so toggling masks before a run is quiet)."""
         if self._ran and self._runnable and self.sample_id is not None:
-            self._on_run()
+            self._on_run(reuse_blank_answer=True)
 
     def _set_state(self, header_html: str, runnable: bool) -> None:
         self.header.setText(header_html)
@@ -1303,7 +1460,7 @@ class _AnalysisTab(QtWidgets.QWidget):
                  self.controller.preview_calibration_note(sid) or '', problem=False)
         try:
             preview = self.controller.preview_k_c(sid)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — surfaced in the label
             self.kc_label.setText(span(self, 'error', f'cannot compute: {exc}'))
             return
         committed = self.controller.committed_k_c(sid)
@@ -1450,7 +1607,7 @@ class _AnalysisTab(QtWidgets.QWidget):
     def _on_method_changed(self) -> None:
         key = self.method_combo.currentData()
         self.conc_combo.setEnabled(key in ('debye', 'guinier', 'single'))
-        self.angle_combo.setEnabled(key in ('single', 'calfree'))
+        self.angle_combo.setEnabled(key in ('single', 'ladder', 'calfree'))
         zimm = key in ('zimm', 'berry')
         self.zimm_k_edit.setEnabled(zimm)
         self.zimm_k_suggest.setEnabled(zimm)
@@ -1557,7 +1714,7 @@ class _AnalysisTab(QtWidgets.QWidget):
             return
         try:
             rr = self.controller.masked_rayleigh(self.sample_id, self._fraction)
-        except Exception:
+        except Exception:  # noqa: BLE001 — no suggestion without a series
             return
         # Suggest fills the edit in the AXIS units (matching how a typed k is
         # read back); canonical at the default nm⁻² choice, factor exactly 1.0.
@@ -1568,17 +1725,21 @@ class _AnalysisTab(QtWidgets.QWidget):
         self._k_field_qfac = qfac
 
     @QtCore.Slot()
-    def _on_run(self) -> None:
+    def _on_run(self, *, reuse_blank_answer: bool = False) -> None:
+        """Run the selected SLS analysis.
+
+        `reuse_blank_answer` is passed by the two non-button callers (`_rerun` after a
+        mask-list edit, and the plot's pick-to-mask handler). A PRESS OF RUN always asks
+        about a missing solvent blank; a live refit reuses the answer given at that
+        sample's last Run, so masking points does not re-prompt on every click.
+        """
         if not self._runnable or self.sample_id is None:
             return
         sid = self.sample_id
-        samp = self.controller.workspace.samples[sid]
-        if samp.solvent_reference_item_id is None:
-            QtWidgets.QMessageBox.warning(
-                self, 'No solvent reference',
-                'This sample has no c = 0 solvent reference. SLS calibration and '
-                'the excess Rayleigh ratio require one.')
-            return
+        if not self.controller.sample_has_measured_blank(sid):
+            if not _confirm_unmeasured_blank(self, self.controller, sid,
+                                             reuse=reuse_blank_answer):
+                return
         # Read everything the fit needs on the main thread; the compute phase
         # runs on the worker (the SLS fits build + fit every angle/concentration),
         # then the present phase plots + fills tables back on the main thread.
@@ -1593,8 +1754,15 @@ class _AnalysisTab(QtWidgets.QWidget):
         # SampleResult docstring). Resolve which picks are at stake BEFORE the
         # dispatch — one query behind the optional ask-first confirm and the
         # always-on disclose-after line, so they cannot disagree.
+        # `blankless` is the sample-level guard for a per-series operation; the two are
+        # equivalent because `_regroup` fills the blank slot before parking any extra --
+        # measured over five cases, not assumed (rule 12).
         replaced_picks = []
-        if method in ('zimm', 'berry'):     # the one SLS path that writes sample values
+        blankless = not self.controller.sample_has_measured_blank(sid)
+        if method in ('zimm', 'berry') and not blankless:
+            # A blankless fit is not offered to Cross-Sample, so `run_zimm` returns before
+            # the SampleResult write and this run replaces NOTHING -- the dialog below
+            # would have promised a replacement and offered a Cancel protecting nothing.
             replaced_picks = self.controller.picks_a_run_would_replace(
                 sid, frac, ('mw', 'rg', 'a2'))
         if replaced_picks and self.controller.settings.confirm_run_replaces_pick:
@@ -1623,26 +1791,36 @@ class _AnalysisTab(QtWidgets.QWidget):
                     if getattr(r, f'{q}_source') != 'picked']
 
         def fail(exc: BaseException) -> None:
-            # A failure landing after a sample/fraction switch must not act on
-            # the view now shown (its Export belongs to the fit redisplayed
-            # there) -- the same epoch guard `done` applies. The dialog names
-            # the sample either way, so a late one cannot be misread.
-            fresh = epoch == self._run_epoch
-            who = _sample_label(self.controller.workspace.samples[sid])
+            # A failure for a sample or fraction no longer shown must not act on the
+            # view now shown (its Export belongs to the fit redisplayed there), so it
+            # is told in a dialog naming the sample. One superseded by a newer run of
+            # this same view is not shown: that run reports its own outcome. A fresh
+            # one is flagged in the panel, not a modal (style guide R8.4) -- a mask
+            # edit re-runs this live, and a modal would come up per click -- and the
+            # previous fit's numbers go with its flag, so none stays on screen under
+            # the failure.
+            same_view = (sid, frac) == (self.sample_id, self._fraction)
+            fresh = same_view and epoch == self._run_epoch
+            who = sample_display_name(self.controller.workspace.samples[sid])
+            text = (f'Could not run {method_text!r} on {who}: '
+                    f'{humanize_field_names(str(exc))} Confirm parameters (Data tab) '
+                    'and the calibration, then Update.')
             if fresh:
+                self._clear_result_table()
                 self.export_button.setEnabled(False)
-            QtWidgets.QMessageBox.critical(
-                self, 'Analysis failed',
-                f'Could not run {method_text!r} on {who}.\n\n'
-                f'{humanize_field_names(str(exc))}\n\n'
-                'Confirm parameters (Data tab) and the calibration, then Update.')
+                set_flag(self.flag_label, text)
+            elif not same_view:
+                QtWidgets.QMessageBox.critical(self, 'Analysis failed', text)
             gone = _picks_replaced_by_this_run()
             if gone:
                 names = ', '.join(_QTY_DISPLAY[q] for q, _ in gone)
-                self.status.setText(f'Analysis failed — see dialog. The run had '
-                                    f'already replaced your picked {names} on {who}.')
+                lead = ('Analysis failed — see the warning below.' if fresh
+                        else 'Analysis failed — see dialog.' if not same_view
+                        else 'An earlier run failed.')
+                self.status.setText(f'{lead} The run had already replaced your '
+                                    f'picked {names} on {who}.')
             elif fresh:
-                self.status.setText('Analysis failed — see dialog.')
+                self.status.setText('Analysis failed — see the warning below.')
 
         def done(payload) -> None:
             # Disclose-after is NOT view-gated: the worker's write happened
@@ -1657,9 +1835,30 @@ class _AnalysisTab(QtWidgets.QWidget):
             disclosure = ''
             if gone:
                 names = ', '.join(_QTY_DISPLAY[q] for q, _ in gone)
-                who = _sample_label(self.controller.workspace.samples[sid])
+                who = sample_display_name(self.controller.workspace.samples[sid])
                 disclosure = (f'{method_text} on {who} replaced your picked '
                               f'{names} (re-pick in Cross-Sample if needed).')
+            elif blankless and method in ('zimm', 'berry'):
+                # The mirror of the disclosure above, for the write that did NOT happen.
+                # The dialog says this too, but a mask refit passes `reuse=True` and never
+                # re-opens it, so a user can refit ten times without seeing it again --
+                # and a silent non-write is how the SLS tab and the Cross-Sample tab come
+                # to show different numbers for one sample with nothing explaining it.
+                # Composed here with the replaced-pick line so both ride the same
+                # not-view-gated path.
+                who = sample_display_name(self.controller.workspace.samples[sid])
+                disclosure = (f'{method_text} on {who} was not sent to Cross-Sample '
+                              f'(no measured solvent blank); enter the value by hand '
+                              f'there if you need it in a scaling plot.')
+                # ...and name the OLDER value if one is still standing. Removing the blank
+                # clears the computed triple, but a regroup that re-keys the blank away
+                # does not, so Cross-Sample can still be serving an earlier run's number
+                # while this tab shows a different, flagged one (round d0ce f3).
+                stored = self.controller.workspace.samples[sid].result_for(frac)
+                if any(getattr(stored, f'{q}_source', '') == 'computed'
+                       for q in ('mw', 'rg', 'a2')):
+                    disclosure += (' A value from an earlier run is still shown there '
+                                   'for this sample.')
             if epoch != self._run_epoch:
                 if disclosure:
                     self.status.setText(disclosure)
@@ -1675,7 +1874,7 @@ class _AnalysisTab(QtWidgets.QWidget):
             # uncaught slot exception with the UI half-updated.
             try:
                 self._present_method(method, sid, conc, payload)
-            except Exception as exc:         # noqa: BLE001
+            except Exception as exc:         # noqa: BLE001 — routed to fail(), the Analysis-failed path
                 fail(exc)
                 return
             self._ran = True
@@ -1719,6 +1918,8 @@ class _AnalysisTab(QtWidgets.QWidget):
             payload['res'] = c.run_guinier(sid, conc, fraction=frac)
         elif method == 'single':
             payload['res'] = c.run_single_angle(sid, conc, angle, frac)
+        elif method == 'ladder':
+            payload['res'] = c.run_single_angle_ladder(sid, angle, frac)
         elif method == 'calfree':
             payload['res'] = c.run_calibration_free_a2(sid, angle, fraction=frac)
         else:  # rayleigh
@@ -1773,7 +1974,7 @@ class _AnalysisTab(QtWidgets.QWidget):
         self.status.clear()
         try:
             self._present_method(method, sid, conc, payload)
-        except Exception:                    # noqa: BLE001
+        except Exception:                    # noqa: BLE001 — stale cached payload; cleared, status says so
             # A cached payload that no longer plots (rare) — clear rather than crash.
             self._clear_plot()
             self.export_button.setEnabled(False)
@@ -1868,8 +2069,12 @@ class _AnalysisTab(QtWidgets.QWidget):
         if rg_cautions:
             flag += '  ' + rg_cautions[0]
         if any(not r.axial_ratio_reliable for r in results):
+            # The trailing "Rg is still reliable" is the f11 class: true of an
+            # unidentifiable SHAPE, false when the blank gate has taken Rg down, and it
+            # sat one line below the Rg caution that says so (round d0ce f7/f8).
             flag += ('  Axial ratio unresolved at this qRg (all shapes share the Guinier '
-                     'limit) — Rg is still reliable.')
+                     'limit)'
+                     + ('.' if rg_cautions else ' — Rg is still reliable.'))
         problem = (bool(_scale_causes(first))
                    or any(not r.mw_reliable for r in results))
         self._set_flag(flag, problem=problem)
@@ -1947,9 +2152,12 @@ class _AnalysisTab(QtWidgets.QWidget):
                  '  Thermodynamic across angle and concentration.')
         flag += _STAT_CAVEAT + _ols_marker(getattr(first, 'se_estimator', 'hc3'))
         if _scale_causes(first):
+            # The survival clause only while the sizes' own verdict allows it (f11).
+            _survive = (' (radii/Rg survive)'
+                        if getattr(first, 'rg_reliable', True) else '')
             flag += ('  ' + _scale_phrase(first).capitalize() + ' → Mw'
                      + ('' if first.is_apparent else '/A₂')
-                     + ' unreliable (radii/Rg survive).')
+                     + f' unreliable{_survive}.')
         cautions = [c for c in (_mw_unreliable_caution(r) for r in results) if c]
         if cautions:
             flag += '  ' + cautions[0]
@@ -2096,16 +2304,19 @@ class _AnalysisTab(QtWidgets.QWidget):
             # Settings value was); the ill-conditioned note rides the same field.
             note = getattr(res, 'reliability_note', '') or ''
             caution = _mw_unreliable_caution(res)
-            rg_caution = '' if note else _rg_unreliable_caution(res)
+            # ACCUMULATE, never rank (round 0e15 f3). This read `'' if note else ...`,
+            # so a blankless run whose qRg passed the Guinier limit -- the several-hundred-nm
+            # scatterer this feature exists for, which ALWAYS writes that note -- showed
+            # the regime sentence and never said the blank was unmeasured. Two independent
+            # causes are two sentences; the debye/zimm/form-factor arms already do this.
+            rg_caution = _rg_unreliable_caution(res)
             flag = ('apparent (single concentration): Rg still contains '
                     'concentration effects — extrapolate over c for the '
                     'thermodynamic Rg.')
             if note:
                 flag += '  ' + note + ('' if note.endswith('.') else '.')
-            elif caution:
-                flag += '  Mw (from the intercept): ' + caution
-            if rg_caution:
-                flag += '  Rg: ' + rg_caution
+            flag = _append_caution(flag, caution, note, '  Mw (from the intercept): ')
+            flag = _append_caution(flag, rg_caution, note, '  Rg: ')
             self._set_flag(flag, problem=bool(note) or bool(caution) or bool(rg_caution))
             if not getattr(res, 'well_conditioned', True):
                 self.flag_label.setToolTip(_ILL_COND_TOOLTIP)
@@ -2127,19 +2338,87 @@ class _AnalysisTab(QtWidgets.QWidget):
                 ('c (mg/mL)', f'{res.concentration_g_per_mL * 1000:.3g}'),
             ])
             caution = _mw_unreliable_caution(res)
+            # ACCUMULATE (round 0e15 f3): an `elif` behind the scale branch dropped the
+            # caution on every uncalibrated or dn/dc-absent run -- the ordinary state of
+            # the quick look this feature exists for. A scale cause and an unmeasured
+            # blank are independent, and this result type carries no Rg caution to
+            # rescue the sentence.
+            base = ('apparent: single angle + single concentration (contains the '
+                    'form factor and the 2A₂c term).')
             if _scale_causes(res):
-                self._set_flag(
-                    f'apparent + {_scale_phrase(res)}: single angle + single '
-                    'concentration (contains the form factor and the 2A₂c term), and '
-                    'Mw_app is on an arbitrary scale.', problem=True)
-            elif caution:
-                self._set_flag(
-                    'apparent: single angle + single concentration (contains the '
-                    'form factor and the 2A₂c term).  ' + caution, problem=True)
+                base = (f'apparent + {_scale_phrase(res)}: single angle + single '
+                        'concentration (contains the form factor and the 2A₂c term), '
+                        'and Mw_app is on an arbitrary scale.')
+            if caution:
+                base += '  ' + caution
+            self._set_flag(base, problem=bool(_scale_causes(res)) or bool(caution))
+        elif method == 'ladder':
+            res = payload['res']
+            self._stash_export(sid, 'single_angle_ladder',
+                               lambda p: c.export_single_angle_ladder(res, p))
+            self._setup_axes()
+            plot_single_angle_ladder(res, ax=self.ax)
+            self.ax.set_title(f'Single-angle ladder at {res.angle_deg:.0f}°')
+            # Mw and the absolute A₂ carry both scales (dashed at the value when either
+            # is unknown, as Zimm's are); the 2·A₂·Mw product cancels them and is shown
+            # whatever the calibration state, as on the calibration-free tab.
+            mw_value = _scaled_value(res, format_pm(res.mw_apparent_g_per_mol,
+                                                    res.mw_apparent_se))
+            a2_value = _scaled_value(res, format_pm(res.a2_apparent_mol_mL_per_g2,
+                                                    res.a2_apparent_se))
+            self._fill_result_table([
+                ('M<sub>w,app</sub> (g/mol)', mw_value),
+                ('A<sub>2,app</sub> (mol·mL/g²)', a2_value),
+                ('2·A₂·M<sub>w</sub> (scale-independent)',
+                 format_pm(res.two_a2_mw, res.two_a2_mw_se)),
+                ('Angle', f'{res.angle_deg:.0f}°'),
+                ('Points', str(res.n_conc)),
+            ])
+            apparent = ('apparent (one angle): Mw and A₂ are not extrapolated to '
+                        'q → 0 — Mw,app = Mw·P(q) ≤ Mw and A₂ carries the same angle '
+                        'dependence; a multi-angle Zimm/Berry set gives the '
+                        'thermodynamic values.')
+            note = getattr(res, 'reliability_note', '') or ''
+            caution = _mw_unreliable_caution(res)
+            # Independent facts ACCUMULATE (the debye/zimm arms' shape): the scale
+            # sentence, the engine's precondition note and the Mw caution are each
+            # true on their own, and an unknown scale must never hide the note --
+            # 2·A₂·Mw survives an uncalibrated run and is the one number the note is
+            # about. The statistical caveat and the estimator marker ride the visible
+            # text unconditionally, as on every sibling.
+            flag = (apparent + _STAT_CAVEAT
+                    + _ols_marker(getattr(res, 'se_estimator', 'hc3')))
+            problem = False
+            if _scale_causes(res):
+                flag += (f'  Mw,app and A₂ are on an arbitrary scale '
+                         f'({_scale_phrase(res)}); the 2·A₂·Mw product is not.')
+                problem = True
+            # ACCUMULATE (round 0e15 f3): `elif` dropped the caution whenever the engine
+            # had written any reliability_note of its own.
+            if note:
+                flag += '  ' + note + ('' if note.endswith('.') else '.')
+                problem = True
+            if caution:
+                flag = _append_caution(flag, caution, note,
+                                       '  Mw (from the intercept): ')
+                problem = True
+            self._set_flag(flag, problem=problem)
+            if not getattr(res, 'well_conditioned', True):
+                # The conditioning hover only where conditioning is the cause; a
+                # sign-only note keeps the ± hover below, which stays true.
+                self.flag_label.setToolTip(_ILL_COND_TOOLTIP)
             else:
-                self._set_flag(
-                    'apparent: single angle + single concentration (contains the '
-                    'form factor and the 2A₂c term).', problem=False)
+                # Calculation nuance, on hover (rule 8's tooltip tier): the direction of
+                # the ± on a short ladder, disclosed rather than left to be inferred.
+                self.flag_label.setToolTip(
+                    'The ± values are statistical SEs (HC3 by default) and exclude '
+                    'calibration and dn/dc systematics. Mw,app is a reciprocal of the '
+                    'fitted intercept; on a short concentration ladder its SE is '
+                    'CONSERVATIVE — it meets or exceeds the sampling spread and never '
+                    'under-reports (Monte-Carlo-validated) — and tightens with more '
+                    'concentration points or replicates. The A₂ ± is the slope SE '
+                    'halved. See the Theory-and-Equations-Guide §4.3 and §6.1.'
+                    + _ols_marker(getattr(res, 'se_estimator', 'hc3')))
         elif method == 'calfree':
             res = payload['res']
             self._stash_export(sid, 'calibration_free_a2',
@@ -2163,13 +2442,23 @@ class _AnalysisTab(QtWidgets.QWidget):
                  format_pm(res.two_a2_mw, getattr(res, 'two_a2_mw_se', None))),
                 ('A₂ (mol·mL/g²)', a2),
             ])
-            # An ill-conditioned Y-vs-c design (near-equal concentrations) makes
-            # 2·A₂·Mw = slope/intercept numerically unreliable — red tier, value still
-            # shown. The neutral ± caveat is secondary and yields to it.
-            ill_cond = '' if getattr(res, 'well_conditioned', True) else (
-                getattr(res, 'reliability_note', '')
-                or 'ill-conditioned design (near-equal concentrations); '
-                   '2·A₂·Mw numerically unreliable.')
+            # The product's OWN verdict (the export's predicate): an ill-conditioned
+            # Y-vs-c design, or a non-positive fitted intercept, makes
+            # 2·A₂·Mw = slope/intercept unreliable — red tier, value still shown, the
+            # note naming which. The neutral ± caveat is secondary and yields to it.
+            # This arm calls neither caution helper, so it owned a third copy of the
+            # fallback, which the blank gate made false. Same three-case split as the two
+            # helpers -- see `_blank_caution`.
+            _blank = _blank_caution(res, for_size=False)
+            if getattr(res, 'two_a2_mw_reliable', True):
+                ill_cond = _blank
+            elif _blank:
+                ill_cond = ' '.join(
+                    x for x in (_blank, getattr(res, 'reliability_note', '')) if x)
+            else:
+                ill_cond = (getattr(res, 'reliability_note', '')
+                            or 'ill-conditioned design (near-equal concentrations); '
+                               '2·A₂·Mw numerically unreliable.')
             if ill_cond:
                 # Ill-conditioning corrupts the PRODUCT and so everything below it, and
                 # leads. The withheld clause is appended rather than dropped (the pattern
@@ -2177,7 +2466,10 @@ class _AnalysisTab(QtWidgets.QWidget):
                 # both true, and the user needs both.
                 self._set_flag(ill_cond + (f' {_WITHHELD_A2_FLAG}' if withheld else ''),
                                problem=True)
-                self.flag_label.setToolTip(_ILL_COND_TOOLTIP)
+                # The conditioning hover only where conditioning is the cause.
+                self.flag_label.setToolTip(
+                    _ILL_COND_TOOLTIP if not getattr(res, 'well_conditioned', True)
+                    else '')
             elif withheld:
                 self._set_flag(_WITHHELD_A2_FLAG, problem=True)
                 self.flag_label.setToolTip(_WITHHELD_A2_TOOLTIP)
@@ -2211,10 +2503,16 @@ class _AnalysisTab(QtWidgets.QWidget):
             calibrated = all(r.calibrated for r in rr)
             self._clear_result_table()           # a per-c series, not a scalar result
             self.status.setText(f'Excess Rayleigh ratio for {len(rr)} concentrations.')
-            self._set_flag(
-                '' if calibrated else
-                'uncalibrated: ΔR is on an arbitrary scale.',
-                problem=not calibrated)
+            # This is the one view that plots ΔR itself -- the quantity an assumed or
+            # absent blank corrupts directly -- and its flag consulted only `calibrated`,
+            # so a CALIBRATED blankless run showed an empty label at a neutral tier while
+            # its own exporter disclosed the blank in the same cells (round d0ce f10).
+            # Two independent absences, both stated.
+            blank_note = _blank_caution(rr[0], for_size=False) if rr else ''
+            scale_note = ('' if calibrated
+                          else 'uncalibrated: ΔR is on an arbitrary scale.')
+            self._set_flag('  '.join(x for x in (scale_note, blank_note) if x),
+                           problem=not calibrated or bool(blank_note))
         # Passive ⓘ result notes (uniform across every method that returns a result —
         # rayleigh carries a per-c series, not a scalar result, so it has none). One
         # render site, tolerant getattr, so no method branch can silently drop them.
@@ -2227,7 +2525,7 @@ class _AnalysisTab(QtWidgets.QWidget):
         # single). Append the pooling hint for that whole family, not just Zimm/Berry/Debye
         # (rule 10; the pure engine can't see mw_fraction, so the controller supplies it).
         if method in ('zimm', 'berry', 'form_factor', 'debye', 'guinier',
-                      'single', 'calfree'):
+                      'single', 'ladder', 'calfree'):
             hint = self.controller.sls_pooling_hint(sid, self._fraction)
             if hint:
                 notes.append(hint)
@@ -2363,7 +2661,7 @@ class _AnalysisTab(QtWidgets.QWidget):
             return   # hidden by an angle/concentration mask -> use the lists
         else:
             self.controller.mask_point(self.sample_id, cc, ang, frac)
-        self._on_run()
+        self._on_run(reuse_blank_answer=True)
 
     def _fill_result_table(self, rows) -> None:
         """Rebuild the per-method results table from (label, value) pairs."""
@@ -2407,9 +2705,19 @@ class _AnalysisTab(QtWidgets.QWidget):
         # The "Rg survives" clause is gated on the size's own verdict -- beside a
         # flagged Rg cell it must not assert validity (the form-factor arm's rule).
         rg_caution = _rg_unreliable_caution(res)
+        # "remains valid (the scale cancels)" is an UPPER-TAIL claim about the
+        # calibration-free product, and it is false when the blank gate is down: this
+        # program's own `two_a2_mw_reliable` folds `blank_measured` in, because an
+        # additive term survives the ratio a scale cancels in. So the clause is stated
+        # only while that verdict allows it -- the ellipsoid arm's rule, applied to its
+        # four siblings.
+        _blank_down = _blank_flagged(res)
+        _product_clause = ('the calibration-free 2·A₂·Mw remains valid (the scale cancels)'
+                           if not _blank_down
+                           else 'the calibration-free 2·A₂·Mw is also unreliable (the '
+                                'scale cancels, but an unmeasured blank does not)')
         flag = (
-            f'{_scale_phrase(res)}: Mw and absolute A₂ are unreliable; the '
-            'calibration-free 2·A₂·Mw remains valid (the scale cancels)'
+            f'{_scale_phrase(res)}: Mw and absolute A₂ are unreliable; ' + _product_clause
             + ('; Rg: ' + rg_caution if rg_caution
                else '; Rg remains valid (the scale cancels).')
             if _scale_causes(res) else (('Rg: ' + rg_caution) if rg_caution else ''))
@@ -2475,7 +2783,11 @@ class _AnalysisTab(QtWidgets.QWidget):
         base = 'apparent (single concentration): intercept is 1/Mw + 2A₂c.'
         phrase = _scale_phrase(res)
         if phrase:
-            base += f' Also {phrase} → Mw unreliable (Rg survives).'
+            # "(Rg survives)" is true of an unknown SCALE and false when the blank gate is
+            # down -- an additive blank does not cancel in the slope-to-intercept ratio Rg
+            # is read from. Keyed on the size's own verdict (round d0ce f11).
+            survives = ' (Rg survives)' if getattr(res, 'rg_reliable', True) else ''
+            base += f' Also {phrase} → Mw unreliable{survives}.'
         return base
 
     # ------------------------------------------------------------ figure ---
@@ -2483,7 +2795,7 @@ class _AnalysisTab(QtWidgets.QWidget):
         if self.ax is not None:
             try:
                 self.ax.set_xscale('linear')
-            except Exception:
+            except Exception:  # noqa: BLE001 — stale axes on rebuild
                 pass
         self.figure.clf()
         self.ax = self.figure.add_subplot(1, 1, 1)
@@ -2492,7 +2804,7 @@ class _AnalysisTab(QtWidgets.QWidget):
         if self.ax is not None:
             try:
                 self.ax.set_xscale('linear')
-            except Exception:
+            except Exception:  # noqa: BLE001 — stale axes on rebuild
                 pass
         if message:
             # Empty-state message via the shared helper (`clear_figure=True`): a `clf()`
@@ -2524,8 +2836,20 @@ _INELIGIBLE_REASON = {
                       'value, can fill it.'),
     'bad_count_rate': ('The committed mean count rate is not a positive number, so '
                        'it cannot be a scattered intensity.'),
+    'replicate_average': ('An averaged correlogram is not a repeat measurement, and it '
+                          'carries its first run\'s count rate, so it cannot enter a '
+                          'static point. Tick its source runs instead.'),
     'no_concentration': ('No concentration committed. Set one on the Data tab; a '
                          'static measurement needs one.'),
+    'no_angle': ('No scattering angle. This sample\'s runs span several angles, so '
+                 'the angle this trace was recorded at cannot be inferred: '
+                 'double-click the Angle cell and enter it.'),
+    'no_template_run': ('This sample has no DLS run for the trace to take its '
+                        'identity (polymer, solvent, temperature, optics) from.'),
+    'bad_angle': ('The angle entered is not a scattering angle: it must lie between '
+                  '0° and 180°.'),
+    'bad_concentration': ('The concentration entered is negative or not a number. '
+                          'Use 0 for a solvent blank.'),
 }
 
 
@@ -2540,15 +2864,29 @@ class _DerivedIntensityTab(QtWidgets.QWidget):
     and where that number came from. The SOURCE COLUMN IS READ-ONLY here: the mean
     count rate is chosen once, on the Data tab, so there is exactly one
     authoritative home for it and no second copy of the choice to drift.
+
+    UNATTACHED count-rate traces are listed too, un-ticked by default. A solvent
+    blank is often measured without a correlogram (nothing to fit; the run exists
+    to measure the solvent's intensity), so it reaches this route only through the
+    trace it left. Such a row takes the sample's identity from the first ticked DLS
+    run at derive time, its concentration defaults to 0 (a blank) and its angle is
+    seeded when the sample's runs share one; both cells are editable on a trace row
+    -- the one place this table is not read-only, because a trace carries neither.
     """
 
     workspaceChanged = QtCore.Signal()   # measurements were created
 
     # Short headers on purpose: spelled out, six columns overflowed the control
     # panel and pushed Status off the edge. Units follow ui_style_guide S9's
-    # table convention (the degree sign, not the word).
-    _COLS = ('Use', 'Angle (°)', 'Count rate (cps)', 'Source',
+    # table convention (the degree sign, not the word). 'Run' is the name every
+    # other surface shows (`core.naming`): without it six replicates at one angle
+    # are six identical rows, and the run a count-rate-disagreement note names
+    # cannot be found to untick. It is width-capped and left-elided (a file stem's
+    # TAIL tells runs apart) so the seventh column cannot push Status off again.
+    _COLS = ('Use', 'Measurement', 'Angle (°)', 'Count rate (cps)', 'Source',
              'c (mg/mL)', 'Status')
+    _NAME_COL = 1
+    _NAME_MAX_W = NAME_COL_MAX_W      # the shared cap; see gui/widgets.py
 
     def __init__(self, controller, parent=None) -> None:
         super().__init__(parent)
@@ -2561,14 +2899,25 @@ class _DerivedIntensityTab(QtWidgets.QWidget):
         # this the exclusions are silently re-ticked between choosing them and
         # pressing Derive. Keyed by id, not row, because the row order moves.
         self._excluded: set = set()
+        # Unattached traces are OPT-IN: a trace belongs to no sample, so every
+        # sample lists every one, and auto-ticking it would derive a stray blank
+        # into whichever sample was selected. Ticked ids are remembered here.
+        self._ticked_traces: set = set()
+        # The user's own angle / concentration for a trace row, by trace id --
+        # the two cells a trace carries no value for (see the class docstring).
+        self._trace_params: Dict[str, Dict[str, Any]] = {}
+        self._building = False
         self.ax = None
         self._build_ui()
         self._refresh()
 
     # ---------------------------------------------------------------- UI ---
     def _build_ui(self) -> None:
-        _, left, right = make_split_panels(self, left_min_width=420,
-                                           sizes=(470, 700))
+        # A wide default column, so the seven columns fit with the name capped and
+        # Status stays on the panel at the shipped window size. The splitter scales these
+        # sizes to the window, hence the proportion rather than the plot's usual 700.
+        splitter, left, right = make_split_panels(self, left_min_width=420,
+                                                  sizes=(530, 440))
         left.addWidget(section_header(
             'Derived Intensity',
             'Build an SLS intensity series from this sample\'s DLS runs.',
@@ -2586,6 +2935,13 @@ class _DerivedIntensityTab(QtWidgets.QWidget):
                 'cps as well; only the ratio matters, but the units must match.',
                 'A derived point is a snapshot: re-running a fit or editing a '
                 'source run never changes it. Derive again to refresh.',
+                'A count-rate trace that is not attached to any run -- a solvent '
+                'blank recorded without a correlogram, typically -- is listed too, '
+                'un-ticked. Tick it to derive a point from its mean: it takes this '
+                'sample\'s identity from the first ticked DLS run, its '
+                'concentration defaults to 0 (a blank), and its angle is filled '
+                'in when the runs share one -- otherwise double-click the cell '
+                'and enter it.',
             ]))
 
         self.header = QtWidgets.QLabel()
@@ -2595,15 +2951,27 @@ class _DerivedIntensityTab(QtWidgets.QWidget):
         self.table = QtWidgets.QTableWidget(0, len(self._COLS))
         self.table.setHorizontalHeaderLabels(list(self._COLS))
         self.table.verticalHeader().setVisible(False)
+        # Editing is per CELL, not per table: every item is built non-editable
+        # (`_refresh` clears ItemIsEditable) except a trace row's Angle and c
+        # cells, so the read-only promise the help badge makes holds everywhere
+        # a value has an authoritative home elsewhere.
         self.table.setEditTriggers(
-            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed)
         self.table.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
+        # A capped name column elides rather than truncating the table: from the
+        # LEFT, so the tail that distinguishes 'batch 1-3' from 'batch 1-6' survives.
+        self.table.setTextElideMode(QtCore.Qt.TextElideMode.ElideLeft)
+        self.table.itemChanged.connect(self._on_cell_edited)
         left.addWidget(self.table, 1)
 
         tick_row = QtWidgets.QHBoxLayout()
         self.all_button = QtWidgets.QPushButton('Select all')
+        self.all_button.setToolTip(
+            'Tick every usable DLS run. Unattached traces stay as they are -- '
+            'tick a trace yourself to use it.')
         self.none_button = QtWidgets.QPushButton('Select none')
         self.all_button.clicked.connect(lambda: self._set_all(True))
         self.none_button.clicked.connect(lambda: self._set_all(False))
@@ -2635,17 +3003,16 @@ class _DerivedIntensityTab(QtWidgets.QWidget):
             'check this. At high count rates detector dead time makes the '
             'response non-linear; see your instrument manual for its limit.')
         self.derive_button.clicked.connect(self._on_derive)
-        left.addWidget(self.derive_button)
 
         self.status = QtWidgets.QLabel('')
         self.status.setWordWrap(True)
-        left.addWidget(self.status)
         self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
-        left.addWidget(self.flag_label)
         self.notes_label = ThemedLabel('', size=11)
         self.notes_label.setWordWrap(True)
         left.addWidget(self.notes_label)
+        # Derive, the status and the flag pinned under the column (§3 column template).
+        pin_under_column(splitter, self.derive_button, self.status, self.flag_label)
 
         self.figure = Figure(figsize=(5.5, 4.6))
         self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
@@ -2674,6 +3041,8 @@ class _DerivedIntensityTab(QtWidgets.QWidget):
         if sid != self.sample_id:
             self._series = []
             self._excluded.clear()
+            self._ticked_traces.clear()
+            self._trace_params.clear()
             self.status.clear()
             self.notes_label.clear()
             self.flag_label.clear()
@@ -2689,8 +3058,12 @@ class _DerivedIntensityTab(QtWidgets.QWidget):
         return out
 
     def _on_row_toggled(self, item_id: str, checked: bool) -> None:
-        """Remember an exclusion so the next refresh does not undo it."""
-        if checked:
+        """Remember an exclusion (a run) or an inclusion (a trace) so the next
+        refresh does not undo it."""
+        if item_id in self.controller.workspace.traces:
+            (self._ticked_traces.add if checked
+             else self._ticked_traces.discard)(item_id)
+        elif checked:
             self._excluded.discard(item_id)
         else:
             self._excluded.add(item_id)
@@ -2698,21 +3071,87 @@ class _DerivedIntensityTab(QtWidgets.QWidget):
     def _set_all(self, checked: bool) -> None:
         for row, info in enumerate(self._rows):
             widget = self.table.cellWidget(row, 0)
+            if info.get('kind') == 'trace' and checked:
+                continue                            # traces are opt-in only
             if widget is not None and widget.isEnabled():
                 widget.setChecked(checked)          # drives _on_row_toggled
             elif not checked:
                 self._excluded.add(info['item_id'])
 
+    def _on_cell_edited(self, item) -> None:
+        """A trace row's Angle or c cell was edited: keep the value and re-list."""
+        if self._building:
+            return
+        row, col = item.row(), item.column()
+        if row >= len(self._rows) or self._rows[row].get('kind') != 'trace':
+            return
+        key = {2: 'angle_deg', 5: 'concentration_g_per_mL'}.get(col)
+        if key is None:
+            return
+        text = item.text().strip()
+        params = self._trace_params.setdefault(self._rows[row]['item_id'], {})
+        try:
+            value = float(text) if text else None
+        except ValueError:
+            value = None
+        if key == 'concentration_g_per_mL' and value is not None:
+            value = value / 1000.0                  # the cell is in mg/mL
+        params[key] = value
+        # Rebuild after the editor has closed, not from inside its commit.
+        QtCore.QTimer.singleShot(0, self._refresh)
+
     # --------------------------------------------------------- display ---
     def _refresh(self) -> None:
-        self._rows = (self.controller.derived_intensity_candidates(self.sample_id)
+        self._rows = (self.controller.derived_intensity_candidates(
+                          self.sample_id, self._trace_params)
                       if self.sample_id else [])
+        self._building = True
+        try:
+            self._fill_table()
+        finally:
+            self._building = False
+        self.table.resizeColumnsToContents()
+        if self.table.columnWidth(self._NAME_COL) > self._NAME_MAX_W:
+            self.table.setColumnWidth(self._NAME_COL, self._NAME_MAX_W)
+
+        runs = [r for r in self._rows if r.get('kind') != 'trace']
+        traces = [r for r in self._rows if r.get('kind') == 'trace']
+        if not self.sample_id:
+            self.header.setText('No sample selected.')
+        elif not self._rows:
+            self.header.setText(
+                'This sample has no DLS runs, so there is nothing to derive from.')
+        else:
+            n_ok = sum(1 for r in runs if r['eligible'])
+            text = ('{0} DLS run(s) in this sample; {1} can supply a static '
+                    'point.'.format(len(runs), n_ok))
+            if traces:
+                text += (' {0} unattached trace(s) listed too (a blank recorded '
+                         'without a correlogram, typically): tick one to use its '
+                         'mean; its Angle and c cells are editable.'.format(
+                             len(traces)))
+            if any(not r['eligible'] for r in self._rows):
+                text += (' A row marked "not usable" says what it needs in its '
+                         'tooltip (turn on "Show tooltips on hover" under Settings '
+                         'if none appears).')
+            self.header.setText(text)
+        self.derive_button.setEnabled(
+            any(r['eligible'] for r in self._rows))
+        self._draw()
+
+    def _fill_table(self) -> None:
+        """Rebuild the rows from `_rows` (called with itemChanged muted)."""
         self.table.setRowCount(len(self._rows))
         for row, info in enumerate(self._rows):
+            is_trace = info.get('kind') == 'trace'
             box = QtWidgets.QCheckBox()
             box.setEnabled(bool(info['eligible']))
-            box.setChecked(bool(info['eligible'])
-                           and info['item_id'] not in self._excluded)
+            if is_trace:
+                box.setChecked(bool(info['eligible'])
+                               and info['item_id'] in self._ticked_traces)
+            else:
+                box.setChecked(bool(info['eligible'])
+                               and info['item_id'] not in self._excluded)
             box.toggled.connect(
                 lambda on, iid=info['item_id']: self._on_row_toggled(iid, on))
             reason = _INELIGIBLE_REASON.get(info['reason_code'], '')
@@ -2722,6 +3161,7 @@ class _DerivedIntensityTab(QtWidgets.QWidget):
 
             conc = info['concentration_g_per_mL']
             cells = [
+                info['label'],
                 _EMPTY if info['angle_deg'] is None
                 else format_fixed_sig(info['angle_deg'], 4),
                 _EMPTY if info['mean_count_rate_cps'] is None
@@ -2734,33 +3174,28 @@ class _DerivedIntensityTab(QtWidgets.QWidget):
                 _EMPTY if conc is None else format_fixed_sig(conc * 1000.0, 4),
                 'ready' if info['eligible'] else 'not usable',
             ]
+            lm = (None if is_trace else
+                  self.controller.workspace.measurements.get(info['item_id']))
             for col, text in enumerate(cells, start=1):
                 item = QtWidgets.QTableWidgetItem(text)
+                editable = is_trace and col in (2, 5)
+                if not editable:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
                 # The reason rides as a tooltip on every cell of the row rather
                 # than as column text: spelled out in the cell it widened the
                 # table past the panel and pushed Status off the edge entirely.
-                if reason:
+                # The name cell is the exception: it carries the identity card
+                # every name in the program carries, its own full text first.
+                if col == self._NAME_COL and lm is not None:
+                    card = measurement_hover_card(lm)
+                    item.setToolTip(f'{card}\n\n{reason}' if reason else card)
+                elif reason:
                     item.setToolTip(reason)
+                elif editable:
+                    item.setToolTip(
+                        'Double-click to edit: a trace carries no angle or '
+                        'concentration of its own (c is in mg/mL; 0 = a blank).')
                 self.table.setItem(row, col, item)
-        self.table.resizeColumnsToContents()
-
-        if not self.sample_id:
-            self.header.setText('No sample selected.')
-        elif not self._rows:
-            self.header.setText(
-                'This sample has no DLS runs, so there is nothing to derive from.')
-        else:
-            n_ok = sum(1 for r in self._rows if r['eligible'])
-            text = ('{0} DLS run(s) in this sample; {1} can supply a static '
-                    'point.'.format(len(self._rows), n_ok))
-            if n_ok < len(self._rows):
-                text += (' A row marked "not usable" says what it needs in its '
-                         'tooltip (turn on "Show tooltips on hover" under Settings '
-                         'if none appears).')
-            self.header.setText(text)
-        self.derive_button.setEnabled(
-            any(r['eligible'] for r in self._rows))
-        self._draw()
 
     def _draw(self) -> None:
         if not self._series:
@@ -2805,7 +3240,10 @@ class _DerivedIntensityTab(QtWidgets.QWidget):
                 return
         try:
             out = self.controller.derive_static_points(
-                item_ids, dn_dc_mL_per_g=dn_dc)
+                item_ids, dn_dc_mL_per_g=dn_dc,
+                trace_params={i: self._trace_params.get(i, {}) for i in item_ids
+                              if i in self.controller.workspace.traces},
+                template_sample_id=self.sample_id)
         except ValueError as exc:
             set_flag(self.flag_label, humanize_field_names(str(exc)))
             self.status.clear()
@@ -2861,13 +3299,13 @@ class _ModeResolvedTab(QtWidgets.QWidget):
 
     # ---------------------------------------------------------------- UI ---
     def _build_ui(self) -> None:
-        _, left, right = make_split_panels(self, left_min_width=420,
-                                           sizes=(470, 700))
+        splitter, left, right = make_split_panels(self, left_min_width=420,
+                                                  sizes=(470, 700))
         left.addWidget(section_header(
             'Mode-Resolved',
             'Split an SLS intensity series by the DLS modes\' amplitudes — '
             'the Sedlák partition — and analyze each mode\'s share; see the '
-            'Theory-and-Equations-Guide §4.1.2.',
+            'Theory-and-Equations-Guide §4.2.',
             bullets=[
                 'Record a mode set on the DLS tab\'s Mode Map; it appears '
                 'here with its method, regularization and date.',
@@ -2901,6 +3339,12 @@ class _ModeResolvedTab(QtWidgets.QWidget):
         self.sets_table.setContextMenuPolicy(
             QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.sets_table.customContextMenuRequested.connect(self._on_set_menu)
+        # Both tables size from their floors and share the spare height, so their
+        # preferred height, empty or not, never becomes the column's floor and carries
+        # Run out of view (style guide R3.8).
+        self.sets_table.setMinimumHeight(90)
+        self.sets_table.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                      QtWidgets.QSizePolicy.Policy.Ignored)
         left.addWidget(self.sets_table, 1)
 
         nav_row = QtWidgets.QHBoxLayout()
@@ -2935,6 +3379,8 @@ class _ModeResolvedTab(QtWidgets.QWidget):
             QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.part_table.verticalHeader().setVisible(False)
         self.part_table.setMinimumHeight(110)
+        self.part_table.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                      QtWidgets.QSizePolicy.Policy.Ignored)
         left.addWidget(self.part_table, 1)
 
         fit_form = QtWidgets.QFormLayout()
@@ -2967,17 +3413,17 @@ class _ModeResolvedTab(QtWidgets.QWidget):
         self.export_button = QtWidgets.QPushButton('Export CSV…')
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._on_export)
-        left.addWidget(self.export_button)
 
         self.status = QtWidgets.QLabel('')
         self.status.setWordWrap(True)
-        left.addWidget(self.status)
         self.flag_label = ThemedLabel('', role='error', bold=True)
         self.flag_label.setWordWrap(True)
-        left.addWidget(self.flag_label)
         self.notes_label = ThemedLabel('', size=11)
         self.notes_label.setWordWrap(True)
         left.addWidget(self.notes_label)
+        # Export, the status and the flag pinned under the column (§3 column template).
+        # Partition and Run stay in the body, each after the inputs it acts on.
+        pin_under_column(splitter, self.export_button, self.status, self.flag_label)
 
         rw = QtWidgets.QWidget()
         rl = QtWidgets.QVBoxLayout(rw)
@@ -3194,6 +3640,14 @@ class _ModeResolvedTab(QtWidgets.QWidget):
         sel = self._selected()
         if sel is None or not self.sample_id:
             return
+        # The same blankless confirmation the Analysis tab asks (round d0ce f12). Partition
+        # is this tab's entry point -- a mode-static fit refuses until one has run -- so
+        # gating here covers both of its controller calls. `reuse=False`: a press of
+        # Partition is a deliberate act, exactly like a press of Run.
+        if not self.controller.sample_has_measured_blank(self.sample_id):
+            if not _confirm_unmeasured_blank(self, self.controller, self.sample_id,
+                                             reuse=False):
+                return
         frac, s = sel
         try:
             self._parts = self.controller.run_mode_partition(
@@ -3294,7 +3748,7 @@ class _ModeResolvedTab(QtWidgets.QWidget):
                 who = self.controller.workspace.samples.get(sid)
                 QtWidgets.QMessageBox.warning(
                     self, 'Mode-resolved analysis failed',
-                    f'Could not run {method!r} on {_sample_label(who) if who else sid} '
+                    f'Could not run {method!r} on {sample_display_name(who) if who else sid} '
                     f'(set {set_id}).\n\n{humanize_field_names(str(exc))}')
                 return
             set_flag(self.flag_label, humanize_field_names(str(exc)))
@@ -3380,8 +3834,9 @@ class _ModeResolvedTab(QtWidgets.QWidget):
         if rg_caution:
             flag += ' — ' + rg_caution
         if _scale_causes(res):
-            flag += ('  ' + _scale_phrase(res).capitalize()
-                     + ' → Mw unreliable (Rg survives).')
+            # Not "(Rg survives)" beside an Rg caution that says it did not (f11).
+            flag += ('  ' + _scale_phrase(res).capitalize() + ' → Mw unreliable'
+                     + ('.' if rg_caution else ' (Rg survives).'))
         problem = bool(_scale_causes(res)) or bool(caution) or bool(rg_caution)
         # The estimator travels with the ± it qualifies (invariant 8 clause A), in the
         # DDLS tab's words -- and only when a ± is rendered: a withheld SE leaves no ±

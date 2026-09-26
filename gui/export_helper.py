@@ -4,13 +4,19 @@ gui/export_helper.py
 
 A tiny shared helper for the analysis tabs' "Export CSV…" buttons. It opens a
 save-file dialog (seeded with the remembered export folder and a suggested
-filename), runs the supplied export callable, and reports success/failure via a
-dialog — so each tab's export handler stays a one-liner and widgets reach the
+filename), runs the supplied export callable, and reports the outcome — success
+as a status string the tab shows, failure in a dialog — so each tab's export
+handler stays a one-liner and widgets reach the
 `exporting/` layer's *data* exporters only through the controller. The
 suggested-filename scheme (`exporting/filenames.py`) is imported and re-exported
 HERE, which is sound for the same reason the convention exists: it is a pure
 string utility that touches no workspace data, so nothing data-shaped bypasses
 the controller, and widgets keep importing only from this module.
+
+The scheme needs three facts about each measurement it names — the sample's
+polymer/solvent, the run's name, and its committed angle — so the functions below
+are where those are read off the workspace and handed to that pure layer as
+strings. They read only what a name is made of; nothing analysable travels here.
 
     status = export_to_csv(self, self.controller, 'cumulant_fit.csv',
                             lambda p: self.controller.export_correlogram_fit(iid, res, p))
@@ -33,55 +39,85 @@ persisted best-effort — a failed settings write never blocks an export.
 from __future__ import annotations
 
 import os
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 from PySide6 import QtCore, QtWidgets
 
+from core.naming import measurement_name
 from exporting.filenames import (  # noqa: F401
-    sample_token, sanitize_component, suggested_name)
+    ExportMember, batch_export_names, sample_token, sanitize_component,
+    suggested_name)
 #   (re-exported: widgets build suggested names through this module)
 
 
-def sample_suggested_name(controller, sample_id: Optional[str],
-                          analysis: str, ext: str = 'csv') -> str:
-    """Suggested `{sample}_{analysis}.{ext}` name for a sample-scoped export.
+def sample_name_fields(controller, sample_id: Optional[str]):
+    """The `(polymer, solvent)` pair behind a sample token, or None for a
+    sample-independent export.
 
     Uses the verbatim-cased committed fields; when they are unavailable or all
     blank (e.g. a manual `override-0007` sample with nothing committed), the
     sanitized sample id itself becomes the token — still unique, and routed
-    through the same reserved-stem/length guards."""
-    fields = (controller.sample_display_fields(sample_id)
-              if sample_id is not None else None)
-    if fields is None or not sample_token(*fields):
-        fields = (sample_id or '', '', None)     # sanitized sid as the token
-    return suggested_name(fields, analysis, ext)
+    through the same reserved-stem/length guards.
+    """
+    if sample_id is None:
+        return None
+    fields = controller.sample_display_fields(sample_id)
+    pair = (fields[0], fields[1]) if fields is not None else None
+    if pair is None or not sample_token(*pair):
+        pair = (sample_id, '')                   # sanitized sid as the token
+    return pair
+
+
+def sample_suggested_name(controller, sample_id: Optional[str],
+                          analysis: str, ext: str = 'csv') -> str:
+    """Suggested `{sample}_{analysis}.{ext}` name for a sample-scoped export."""
+    return suggested_name(sample_name_fields(controller, sample_id), analysis, ext)
+
+
+def measurement_export_names(controller, sample_id: Optional[str],
+                             items: Sequence[Tuple[str, Optional[str]]],
+                             analysis: str,
+                             ext: str = 'csv') -> Tuple[str, List[str]]:
+    """`(dialog name, per-file suffixes)` for a per-measurement export or batch.
+
+    `items` is `(item_id, method-or-None)` in the order the files are written; the
+    suffixes come back aligned with it. This is where the workspace is read — the
+    name from the one builder, the angle from the COMMITTED parameters — so
+    `exporting/filenames.py` stays pure over strings. An id the workspace no longer
+    holds contributes no name token; the collision fallback still keeps its file
+    apart from its neighbours.
+    """
+    ws = controller.workspace.measurements
+    members = []
+    for iid, method in items:
+        lm = ws.get(iid)
+        members.append(ExportMember(
+            iid, measurement_name(lm) if lm is not None else '',
+            lm.committed_params.get('angle_deg') if lm is not None else None,
+            method))
+    return batch_export_names(sample_name_fields(controller, sample_id), analysis,
+                              members, ext)
 
 
 def trace_suggested_name(controller, trace_id: str, ext: str = 'csv') -> str:
     """Suggested name for a raw count-rate trace export.
 
-    An ATTACHED trace takes its measurement's sample token, so the trace CSV lands
-    beside that sample's other exports; a standalone one falls back to its own
+    An ATTACHED trace follows the one-measurement rule, so the trace CSV lands
+    beside that measurement's other exports and carries the same name and angle
+    they do (the sample token alone is not unique: a multi-angle file gives one
+    sample eight traces, which would all propose the same name and quietly
+    overwrite each other). A STANDALONE trace has no measurement and keeps its own
     label, then its id. The `count_rate_trace` stem matches the trace plot's image
     stem, so the CSV and the PNG of one trace sort together.
     """
     lt = controller.workspace.traces.get(trace_id)
     iid = getattr(lt, 'measurement_id', None)
     if iid is not None and iid in controller.workspace.measurements:
-        # The sample token alone is NOT unique here: a trace belongs to one
-        # measurement, and a multi-angle file gives a sample eight of them, which
-        # would all propose the same name and quietly overwrite each other. The
-        # angle is the within-sample axis the sidebar already distinguishes them by.
-        lm = controller.workspace.measurements[iid]
-        angle = lm.committed_params.get('angle_deg')
-        if angle is None:
-            angle = lm.working_params.get('angle_deg')
-        analysis = ('count_rate_trace' if angle is None else
-                    sanitize_component(f'count_rate_trace_{angle:g}deg'))
-        return sample_suggested_name(
-            controller, controller.sample_id_of(iid), analysis, ext)
+        return measurement_export_names(
+            controller, controller.sample_id_of(iid), [(iid, None)],
+            'count_rate_trace', ext)[0]
     label = (getattr(lt, 'sample_label', None) or trace_id)
-    return suggested_name((label, '', None), 'count_rate_trace', ext)
+    return suggested_name((label, ''), 'count_rate_trace', ext)
 
 
 def _start_dir(stored: str) -> str:
@@ -144,8 +180,25 @@ def confirm_overwrite(parent, paths) -> bool:
     return resp == QtWidgets.QMessageBox.StandardButton.Yes
 
 
+# How long an export's outcome stays on the window's status bar, where a tab with no
+# status line of its own reports it (ms).
+EXPORT_STATUS_MS = 6000
+
+
+def written_summary(paths: Sequence[str]) -> str:
+    """The status line for a multi-file export: `N files → <folder>`, or the one
+    path. A count and a folder keep the control column's word-wrapping status label to
+    one line however many measurements were ticked."""
+    if len(paths) == 1:
+        return f'→ {paths[0]}'
+    folders = {os.path.dirname(p) for p in paths}
+    where = folders.pop() if len(folders) == 1 else 'several folders'
+    return f'{len(paths)} files → {where}'
+
+
 def export_to_csv(parent, controller, default_name: str,
-                  do_export: Callable[[str], Optional[str]]) -> Optional[str]:
+                  do_export: Callable[[str], Optional[Union[str, Sequence[str]]]]
+                  ) -> Optional[str]:
     """Prompt for a path and run `do_export(path)`; report the outcome.
 
     Returns a status string on success/failure, or None if canceled — either
@@ -159,11 +212,13 @@ def export_to_csv(parent, controller, default_name: str,
         return None
     try:
         written = do_export(path)
-    except Exception as exc:                       # noqa: BLE001 - surface to user
+    except Exception as exc:                       # noqa: BLE001 — surfaced in the dialog
         QtWidgets.QMessageBox.critical(
             parent, 'Export failed', f'Could not export.\n\n{exc}')
         return 'Export failed — see dialog.'
     if written is None:
         return None
     remember_export_dir(controller, path)
+    if isinstance(written, (list, tuple)):          # a multi-file export's paths
+        return f'Exported {written_summary(written)}'
     return f'Exported → {written}'

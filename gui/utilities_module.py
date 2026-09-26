@@ -35,6 +35,7 @@ from PySide6 import QtCore, QtWidgets
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+from analysis.synthetic_dataset import DDLS_SHAPES
 from analysis.trace_analysis import (FALSE_ALARM_PROBABILITY_DEFAULT,
                                      HAMPEL_WINDOW_MIN_PTS, OUTLIER_K_DEFAULT,
                                      PSD_WINDOWS, preload_stationarity_backend,
@@ -42,12 +43,13 @@ from analysis.trace_analysis import (FALSE_ALARM_PROBABILITY_DEFAULT,
 from app.controller import (TRACE_DIAGNOSTIC_PLOT_VIEWS,
                             TRACE_DIAGNOSTIC_VIEWS)
 from app import units as U
+from core.naming import sample_display_name
 from gui.plot_controls import (
     make_split_panels, make_canvas_expanding, make_vertical_plot_stack,
     set_plot_export_name, themed_navtoolbar,
 )
 from gui.export_helper import (
-    export_start_dir, export_to_csv, open_start_dir, remember_open_dir,
+    EXPORT_STATUS_MS, export_start_dir, export_to_csv, open_start_dir, remember_open_dir,
     sample_suggested_name, trace_suggested_name)
 from gui.help import add_help_to_groupbox, section_header
 from gui.solvent_explorer_module import SolventExplorerModule
@@ -56,14 +58,7 @@ from gui.widgets import (roomy_tabs, SampleSelector, show_parse_notes,
                          value_unit_row as _value_unit_row)
 
 
-def _sample_label(sample) -> str:
-    """The 'polymer / solvent @ T K' sample name the sidebar shows (not the raw
-    sample_id key)."""
-    poly, solv, temp = sample.polymer_name, sample.solvent_name, sample.temperature_K
-    if poly and solv and temp is not None and temp == temp:      # temp==temp: not NaN
-        return f'{poly} / {solv} @ {temp:g} K'
-    return f'{poly or "?"} / {solv or "?"}'
-from gui.worker import BUSY_NOTICE, busy_notice, run_when_idle, runner
+from gui.worker import busy_notice, run_when_idle, runner
 
 from plotting.plots import (
     plot_i_sin_theta, plot_synthetic_correlogram, plot_intensity_trace,
@@ -172,7 +167,21 @@ _SYNTH_DLS = [
     ('angle_deg', 'Angle, single (°)', '90'),
     ('beta', 'β (coherence)', '0.8'),
     ('noise_level', 'Noise level', '0.005'),
+    # The residual instrument baseline: a flat offset on g2-1, left behind when a
+    # correlator's MEASURED baseline misses its calculated one. Surfaced because the
+    # condition was reachable only from the test suite -- the fixture could build it and
+    # the shipped program could not.
+    ('baseline', 'Baseline offset (g₂−1)', '0.0'),
     ('n_points', 'Points', '200'),
+]
+# Noise-realism fields: (key, label, default). The count rate is read only by the full
+# noise model (enabled with it, the shown-but-disabled idiom the multi-tau fields
+# use); the correlation applies whatever the model. Both default to "off": 300 kcps is a
+# typical header value but is inert until the full model is chosen, and 0 correlation is
+# today's independent draw -- so an untouched panel produces exactly the call it always did.
+_SYNTH_NOISE = [
+    ('mean_count_rate_kcps', 'Mean count rate (kcps)', '300'),
+    ('noise_correlation', 'Channel noise correlation (lag 1)', '0'),
 ]
 # Multi-tau lag-axis fields: (key, label, default). Shown always, enabled only when the
 # lag axis is Multi-tau — a real correlator's axis is set by its sample time and block
@@ -323,7 +332,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             # "has SLS" -- sls_item_ids holds only non-zero concentrations.
             predicate=lambda s: bool(
                 s.solvent_reference_item_id or s.extra_solvent_reference_item_ids),
-            label_fn=_sample_label, title='Sample',
+            label_fn=sample_display_name, title='Sample',
             help_text='Choose which sample to plot I·sin θ for.',
             help_bullets=['Only samples with a c = 0 (solvent-reference) curve appear.',
                           'I·sin θ uses the c = 0 (solvent-reference) curves.'])
@@ -625,7 +634,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             'Data window applied to each segment before transforming. Hann is the '
             'modern default; W1 (1 − t²) and W2 (1 − |t|) are the two classical '
             'Welch windows, whose degrees-of-freedom figures the confidence band '
-            'uses directly (Theory-and-Equations-Guide §2.1).')
+            'uses directly (Theory-and-Equations-Guide §2.1.6).')
         win_lbl.setToolTip(_win_help)
         prow.addWidget(win_lbl)
         self.psd_window = QtWidgets.QComboBox()
@@ -643,7 +652,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             'False-alarm probability the significance line is drawn for: the chance '
             'that pure noise would produce a peak that tall somewhere in the '
             'spectrum. Lower means a stricter line. No level is prescribed; 1% is '
-            'the usual convention (Theory-and-Equations-Guide §2.1).')
+            'the usual convention (Theory-and-Equations-Guide §2.1.8).')
         fap_lbl = QtWidgets.QLabel('false alarm (%):')
         fap_lbl.setToolTip(_fap_help)
         frow.addWidget(fap_lbl)
@@ -715,14 +724,21 @@ class UtilitiesModule(QtWidgets.QWidget):
             with QtCore.QSignalBlocker(self.hampel_window):
                 self.hampel_window.setValue(snapped)
 
+    def _show_export_status(self, status: Optional[str]) -> None:
+        """Report an export's outcome on the window's status bar, where the sidebar's
+        trace export reports it: these tabs have no status line of their own."""
+        win = self.window()
+        if status and isinstance(win, QtWidgets.QMainWindow):
+            win.statusBar().showMessage(status, EXPORT_STATUS_MS)
+
     def _export_focused_trace(self) -> None:
         """Export the focused count-rate trace as Origin-style (t, cps) columns."""
         tid = self._current_trace_id()
         if tid is None:
             return
-        export_to_csv(self, self.controller,
-                      trace_suggested_name(self.controller, tid),
-                      lambda p: self.controller.export_trace(tid, p))
+        self._show_export_status(export_to_csv(
+            self, self.controller, trace_suggested_name(self.controller, tid),
+            lambda p: self.controller.export_trace(tid, p)))
 
     def _export_focused_decomposition(self) -> None:
         """Export the focused trace's windowed-Hampel decomposition."""
@@ -732,11 +748,11 @@ class UtilitiesModule(QtWidgets.QWidget):
         k, wp = self._windowed_params()
         name = trace_suggested_name(self.controller, tid)
         stem, _, ext = name.rpartition('.')
-        export_to_csv(
+        self._show_export_status(export_to_csv(
             self, self.controller,
             f'{stem or name}_decomposition{("." + ext) if stem else ""}',
             lambda p: self.controller.export_trace_windowed_hampel(
-                tid, p, k=k, window_pts=wp))
+                tid, p, k=k, window_pts=wp)))
 
     def _suggested_diag_name(self, tid: str, view: str) -> str:
         """The trace's export name with the view spliced in before the extension."""
@@ -761,9 +777,9 @@ class UtilitiesModule(QtWidgets.QWidget):
         elif view == 'periodogram':
             (fap,) = self._periodogram_params()
             kw = {'false_alarm_probability': fap}
-        export_to_csv(
+        self._show_export_status(export_to_csv(
             self, self.controller, self._suggested_diag_name(tid, view),
-            lambda p: self.controller.export_trace_diagnostic(tid, view, p, **kw))
+            lambda p: self.controller.export_trace_diagnostic(tid, view, p, **kw)))
 
     def _export_focused_running_average(self) -> None:
         """Export the focused trace's running average at the window on screen."""
@@ -773,11 +789,11 @@ class UtilitiesModule(QtWidgets.QWidget):
         # Resolved through the same helper the overlay draws with, so the file
         # holds the curve that is on screen rather than one at a nearby width.
         window = self._running_window(self.controller.trace_point_count(tid))
-        export_to_csv(
+        self._show_export_status(export_to_csv(
             self, self.controller,
             self._suggested_diag_name(tid, 'running_average'),
             lambda p: self.controller.export_trace_diagnostic(
-                tid, 'running_average', p, window_points=window))
+                tid, 'running_average', p, window_points=window)))
 
     def refresh_traces(self, select_id: Optional[str] = None) -> None:
         """Rebuild the trace list from the workspace (call after a load or a
@@ -897,7 +913,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             try:
                 stats = self.controller.run_trace_statistics(tid)
                 trace = self.controller.build_trace(tid)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — per-trace; surfaced when single
                 if single:
                     self.trace_stats.setText(str(exc))
                 continue
@@ -994,7 +1010,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                 self.trace_ax.plot(t[mask], disp(cr[mask]), 'o',
                                    color=_OUTLIER_COLOR, ms=4, label=lbl)
                 self.trace_ax.legend(frameon=False, fontsize=8)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — surfaced via _overlay_note
                 self._overlay_note('Outliers overlay not drawn', exc)
         if self.ov_whampel.isChecked() and not self._windowed_ready(tid):
             # A cold memo here means the compute that should have filled it did not
@@ -1024,7 +1040,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                                    color=_HAMPEL_COLOR, ms=6, mew=1.4,
                                    label=f'{wh.n_events} impulse events (windowed)')
                 self.trace_ax.legend(frameon=False, fontsize=8)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — surfaced via _overlay_note
                 self._overlay_note('Windowed Hampel overlay not drawn', exc)
         if self.ov_running.isChecked():
             try:
@@ -1036,7 +1052,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                 self.trace_ax.plot(tt, mean, '-', color='#000000', lw=1.2)
                 self.trace_ax.fill_between(tt, mean - std, mean + std,
                                            color='#000000', alpha=0.15)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — surfaced via _overlay_note
                 self._overlay_note('Running-average overlay not drawn', exc)
 
     def _overlay_note(self, what: str, detail) -> None:
@@ -1179,7 +1195,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         the worker thread rather than block the UI."""
         try:
             return self.controller.trace_point_count(tid) >= _HEAVY_TRACE_POINTS
-        except Exception:
+        except Exception:  # noqa: BLE001 — unknown trace is not heavy
             return False
 
     def _spectral_ready(self, tid: str) -> bool:
@@ -1227,7 +1243,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             if view in ('psd', 'periodogram'):
                 try:
                     self._focus_view(tid, view)
-                except Exception:      # noqa: BLE001 - surfaced by _update_diag
+                except Exception:      # noqa: BLE001 — surfaced by _update_diag
                     # Leave the memo cold and let `then` run. `_update_diag`
                     # re-enters the same call inside its own try/except and
                     # renders the reason on the axes -- the handler that already
@@ -1313,12 +1329,12 @@ class UtilitiesModule(QtWidgets.QWidget):
         ]
         try:
             parts.append(f'Fano {self._focus_histogram(tid).fano_factor:.2f}')
-        except Exception:
+        except Exception:  # noqa: BLE001 — optional stat omitted
             pass
         try:
             bv = self._focus_block_variance(tid)
             parts.append('correlated' if bv.correlations_detected else 'uncorrelated')
-        except Exception:
+        except Exception:  # noqa: BLE001 — optional stat omitted
             pass
         # The windowed counts must be built into `base`, not appended to the label
         # afterwards: _dispatch_adf below rewrites the whole line when its verdict
@@ -1335,7 +1351,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                         f'{wh.fraction_abstained:.0%} not judged '
                         f'(ends {wh.fraction_abstained_edge:.0%}, '
                         f'no scale {wh.fraction_abstained_implosion:.0%})')
-            except Exception:
+            except Exception:  # noqa: BLE001 — optional stat omitted
                 pass
         base = prefix + '   ·   '.join(parts)
         self._dispatch_adf(tid, base)
@@ -1385,7 +1401,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         try:
             plotter = _DIAG_PLOTTERS[view]
             plotter(self._focus_view(tid, view), ax=self.diag_ax)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — surfaced on the axes
             self.diag_ax.text(0.5, 0.5, str(exc), ha='center', va='center',
                               fontsize=8, wrap=True, transform=self.diag_ax.transAxes)
         self.diag_fig.tight_layout()
@@ -1480,7 +1496,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         """
         try:
             return autodetect(path, _TRACE_PARSERS, skip_missing_file=True)
-        except Exception as exc:             # not a ParseError -- a real bug
+        except Exception as exc:  # noqa: BLE001 — dialog catch, a real bug surfaced; not a ParseError -- a real bug
             QtWidgets.QMessageBox.critical(self, 'Could not load trace', str(exc))
             return None
 
@@ -1557,16 +1573,21 @@ class UtilitiesModule(QtWidgets.QWidget):
         w = QtWidgets.QWidget()
         h = QtWidgets.QHBoxLayout(w)
 
-        # ---- left: inputs (scrollable; the panel is tall) ----
+        # ---- left: inputs (scrollable; the panel is tall), Generate pinned under
+        # them (the §3 column template), so the inputs' length never hides it
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         scroll.setMinimumWidth(380)
         scroll.setHorizontalScrollBarPolicy(
             QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         inner = QtWidgets.QWidget()
         left = QtWidgets.QVBoxLayout(inner)
         scroll.setWidget(inner)
-        h.addWidget(scroll, 0)
+        column = QtWidgets.QVBoxLayout()
+        column.setContentsMargins(0, 0, 0, 0)
+        column.addWidget(scroll, 1)
+        h.addLayout(column, 0)
 
         # Conditions (shared by DLS + SLS)
         cond_box = QtWidgets.QGroupBox('Conditions (Shared)')
@@ -1611,9 +1632,26 @@ class UtilitiesModule(QtWidgets.QWidget):
             'artifacts; the others keep a uniform grid and still read <b>Points</b>.',
             '<b>Noise model</b> — <i>Per-channel</i> varies the noise across the axis '
             'the way a correlator does: quietest through the decay, noisiest in the '
-            'coarsest blocks. <b>Noise level</b> then sets the first channel’s SD. '
+            'coarsest blocks. <i>Per-channel + shot noise</i> adds the photon-counting '
+            'noise a real count rate brings, read from <b>Mean count rate</b> (for a '
+            'multi-angle set — <b>Multi-angle DLS</b> or <b>Two-mode DLS</b> — the rate '
+            'at 90°; each angle takes its own from the 1/sin θ law, and its trace follows; '
+            'the <b>Mode-resolved</b> set draws at its own static intensities); with a '
+            'real file’s header value it reproduces that file’s replicate scatter. '
+            '<b>Noise level</b> then sets the first channel’s SD. '
             'It is grounded on the multi-τ axis, where a block’s sample time is a real '
-            'accumulation time; on a <i>Log</i> axis it uses the local channel spacing.',
+            'accumulation time; on a <i>Log</i> axis it uses a sample time read off the '
+            'axis, the nearest one that divides each lag a whole number of times.',
+            '<b>Channel noise correlation</b> — 0 draws every channel’s noise '
+            'independently, which no correlator does; real correlograms sit near +0.3. '
+            'Set it to see how a distribution fit behaves under correlated noise. It '
+            'reproduces that one measured statistic, not the instrument’s full '
+            'structure.',
+            '<b>Baseline offset</b> — a flat shift of the whole g₂−1 curve, the '
+            'residual an imperfect correlator baseline leaves behind. Leave it at 0 for '
+            'a textbook correlogram; raise it to see what the floating-baseline cumulant '
+            'fit is for. It reaches the <b>Correlogram</b>, <b>Multi-angle DLS</b> and '
+            '<b>Depolarized (VV/VH)</b> artifacts (on both the VV and the VH channels).',
             'Recover what you put in by analyzing the generated data in the DLS tab; '
             'the ground truth is printed under the preview.',
         ])
@@ -1687,6 +1725,13 @@ class UtilitiesModule(QtWidgets.QWidget):
             e = QtWidgets.QLineEdit(default)
             self.syn_dls[key] = e
             dform.addRow(f'{label}:', e)
+        self.syn_dls['baseline'].setToolTip(
+            'A flat offset added to g₂−1 at every lag — the residual baseline a '
+            'correlator leaves when its measured baseline misses its calculated one. '
+            '0 (the default) is a perfectly baselined correlogram, which no instrument '
+            'gives. Reaches the Correlogram, Multi-angle DLS and Depolarized (VV/VH) '
+            'artifacts; see the Theory-and-Equations-Guide for what the '
+            'floating-baseline cumulant fit does with it.')
         # Lag axis + noise model. Every real instrument emits a multi-tau staircase, so
         # these two selectors decide whether the generated data is as hard to invert as
         # a measurement or systematically easier.
@@ -1704,18 +1749,57 @@ class UtilitiesModule(QtWidgets.QWidget):
             'See the Theory-and-Equations-Guide (synthetic generator).')
         self.syn_lag_axis.currentIndexChanged.connect(self._on_lag_axis_changed)
         dform.addRow('Lag axis:', self.syn_lag_axis)
+        # The per-channel models offered here are the exact-in-Γ Biganzoli–Ferri pair; the
+        # generator's Schätzel closed forms stay API-only (owner-ruled 2026-09-11, this
+        # comment its normative home).
         self.syn_noise_model = QtWidgets.QComboBox()
         for lbl, key in (('Constant', 'constant'),
-                         ('Per-channel (Schätzel)', 'schatzel_classical')):
+                         ('Per-channel (Biganzoli–Ferri)', 'biganzoli_classical'),
+                         ('Per-channel + shot noise (Biganzoli–Ferri, full)',
+                          'biganzoli_full')):
             self.syn_noise_model.addItem(lbl, key)
         self.syn_noise_model.setToolTip(
             'How the noise level varies across channels.\n'
             '• Constant: one SD everywhere — simple, but no correlator behaves this way.\n'
-            '• Per-channel: the SD follows the Schätzel classical-limit variance, falling '
-            'through the decay and turning up in the coarsest blocks. The Noise level '
-            'above then sets the FIRST channel’s SD. See the Theory-and-Equations-Guide.')
+            '• Per-channel: the SD follows the Biganzoli–Ferri variance in its '
+            'classical limit, falling through the decay and turning up in the coarsest '
+            'blocks. The Noise level above then sets the FIRST channel’s SD.\n'
+            '• Per-channel + shot noise: the same shape plus the photon-counting terms '
+            'that vanish only at infinite count rate — needs the Mean count rate below '
+            '(for a multi-angle set — Multi-angle DLS or Two-mode DLS — the rate at 90°, '
+            'scaled to each angle by 1/sin θ; a Mode-resolved set draws at its own static '
+            'intensities). '
+            'With a real file’s header value it reproduces that file’s replicate scatter.\n'
+            'Both per-channel models draw at the run duration a multi-angle file states '
+            '(60 s), and under every model a multi-angle set’s lag axis must end before it; '
+            'a single correlogram carries none. '
+            'See the Theory-and-Equations-Guide §7.2.')
         self.syn_noise_model.currentIndexChanged.connect(self._on_lag_axis_changed)
         dform.addRow('Noise model:', self.syn_noise_model)
+        self.syn_noise = {}
+        for key, label, default in _SYNTH_NOISE:
+            e = QtWidgets.QLineEdit(default)
+            self.syn_noise[key] = e
+            dform.addRow(f'{label}:', e)
+        self.syn_noise['mean_count_rate_kcps'].setToolTip(
+            'Mean photon count rate of the run, in kcps — the value an instrument writes '
+            'in its file header (an ALV’s MeanCR, a Brookhaven .dat’s mean rate; the '
+            'committed real files carry 58–441 kcps). Read only by the Per-channel + shot '
+            'noise model, where it sets how much photon-counting noise the short lags '
+            'carry: the lower the count rate, the wider the per-channel spread. '
+            'For a multi-angle set (Multi-angle DLS, Two-mode DLS) this is the rate at 90°: '
+            'each angle’s rate follows 1/sin θ from it, its correlogram’s noise is drawn at '
+            'that rate and its trace’s mean matches it, so the committed rates and the '
+            'linked traces agree. A Mode-resolved set draws at its own static intensities '
+            'instead, so the value only selects the model there. '
+            'See the Theory-and-Equations-Guide §7.2.')
+        self.syn_noise['noise_correlation'].setToolTip(
+            'Lag-1 correlation between neighbouring channels’ noise, −1 to 1. 0 draws '
+            'every channel independently, which no correlator does; real correlograms '
+            'sit near +0.3. Applied as a first-order autoregression over the channel '
+            'index, which reproduces this one measured statistic and nothing else about '
+            'the covariance — see the Theory-and-Equations-Guide §7.3 before reading a '
+            'result as the instrument’s structure. Applies whatever the noise model.')
         self.syn_multitau = {}
         for key, label, default in _SYNTH_MULTITAU:
             e = QtWidgets.QLineEdit(default)
@@ -1807,7 +1891,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                              '(static Cabannes + dynamic DDLS).', bullets=[
             'ρ<sub>v</sub> sets the static VV/VH intensity pair (→ δ², Cabannes factor). '
             'Copy the shown I<sub>VV</sub>/I<sub>VH</sub> into the SLS anisotropy panel.',
-            'The <b>shape</b> (rod or ellipsoid) + its dimensions set the dynamic VV/VH '
+            'The <b>shape</b> (rod, ellipsoid or sphere) + its dimensions set the dynamic VV/VH '
             'correlograms with a true D<sub>t</sub> and D<sub>r</sub>, over the shared angle grid.',
             'Rod uses the rigid-rod model (valid 2 &lt; L/d &lt; 30); ellipsoid uses the '
             'Perrin ellipsoid model. See the Theory-and-Equations-Guide (DPLS).',
@@ -1825,11 +1909,14 @@ class UtilitiesModule(QtWidgets.QWidget):
             'g₂−1 noise added to the depolarized (VH) channel only — VH is intrinsically '
             'weak, so it is the noisy side. The VV channel is generated clean.')
         self.syn_shape_combo = QtWidgets.QComboBox()
-        self.syn_shape_combo.addItems(['rod', 'ellipsoid'])
+        # The builder's own vocabulary, not a copy of it: a shape added to
+        # DDLS_SHAPES reaches this combo, and one removed from it disappears here.
+        self.syn_shape_combo.addItems(list(DDLS_SHAPES))
         self.syn_shape_combo.setToolTip(
             'Rod → the rigid-rod D_t, D_r model (valid 2 < L/d < 30); ellipsoid → the '
-            'Perrin ellipsoid model. Sets the dynamic VV/VH decay rates; see the '
-            'Theory-and-Equations-Guide.')
+            'Perrin ellipsoid model; sphere → the one-unknown Stokes–Einstein–Debye '
+            'model, whose R from D_r and R from D_t must agree. Sets the dynamic VV/VH '
+            'decay rates; see the Theory-and-Equations-Guide.')
         pdform.addRow('Shape:', self.syn_shape_combo)
         self.syn_dim1 = QtWidgets.QLineEdit('60')
         self.syn_dim2 = QtWidgets.QLineEdit('6')
@@ -1965,7 +2052,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             'Builds (and optionally saves/adds) in the background — the window '
             'stays usable and the preview appears when it finishes. One task at a time.')
         self.syn_gen_button.clicked.connect(self._synth_generate)
-        srow.addWidget(self.syn_gen_button)
+        column.addWidget(self.syn_gen_button)
         ov.addLayout(srow)
         left.addWidget(out_box)
         left.addStretch(1)
@@ -2021,8 +2108,17 @@ class UtilitiesModule(QtWidgets.QWidget):
                 self.syn_multitau['multitau_channels_per_octave'].text()))
             kw['multitau_n_blocks'] = int(float(
                 self.syn_multitau['multitau_n_blocks'].text()))
-        if self.syn_noise_model.currentData() == 'schatzel_classical':
-            kw['noise_model'] = 'schatzel_classical'
+        model = self.syn_noise_model.currentData()
+        if model != 'constant':
+            kw['noise_model'] = model
+        if model == 'biganzoli_full':
+            # kcps in the field, cps in the engine -- the same unit seam as the trace
+            # loaders, converted here so the generator never sees a display unit.
+            kw['mean_count_rate_cps'] = (
+                float(self.syn_noise['mean_count_rate_kcps'].text()) * 1.0e3)
+        rho = float(self.syn_noise['noise_correlation'].text() or 0.0)
+        if rho != 0.0:
+            kw['noise_correlation'] = rho
         return kw
 
     def _on_lag_axis_changed(self) -> None:
@@ -2048,6 +2144,10 @@ class UtilitiesModule(QtWidgets.QWidget):
         multitau = self.syn_lag_axis.currentData() == 'multitau'
         for e in self.syn_multitau.values():
             e.setEnabled(multitau)
+        # The count rate is read by the full model alone, so it follows that
+        # selection (same idiom); the correlation applies to every model and stays live.
+        self.syn_noise['mean_count_rate_kcps'].setEnabled(
+            self.syn_noise_model.currentData() == 'biganzoli_full')
 
     def _synth_add_row(self) -> None:
         r = self.pop_table.rowCount()
@@ -2062,17 +2162,29 @@ class UtilitiesModule(QtWidgets.QWidget):
 
     def _synth_shape_changed(self, shape: str) -> None:
         """Relabel the two dimension fields (and reset to that shape's canonical defaults)
-        when the DPLS shape switches between rod and ellipsoid."""
+        when the DPLS shape switches between rod, ellipsoid and sphere.
+
+        A sphere has ONE dimension, so the second field is disabled rather than hidden --
+        the same shown-but-disabled idiom the multi-tau fields in this panel already use
+        for a control that does not apply to the current selection."""
         if shape == 'ellipsoid':
             self._syn_dim1_lbl.setText('Polar semi-axis a (nm):')
             self._syn_dim2_lbl.setText('Equatorial radius b (nm):')
             self.syn_dim1.setText('30')
             self.syn_dim2.setText('10')
+        elif shape == 'sphere':
+            self._syn_dim1_lbl.setText('Radius R (nm):')
+            self._syn_dim2_lbl.setText('(not used for a sphere):')
+            self.syn_dim1.setText('40')
+            self.syn_dim2.setText('40')
         else:                                             # rod
             self._syn_dim1_lbl.setText('Length L (nm):')
             self._syn_dim2_lbl.setText('Diameter d (nm):')
             self.syn_dim1.setText('60')
             self.syn_dim2.setText('6')
+        one_dimension = shape == 'sphere'
+        self.syn_dim2.setEnabled(not one_dimension)
+        self._syn_dim2_lbl.setEnabled(not one_dimension)
 
     def _read_pop_specs(self) -> List[dict]:
         specs = []
@@ -2090,7 +2202,14 @@ class UtilitiesModule(QtWidgets.QWidget):
     # ---- input helpers ----
     @staticmethod
     def _synth_floats(text: str) -> List[float]:
-        return [float(tok) for tok in text.replace(',', ' ').split()]
+        vals = [float(tok) for tok in text.replace(',', ' ').split()]
+        # float() accepts 'inf'/'nan', which sail past the callers' `> 0` filters and
+        # overflow deep in the generator (round 333f f12, corrected decline 2026-09-01):
+        # refuse them here, at the one parse site, so the error surface names the input.
+        for v in vals:
+            if not math.isfinite(v):
+                raise ValueError(f'non-finite value in a numeric field: {v!r}')
+        return vals
 
     def _synth_identity(self):
         """Parse the workspace sample-name field into (polymer, solvent)."""
@@ -2148,6 +2267,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                 angle=float(self.syn_dls['angle_deg'].text()),
                 beta=float(self.syn_dls['beta'].text()),
                 noise=float(self.syn_dls['noise_level'].text()),
+                baseline=float(self.syn_dls['baseline'].text() or 0.0),
                 npts=int(float(self.syn_dls['n_points'].text())),
                 axis_kw=self._synth_axis_kw(),
                 mw=float(self.syn_sls['mw'].text()),
@@ -2162,7 +2282,13 @@ class UtilitiesModule(QtWidgets.QWidget):
                 rho_v=float(self.syn_depol['rho_v'].text()),
                 vh_noise=float(self.syn_depol['vh_noise'].text()),
                 shape=self.syn_shape_combo.currentText(),
-                dims_nm=(float(self.syn_dim1.text()), float(self.syn_dim2.text())),
+                # A sphere is built from ONE dimension: the second field is disabled, so
+                # its text is whatever the previous shape left there and must not be
+                # read. The builder refuses two unequal entries, so mirroring here is
+                # what keeps the disabled field from raising on the user's behalf.
+                dims_nm=((float(self.syn_dim1.text()), float(self.syn_dim1.text()))
+                         if self.syn_shape_combo.currentText() == 'sphere'
+                         else (float(self.syn_dim1.text()), float(self.syn_dim2.text()))),
                 weight_basis=self.syn_weight_basis.currentData(),
                 comp_model=self.syn_comp_model.currentData(),
                 comp_solute_ri=(float(self.syn_comp_solute_ri.text())
@@ -2171,7 +2297,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             )
             specs = self._read_pop_specs()
             poly, solv = self._synth_identity()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — dialog catch
             QtWidgets.QMessageBox.warning(self, 'Check your inputs', str(exc))
             return
 
@@ -2211,7 +2337,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             out = {'built': built}
             try:
                 out['saved'] = self._synth_save(save_keys, built, folder, eta_cp)
-            except Exception as exc:                         # noqa: BLE001
+            except Exception as exc:                         # noqa: BLE001 — carried to done() as save_exc
                 out['save_exc'] = exc
             return out
 
@@ -2244,7 +2370,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                         inj = self.controller.inject_form_factor_series(solvent_name=solv)
                         parts.append(f'form-factor series ({len(inj)} samples, '
                                      f'SLS + paired DLS)')
-                except Exception as exc:           # noqa: BLE001
+                except Exception as exc:           # noqa: BLE001 — dialog catch; earlier injects survive
                     QtWidgets.QMessageBox.warning(
                         self, 'Add to workspace failed', str(exc))
                     # Do NOT discard `parts`: an earlier inject may already have mutated the
@@ -2281,7 +2407,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         if not runner().try_submit(work, done, fail,
                                    description='synthetic data generation',
                                    busy_widgets=(self.syn_gen_button,)):
-            QtWidgets.QMessageBox.information(self, 'Busy', BUSY_NOTICE)
+            busy_notice(self)          # the status-bar notice every other tab gives
 
     def _synth_build_one(self, key, specs, ctx, poly, solv):
         c = self.controller
@@ -2320,6 +2446,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                 specs, angle_deg=ctx['angle'], wavelength_nm=ctx['wl'],
                 solvent_refractive_index=ctx['n'], temperature_K=ctx['T'],
                 viscosity_Pa_s=ctx['eta'], beta=ctx['beta'], noise_level=ctx['noise'],
+                baseline=ctx['baseline'],
                 n_points=ctx['npts'], seed=ctx['seed'], **ctx['axis_kw'])
         if key == 'trace':
             return c.synth_trace(seed=ctx['seed'], label=f'{poly} / {solv}',
@@ -2336,7 +2463,8 @@ class UtilitiesModule(QtWidgets.QWidget):
                 temperature_K=ctx['T'], viscosity_Pa_s=ctx['eta'], beta=ctx['beta'],
                 vh_noise_level=ctx['vh_noise'], n_points=ctx['npts'], seed=ctx['seed'],
                 label=f'{poly} {solv} DDLS',
-                concentration_g_per_mL=(ctx['concs'][0] if ctx['concs'] else 6e-4))
+                concentration_g_per_mL=(ctx['concs'][0] if ctx['concs'] else 6e-4),
+                baseline=ctx['baseline'])
         if key == 'mode_resolved':
             # The linked set (two-mode correlograms + exact-mean traces +
             # per-angle static truth from ONE partition ground truth). The
@@ -2370,6 +2498,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                 specs, angles_deg=ctx['angles'], wavelength_nm=ctx['wl'],
                 solvent_refractive_index=ctx['n'], temperature_K=ctx['T'],
                 viscosity_Pa_s=ctx['eta'], beta=ctx['beta'], noise_level=ctx['noise'],
+                baseline=ctx['baseline'],
                 n_points=ctx['npts'], label=f'{poly} in {solv}',
                 concentration_g_per_mL=conc0, seed=ctx['seed'], **ctx['axis_kw'])
         if key == 'two_mode':
@@ -2575,7 +2704,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             return
         try:
             self._synth_plot(key, obj)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — surfaced on the axes
             self.syn_ax.text(0.5, 0.5, str(exc), ha='center', va='center', fontsize=8,
                              wrap=True, transform=self.syn_ax.transAxes)
         self.syn_fig.tight_layout()
@@ -2793,7 +2922,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         # (only the neutral placeholder is selected in the dropdown).
         if not self.isin_selector.has_sample(self.sample_id):
             s = self.controller.workspace.samples.get(self.sample_id)
-            label = _sample_label(s) if s is not None else self.sample_id
+            label = sample_display_name(s) if s is not None else self.sample_id
             self.isin_note.setText(
                 f'No c = 0 (solvent-reference) curve for {label} — I·sin θ plots only '
                 'c = 0 intensities. Load or assign one, or pick another sample.')
@@ -2802,7 +2931,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         mode = 'normalized' if self.isin_rel.isChecked() else 'absolute'
         try:
             res = self.controller.run_i_sin_theta(self.sample_id, mode=mode)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — surfaced in the note
             self.isin_note.setText(str(exc))
             self.isin_canvas.draw_idle()
             return

@@ -158,13 +158,23 @@ def section_header(title: str, help_text: str = '', *,
 
 def add_help_to_groupbox(box: QtWidgets.QGroupBox, help_text: str = '', *,
                          bullets: Optional[Sequence[str]] = None) -> HelpBadge:
-    """Float a "?" `HelpBadge` at the top-right corner of a QGroupBox's frame, next to
-    its title. Returns the badge. (Qt group-box titles can't host child widgets, so the
-    badge is a free child positioned in the box's `resizeEvent` shim.)"""
+    """Float a "?" `HelpBadge` right after a QGroupBox's title, the place
+    `section_header` puts it (GUI style guide §6). Returns the badge. (Qt group-box
+    titles can't host child widgets, so the badge is a free child positioned in the
+    box's `resizeEvent` shim.) The title's rectangle comes from the style, so the badge
+    follows the title's real width and font; a box too narrow for both keeps the badge
+    inside its right edge."""
     badge = HelpBadge(help_text, bullets=bullets, parent=box)
 
     def _place() -> None:
-        badge.move(box.width() - badge.width() - 8, 2)
+        opt = QtWidgets.QStyleOptionGroupBox()
+        box.initStyleOption(opt)
+        title = box.style().subControlRect(
+            QtWidgets.QStyle.ComplexControl.CC_GroupBox, opt,
+            QtWidgets.QStyle.SubControl.SC_GroupBoxLabel, box)
+        x = min(title.right() + 6, box.width() - badge.width() - 8)
+        y = max(0, title.center().y() - badge.height() // 2)
+        badge.move(x, y)
 
     # Reposition on resize without subclassing: wrap the existing resizeEvent.
     _orig = box.resizeEvent

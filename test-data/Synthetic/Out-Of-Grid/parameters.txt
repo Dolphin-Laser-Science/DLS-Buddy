@@ -1,0 +1,67 @@
+DLS Buddy -- Synthetic OUT-OF-GRID test data
+============================================
+
+Why this set exists
+-------------------
+The NNLS / CONTIN inversion runs on a FIXED size grid (1-1000 nm by default). A
+population larger than the ceiling does not vanish from the solution: its weight piles up
+against the boundary grid point, and the peak scan reports that pile-up as a genuine mode
+sitting exactly at the edge, with no note. Every other committed synthetic population
+sits inside the grid, so until this set the contract -- out-of-range weight goes to the
+BOUNDARY and is not LOST -- had no case built from known truth.
+
+It pairs with the real instance rather than replacing it: `test-data/Real/ALV/NaPSS 40gL
+in Water/` is a semidilute polyelectrolyte whose ~28 um slow mode rails against the same
+ceiling on an actual instrument (the maintainer's test-data notes carry the run). The
+real file proves
+the condition occurs; this one says what the program should do about it, against a
+population whose size we chose.
+
+
+THE TWO FILES
+-------------
+  DLS out-of-grid - 20nm + 28um.ASC
+      Rh 20 nm (g1 amplitude 0.15) + Rh 28000 nm
+      = 28 um (amplitude 0.85). The slow mode is 28x the grid ceiling --
+      the same factor the NaPSS sample sits at.
+
+  DLS in-grid twin - 20nm + 200nm.ASC
+      The CONTROL: identical seed, angles, noise, coherence and amplitudes, with the slow
+      mode moved to Rh 200 nm, inside the grid. Any difference between the two
+      files is the grid truncation and nothing else.
+
+
+GLOBAL PARAMETERS (enter at the Data-tab confirmation step)
+-----------------------------------------------------------
+  Solvent                 : water
+  Solvent refractive index: 1.33
+  Viscosity               : 0.89 cP
+  Temperature             : 25.0 C (298.15 K)
+  Wavelength              : 532 nm
+  Angles                  : 30, 45, 60, 75, 90, 105, 120, 135 deg
+  noise_level             : 0.003, uniform-log lag axis (so the axis is not a second
+                            variable between the twins)
+
+
+WHAT TO EXPECT (dated observation, 2026-09-02, NNLS on the engine default grid)
+-------------------------------------------------------------------
+Boundary-neighbourhood weight = sum of the first THREE and last THREE grid bins -- the
+neighbourhood, not the endpoint alone, because a railed solution does not always put its
+mass in bin 0 (measured on NaPSS at 110/120 deg, where an endpoint-only sum reads 0.64).
+
+  angle          30     45     60     75     90    105    120    135
+  out-of-grid  0.730  0.859  0.913  0.941  0.957  0.967  0.972  0.976
+  in-grid twin 0.000  0.001  0.034  0.010  0.031  0.000  0.000  0.036
+
+The top boundary bin is reported as a peak at EVERY angle of the out-of-grid file and at
+none of the twin's. From 90 deg up the out-of-grid file reports the boundary bin as its
+ONLY peak -- the 20 nm mode that is really there is gone from the
+report, and what is left reads as one resolved population at 1000 nm.
+
+Read the NUMBERS as a dated observation and the STRUCTURE as the contract: the weight
+goes to the boundary rather than being lost, and nothing marks it.
+The table is NNLS's. CONTIN on the same files (re-measured 2026-09-07) rails just as
+completely from 60 deg up -- 0.914 / 0.942 / 0.957 / 0.966 / 0.972 / 0.979 -- and reads
+lower at the two smallest angles (0.447 at 30 deg, 0.713 at 45 deg), where its smoothing
+spreads the pile-up over more than the three boundary bins; the boundary bin is still
+reported as a peak at every angle under both.

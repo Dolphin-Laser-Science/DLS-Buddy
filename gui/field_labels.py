@@ -41,6 +41,7 @@ PARAM_LABELS = {
     'dn_dc_mL_per_g': 'dn/dc',
     'mw_fraction': 'Mw fraction',
     'solvent_blank_item_id': 'Solvent blank',
+    'solvent_blank_intensity_90deg': 'Solvent blank intensity at 90°',
     'analyzer_geometry': 'Polarization (DDLS)',
     'chain_type': 'Chain type',
 }

@@ -39,10 +39,13 @@ independent streams by ADDITIVE offsets in disjoint bands, so that adding an ang
 a concentration or a blank later never moves the noise of anything already built --
     + round(100 * angle_deg)                 per-angle correlogram (0 .. 18 000); the matched
                                              traces of with_intensity_matched_traces too
-    + 500 000                                the second run of a pair (VH; the blank)
+    + 500 000                                the second run of a pair (VH; the blank) --
+                                             also the SLS blank's own noise draw, which
+                                             `blank_seed` overrides outright
     + 1 000 000 000 + k * 100 000            per-concentration correlograms, k = µg/mL
     + 2 000 000 000 + k * 100 000            per-concentration matched traces
     + 30 000                                 the calibrant trace
+    + 3 000 000 000 + k * 100 000            replicate k of a repeat set
 and the batch writers draw one seed per RUN from a profile-seeded stream (never the
 literal profile seed for every run). ONE DOCUMENTED EXCEPTION: build_multi_angle_dls's
 inline count-rate traces walk a single stream over the angle grid (they are ordered by
@@ -417,6 +420,21 @@ class MultiAngleDLS:
     n_solvent: float
     wavelength_nm: float
     output_form: str = 'g2m1'
+    # The draws' own per-channel sample times (one axis, shared by every angle) with the
+    # grid they were made on, and, per angle, the mean count rate THAT angle's shot-noise
+    # terms consumed (None when no draw consumed one). The rate is per angle because it
+    # is the set's brightness model evaluated at that angle -- the same number the
+    # angle's count-rate trace is built around -- so a consumer that commits it beside
+    # the trace commits one quantity, not two. Only a 'multitau' grid's sample times are
+    # the layout's own; the consumer that seeds a measurement decides on `grid`.
+    sample_times_s: Optional[np.ndarray] = None
+    noise_rate_cps: Optional[Dict[float, float]] = None   # angle -> cps
+    grid: Optional[str] = None
+    # The run duration T in seconds: the span `build_multi_angle_dls` gives the count-rate
+    # traces, the `Duration` the ALV writer states, and, under an exact-in-Gamma noise
+    # model, the T every angle's Eq. (9) draw consumed. One quantity, so a file written
+    # from the set hands the engine the duration its noise was drawn at.
+    run_duration_s: float = 60.0
 
 
 @dataclass
@@ -457,6 +475,14 @@ class SyntheticSLSSet:
     # 3). It exists so that shipped path is reachable from synthetic ground truth
     # (owner-ruled 2026-08-26); dn/dc is still never proposed or defaulted by the program.
     dn_dc_in_files: bool = True
+    # The blank's own noise realisation. `blank_noise_level` is the
+    # fractional scatter applied to the c = 0 row -- 0.0, the default and the historical
+    # behaviour, makes the blank EXACT, which no instrument's is. `blank_seed`, when set,
+    # draws that row from a stream independent of `seed`, so two sets built from one spec
+    # differ in the blank alone: one is the blank that was SUBTRACTED, the other the blank
+    # that was TRUE. Carried so a generated set says which it is.
+    blank_noise_level: float = 0.0
+    blank_seed: Optional[int] = None
 
     @property
     def calibrated(self) -> bool:
@@ -466,25 +492,45 @@ class SyntheticSLSSet:
 # ===========================================================================
 # Builders (pure — return data, no I/O, no plotting)
 # ===========================================================================
+# The generator's two noise models whose relative shape keeps the run duration T, and so
+# consume one (`generate_synthetic_correlogram`'s `duration_s`); every other model
+# refuses a T.
+_EXACT_NOISE_MODELS = ('biganzoli_classical', 'biganzoli_full')
+
+# The multi-angle set's count-rate trace sample, in seconds.
+_MULTI_ANGLE_TRACE_DT_S = 0.05
+
+
 def build_correlogram(populations: Sequence[SyntheticPopulation], *, angle_deg: float,
                       wavelength_nm: float, solvent_refractive_index: float,
                       temperature_K: float, viscosity_Pa_s: float, beta: float = 0.8,
                       noise_level: float = 0.0, n_points: int = 200,
                       output_form: str = 'g2m1',
                       seed: Optional[int] = None,
+                      baseline: float = 0.0,
                       **axis_kw) -> SyntheticCorrelogramResult:
     """A single correlogram (thin pass-through to the utilities generator).
 
     ``axis_kw`` forwards the lag-axis and noise-model parameters -- ``grid``,
-    ``noise_model`` and the ``multitau_*`` set -- so a caller can ask
-    for the multi-tau staircase a real correlator emits. Defaults are the generator's,
-    i.e. the uniform log grid with constant noise.
+    ``noise_model``, the ``multitau_*`` set, ``mean_count_rate_cps``,
+    ``noise_correlation`` and ``duration_s`` -- so a caller can ask for the multi-tau
+    staircase a real correlator emits, and for the noise it produces. Defaults are the
+    generator's, i.e. the uniform log grid with constant noise.
+
+    ``baseline`` plants a FLAT offset on g2-1 (0.0 = none): the residual instrument
+    baseline a correlator leaves when its measured baseline misses its calculated one.
+    It is named here explicitly rather than left to ``axis_kw`` because it is neither a
+    lag-axis nor a noise-model parameter, and because it is the ground truth a
+    floating-baseline fit is checked against. NOT the ``offset_*`` family on
+    :func:`build_count_rate_trace` -- that is a count-rate step on a different builder.
+    See :func:`analysis.utilities.generate_synthetic_correlogram` for the g1 refusal.
     """
     return generate_synthetic_correlogram(
         populations, angle_deg=angle_deg, wavelength_nm=wavelength_nm,
         solvent_refractive_index=solvent_refractive_index, temperature_K=temperature_K,
         viscosity_Pa_s=viscosity_Pa_s, beta=beta, noise_level=noise_level,
-        n_points=n_points, output_form=output_form, seed=seed, **axis_kw)
+        n_points=n_points, output_form=output_form, seed=seed, baseline=baseline,
+        **axis_kw)
 
 
 def build_count_rate_trace(*, duration_s: float = 120.0, dt_s: float = 0.1,
@@ -551,7 +597,11 @@ def build_multi_angle_dls(populations_at_angle, *, angles_deg: Sequence[float],
                           noise_level: float = 0.0, n_points: int = 200,
                           trace_cv: float = 0.03, drift: float = 0.0, spikes: int = 0,
                           label: str = '', concentration_g_per_mL: float = 0.0,
-                          seed: Optional[int] = None, **axis_kw) -> MultiAngleDLS:
+                          seed: Optional[int] = None,
+                          mean_count_rate_cps: Optional[float] = None,
+                          intensity_cps: Optional[Dict[float, float]] = None,
+                          run_duration_s: float = 60.0,
+                          **axis_kw) -> MultiAngleDLS:
     """Correlograms at every angle (+ a count-rate trace per angle), for one sample.
 
     ``populations_at_angle`` is either a fixed list of SyntheticPopulation (same
@@ -562,39 +612,125 @@ def build_multi_angle_dls(populations_at_angle, *, angles_deg: Sequence[float],
 
     The count-rate trace at each angle follows the SAME angular law as the module's
     static forward model (``solvent_intensity``: I proportional to 1/sin(theta), the
-    scattering-volume factor), anchored at 350 kHz at 95 deg. Trace and static
-    intensity are forward models of one observable, so a static series derived from
-    these traces carries the solvent / scattering-volume angular shape (the 1/sin(theta)
-    factor only -- no P(q): a derived static series from a bare multi-angle set is flat
-    after the volume correction; the sample's own angular structure lives in the
-    consistency tuple's matched traces).
+    scattering-volume factor). Trace and static intensity are forward models of one
+    observable, so a static series derived from these traces carries the solvent /
+    scattering-volume angular shape (the 1/sin(theta) factor only -- no P(q): a derived
+    static series from a bare multi-angle set is flat after the volume correction; the
+    sample's own angular structure lives in the consistency tuple's matched traces).
+
+    ONE brightness model serves the traces AND the correlograms' shot noise -- the two
+    describe one physical quantity, the count rate at each angle, and are never allowed
+    to disagree:
+
+    * ``mean_count_rate_cps`` is the set's count rate AT 90 DEG (the ``i_ref_90``
+      convention of ``solvent_intensity``; sin 90 = 1 exactly, so an angle of 90 deg
+      consumes the entered number verbatim). Each angle's rate is that value / sin(theta);
+      its correlogram's noise is drawn at that rate and its trace's mean is that rate. The
+      anchor ALONE switches the draw rate on: it reaches ``generate_synthetic_correlogram``
+      as its ``mean_count_rate_cps``, which that function accepts only under the full
+      noise models (``'schatzel_full'``, ``'biganzoli_full'``) and requires there (its own
+      refusals -- no second guard here).
+    * ``intensity_cps`` (angle -> cps) names each angle's brightness outright and wins
+      over the anchor's value; the consistency and mode-resolved tuples pass their static
+      truth here so the correlograms are drawn at the very intensities their matched
+      traces carry. It sets the traces always, and the draw rate only when the anchor is
+      also given (a rate is refused under every other noise model).
+    * Neither given: the traces keep the module's historical anchor, 350 kHz at 95 deg,
+      and no draw consumes a rate (``noise_rate_cps`` is None).
+
+    ``noise_rate_cps`` on the returned set records, per angle, the rate the draw consumed
+    (the generator echoes it), so a consumer committing it beside the trace commits one
+    quantity.
+
+    ``run_duration_s`` is the set's run duration T, held to the same rule: the span of
+    every angle's count-rate trace, the ``Duration`` :func:`write_alv_asc` states, and,
+    under an exact-in-Gamma noise model (``'biganzoli_classical'`` / ``'biganzoli_full'``),
+    the ``duration_s`` every angle's Eq. (9) draw consumes -- the models whose relative
+    shape keeps T (``generate_synthetic_correlogram``). The Schaetzel and constant models
+    cancel T, so their draws take none and it sets the traces alone. Under every model it
+    must outlast the axis's longest lag, since the set states it for every angle and a fit
+    weights by it. It is recorded on the
+    set as ``run_duration_s``, and ``duration_s`` in ``axis_kw`` is refused so the draw and
+    the trace cannot be handed two different runs. (A set whose traces are rebuilt by
+    :func:`with_intensity_matched_traces` keeps the T its draws consumed; that function's
+    own ``duration_s`` sets only the rebuilt traces' span, so the linked-set builders pass
+    one value to both.)
 
     ``axis_kw`` forwards the lag-axis and noise-model parameters (see
     :func:`build_correlogram`). Every angle shares one axis, as a real instrument's
     angles do -- which is what lets the set be written to a single multi-angle .ASC.
     """
+    if 'duration_s' in axis_kw:
+        raise ValueError(
+            "build_multi_angle_dls: the set's run duration is run_duration_s -- the span of "
+            "its count-rate traces and, under an exact-in-Gamma noise model, the T of every "
+            "angle's draw -- so it is not an axis parameter; pass run_duration_s instead "
+            "of duration_s.")
+    if not (math.isfinite(run_duration_s) and run_duration_s > _MULTI_ANGLE_TRACE_DT_S):
+        raise ValueError(
+            f"build_multi_angle_dls: run_duration_s must be a finite number of seconds "
+            f"longer than one {_MULTI_ANGLE_TRACE_DT_S} s trace sample, got "
+            f"{run_duration_s!r}.")
+    draw_kw = dict(axis_kw)
+    if axis_kw.get('noise_model') in _EXACT_NOISE_MODELS:
+        draw_kw['duration_s'] = float(run_duration_s)
     angles = [float(a) for a in angles_deg]
+
+    def _brightness_cps(a: float) -> Optional[float]:
+        # Computed ONCE, in cps: the trace base is this / 1000 and the draw rate is this
+        # unchanged, so the two consumers cannot part company by a rounding of the unit
+        # seam (rate / 1000 * 1000 is not bit-equal to rate).
+        if intensity_cps is not None:
+            return float(intensity_cps[a])
+        if mean_count_rate_cps is not None:
+            return solvent_intensity(a, float(mean_count_rate_cps))
+        return None
+
     signals: Dict[float, np.ndarray] = {}
     delay = None
+    sample_times = None
+    grid = None
+    rates: Dict[float, float] = {}
     for a in angles:
         pops = populations_at_angle(a) if callable(populations_at_angle) else populations_at_angle
+        draw_rate = None if mean_count_rate_cps is None else _brightness_cps(a)
         g = generate_synthetic_correlogram(
             pops, angle_deg=a, wavelength_nm=wavelength_nm,
             solvent_refractive_index=solvent_refractive_index, temperature_K=temperature_K,
             viscosity_Pa_s=viscosity_Pa_s, beta=beta, noise_level=noise_level,
             n_points=n_points, output_form='g2m1',
-            seed=(None if seed is None else seed + int(round(100.0 * a))), **axis_kw)
+            seed=(None if seed is None else seed + int(round(100.0 * a))),
+            mean_count_rate_cps=draw_rate, **draw_kw)
         delay = g.delay_times_s
+        sample_times = g.sample_times_s
+        grid = g.grid
+        if g.mean_count_rate_cps is not None:
+            rates[a] = float(g.mean_count_rate_cps)
         signals[a] = g.signal
+    # The set states its one T for every angle -- the traces, the written file's Duration,
+    # the injected measurements -- so T must outlast the longest lag under EVERY noise
+    # model, not only the exact ones whose draw refuses it above: the fit weights by T.
+    if not run_duration_s > float(delay[-1]):
+        raise ValueError(
+            f"build_multi_angle_dls: run_duration_s = {run_duration_s!r} s does not outlast "
+            f"the lag axis, whose longest lag is {float(delay[-1])!r} s. The set states this "
+            f"run duration for every angle, and the exact-in-Gamma weight a fit builds from "
+            f"it needs T longer than every lag: lengthen the run or shorten the axis.")
 
     # count-rate traces: more scattering at low angle; fractional-CV scatter (NOT shot
     # noise -- see build_count_rate_trace's docstring) + drift/spikes
     rng = np.random.default_rng(seed)
-    t = np.arange(0.0, 60.0, 0.05)
+    t = np.arange(0.0, run_duration_s, _MULTI_ANGLE_TRACE_DT_S)
     trace_cps: Dict[float, np.ndarray] = {}
     mean_cr: Dict[float, float] = {}
     for a in angles:
-        base = solvent_intensity(a, 350.0 * math.sin(math.radians(95.0)))    # kHz
+        b = _brightness_cps(a)
+        # The historical anchor is kept character-for-character: the committed synthetic
+        # corpora regenerate byte-identical only while this expression and the RNG draw
+        # order below stay as they are (pinned by tests/test_synthetic_generator.py::
+        # test_committed_corpus_regenerates_byte_identical).
+        base = (b / 1000.0 if b is not None
+                else solvent_intensity(a, 350.0 * math.sin(math.radians(95.0))))    # kHz
         cr = base * (1.0 + trace_cv * rng.standard_normal(t.size))
         if drift and t.size and t[-1] > 0:           # guard t=[0.0] -> 0/0
             cr = cr + base * drift * (t / t[-1])
@@ -609,7 +745,184 @@ def build_multi_angle_dls(populations_at_angle, *, angles_deg: Sequence[float],
         trace_times_s=t, trace_cps=trace_cps, mean_cr_kHz=mean_cr,
         label=label, concentration_g_per_mL=concentration_g_per_mL,
         temperature_K=temperature_K, viscosity_Pa_s=viscosity_Pa_s,
-        n_solvent=solvent_refractive_index, wavelength_nm=wavelength_nm)
+        n_solvent=solvent_refractive_index, wavelength_nm=wavelength_nm,
+        sample_times_s=sample_times, noise_rate_cps=(rates or None), grid=grid,
+        run_duration_s=float(run_duration_s))
+
+
+@dataclass
+class SyntheticKWW:
+    """A stretched-exponential (KWW) correlogram plus the ground truth used to make it.
+
+    ``g2(tau) - 1 = baseline + beta * exp(-2 (tau/tau_c)^stretch)``.
+
+    **AT baseline = 0 THIS IS THE MODEL ``analysis.dls.exponentials.fit_kww`` FITS**, so a
+    fit of ``signal`` returns ``tau_c_s``, ``stretch`` and ``beta``, and both of its Rh
+    channels return the two carried here. **At a non-zero baseline it is not**:
+    ``_kww_model`` carries no B term, so the offset is absorbed into ``stretch`` and
+    ``tau_c`` and NO field here is recovered. Measured 2026-09-02 on tau_c = 2e-4,
+    s = 0.7: at B = 0.04 the fit returns tau_c 2.51e-4, s 0.640 and Rh 30.4 nm against a
+    planted 24.2 nm (+26 %), and flips ``rh_reliable`` to False. That is not a defect in
+    either half -- it is precisely the condition the baseline knob exists to make
+    reachable, and the open question about what the KWW decay criterion should do with an
+    offset is the register's, under undecayed-mode-propagation. Assert the additive
+    property at a non-zero baseline; assert recovery only at zero.
+
+    ``stretch = 1`` is a single exponential, which is the degenerate case worth keeping
+    reachable: it is the control that says the KWW path agrees with the exponential one
+    where the physics says it must.
+
+    Not a :class:`~analysis.utilities.SyntheticCorrelogramResult`: that object's curve is
+    a SUM of exponentials over size populations, and a stretched exponential is not one
+    of those -- it is a continuous relaxation-time spectrum with no discrete population
+    list and no cumulant ground truth to report. Giving it a ``populations`` field would
+    have to invent one.
+    """
+    delay_times_s: np.ndarray
+    signal: np.ndarray                 # g2(tau) - 1
+    tau_c_s: float                     # characteristic relaxation time
+    stretch: float                     # KWW exponent s, in (0, 1]
+    mean_tau_s: float                  # <tau> = (tau_c/s) * Gamma(1/s)
+    beta: float
+    baseline: float
+    # both Rh channels fit_kww reports, from Gamma = 1/tau_c and Gamma = 1/<tau>
+    rh_from_tau_c_nm: float
+    rh_from_mean_tau_nm: float
+    q_m_inv: float
+    angle_deg: float
+    wavelength_nm: float
+    solvent_refractive_index: float
+    temperature_K: float
+    viscosity_Pa_s: float
+    noise_level: float = 0.0
+    seed: Optional[int] = None
+
+
+def build_kww_correlogram(*, tau_c_s: float, stretch: float, angle_deg: float,
+                          wavelength_nm: float, solvent_refractive_index: float,
+                          temperature_K: float, viscosity_Pa_s: float,
+                          beta: float = 0.9, noise_level: float = 0.0,
+                          baseline: float = 0.0, n_points: int = 200,
+                          delay_min_s: float = 1.0e-7, delay_max_s: float = 1.0,
+                          seed: Optional[int] = None) -> SyntheticKWW:
+    """A Kohlrausch-Williams-Watts (stretched-exponential) correlogram with its truth.
+
+        g1(tau) = exp(-(tau/tau_c)^s)     ->     g2 - 1 = B + beta * g1^2
+
+    The KWW path has been shipped since 2026-06 with NO synthetic ground truth at all --
+    the correlogram kernel emits sums of exponentials and log-normal-broadened
+    populations only, so there was no stretch exponent input anywhere in the generator
+    -- a pre-rule backlog item, not a rule failure: the KWW path predates CLAUDE.md's
+    generator-coverage rule and nobody went back.
+
+    ``stretch`` must be in (0, 1]: 1 is a single exponential and values above 1 are
+    COMPRESSED, which ``fit_kww``'s own bounds exclude, so generating one would produce
+    data the shipped fit cannot return. The mean relaxation time uses the same closed
+    form the fit reports, ``<tau> = (tau_c/s) * Gamma(1/s)``, and both Rh channels are
+    the Stokes radii of ``Gamma = 1/tau_c`` and ``Gamma = 1/<tau>``.
+
+    ``baseline`` plants the same flat g2-1 offset as :func:`build_correlogram`; it is
+    here because the KWW data-form decay criterion reads an un-baselined correlogram and
+    is the analysis most sensitive to one.
+    """
+    if not (0.0 < stretch <= 1.0):
+        raise ValueError(
+            f"stretch must be in (0, 1] -- 1 is a single exponential and fit_kww's own "
+            f"bounds exclude a compressed exponent; got {stretch!r}.")
+    if not (math.isfinite(tau_c_s) and tau_c_s > 0):
+        raise ValueError(f"tau_c_s must be a positive finite number, got {tau_c_s!r}.")
+    if not (0.0 < beta <= 1.0):
+        raise ValueError(f"beta must be in (0, 1], got {beta!r}.")
+    tau = np.geomspace(delay_min_s, delay_max_s, n_points)
+    g1 = np.exp(-(tau / tau_c_s) ** stretch)
+    signal = baseline + beta * g1 ** 2
+    if noise_level:
+        # Channel-INDEPENDENT draws, and permanently so -- this builder has no
+        # `noise_model` option, so it is always the flat case. The two ways that is
+        # unlike an instrument's noise (real lag-1 channel correlation +0.27..+0.43
+        # against ~0 here; too narrow an SD span) are stated in full on
+        # `utilities.generate_synthetic_correlogram`'s `noise_level` parameter and in the
+        # Theory-and-Equations-Guide's noise-model section. They apply here identically,
+        # and this builder feeds a committed corpus -- so read them before drawing a
+        # correctness conclusion from data it produced.
+        signal = signal + np.random.default_rng(seed).normal(0.0, noise_level,
+                                                             size=signal.shape)
+    mean_tau = (tau_c_s / stretch) * math.gamma(1.0 / stretch)
+    q = phys.scattering_vector_q_m(angle_deg, wavelength_nm, solvent_refractive_index)
+
+    def _rh(gamma: float) -> float:
+        return phys.stokes_einstein_rh(gamma / (q * q), temperature_K,
+                                       viscosity_Pa_s) * 1e9
+
+    return SyntheticKWW(
+        delay_times_s=tau, signal=signal, tau_c_s=float(tau_c_s),
+        stretch=float(stretch), mean_tau_s=float(mean_tau), beta=float(beta),
+        baseline=float(baseline), rh_from_tau_c_nm=_rh(1.0 / tau_c_s),
+        rh_from_mean_tau_nm=_rh(1.0 / mean_tau), q_m_inv=q, angle_deg=float(angle_deg),
+        wavelength_nm=float(wavelength_nm),
+        solvent_refractive_index=float(solvent_refractive_index),
+        temperature_K=float(temperature_K), viscosity_Pa_s=float(viscosity_Pa_s),
+        noise_level=float(noise_level), seed=seed)
+
+
+@dataclass
+class ReplicateCorrelograms:
+    """N repeat correlograms of ONE sample, plus the truth they share.
+
+    True replicates in the sense ``analysis.dls.replicate`` requires: one lag grid, one
+    set of optics and conditions, one population -- differing ONLY in the noise
+    realisation. That is the point: the replicate path is the platform's only honest
+    dynamic +/- (CLAUDE.md invariant 8 forbids a +/- from a single correlogram,
+    Schaetzel 1990), and until now the generator emitted one artifact per seed, so a
+    caller had to hand-roll the repeat set and could get the identity fields subtly
+    wrong.
+    """
+    runs: List[SyntheticCorrelogramResult]
+    rh_nm: float                       # the planted size every run shares
+    n_replicates: int
+    seed: Optional[int]
+
+    @property
+    def delay_times_s(self) -> np.ndarray:
+        return self.runs[0].delay_times_s
+
+
+def build_replicate_correlograms(populations: Sequence[SyntheticPopulation], *,
+                                 n_replicates: int, angle_deg: float,
+                                 wavelength_nm: float,
+                                 solvent_refractive_index: float,
+                                 temperature_K: float, viscosity_Pa_s: float,
+                                 beta: float = 0.9, noise_level: float = 0.01,
+                                 n_points: int = 200, seed: Optional[int] = None,
+                                 **axis_kw) -> ReplicateCorrelograms:
+    """``n_replicates`` independent repeats of one measurement.
+
+    Every run shares the populations, the optics, the conditions and the lag grid, and
+    differs only in its noise draw -- so the set passes ``check_replicate_identity`` by
+    construction and ``average_replicate_correlograms`` can be driven from ground truth.
+    A replicate set with ``noise_level = 0`` is N identical curves and averaging it has
+    nothing to average, so the default is the committed corpus's noise floor, not 0.
+
+    Seeding follows the module convention: replicate k draws from
+    ``seed + 3_000_000_000 + k * 100_000``, a band disjoint from the per-angle,
+    per-concentration, blank and trace bands, so adding a replicate never moves the
+    noise of the ones already built.
+    """
+    n = int(n_replicates)
+    if n < 2:
+        raise ValueError(
+            f"a replicate set needs at least two runs (that is what "
+            f"average_replicate_correlograms requires); got "
+            f"n_replicates={n_replicates!r}.")
+    runs = [generate_synthetic_correlogram(
+        list(populations), angle_deg=angle_deg, wavelength_nm=wavelength_nm,
+        solvent_refractive_index=solvent_refractive_index, temperature_K=temperature_K,
+        viscosity_Pa_s=viscosity_Pa_s, beta=beta, noise_level=noise_level,
+        n_points=n_points, output_form='g2m1',
+        seed=(None if seed is None else seed + 3_000_000_000 + k * 100_000),
+        **axis_kw) for k in range(n)]
+    return ReplicateCorrelograms(runs=runs, rh_nm=runs[0].rh_eff_nm,
+                                 n_replicates=n, seed=seed)
 
 
 @dataclass
@@ -781,7 +1094,8 @@ class ConsistencyTuple:
 
     The generator's other builders parameterise a correlogram set and a static set
     independently, so their numbers are unrelated: ``build_multi_angle_dls`` bases
-    its trace on a hard-coded ``350 kHz * (sin 95 / sin theta)**0.5`` shape, while
+    its trace on the bare volume law ``1/sin theta`` (anchored at its ``mean_count_rate_cps``
+    at 90 deg when given, else at the historical 350 kHz at 95 deg), while
     ``sample_intensity`` builds intensity as ``I_solvent(theta) + dR/(k_c sin theta
     (n/n_std)^2)``. That is fine for exercising each surface alone, and useless for
     the trace-derived static chain, whose whole claim is that the two ARE the same
@@ -845,6 +1159,10 @@ def with_intensity_matched_traces(
     NOTE ``drift`` with ``exact_mean=False`` biases the mean by ``drift/2`` -- a
     coherent multiplicative error on the derived intensity that no tolerance derived
     from ``trace_cv / sqrt(n)`` covers. Use drift with ``exact_mean=True``.
+
+    A set whose correlograms consumed a per-angle rate (``noise_rate_cps``) is refused
+    when a target disagrees with that rate: the set's noise and its brightness are one
+    quantity, so hand the same dict to ``build_multi_angle_dls`` as ``intensity_cps``.
     """
     times = None
     trace_cps: Dict[float, np.ndarray] = {}
@@ -856,6 +1174,14 @@ def with_intensity_matched_traces(
                 'with_intensity_matched_traces: the target intensity at '
                 '{0:g} deg is {1!r} cps, which cannot be a count rate.'.format(
                     angle, target))
+        drawn = (dls.noise_rate_cps or {}).get(angle)
+        if drawn is not None and not math.isclose(drawn, target, rel_tol=1e-9):
+            raise ValueError(
+                'with_intensity_matched_traces: the set\'s correlograms at {0:g} deg '
+                'were drawn at {1!r} cps but the traces are being matched to {2!r} '
+                'cps; a set\'s noise and its brightness are one quantity -- pass the '
+                'same intensities to build_multi_angle_dls as intensity_cps.'.format(
+                    angle, drawn, target))
         trace = build_count_rate_trace(
             duration_s=duration_s, dt_s=dt_s, mean_kHz=target / 1000.0,
             trace_cv=trace_cv, drift=drift, spikes=spikes,
@@ -876,6 +1202,30 @@ def with_intensity_matched_traces(
         mean_cr[angle] = float(cps.mean() / 1000.0)
     return replace(dls, trace_times_s=times, trace_cps=trace_cps,
                    mean_cr_kHz=mean_cr)
+
+
+def _tuple_multi_angle(*args, **kw):
+    """`build_multi_angle_dls` for the linked-set builders, translating ONE refusal.
+
+    The tuple builders spend their `trace_duration_s` as the set's `run_duration_s`,
+    because those are one quantity (the trace span, the written file's Duration and the
+    draw's T are the same number). When that duration does not outlast the lag axis the
+    set is incoherent and `build_multi_angle_dls` refuses it -- correctly, and this does
+    not soften that. What it fixes is the VOCABULARY: a caller of `build_consistency_tuple`
+    never passed `run_duration_s` and cannot act on a message naming it. The predicate
+    stays in one place; only the name the error uses is the caller's own.
+    """
+    try:
+        return build_multi_angle_dls(*args, **kw)
+    except ValueError as exc:
+        if 'does not outlast' not in str(exc):
+            raise
+        raise ValueError(
+            f"trace_duration_s = {kw.get('run_duration_s')!r} s does not outlast this "
+            f"set's lag axis. A linked set states one run duration for its traces, its "
+            f"written files and the T its fits weight by, so a run shorter than the "
+            f"longest lag describes a measurement that could not have happened: lengthen "
+            f"trace_duration_s or shorten the axis. ({exc})") from exc
 
 
 def build_consistency_tuple(
@@ -952,14 +1302,19 @@ def build_consistency_tuple(
         k = int(round(conc * 1e6))
         corr_seed = None if seed is None else seed + 1_000_000_000 + k * 100_000
         point_seed = None if seed is None else seed + 2_000_000_000 + k * 100_000
-        built = build_multi_angle_dls(
+        # The point's static truth is the brightness its correlograms are drawn at (when
+        # a noise model consumes a rate) AND the mean its traces are matched to -- one
+        # dict, handed to both, so the matcher's agreement guard cannot fire here.
+        point_intensity = {a: truth[(conc, a)] for a in angles}
+        built = _tuple_multi_angle(
             _pops(conc), angles_deg=angles, wavelength_nm=wavelength_nm,
             solvent_refractive_index=n_solvent, temperature_K=temperature_K,
             viscosity_Pa_s=viscosity_Pa_s, beta=beta, noise_level=noise_level,
             n_points=n_points, label='{0} c={1:g}'.format(label, conc),
-            concentration_g_per_mL=conc, seed=corr_seed, **axis_kw)
+            concentration_g_per_mL=conc, seed=corr_seed,
+            intensity_cps=point_intensity, run_duration_s=trace_duration_s, **axis_kw)
         dls[conc] = with_intensity_matched_traces(
-            built, {a: truth[(conc, a)] for a in angles},
+            built, point_intensity,
             duration_s=trace_duration_s, dt_s=trace_dt_s, trace_cv=trace_cv,
             drift=drift, spikes=spikes, exact_mean=exact_mean, seed=point_seed)
 
@@ -1209,18 +1564,24 @@ def build_mode_resolved_tuple(
     # noise to zero). Traces follow the per-concentration band, k = 0 for the blank.
     k = int(round(conc * 1e6))
     dls: Dict[float, MultiAngleDLS] = {}
-    built = build_multi_angle_dls(
+    # Each run's static truth is the brightness its correlograms are drawn at (when a
+    # noise model consumes a rate) AND the mean its traces are matched to -- one dict,
+    # handed to both, so the matcher's agreement guard cannot fire here.
+    sample_intensity_cps = {a: truth[(conc, a)] for a in angles}
+    blank_intensity_cps = {a: truth[(0.0, a)] for a in angles}
+    built = _tuple_multi_angle(
         _pops, angles_deg=angles, wavelength_nm=wavelength_nm,
         solvent_refractive_index=n_solvent, temperature_K=temperature_K,
         viscosity_Pa_s=viscosity_Pa_s, beta=beta, noise_level=noise_level,
         n_points=n_points, label='{0} c={1:g}'.format(label, conc),
-        concentration_g_per_mL=conc, seed=seed, **axis_kw)
+        concentration_g_per_mL=conc, seed=seed,
+        intensity_cps=sample_intensity_cps, run_duration_s=trace_duration_s, **axis_kw)
     dls[conc] = with_intensity_matched_traces(
-        built, {a: truth[(conc, a)] for a in angles},
+        built, sample_intensity_cps,
         duration_s=trace_duration_s, dt_s=trace_dt_s, trace_cv=trace_cv,
         exact_mean=exact_mean,
         seed=(None if seed is None else seed + 2_000_000_000 + k * 100_000))
-    blank = build_multi_angle_dls(
+    blank = _tuple_multi_angle(
         # bookkeeping population: the blank must be loadable as a run
         [SyntheticPopulation(rh_nm=1.0, weight=1.0)],
         angles_deg=angles, wavelength_nm=wavelength_nm,
@@ -1228,9 +1589,10 @@ def build_mode_resolved_tuple(
         viscosity_Pa_s=viscosity_Pa_s, beta=beta, noise_level=noise_level,
         n_points=n_points, label='{0} blank'.format(label),
         concentration_g_per_mL=0.0,
-        seed=(None if seed is None else seed + 500_000), **axis_kw)
+        seed=(None if seed is None else seed + 500_000),
+        intensity_cps=blank_intensity_cps, run_duration_s=trace_duration_s, **axis_kw)
     dls[0.0] = with_intensity_matched_traces(
-        blank, {a: truth[(0.0, a)] for a in angles},
+        blank, blank_intensity_cps,
         duration_s=trace_duration_s, dt_s=trace_dt_s, trace_cv=trace_cv,
         exact_mean=exact_mean,
         seed=(None if seed is None else seed + 2_000_000_000))
@@ -1270,6 +1632,7 @@ def build_sls_set(*, mw: float, rg_nm: float, a2_mol_mL_per_g2: float,
                   wavelength_nm: float, temperature_K: float, n_solvent: float,
                   dn_dc: float, cal: CalibrationSpec, solvent_intensity_90: float,
                   noise_level: float = 0.0, seed: Optional[int] = None,
+                  blank_noise_level: float = 0.0, blank_seed: Optional[int] = None,
                   polymer_name: str = '', solvent_name: str = '', label: str = '',
                   kind: str = 'zimm',
                   form_factor_model: str = 'guinier',
@@ -1286,6 +1649,19 @@ def build_sls_set(*, mw: float, rg_nm: float, a2_mol_mL_per_g2: float,
     ``dn_dc_in_files=False`` builds a dn/dc-LESS set: the intensities still use
     ``dn_dc`` (the physics needs a contrast), but the written file and an injected
     measurement carry none, so the analysis takes the K = 1 arbitrary-scale path.
+
+    THE BLANK (``blank_noise_level``, ``blank_seed``). ``noise_level`` reaches the
+    ``c > 0`` rows only, so at the defaults the ``c = 0`` solvent reference is EXACT and
+    identical across runs -- a sample can then be pushed arbitrarily close to its blank
+    and the excess still recovers cleanly, because the blank it subtracts is perfect. No
+    instrument's is: two 1 mm / 5 %T blanks of one cell ten minutes apart differ by
+    -9 % to +19 %, SD 8.3 % (measured on a real 2026-08-21 pair; the maintainer's
+    test-data notes carry the run).
+    ``blank_noise_level`` is the fractional scatter on that row, and ``blank_seed``
+    draws it from a stream INDEPENDENT of ``seed`` -- so two sets from one spec, built
+    with two blank seeds, differ in the blank alone: one is the blank that was
+    SUBTRACTED, the other the blank that was TRUE. Both default to the historical
+    behaviour (0.0 / derived), so every committed set is byte-unchanged.
 
     `form_factor_model` selects the angular model of the generated intensities:
     'guinier' (default, the small-qRg Zimm expansion) or the full form factor
@@ -1311,13 +1687,25 @@ def build_sls_set(*, mw: float, rg_nm: float, a2_mol_mL_per_g2: float,
             ellipsoid_axial_ratio=ellipsoid_axial_ratio, m=m,
             r_core_nm=r_core_nm, r_outer_nm=r_outer_nm, m1=m1, m2=m2)
             for a in angles], dtype=float)
-        if noise_level and c > 0:
+        if c > 0:
             # Per-POINT seeding (the trace path's rule): one stream per concentration,
             # keyed on the concentration value, so editing the ladder never moves the
             # noise of the points already on it.
-            rng = np.random.default_rng(
-                None if seed is None else seed + 1_000_000_000 + int(round(c * 1e6)) * 100_000)
-            I = I * (1.0 + noise_level * rng.standard_normal(I.size))
+            level = noise_level
+            stream = (None if seed is None
+                      else seed + 1_000_000_000 + int(round(c * 1e6)) * 100_000)
+        else:
+            # The blank is its own measurement, so it gets its own level and its own
+            # stream: `blank_seed` when given, else the module's +500_000 blank band
+            # (see the seeding convention in the module docstring). Independence is the
+            # whole point -- a blank drawn from the sample's stream would move whenever
+            # the ladder moved, which is the opposite of what 5c asks for.
+            level = blank_noise_level
+            stream = (blank_seed if blank_seed is not None
+                      else (None if seed is None else seed + 500_000))
+        if level:
+            rng = np.random.default_rng(stream)
+            I = I * (1.0 + level * rng.standard_normal(I.size))
         intensities[c] = np.clip(I, 1.0, None)
     # A Mie set records the solute RI (n_solute = m * n_solvent); a core-shell set records the
     # CORE (m1) and SHELL (m2) indices -- so an injected artifact is fittable end-to-end. None
@@ -1333,7 +1721,8 @@ def build_sls_set(*, mw: float, rg_nm: float, a2_mol_mL_per_g2: float,
         label=label, polymer_name=polymer_name, solvent_name=solvent_name,
         temperature_K=temperature_K, wavelength_nm=wavelength_nm, n_solvent=n_solvent,
         dn_dc=dn_dc, cal=cal, kind=kind, solute_refractive_index=solute_ri,
-        shell_refractive_index=shell_ri, dn_dc_in_files=bool(dn_dc_in_files))
+        shell_refractive_index=shell_ri, dn_dc_in_files=bool(dn_dc_in_files),
+        blank_noise_level=float(blank_noise_level), blank_seed=blank_seed)
 
 
 # ===========================================================================
@@ -1508,6 +1897,26 @@ def rod_diffusion(length_m: float, diameter_m: float, temperature_K: float,
     return d_t, d_r, p, nu, delta_perp
 
 
+def sphere_diffusion(radius_m: float, temperature_K: float,
+                     viscosity_Pa_s: float):
+    """Translational D_t (m^2/s), rotational D_r (rad^2/s), and axial ratio (1.0) of a
+    sphere. Thin wrapper over physics.constants -- D_t Stokes-Einstein, D_r
+    Stokes-Einstein-Debye (D_r = kT / (8 pi eta R^3)).
+
+    The sphere is the DPLS shape model with ONE unknown, which is what makes it the
+    natural control for the other two: R from D_r and R from D_t must agree, so
+    ``analysis.depolarization.sphere_dimensions_from_diffusion`` must return a
+    sphericity ratio of 1. The strict builder once took 'rod' and 'ellipsoid' only, so
+    the sphere inverse was reachable no other way than by hand-computing D_r and calling
+    the lower-level ``build_ddls_set_from_diffusion`` -- the one model whose ground truth
+    is exact had no generator path.
+    """
+    d_t = phys.stokes_einstein_diffusion_coefficient(
+        radius_m, temperature_K, viscosity_Pa_s)
+    d_r = phys.sphere_rotational_diffusion(radius_m, temperature_K, viscosity_Pa_s)
+    return d_t, d_r, 1.0
+
+
 def ellipsoid_diffusion(polar_semi_axis_m: float, equatorial_radius_m: float,
                         temperature_K: float, viscosity_Pa_s: float):
     """Translational D_t (m^2/s), end-over-end rotational D_perp (rad^2/s), and axial
@@ -1521,19 +1930,68 @@ def ellipsoid_diffusion(polar_semi_axis_m: float, equatorial_radius_m: float,
     return d_t, d_r, a / b
 
 
-def vh_effective_population(d_t: float, d_r: float, *, wavelength_nm: float,
+def _lognormal_scale_grid(spread_cv: float, n_grid: int = 25):
+    """Discretize a log-normal spread of a LINEAR dimension into (scale, weight) pairs.
+
+    ``spread_cv`` is the coefficient of variation of the dimension, converted to the
+    log-space width exactly (sigma_ln = sqrt(ln(1 + CV^2))) and sampled on a geometric
+    grid spanning +/-3 sigma_ln, i.e. ~99.7 % of the mass -- the same convention
+    ``analysis.utilities.generate_synthetic_correlogram`` uses for a polydisperse
+    population, INCLUDING the ``pdf * r`` Jacobian a geometric grid needs (omitting it
+    shifts the emitted geometric mean by -8 % at CV = 0.3). Weights sum to 1.
+
+    Returned as SCALE FACTORS about 1.0 rather than as sizes, because a DDLS body has
+    two dimensions that must scale together: a polydisperse rod is a distribution of
+    LENGTHS at fixed axial ratio, not a distribution of shapes.
+    """
+    sigma_ln = math.sqrt(math.log(1.0 + spread_cv ** 2))
+    lo, hi = math.exp(-3.0 * sigma_ln), math.exp(3.0 * sigma_ln)
+    scales = np.geomspace(lo, hi, n_grid)
+    pdf = (1.0 / (scales * sigma_ln * math.sqrt(2.0 * math.pi))) * \
+        np.exp(-(np.log(scales)) ** 2 / (2.0 * sigma_ln ** 2))
+    w = pdf * scales                 # geometric-grid Jacobian: dr = r d(ln r)
+    return scales, w / w.sum()
+
+
+def vh_effective_population(d_t, d_r, *, wavelength_nm: float,
                            n_solvent: float, temperature_K: float,
-                           viscosity_Pa_s: float):
+                           viscosity_Pa_s: float,
+                           weights: Optional[Sequence[float]] = None):
     """Return a callable ``angle_deg -> [SyntheticPopulation]`` whose Stokes-Einstein
     decay equals Gamma_VH(angle) = q^2 D_t + 6 D_r, so the generated single exponential
     carries the rotational term. The effective radius is pure bookkeeping (never written
     out); reading it back as a "size" is meaningless -- DDLS works with decay rates.
+
+    ``d_t`` and ``d_r`` may be scalars (one body: the historical behaviour, unchanged)
+    or EQUAL-LENGTH sequences (a polydisperse body: one rate pair per component, with
+    ``weights``, default equal). The polydisperse form is built component by component
+    rather than by spreading one effective radius, because D_t and D_r do not scale
+    with the same power of the dimension -- D_t goes as 1/R and D_r as 1/R^3 for a
+    sphere -- so a log-normal spread of the EFFECTIVE radius is not the spread any real
+    size distribution produces.
     """
+    d_ts = np.atleast_1d(np.asarray(d_t, dtype=float))
+    d_rs = np.atleast_1d(np.asarray(d_r, dtype=float))
+    if d_ts.size != d_rs.size:
+        raise ValueError(
+            f"d_t and d_r must have the same number of components; got "
+            f"{d_ts.size} and {d_rs.size}.")
+    w = (np.full(d_ts.size, 1.0 / d_ts.size) if weights is None
+         else np.asarray(weights, dtype=float))
+    if w.size != d_ts.size:
+        raise ValueError(
+            f"weights must have one entry per rate pair; got {w.size} for "
+            f"{d_ts.size} components.")
+
     def pops(angle_deg: float) -> List[SyntheticPopulation]:
         q = phys.scattering_vector_q_m(angle_deg, wavelength_nm, n_solvent)
-        d_eff = d_t + 6.0 * d_r / (q * q)            # so q^2 * d_eff = Gamma_VH
-        rh_eff_nm = phys.stokes_einstein_rh(d_eff, temperature_K, viscosity_Pa_s) * 1e9
-        return [SyntheticPopulation(rh_nm=rh_eff_nm, weight=1.0)]
+        out = []
+        for dt_i, dr_i, w_i in zip(d_ts, d_rs, w, strict=True):
+            d_eff = dt_i + 6.0 * dr_i / (q * q)      # so q^2 * d_eff = Gamma_VH
+            rh_eff_nm = phys.stokes_einstein_rh(
+                d_eff, temperature_K, viscosity_Pa_s) * 1e9
+            out.append(SyntheticPopulation(rh_nm=rh_eff_nm, weight=float(w_i)))
+        return out
     return pops
 
 
@@ -1554,9 +2012,19 @@ class DDLSSet:
     d_r_rad2_s: float
     axial_ratio: float
     rh_t_nm: float
+    # Polydisperse sets only. One rate pair per component
+    # with its weight; the scalar `d_t_m2_s` / `d_r_rad2_s` above are then the
+    # WEIGHTED MEANS, which is what the first cumulant of each channel recovers
+    # (Gamma_VV = q^2 <D_t>, Gamma_VH = q^2 <D_t> + 6 <D_r>, both linear in the rates).
+    # A monodisperse set leaves these empty rather than storing a one-element copy, so
+    # `if set.component_weights:` is the honest test for "is this polydisperse".
+    size_spread_cv: float = 0.0
+    d_t_components_m2_s: Tuple[float, ...] = ()
+    d_r_components_rad2_s: Tuple[float, ...] = ()
+    component_weights: Tuple[float, ...] = ()
 
 
-def build_ddls_set_from_diffusion(d_t_m2_s: float, d_r_rad2_s: float, *,
+def build_ddls_set_from_diffusion(d_t_m2_s, d_r_rad2_s, *,
                                   angles_deg: Sequence[float], wavelength_nm: float,
                                   n_solvent: float, temperature_K: float,
                                   viscosity_Pa_s: float, beta: float = 0.9,
@@ -1565,7 +2033,10 @@ def build_ddls_set_from_diffusion(d_t_m2_s: float, d_r_rad2_s: float, *,
                                   shape: str = 'unspecified',
                                   dims_nm: Optional[Tuple[float, float]] = None,
                                   axial_ratio: Optional[float] = None,
-                                  concentration_g_per_mL: float = 0.0) -> DDLSSet:
+                                  concentration_g_per_mL: float = 0.0,
+                                  weights: Optional[Sequence[float]] = None,
+                                  size_spread_cv: float = 0.0,
+                                  baseline: float = 0.0) -> DDLSSet:
     """Paired VV/VH multi-angle set from the two diffusion rates directly.
 
     The primitive form. DDLS measures RATES -- Gamma_VV = q^2 D_t and
@@ -1595,27 +2066,96 @@ def build_ddls_set_from_diffusion(d_t_m2_s: float, d_r_rad2_s: float, *,
     land in one sample, and generating that pair is the only way to exercise the
     identity refusal in the controller's DDLS averaging. Default 0.0 = the historical
     value, so an existing call's artifact is unchanged.
+
+    POLYDISPERSE SETS. ``d_t_m2_s`` and ``d_r_rad2_s`` may
+    each be a SEQUENCE of equal length -- one rate pair per component of a size
+    distribution -- with ``weights`` (default equal). Both channels are then genuine
+    multi-population sums rather than single exponentials, which is the condition every
+    DDLS set lacked: each was one monodisperse body, VV a single population and VH a
+    single effective one. The reported scalar ``d_t_m2_s`` / ``d_r_rad2_s`` on the
+    result are the WEIGHTED MEANS, because both channels' first cumulants are linear in
+    the rates (Gamma_VV = q^2 <D_t>; Gamma_VH = q^2 <D_t> + 6 <D_r>), so those means are
+    exactly what an ideal analysis of the pair recovers. ``size_spread_cv`` is carried
+    as a LABEL here (the rates-first form never saw a dimension); ``build_ddls_set``
+    sets it from the spread it actually applied.
+
+    ``baseline`` plants the same flat g2-1 offset as :func:`build_correlogram` on BOTH
+    channels' correlograms (0.0 = none, so an existing call's artifact is unchanged),
+    which is what lets a DDLS run be checked against a user-placed baseline region.
     """
     dims = ((float('nan'), float('nan')) if dims_nm is None
             else (float(dims_nm[0]), float(dims_nm[1])))
     p = float('nan') if axial_ratio is None else float(axial_ratio)
-    d_t, d_r = float(d_t_m2_s), float(d_r_rad2_s)
+    d_ts = np.atleast_1d(np.asarray(d_t_m2_s, dtype=float))
+    d_rs = np.atleast_1d(np.asarray(d_r_rad2_s, dtype=float))
+    if d_ts.size != d_rs.size:
+        raise ValueError(
+            f"d_t_m2_s and d_r_rad2_s must have the same number of components; got "
+            f"{d_ts.size} and {d_rs.size}.")
+    w = (np.full(d_ts.size, 1.0 / d_ts.size) if weights is None
+         else np.asarray(weights, dtype=float))
+    if w.size != d_ts.size:
+        raise ValueError(
+            f"weights must have one entry per rate pair; got {w.size} for "
+            f"{d_ts.size} components.")
+    if not (np.all(np.isfinite(w)) and np.all(w > 0)):
+        raise ValueError("weights must all be positive and finite.")
+    w = w / w.sum()
+    # The reported truth is the weighted mean, which is what each channel's first
+    # cumulant recovers -- both Gammas are linear in the rates. For one component this
+    # is the component itself, bit for bit, so a monodisperse call is unchanged.
+    d_t = float(d_ts[0]) if d_ts.size == 1 else float(np.sum(w * d_ts))
+    d_r = float(d_rs[0]) if d_rs.size == 1 else float(np.sum(w * d_rs))
     rh_t_nm = phys.stokes_einstein_rh(d_t, temperature_K, viscosity_Pa_s) * 1e9
     common = dict(angles_deg=angles_deg, wavelength_nm=wavelength_nm,
                   solvent_refractive_index=n_solvent, temperature_K=temperature_K,
                   viscosity_Pa_s=viscosity_Pa_s, beta=beta, n_points=n_points,
-                  concentration_g_per_mL=float(concentration_g_per_mL))
+                  concentration_g_per_mL=float(concentration_g_per_mL),
+                  baseline=float(baseline))
+    vv_pops = [SyntheticPopulation(
+        rh_nm=phys.stokes_einstein_rh(float(dt_i), temperature_K,
+                                      viscosity_Pa_s) * 1e9, weight=float(w_i))
+        for dt_i, w_i in zip(d_ts, w, strict=True)]
     vv = build_multi_angle_dls(
-        [SyntheticPopulation(rh_nm=rh_t_nm, weight=1.0)], noise_level=0.0,
-        label=f'{label} VV', seed=seed, **common)
+        vv_pops, noise_level=0.0, label=f'{label} VV', seed=seed, **common)
     vh = build_multi_angle_dls(
-        vh_effective_population(d_t, d_r, wavelength_nm=wavelength_nm,
+        vh_effective_population(d_ts, d_rs, wavelength_nm=wavelength_nm,
                                 n_solvent=n_solvent, temperature_K=temperature_K,
-                                viscosity_Pa_s=viscosity_Pa_s),
+                                viscosity_Pa_s=viscosity_Pa_s, weights=w),
         noise_level=vh_noise_level, label=f'{label} VH',
         seed=(None if seed is None else seed + 500_000), **common)
+    poly = d_ts.size > 1
     return DDLSSet(vv=vv, vh=vh, shape=shape, dims_nm=dims,
-                   d_t_m2_s=d_t, d_r_rad2_s=d_r, axial_ratio=p, rh_t_nm=rh_t_nm)
+                   d_t_m2_s=d_t, d_r_rad2_s=d_r, axial_ratio=p, rh_t_nm=rh_t_nm,
+                   size_spread_cv=float(size_spread_cv),
+                   d_t_components_m2_s=(tuple(float(x) for x in d_ts) if poly else ()),
+                   d_r_components_rad2_s=(tuple(float(x) for x in d_rs) if poly else ()),
+                   component_weights=(tuple(float(x) for x in w) if poly else ()))
+
+
+DDLS_SHAPES = ('rod', 'ellipsoid', 'sphere')
+
+
+def _shape_diffusion(shape: str, x_nm: float, y_nm: float,
+                     temperature_K: float, viscosity_Pa_s: float):
+    """(D_t, D_r, axial_ratio) for one body of the named shape, dimensions in nm.
+
+    The one place the three shape models are dispatched, so the monodisperse and the
+    polydisperse paths cannot drift apart -- a polydisperse set is this function called
+    once per scale factor, not a second transcription of the same three branches.
+    """
+    if shape == 'rod':
+        d_t, d_r, p, _nu, _dp = rod_diffusion(
+            x_nm * 1e-9, y_nm * 1e-9, temperature_K, viscosity_Pa_s)
+    elif shape == 'ellipsoid':
+        d_t, d_r, p = ellipsoid_diffusion(
+            x_nm * 1e-9, y_nm * 1e-9, temperature_K, viscosity_Pa_s)
+    elif shape == 'sphere':
+        d_t, d_r, p = sphere_diffusion(x_nm * 1e-9, temperature_K, viscosity_Pa_s)
+    else:
+        raise ValueError(
+            f"shape must be one of {DDLS_SHAPES}; got {shape!r}.")
+    return d_t, d_r, p
 
 
 def build_ddls_set(*, shape: str, dims_nm: Tuple[float, float],
@@ -1623,35 +2163,95 @@ def build_ddls_set(*, shape: str, dims_nm: Tuple[float, float],
                    temperature_K: float, viscosity_Pa_s: float, beta: float = 0.9,
                    vh_noise_level: float = 0.02, n_points: int = 200,
                    seed: Optional[int] = None, label: str = 'DDLS',
-                   concentration_g_per_mL: float = 0.0) -> DDLSSet:
-    """Build a paired VV/VH multi-angle correlogram set for a rod or an ellipsoid.
+                   concentration_g_per_mL: float = 0.0,
+                   size_spread_cv: float = 0.0, n_size_grid: int = 25) -> DDLSSet:
+    """Build a paired VV/VH multi-angle correlogram set for a rod, ellipsoid or sphere.
 
-    ``dims_nm`` is (L, d) for ``shape='rod'`` (Tirado) or (a, b) for
-    ``shape='ellipsoid'`` (Perrin). The VV set is generated clean (it is the D_t ground
-    truth); the VH set carries the rotational term and the (weak-signal) ``vh_noise_level``.
+    ``dims_nm`` is (L, d) for ``shape='rod'`` (Tirado), (a, b) for
+    ``shape='ellipsoid'`` (Perrin), or (R, R) for ``shape='sphere'`` -- a sphere has one
+    dimension, and the two entries must be EQUAL rather than the second being quietly
+    ignored, because a body with two different semi-axes is an ellipsoid and that is the
+    shape to ask for. The VV set is generated clean (it is the D_t ground truth); the VH
+    set carries the rotational term and the (weak-signal) ``vh_noise_level``.
 
     This is the STRICT builder: the dimensions go through ``rod_diffusion`` /
-    ``ellipsoid_diffusion``, so the rod's Tirado-fitted 2 < p < 30 range still raises
-    here and the (D_t, D_r) handed on is by construction a real rigid body's. For a set
-    built from rates no rod or ellipsoid produces, call
+    ``ellipsoid_diffusion`` / ``sphere_diffusion``, so the rod's Tirado-fitted
+    2 < p < 30 range still raises here and the (D_t, D_r) handed on is by construction a
+    real rigid body's. For a set built from rates no rigid body produces, call
     ``build_ddls_set_from_diffusion`` and own the physics yourself.
+
+    POLYDISPERSITY (``size_spread_cv``). Non-zero spreads the
+    body's dimensions log-normally about ``dims_nm`` at FIXED shape -- a polydisperse
+    rod is a distribution of lengths at one axial ratio, not a distribution of shapes --
+    and evaluates the shape model at each scale, so every component carries its own
+    exact (D_t, D_r). That matters: D_t goes as 1/R and D_r as 1/R^3, so no single
+    spread of one effective radius reproduces the pair, which is why the knob lives here
+    (where the geometry is known) and not on the rates-first builder. ``n_size_grid``
+    sets the discretization; the grid spans +/-3 sigma_ln, as the correlogram kernel's
+    own polydisperse populations do.
     """
+    return _ddls_set_for_shape(
+        shape=shape, dims_nm=dims_nm, angles_deg=angles_deg, wavelength_nm=wavelength_nm,
+        n_solvent=n_solvent, temperature_K=temperature_K, viscosity_Pa_s=viscosity_Pa_s,
+        beta=beta, vh_noise_level=vh_noise_level, n_points=n_points, seed=seed,
+        label=label, concentration_g_per_mL=concentration_g_per_mL,
+        size_spread_cv=size_spread_cv, n_size_grid=n_size_grid, baseline=0.0)
+
+
+def _ddls_set_for_shape(*, shape, dims_nm, angles_deg, wavelength_nm, n_solvent,
+                        temperature_K, viscosity_Pa_s, beta, vh_noise_level, n_points,
+                        seed, label, concentration_g_per_mL, size_spread_cv, n_size_grid,
+                        baseline: float) -> DDLSSet:
+    """`build_ddls_set`'s body, with the flat offset the rates-first builder plants.
+
+    Private so the strict builder keeps its exact signature
+    (`test_the_strict_builders_kept_their_exact_signature`) while the Depolarized artifact
+    can still carry the generator's Baseline offset: the offset is applied by
+    `build_ddls_set_from_diffusion`, the one place a DDLS set's correlograms are built,
+    after the strict shape checks here have run."""
     x_nm, y_nm = float(dims_nm[0]), float(dims_nm[1])
-    if shape == 'rod':
-        d_t, d_r, p, _nu, _dp = rod_diffusion(
-            x_nm * 1e-9, y_nm * 1e-9, temperature_K, viscosity_Pa_s)
-    elif shape == 'ellipsoid':
-        d_t, d_r, p = ellipsoid_diffusion(
-            x_nm * 1e-9, y_nm * 1e-9, temperature_K, viscosity_Pa_s)
+    if shape == 'sphere' and x_nm != y_nm:
+        raise ValueError(
+            f"a sphere has ONE dimension: pass dims_nm=(R, R); got "
+            f"({x_nm!r}, {y_nm!r}). Two different semi-axes is an ellipsoid -- use "
+            f"shape='ellipsoid'.")
+    if not (math.isfinite(size_spread_cv) and size_spread_cv >= 0):
+        raise ValueError(
+            f"size_spread_cv must be a finite number >= 0, got {size_spread_cv!r}.")
+    # Refused, not clamped, and refused for the SPREAD as a whole rather than for the
+    # array index that happens to break first. The grid spans +/-3 sigma_ln, so a
+    # two-point grid is nothing but its own tails and a one-point grid is only the LOWER
+    # tail -- `np.geomspace(lo, hi, 1)` returns `[lo]`, which made a 40 nm sphere at
+    # CV 0.3 report D_t 2.4x its monodisperse value while `component_weights` still said
+    # monodisperse. Below three points there is no interior point to be a median of.
+    if size_spread_cv > 0 and n_size_grid < 3:
+        raise ValueError(
+            f"n_size_grid must be at least 3 to represent a spread (the grid spans "
+            f"+/-3 sigma_ln, so fewer points are its tails and nothing else); got "
+            f"{n_size_grid!r} with size_spread_cv={size_spread_cv!r}.")
+    if size_spread_cv == 0:
+        d_t, d_r, p = _shape_diffusion(shape, x_nm, y_nm,
+                                       temperature_K, viscosity_Pa_s)
+        rates_t, rates_r, weights = d_t, d_r, None
     else:
-        raise ValueError(f"shape must be 'rod' or 'ellipsoid'; got {shape!r}.")
+        scales, weights = _lognormal_scale_grid(size_spread_cv, n_size_grid)
+        # Every scale goes through the SAME shape model, so the axial ratio is one
+        # number for the whole distribution and the rod validity range is checked at
+        # every component (the smallest and largest included) rather than at the median
+        # alone -- the guard has to cover the bodies actually generated.
+        pairs = [_shape_diffusion(shape, x_nm * f, y_nm * f,
+                                  temperature_K, viscosity_Pa_s) for f in scales]
+        rates_t = [q[0] for q in pairs]
+        rates_r = [q[1] for q in pairs]
+        p = pairs[len(pairs) // 2][2]
     return build_ddls_set_from_diffusion(
-        d_t, d_r, angles_deg=angles_deg, wavelength_nm=wavelength_nm,
+        rates_t, rates_r, angles_deg=angles_deg, wavelength_nm=wavelength_nm,
         n_solvent=n_solvent, temperature_K=temperature_K,
         viscosity_Pa_s=viscosity_Pa_s, beta=beta, vh_noise_level=vh_noise_level,
         n_points=n_points, seed=seed, label=label,
         shape=shape, dims_nm=(x_nm, y_nm), axial_ratio=p,
-        concentration_g_per_mL=concentration_g_per_mL)
+        concentration_g_per_mL=concentration_g_per_mL,
+        weights=weights, size_spread_cv=size_spread_cv, baseline=baseline)
 
 
 @dataclass
@@ -1668,14 +2268,18 @@ def build_depolarized(*, rho_v: float, shape: str, dims_nm: Tuple[float, float],
                       vh_noise_level: float = 0.02, n_points: int = 200,
                       i_vv_ref: float = DEFAULT_CALIBRANT_INTENSITY,
                       seed: Optional[int] = None, label: str = 'DDLS',
-                      concentration_g_per_mL: float = 0.0) -> DepolarizedArtifact:
-    """Compose the static pair + the dynamic DDLS set into one artifact."""
+                      concentration_g_per_mL: float = 0.0,
+                      baseline: float = 0.0) -> DepolarizedArtifact:
+    """Compose the static pair + the dynamic DDLS set into one artifact. `baseline` is a
+    flat offset planted on both the VV and the VH correlograms (the generator's Baseline
+    offset field), through the rates-first builder; 0 is the textbook set."""
     pair = build_depolarized_pair(rho_v=rho_v, i_vv_ref=i_vv_ref)
-    ddls = build_ddls_set(
+    ddls = _ddls_set_for_shape(
         shape=shape, dims_nm=dims_nm, angles_deg=angles_deg, wavelength_nm=wavelength_nm,
         n_solvent=n_solvent, temperature_K=temperature_K, viscosity_Pa_s=viscosity_Pa_s,
         beta=beta, vh_noise_level=vh_noise_level, n_points=n_points, seed=seed, label=label,
-        concentration_g_per_mL=concentration_g_per_mL)
+        concentration_g_per_mL=concentration_g_per_mL, size_spread_cv=0.0,
+        n_size_grid=25, baseline=baseline)
     return DepolarizedArtifact(pair=pair, ddls=ddls)
 
 
@@ -1762,7 +2366,7 @@ def write_alv_asc(path: str, dls: MultiAngleDLS, *,
           f'Refractive Index:\t{dls.n_solvent:.5f}',
           f'Wavelength [nm] :\t{dls.wavelength_nm:.5f}']
     L += [f'Angle({i})[deg]     :\t{a:.5f}' for i, a in enumerate(angles, 1)]
-    L += ['Duration [s]    :\t60.0', 'Runs            :\t1',
+    L += [f'Duration [s]    :\t{float(dls.run_duration_s)}', 'Runs            :\t1',
           'Mode            :\t"synthetic"']
     L += [f'MeanCR{i} [kHz]   :\t{dls.mean_cr_kHz[a]:.5f}' for i, a in enumerate(angles, 1)]
     L += [f'DC[{i}][kHz]      :\t0.00000' for i in range(1, len(angles) + 1)]
@@ -1882,6 +2486,272 @@ def write_trace_csv(path: str, trace: SyntheticTrace, *, count_rate_unit: str = 
     return path
 
 
+
+def write_kww_csv(path: str, kww: SyntheticKWW, *, delay_unit: str = 's') -> str:
+    """Write a :class:`SyntheticKWW` as the generic parser's two-column CSV.
+
+    A THIN ADAPTER over :func:`analysis.utilities.export_synthetic_correlogram_csv`, not a
+    second copy of it. Two facts make that the right shape:
+
+    * that function already accepts a KWW result **at runtime** -- its body reads only
+      ``delay_times_s`` and ``signal``, both of which :class:`SyntheticKWW` has -- so the
+      only thing missing was a contract saying so, and duplicating the write loop to add
+      one would put two spellings of the same format in the tree;
+    * it cannot say so itself. ``analysis/utilities.py`` is imported BY this module and
+      imports nothing from it, so annotating its parameter with ``SyntheticKWW`` would
+      invert the layering. The adapter lives here, where every other ``write_*`` lives and
+      where both classes are already in scope.
+
+    Why a KWW set needs this at all: :class:`SyntheticKWW` is deliberately not a
+    :class:`~analysis.utilities.SyntheticCorrelogramResult` (a stretched exponential is a
+    continuous relaxation-time spectrum with no discrete population list), so
+    :func:`write_alv_asc` cannot take one either -- and that one is not adaptable, because
+    it needs angles, count-rate traces and per-angle mean count rates a single correlogram
+    does not have.
+
+    Load the result with ``GenericDLSParser``, setting ``delay_time_unit`` to match
+    ``delay_unit`` and ``data_form`` to ``'g2m1'``.
+    """
+    from analysis.utilities import export_synthetic_correlogram_csv
+
+    return export_synthetic_correlogram_csv(kww, path, delay_unit=delay_unit)
+
+
+# ---------------------------------------------------------------------------
+# Brookhaven raw ASCII .dat (the writer axis: internal model -> vendor file)
+# ---------------------------------------------------------------------------
+# This writer sits beside its four siblings above rather than in `parsers/`: that layer
+# is declared as the one translating a native file INTO the common model (architecture
+# invariant 2), and what keeps a writer honest is the round trip driving the REAL
+# parser, not adjacency.
+
+# Ten significant figures: one before the point, nine after ('%.9e'). Half a unit in the
+# last place is 5e-10 relative, and the recovered correlogram divides one quantized
+# number (the contents) by another (the baseline), so its budget is twice that. This is
+# the tolerance the round-trip test states -- the format's, not a tuned one.
+BROOKHAVEN_DAT_SIG_FIGS = 10
+BROOKHAVEN_DAT_RELATIVE_QUANTUM = 1.0e-9
+
+# Header positions this writer fills, by the manual's 1-based numbering (Appendix A,
+# "Raw Data File Formats"). Named here rather than imported from the parser: the writer
+# and the parser are meant to be independent transcriptions of one published layout, so
+# that a round trip is a check on both rather than a tautology on one shared constant.
+_DAT_N_PARAMS_LESS_ONE = 36          # item 17; header is this + 1 lines
+_DAT_DELAY_MODE = -2                 # item 19, constant-ratio spacing (written bare)
+_DAT_ANALYSIS_MODE = 2               # item 20, autocorrelation
+_DAT_TRAILER_LINES = 4               # Sample ID, Operator ID, Date, Time
+_DAT_BASELINE_MODE_CODE = {'prompt': 0, 'calculated': 1, 'measured': 2}
+
+
+def _fmt_dat_scalar(value: float) -> str:
+    """One header or data value in the vendor's '%.9e' form with a 3-digit exponent.
+
+    Three digits ('1.000000000e+000') is what the real exports carry; Python's own '%e'
+    emits two. The parser reads with ``float()`` and does not care, so this is
+    faithfulness to the vendor's shape rather than a requirement.
+    """
+    text = f'{float(value):.9e}'
+    mantissa, _, exponent = text.partition('e')
+    sign, digits = exponent[0], exponent[1:]
+    return f'{mantissa}e{sign}{int(digits):03d}'
+
+
+#: The run duration a synthetic file states when its draw names none -- a TYPICAL DLS
+#: acquisition (owner, 2026-09-12). Consumed by `write_brookhaven_dat`, whose format
+#: cannot express "no duration": items 4 and 25 are always written, and since 2026-09-12
+#: the parser reads them as Eq. (9)'s T. `build_multi_angle_dls` already defaults its own
+#: `run_duration_s` to the same 60 s.
+_DEFAULT_SYNTHETIC_RUN_S = 60.0
+
+
+def write_brookhaven_dat(path: str, corr: SyntheticCorrelogramResult, *,
+                         baseline: float = 2.0e7,
+                         baseline_mode: str = 'calculated',
+                         viscosity_cp: Optional[float] = None,
+                         n_samples: Optional[float] = None,
+                         sampling_time_us: float = 5.0,
+                         first_channel_used: int = 1,
+                         n_baseline_channels: int = 6,
+                         sample_label: str = 'synthetic',
+                         operator: str = 'DLS Buddy',
+                         acquired_date: str = '01/01/26',
+                         acquired_time: str = '00:00:00') -> str:
+    """Write a generated correlogram as a Brookhaven raw ASCII ``.dat`` export.
+
+    The inverse of ``parsers/brookhaven_dat.py``'s normalization: that parser recovers
+    ``C(tau) = contents(tau)/B - 1`` from raw correlator counts, so this writes
+    ``contents = B * (1 + C)`` with ``B = baseline``. The point of having it is that the
+    ``.dat``'s numerics were pinned only against whichever real file happened to stay
+    committed -- a genuine numeric transform on the way to a result, with nothing
+    asserting that it inverts, and one ``git rm`` from being pinned against nothing.
+
+    ``corr`` must be in ``'g2m1'`` form. The other two forms are refused rather than
+    converted: a ``'g2'`` column differs by exactly the 1 this format's normalization
+    removes, so writing one would produce a file whose recovered correlogram is off by
+    unity with nothing to say so, and ``'g1'`` is not an intensity correlation at all.
+
+    ``baseline_mode`` sets header item 8 -- what the acquiring software intended.
+    ``'calculated'`` and ``'measured'`` name one and the parser honours it; ``'prompt'``
+    (code 0, what both real exports carry) leaves the choice to the application default,
+    which is the case worth being able to generate.
+
+    BOTH baselines are written and both are honest. Item 22, the calculated baseline, is
+    ``baseline``, and the total counts are chosen so the manual's identity
+    ``A * B / n_samples`` reproduces it. Item 23, the measured baseline, is the actual
+    mean of the last ``n_baseline_channels`` written channels, computed from the ROUNDED
+    counts so the file is self-consistent at its own precision -- so a reader that
+    re-derives either baseline from the data gets the header value back, and
+    ``set_baseline_choice('measured')`` returns the affine transform the parser's
+    docstring describes rather than an arbitrary second number.
+
+    Header slots this parser does not read are written as ``0.0``, and so is ONE it does:
+    item 15, the particle refractive index, which ``parsers/brookhaven_dat.py`` reads onto
+    the preview as ``solute_refractive_index_from_file`` and deliberately does not
+    propagate (invariant 3 keeps a solute index hand-entered). A generated file therefore
+    parses back with that field at 0.0 rather than at a real index, which is honest --
+    the generator has no solute index to state -- but it is a READING, not an absent
+    value, so do not treat a parsed 0.0 there as "the file said nothing". Everything else
+    written as ``0.0`` is a slot the parser never looks at, and that half is the sheet's
+    scope line: a writer emits what its parser reads, and inventing plausible values for
+    fields whose meaning we have not established would be a fabrication dressed as
+    fidelity.
+
+    ``viscosity_cp`` defaults to the correlogram's own ``viscosity_Pa_s`` in centipoise,
+    so the written file describes the medium the data was generated in.
+
+    ``n_samples`` DEFAULTS FROM THE DRAW. Items
+    4 and 25 are the run duration this format states -- ``n_samples * sampling_time_us`` --
+    and since 2026-09-12 the parser reads them onto the measurement as Eq. (9)'s ``T``.
+    A fixed default was harmless while nothing read them and a fabrication the moment
+    something did: it implied a 54-minute acquisition whatever the draw actually was, so a
+    correlogram drawn with ``duration_s=60`` round-tripped back claiming 3250 s. Left at
+    ``None`` the count is derived from ``corr.duration_s``; a draw that states none takes
+    ``_DEFAULT_SYNTHETIC_RUN_S``, a typical DLS run rather than a long one (owner,
+    2026-09-12: a typical measurement is never half an hour). Passing a count explicitly
+    still works and is not second-guessed.
+
+    A default that does not cover the drawn lag axis is NOT refused here, because the
+    reader already owns that boundary: a header disagreeing with its own data is exactly
+    what ``base_parser.carried_run_duration`` withholds ``T`` for, with a note. A second
+    predicate policing the same edge is the gap rule 12 says to remove, not to double.
+    """
+    if corr.output_form != 'g2m1':
+        raise ValueError(
+            f"write_brookhaven_dat needs a 'g2m1' correlogram -- the .dat's "
+            f"contents/B - 1 normalization IS g2-1, so any other form would be written "
+            f"as data it is not; got output_form={corr.output_form!r}.")
+    if not (math.isfinite(baseline) and baseline > 0):
+        raise ValueError(
+            f"baseline must be a positive finite number of counts (the parser divides "
+            f"by it); got {baseline!r}.")
+    if baseline_mode not in _DAT_BASELINE_MODE_CODE:
+        raise ValueError(
+            f"baseline_mode must be one of {tuple(_DAT_BASELINE_MODE_CODE)}, got "
+            f"{baseline_mode!r}.")
+    tau_us = np.asarray(corr.delay_times_s, dtype=float) * 1.0e6
+    n_channels = int(tau_us.size)
+    if not (1 <= n_baseline_channels <= n_channels):
+        raise ValueError(
+            f"n_baseline_channels must be between 1 and the channel count "
+            f"({n_channels}); got {n_baseline_channels!r}.")
+    counts = baseline * (1.0 + np.asarray(corr.signal, dtype=float))
+
+    # The measured baseline is the mean of the channels it names, read back at the
+    # precision the file stores -- so re-deriving it from the written rows reproduces
+    # the written header value instead of missing it by a rounding.
+    written_counts = [_fmt_dat_scalar(c) for c in counts]
+    tail = [float(x) for x in written_counts[n_channels - n_baseline_channels:]]
+    baseline_measured = float(np.mean(tail))
+    # Items 4 and 25 ARE the run duration this format states, so they come from the draw
+    # rather than from a constant -- see the docstring.
+    if n_samples is None:
+        drawn = getattr(corr, 'duration_s', None)
+        duration_s = float(drawn) if drawn else _DEFAULT_SYNTHETIC_RUN_S
+        n_samples = duration_s / (float(sampling_time_us) * 1.0e-6)
+    # A * B / n_samples must reproduce the calculated baseline (the manual's identity).
+    total_counts = math.sqrt(float(baseline) * float(n_samples))
+
+    visc = (viscosity_cp if viscosity_cp is not None
+            else float(corr.viscosity_Pa_s) * 1.0e3)
+
+    header = {
+        1: 1.0,
+        2: total_counts, 3: total_counts, 4: float(n_samples),
+        6: float(tau_us[0]), 7: float(n_channels),
+        8: float(_DAT_BASELINE_MODE_CODE[baseline_mode]),
+        9: float(corr.angle_deg), 10: float(corr.wavelength_nm),
+        11: float(corr.temperature_K), 12: float(visc),
+        14: float(corr.solvent_refractive_index),
+        17: float(_DAT_N_PARAMS_LESS_ONE), 18: float(first_channel_used),
+        20: float(_DAT_ANALYSIS_MODE),
+        22: float(baseline), 23: baseline_measured,
+        24: float(tau_us[-1]), 25: float(sampling_time_us),
+        35: float(n_channels - n_baseline_channels + 1), 36: float(n_channels),
+    }
+    lines = []
+    for item in range(1, _DAT_N_PARAMS_LESS_ONE + 2):
+        if item == 19:
+            lines.append(str(_DAT_DELAY_MODE))       # item 19 is a bare int
+        else:
+            lines.append(_fmt_dat_scalar(header.get(item, 0.0)))
+    for t_us, count_text in zip(tau_us, written_counts, strict=True):
+        lines.append(f'{_fmt_dat_scalar(t_us)}, {count_text}')
+    lines.extend([sample_label, operator, acquired_date, acquired_time])
+    assert len(lines) == _DAT_N_PARAMS_LESS_ONE + 1 + n_channels + _DAT_TRAILER_LINES
+
+    with open(path, 'w', encoding='latin-1', newline='\r\n') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    return path
+
+
+def write_depolarized_pair_csv(path: str, pair: DepolarizedPair) -> str:
+    """Write a static VV/VH intensity pair as the corpus's two-line stand-in file.
+
+        VV,<I_VV>
+        VH,<I_VH>
+
+    DPLS has no instrument file format -- the BI-200SM is VU, with no analyzer -- so
+    there is nothing to be byte-faithful TO. This two-line shape is the convention the
+    committed corpus already uses for its two adversarial pairs
+    (``Synthetic/Stress/2 - Unphysical/dpls-*.csv``), and writing it from the generator
+    is what gives the static Cabannes path an end-to-end synthetic case built from known
+    truth rather than only from hand-typed pathologies: the static builder returns
+    NUMBERS, and numbers are not a loadable file.
+
+    Full precision, deliberately: the pair's whole content is a RATIO, so rounding the
+    two intensities for display would move rho_v and make the file disagree with the
+    ground truth it was written from. Nothing about this format is a vendor's, so there
+    is no fixed-decimal convention to honour.
+    """
+    with open(path, 'w', encoding='utf-8', newline='\n') as fh:
+        fh.write(f'VV,{pair.i_vv!r}\nVH,{pair.i_vh!r}\n')
+    return path
+
+
+def read_depolarized_pair_csv(path: str) -> Tuple[float, float]:
+    """Read back a ``write_depolarized_pair_csv`` file as ``(I_VV, I_VH)``.
+
+    The inverse lives beside the writer for the same reason a vendor-file writer belongs
+    beside its parser: a reader that drifts from its writer is the failure mode to design
+    against, and there is no ``parsers/`` module to put this one in -- the format is the
+    corpus's own stand-in, not an instrument's.
+    Order-insensitive and case-insensitive on the row labels; anything else in the file
+    is ignored, which is what makes it usable on the hand-typed stress pairs too.
+    """
+    vals: Dict[str, float] = {}
+    with open(path, encoding='utf-8') as fh:
+        for line in fh:
+            if ',' in line:
+                k, v = line.strip().split(',', 1)
+                vals[k.strip().upper()] = float(v)
+    missing = {'VV', 'VH'} - set(vals)
+    if missing:
+        raise ValueError(
+            f"{path}: a depolarized pair file needs a VV and a VH row; missing "
+            f"{sorted(missing)}.")
+    return vals['VV'], vals['VH']
+
+
 # ===========================================================================
 # Full-dataset orchestrator (writes a whole test-data/Synthetic * folder)
 # ===========================================================================
@@ -1975,29 +2845,43 @@ def write_parameters_txt(out_dir: str, profile_name: str,
                          series: Optional[Dict[str, dict]] = None) -> str:
     """Write the human-readable parameters.txt (what to enter + ground truth)."""
     import os
+    from physics import solvents as solvent_lib
     series = series or DEFAULT_SERIES
     messy = 'Messy' in profile_name
     cal = CalibrationSpec()
+    # The text follows the Quickstart's path through the Data tab (its reader picks the
+    # solvent and accepts what the program proposes), so the proposed values are the
+    # library's at the set's wavelength and temperature, printed as the program shows
+    # them, beside the round values the set was generated with. The committed Clean file
+    # is pinned byte-for-byte to this writer (tests/test_synthetic_generator.py).
+    n_water = solvent_lib.refractive_index_solvent('water', DEFAULT_WAVELENGTH_NM, DEFAULT_TEMPERATURE_C)
+    eta_water_mpas = solvent_lib.viscosity_solvent('water', DEFAULT_TEMPERATURE_C) * 1e3
+    n_toluene = solvent_lib.refractive_index_solvent('toluene', DEFAULT_WAVELENGTH_NM, DEFAULT_TEMPERATURE_C)
     lines = [
         f'DLS Buddy — {profile_name} test data', '=' * 50, '',
         'System: PEG in water, calibrated against a toluene standard.', '',
-        'GLOBAL PARAMETERS (enter these at the Data-tab confirmation step):',
-        '  Solvent                 : water',
-        f'  Solvent refractive index: {DEFAULT_N_SOLVENT}',
-        f'  Viscosity               : {DEFAULT_VISCOSITY_CP} cP   (= {DEFAULT_VISCOSITY_PA_S:g} Pa.s)',
+        'GLOBAL PARAMETERS (the Data-tab confirmation step; the Quickstart Guide walks through it):',
+        '  Solvent                 : water   (pick it from the Solvent name dropdown, under',
+        '                                     "Measured properties")',
+        f'  Solvent refractive index: {n_water:.4f}  (proposed by the program when you pick water;',
+        f'                                     the set was generated with {DEFAULT_N_SOLVENT} -- either is fine)',
+        f'  Viscosity               : {eta_water_mpas:.3f} mPa.s (proposed likewise; generated with {DEFAULT_VISCOSITY_CP} cP)',
         f'  Temperature             : {DEFAULT_TEMPERATURE_C} C  ({DEFAULT_TEMPERATURE_K} K)',
         f'  Wavelength              : {DEFAULT_WAVELENGTH_NM:g} nm',
         f'  dn/dc                   : {DEFAULT_DN_DC} mL/g', '',
         'SLS CALIBRATION (enter in the SLS tab calibration panel):',
         f'  Standard                : toluene   (geometry {cal.geometry})',
-        f'  Standard refractive index: {cal.n_standard}',
+        f'  Standard refractive index: {n_toluene:.5f}   (the program proposes this from its solvent',
+        f'                                        library at {DEFAULT_WAVELENGTH_NM:g} nm / {DEFAULT_TEMPERATURE_C:g} C -- accept it)',
         f'  Calibrant intensity     : {cal.calibrant_intensity:g}  at 90 deg',
         '  Dark count rate         : 0',
         f'  (the program then computes k_c = {cal.k_c():.4e})', '',
         'Notes:',
         '  - DLS files are ALV .ASC: all angles + a count-rate trace are in one file.',
-        '    Enter polymer name, solvent (water), and the concentration (in the file',
-        '    name) for each. Temperature/viscosity/n/wavelength are read from the file.',
+        '    Enter the polymer name and pick the solvent (water); temperature and',
+        '    wavelength are read from the file, and picking the solvent proposes n and',
+        '    the viscosity from the library. The concentration (in the file name) is',
+        '    optional for a cumulant fit; enter it for the D-vs-c series.',
         '  - SLS Zimm files are Brookhaven .csv (a full Zimm set: solvent reference at',
         '    c=0 plus 5 concentrations x 12 angles). Enter polymer name + temperature.',
         "  - The SLS Guinier file is the SAME data in Brookhaven's other .csv layout:",

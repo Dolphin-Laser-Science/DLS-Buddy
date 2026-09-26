@@ -152,7 +152,7 @@ _NOTE_OVERLAP = (
     "reports the lag at each of its block boundaries twice, once from each neighbouring "
     "block; the value kept at each repeat is the first -- the finer block's estimate -- "
     "as the multi-tau scheme prescribes (Magatti and Ferri 2001, Eq. 11). Keeping the "
-    "other one instead was measured to move the z-average size by 0.02 % and the "
+    "other one instead was measured to move the cumulant size by 0.02 % and the "
     "recovered size distribution's peak not at all, against 0.5-17 % for ordinary "
     "analysis choices on the same file."
 )

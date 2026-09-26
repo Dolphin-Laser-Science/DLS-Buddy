@@ -11,6 +11,161 @@ window title.
 
 ---
 
+## 1.21.0 — Sourced noise weights for every DLS fit, the single-angle ladder, and rewritten guides (2026-09-25)
+
+> **Important.** DLS numbers move in this release — re-run a stored analysis rather than
+> compare across versions. Distribution and mode-resolved results move under the new
+> default residual weight, and nonlinear cumulant results under theirs (typically a couple
+> of per cent in size; most on long correlograms whose file states no sampling times;
+> order-3 fits by more). An L-curve result from an earlier version cannot be reproduced
+> bit for bit. To reproduce an earlier distribution, set **Residual weighting** to
+> *g₁² (older form)* and, for a GCV result, **GCV robustness γ** to 1. The earlier nonlinear
+> cumulant weight is not kept.
+
+### DLS — how the fits weigh the data
+
+- **Distribution fits (CONTIN, NNLS, lognormal) weight by a sourced variance.** The default
+  residual weight is *g*₁²/σ², with the per-channel variance σ² of Biganzoli and Ferri (2018)
+  evaluated on a first-pass fit. A fit takes about twice as long. A committed mean count rate
+  is recommended, never required; without one the fit uses the infinite-count-rate limit
+  and says so. The older weight stays selectable per run (**DLS ▸ Distribution ▸ Residual
+  weighting**, seeded from Settings), and every export names the weight that built it.
+- **CONTIN's default α selector is robust GCV** (Lukas, γ = 0.1), built for the correlated
+  noise between correlogram channels, where classical GCV tends to under-smooth. A **GCV
+  robustness γ** control sets it per run; γ = 1 is classical GCV. On a noisy sample expected
+  to be multimodal, compare against γ = 1: robust GCV can merge two modes classical GCV
+  separates.
+- **The L-curve is rebuilt on Hansen's method**: residual against the distribution's norm,
+  corner found by adaptive pruning. Widening the α range no longer merges two separated
+  populations. New notes cover a sweep with no corner or a single point, drawn with the same
+  halo on the α-sweep panel as the floor and ceiling cautions; an inverted α range is refused.
+- **GCV and the F-test read their degrees of freedom from one decomposition**, exact to
+  rounding and several times faster. The F-test gains the two checks CONTIN's manual
+  prescribes, each shown as a reliability note.
+- **The nonlinear cumulant weights by the same sourced variance**, evaluated on a first-pass
+  single exponential (Koppel 1972), with the photon-counting terms when a count rate is
+  committed. A Brookhaven `.dat` supplies its correlator's own per-section sampling times;
+  other formats use a stand-in read off the delay axis, and the result records which. Every
+  cumulant the program fits — the DLS tab, Γ vs q², D vs c, replicate averaging, DDLS and
+  the Cross-Sample candidates — uses the same weight and count rate for a run.
+- **New: an unweighted cumulant**, under **Settings ▸ Cumulant residual weighting**, for
+  comparison with fits made without a noise model. It is not the more accurate answer.
+- **The floating baseline is bounded to the data's own scale** rather than a fixed ±0.05, so
+  low-amplitude correlograms can move (on the worked reline case, *R*<sub>h</sub> by 16 %).
+
+### DLS — cumulant order, moments and flags
+
+- **New: cumulant order 4**, with **µ₃** and **µ₄** rows in the results and the export
+  (*unmeasured* below the order that fits them, never 0). They are diagnostics for comparing
+  fits of one sample, not a skewness and kurtosis; read µ₄ from the nonlinear method only.
+  Order 4 is for broad samples; order 2 stays the default, and the order control's help says
+  why order 3 is not recommended.
+- **Fixed: an order-3 third moment could be just its starting value.** It now fits;
+  order-3 sizes move, some by a lot. Order 2 is unaffected by this fix.
+- **New setting: Cumulant fit cutoff** (*Settings ▸ DLS Analysis Defaults*), default 0.1.
+  ISO 22412 prescribes 0.01. A lower cutoff lowers the PDI and can unflag a run whose size has
+  moved further from the truth. The linear cumulant now fits the contiguous stretch above the
+  cutoff, which moves a few runs with a large residual offset slightly.
+- **A correlogram with no decay gets no size.** The cumulant returns a blank, flagged size
+  naming why; Γ vs q² and D vs c drop that point and name it.
+- **Every fit drops dead channels** (g₂ = 0) through one shared rule and counts them in a note,
+  and the "did not finish decaying" check reads only the fitted channels.
+- **Passive notes (ⓘ)** when µ₂ or µ₄ rests on its bound, when the floating baseline rests on
+  its limit, and when channels recorded nothing. Notes never change the reliability flag, and
+  they now sit on the cell they concern, in the Summary table and the saved session.
+
+### DLS — delay window, baseline and the tab
+
+- **The baseline region applies to every method** on the Correlogram sub-tab (the exponentials,
+  KWW and both cumulants), with a **baseline** row and export note. **The delay window and
+  baseline apply only once you move them**: until then each run is fitted over its own full
+  lag range, and the Distribution sub-tab uses the fit's own baseline estimate. A baseline
+  region outside the delay window is ignored by every method.
+- **Background fits can use the tab's region.** Γ vs q², D vs c, the Mode Map, DDLS and
+  **Average derived results…** gain a **Use the Correlogram tab's delay window and baseline**
+  box, and every fit without an order control of its own runs at the Settings cumulant order.
+- **Results tables are one row per run** with the plot swatch beside the name; details for the
+  selected run sit in a panel below, and ⚠ sits on the unreliable cell.
+- **Fits to show** draws any fit already run over the correlogram — all seven methods,
+  distributions included — and marks a fit whose inputs changed *(stale)*.
+- **Plots**: color and marker are the measurement, line style is the method, on both plot
+  sub-tabs and their residual panels. The on-screen legend is a compact key; **Save** writes
+  the full legend into the file.
+- **DLS Summary**: **Show fit details** expands each method to every quantity it produced, and
+  these are now saved with the session.
+- **The Distribution sub-tab keeps each fit** across tick changes, as the Correlogram sub-tab does.
+- **Settings ▸ DLS Distribution Defaults** seeds the *R*<sub>h</sub> grid, α selection and range,
+  GCV γ and F-test level, and **Cumulant order** is back in Settings. The **Mode Map** gains its
+  own **Inversion Settings** with **Copy from the Distribution tab**.
+- **Changing a setting a fit reads clears what depends on it, after asking** — Skip initial lag
+  channels now clears every DLS result (it used to clear the cumulant ones alone).
+- **DDLS and replicate averaging**: a run or angle that cannot be fitted, or decays at a rate at
+  or below zero, is left out and named instead of failing the set or skewing the mean; their
+  fits' notes are repeated once in the result. An averaged correlogram cannot be averaged again.
+
+### SLS & Cross-Sample
+
+- **New method: Single-angle *M*<sub>w</sub> + *A*₂ (ladder, apparent)** — the Debye plot at one
+  angle over the concentration series, with HC3 ± and the calibration-free 2*A*₂*M*<sub>w</sub>.
+  Its results are offered (never chosen for you) in the Cross-Sample source picker, one entry per
+  angle. The one-datum *Single-angle M*<sub>w</sub> *(apparent)* method is removed.
+- **New: SLS without a measured solvent blank**, after a confirmation, with an optional
+  **Solvent blank intensity at 90°** on the Data tab (scaled by 1/sin θ). Every result from such
+  a run is flagged unreliable, *R*<sub>g</sub> included, and is not offered to Cross-Sample.
+- **Derived Intensity**: a blank recorded only as a count-rate trace can be derived; same-angle
+  repeats more than 5 % from their mean are reported; re-deriving replaces only that fraction's
+  points; runs are named.
+- **The scaling CSV has a Source column**, and generic SLS files with a single angle load.
+
+### Data, names and exports
+
+- **Measurements are named, not numbered**: your **Label**, else the file name, with angle,
+  concentration and fraction beside it, everywhere a measurement appears, with a hover card.
+  Labeling several runs at once numbers them (`PVP-A 1` … `PVP-A 6`). An average reads
+  `avg of 6`; an unconfirmed sample reads *(unconfirmed sample)*.
+- **Exported files are named for their contents** (sample, analysis, method, measurement,
+  angle), and a single-measurement export carries a **Source file** column.
+- **Malvern Zetasizer**: add **Wavelength**, **Scattering Angle** and **Mean Count Rate** to the
+  export template and they arrive pre-filled. A column **renamed** in the Zetasizer software now
+  arrives blank; User-Manual §5.5 lists the template.
+- **The Mode Map export gains *Alpha*, *Alpha selection* and *GCV gamma* columns**; the columns
+  after them move three places right, so an import template that reads them by position needs
+  updating.
+
+### Utilities — Synthetic data
+
+- **Noise that looks like an instrument's**: a **Per-channel + shot noise** model driven by a
+  mean count rate, and a **Channel noise correlation** control, both off by default. The per-channel
+  models now draw the exact Biganzoli–Ferri variance, so **the same seed regenerates a different
+  per-channel set than before**.
+- **Baseline offset (g₂−1)** plants a flat offset on the correlogram and the VV/VH artifact;
+  **sphere** joins the VV/VH shapes; a multi-angle set's count rate follows the 1/sin θ law.
+
+### Layout and help
+
+- **Run and Export stay in view**: every control column puts **Run** under its settings and
+  **Export** at the foot. Fewer pop-ups — a fit that cannot run shows ⚠ in the panel — and each
+  **?** badge sits beside its title.
+
+### Fixes
+
+- An invalid CONTIN α range is refused at entry and reverted when a settings file holds one; a
+  mean count rate of zero is no longer accepted; a hand-edited `.dat` sampling time no longer
+  crashes the nonlinear cumulant; the Correlogram sub-tab's **Run** no longer scrolls out of view,
+  its delay axis is labeled once, and a repeated warning is explained once. Plus
+  **miscellaneous bug fixes and polish** across the DLS tab.
+
+### Documentation
+
+- **Quickstart Guide**: a tutorial on the PEG 300k example set that ships in
+  `test-data/Synthetic/Clean/`.
+- **User Manual**: one chapter per tab, with new Data and Settings chapters and new figures.
+- **Theory-and-Equations Guide**: rebuilt as one explanation in the order the physics is used,
+  with a notation table and thirteen new figures. Both guides were read page by page and the
+  statements that did not match the program were corrected.
+
+---
+
 ## 1.20.0 — Consolidated Feature List (2026-08-29)
 
 ### Static light scattering (SLS)
@@ -716,6 +871,13 @@ The analysis engine and application were built and validated module by module be
 
 ## Known issues / outstanding
 
+- **The DLS analysis region reaches a background path only when its box is ticked.** Γ vs
+  q², D vs c, the Mode Map, DDLS and replicate averaging fit each run on its own defaults
+  unless you tick **Use the Correlogram tab's delay window and baseline**, and the passive
+  Cross-Sample re-derivation of a single-angle *R*<sub>h</sub> never reads it (it offers the
+  Correlogram tab's own fit while that fit is current). So with the box unticked, a value you
+  placed a region for on the Correlogram tab and the value pooled, averaged or promoted for the
+  same run can still differ by that region — now visible beside the box rather than hidden.
 - **Ethanol's displayed viscosity uncertainty below ≈ −8 °C may be optimistic.** Two published reference correlations diverge toward the cold edge of ethanol's supported range, reaching ≈5 % against the displayed 3 % band at −20 °C; the comparison correlation is extrapolating below its own fitted data range there, so which side errs is unsettled. Affects the displayed uncertainty (and the suggested rounding of a proposed viscosity) only — no fitted result.
 - **DPLS/DDLS not yet tested on real depolarized data** — validated only against synthetic ground truth so far.
 - **Visual peak picker** in the DLS distribution view is planned (peaks are already offered as *R*<sub>h</sub> sources elsewhere, but not click-selectable in the plot).

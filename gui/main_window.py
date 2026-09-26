@@ -28,7 +28,6 @@ load -> confirm -> analyze loop run end to end through the controller.
 from __future__ import annotations
 
 import json
-import math
 import os
 from typing import Dict, Optional
 
@@ -36,6 +35,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from app.version import __version__
 from app.controller import Controller
+from core.naming import (UNCONFIRMED_SAMPLE, measurement_display_name,
+                         measurement_hover_card, sample_display_name)
 from core.workspace import _DLS_PARAM_KEYS, _SLS_PARAM_KEYS, seed_vendor_records
 from parsers.autodetect import autodetect
 from parsers.base_parser import (MalformedDataError, ParseError,
@@ -73,7 +74,8 @@ from gui.cross_module import CrossSampleModule
 from gui.utilities_module import UtilitiesModule
 from gui.settings_module import SettingsModule
 from gui.export_helper import (
-    export_to_csv, open_start_dir, remember_open_dir, trace_suggested_name)
+    EXPORT_STATUS_MS, export_to_csv, open_start_dir, remember_open_dir,
+    trace_suggested_name)
 from gui.help import install_tooltip_gate, set_tooltips_enabled, section_header
 from gui.theme import ThemedLabel, color as theme_color, retheme, is_dark
 from gui.widgets import (roomy_tabs, EmptyState, show_parse_notes,
@@ -94,6 +96,45 @@ class _WheelGuard(QtCore.QObject):
                 event.ignore()
                 return True
         return False
+
+
+# Object name of the scroll area each module tab rides in (`MainWindow._scrollable`).
+MODULE_SCROLL = 'module_scroll'
+
+
+class _MinimumHolder(QtWidgets.QWidget):
+    """Holds one module inside its tab's scroll area with NO layout of its own, so the
+    scroll area sizes the module from its minimum rather than its preferred height
+    (`MainWindow._scrollable` says why). Qt's scroll area asks the content's LAYOUT
+    whether it has height-for-width, so a layout here would pass the module's on.
+
+    The module fills the holder on every resize, and the holder reports the module's
+    own minimum and preferred sizes. A module whose size hint changes posts a layout
+    request to this holder, and `event` passes it on as the holder's own geometry
+    change."""
+
+    def __init__(self, module: QtWidgets.QWidget) -> None:
+        super().__init__()
+        self._module = module
+        module.setParent(self)
+
+    def minimumSizeHint(self) -> QtCore.QSize:   # noqa: N802 -- Qt override
+        return self._module.minimumSizeHint().expandedTo(self._module.minimumSize())
+
+    def sizeHint(self) -> QtCore.QSize:          # noqa: N802 -- Qt override
+        return self._module.sizeHint()
+
+    def resizeEvent(self, event) -> None:        # noqa: N802 -- Qt override
+        self._module.setGeometry(self.rect())
+        super().resizeEvent(event)
+
+    def event(self, event) -> bool:
+        # A module whose minimum moves after build (a group shown on a sample switch)
+        # posts its layout request here. With no layout to take it, pass it on as this
+        # holder's own geometry change, which the scroll area does take.
+        if event.type() == QtCore.QEvent.Type.LayoutRequest:
+            self.updateGeometry()
+        return super().event(event)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -190,7 +231,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 'Click a <b>heading</b> (sample, or DLS/SLS) to select everything '
                 'under it — handy for a one-shot parameter edit.',
                 '<b>Right-click</b> a heading or selection to remove, move to '
-                'another sample, or average replicates.',
+                'another sample, or average replicates (source runs only — an '
+                'average is never averaged again).',
                 'Stored results follow a regrouped sample; you are asked first '
                 'if a merge would drop a hand-entered or picked value.',
                 'Tick measurements in the DLS tab to overlay/fit several at once.',
@@ -348,11 +390,19 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _scrollable(widget: QtWidgets.QWidget) -> QtWidgets.QScrollArea:
         """Wrap a module in a frameless, resizable scroll area so the window can be
-        shrunk below the module's natural height (content scrolls)."""
+        shrunk below the module's natural height (content scrolls).
+
+        The module rides in a `_MinimumHolder`, so the page scrolls only below the
+        module's MINIMUM height. A resizable scroll area whose content has
+        height-for-width (any word-wrapped label) holds that content at its PREFERRED
+        height instead, and a tab page counts every sub-tab, shown or not, so one tall
+        sub-tab would make every sibling scroll (style guide R3.8).
+        """
         sa = QtWidgets.QScrollArea()
+        sa.setObjectName(MODULE_SCROLL)
         sa.setWidgetResizable(True)            # child fills the viewport when it fits
         sa.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        sa.setWidget(widget)
+        sa.setWidget(_MinimumHolder(widget))
         return sa
 
     def _wrap_tab(self, module: QtWidgets.QWidget) -> QtWidgets.QWidget:
@@ -583,6 +633,16 @@ class MainWindow(QtWidgets.QMainWindow):
                     'delay_times_s': [float(x) for x in preview.delay_times_s],
                     'correlogram': [float(x) for x in preview.correlogram],
                 }
+                # A per-channel sample time the FILE states (the Brookhaven .dat's
+                # correlator sections) rides in `raw` beside the lags -- an instrument
+                # fact, not a parameter -- and is absent when the format states none.
+                if getattr(preview, 'sample_times_s', None) is not None:
+                    raw['sample_times_s'] = [float(x) for x in preview.sample_times_s]
+                # The run duration, likewise an instrument fact beside the lags, where the
+                # file states it for this correlogram (an ALV one-run acquisition, or a
+                # Brookhaven run length that covers its own live channels).
+                if getattr(preview, 'duration_s', None) is not None:
+                    raw['duration_s'] = float(preview.duration_s)
                 params = {k: getattr(preview, k, None) for k in _DLS_PARAM_KEYS}
                 if isinstance(preview, BrookhavenDATPreview):
                     # A raw-counts format: which baseline normalized it is absorbed
@@ -785,8 +845,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree.clear()
         self._leaf_items = {}
         for s in self.controller.samples():
-            parent = QtWidgets.QTreeWidgetItem([self._sample_label(s)])
-            parent.setToolTip(0, self._sample_label(s))   # full name if clipped
+            name = sample_display_name(s)
+            parent = QtWidgets.QTreeWidgetItem([name])
+            parent.setToolTip(0, name)                     # full name if clipped
             parent.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
             # A role marker (a tuple) distinguishes structural nodes from measurement
             # leaves (whose role is the bare item_id string). This drives the
@@ -795,7 +856,12 @@ class MainWindow(QtWidgets.QMainWindow):
                            ('sample', s.sample_id))
             # Status annotation: an unconfirmed sample (identity not yet set in the Data
             # tab) reads amber, so it's obvious which samples still need confirming.
-            if self._sample_label(s) == '(unconfirmed sample)':
+            # PREFIX, not equality: `sample_display_name` appends whatever identity IS
+            # set, so a real load reads `(unconfirmed sample: 323.15 K)` and equality
+            # stopped tinting the case every file load produces while still firing on
+            # the all-empty case the fixtures use. `UNCONFIRMED_SAMPLE[:-1]` is the
+            # prefix that builder guarantees, composing the richer form from it.
+            if name.startswith(UNCONFIRMED_SAMPLE[:-1]):
                 parent.setForeground(0, theme_color(self.tree, 'pending'))
             self.tree.addTopLevelItem(parent)
             parent.setExpanded(True)
@@ -870,13 +936,6 @@ class MainWindow(QtWidgets.QMainWindow):
             font.setBold(on)
             item.setFont(0, font)
 
-    @staticmethod
-    def _sample_label(sample) -> str:
-        poly, solv, temp = sample.polymer_name, sample.solvent_name, sample.temperature_K
-        if poly and solv and temp is not None and not math.isnan(temp):
-            return f'{poly} / {solv} @ {temp:g} K'
-        return '(unconfirmed sample)'
-
     def _group_header(self, parent, text: str,
                       role) -> QtWidgets.QTreeWidgetItem:
         """A bold, non-selectable header row that groups a sample's measurements by
@@ -895,39 +954,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _add_meas_item(self, parent, item_id: str,
                        marker: str = '') -> QtWidgets.QTreeWidgetItem:
-        """A measurement leaf under a DLS/SLS group. The kind lives on the group
-        header, so the leaf shows the within-kind axes: angle, Mw fraction, source
-        file (and a 'solvent ref' marker for the c = 0 reference)."""
+        """A measurement leaf under a DLS/SLS group. The kind and the sample live on
+        the headers above it, so the leaf shows the within-sample axes and the name,
+        from the one builder every surface shares (`core.naming`) -- and the same
+        hover card, whose first line is the full name if the leaf is clipped."""
         lm = self.controller.workspace.measurements[item_id]
         is_avg = getattr(lm, 'derived_kind', None) == 'replicate_average'
-        # A derived (replicate-averaged) measurement has no source file; show a
-        # synthetic name instead of the raw item id.
-        label_override = lm.committed_params.get('label') or ''
-        if label_override:
-            base = label_override
-        elif lm.source_path:
-            base = os.path.basename(lm.source_path)
-        elif is_avg:
-            base = f'averaged correlogram ({item_id})'
-        else:
-            base = item_id
-        # COMMITTED, not working: the leaf names the angle / fraction the analysis
-        # tabs compute from (the Data tab owns the pending edit and its highlight).
-        angle = lm.committed_params.get('angle_deg')
-        frac = lm.committed_params.get('mw_fraction')
-        parts = []
-        if marker:
-            parts.append(marker)
-        if is_avg:
-            parts.append(f'avg ×{len(lm.derived_from or [])}')
-        if angle:
-            parts.append(f'{angle:g}°')
-        if frac:
-            parts.append(f'[{frac}]')           # delineate Mw fractions
-        prefix = (' '.join(parts) + ' — ') if parts else ''
-        text = f'{prefix}{base}'
+        # The 'solvent ref' / 'extra blank' marker is the SAMPLE's fact, not the
+        # measurement's, so the caller supplies it; the builder adds 'avg of N'.
+        marks = (marker,) if marker else ()
+        text = measurement_display_name(lm, markers=marks)
         item = QtWidgets.QTreeWidgetItem([text])
-        item.setToolTip(0, text)                       # full name if clipped
+        item.setToolTip(0, measurement_hover_card(lm, markers=marks))
         item.setData(0, QtCore.Qt.ItemDataRole.UserRole, item_id)
         if is_avg:                                     # muted, to read as derived
             item.setForeground(0, theme_color(self.tree, 'marker_active'))
@@ -1028,7 +1066,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # the same angle from the same filename, loaded twice or run as
                 # replicates -- would otherwise collapse to one entry and attach to
                 # whichever came last. Same `[id]` convention as the trace leaves.
-                rows.append((f'{self._sample_label(s)} — {text}  [{iid}]', iid))
+                rows.append((f'{sample_display_name(s)} — {text}  [{iid}]', iid))
         if not rows:
             return
         # editable=False is load-bearing: QInputDialog.getItem defaults to True,
@@ -1056,7 +1094,7 @@ class MainWindow(QtWidgets.QMainWindow):
             trace_suggested_name(self.controller, tid),
             lambda p: self.controller.export_trace(tid, p))
         if status:
-            self.statusBar().showMessage(status)
+            self.statusBar().showMessage(status, EXPORT_STATUS_MS)
 
     def _remove_traces(self, tids: list) -> None:
         if self._busy_guard():        # before the confirm: a Yes must never be a no-op
@@ -1187,7 +1225,7 @@ class MainWindow(QtWidgets.QMainWindow):
         move_menu.setEnabled(bool(others))
         sample_acts: Dict[object, str] = {}
         for s in others:
-            sample_acts[move_menu.addAction(self._sample_label(s))] = s.sample_id
+            sample_acts[move_menu.addAction(sample_display_name(s))] = s.sample_id
         act_auto = None
         if any(iid in self.controller.workspace.overrides for iid in ids):
             act_auto = menu.addAction('Return to auto-grouping')
@@ -1376,10 +1414,12 @@ class MainWindow(QtWidgets.QMainWindow):
         main-thread); the N replicate fits run on the worker."""
         if self._busy_guard():        # before the prompts: a confirmed action must run
             return
-        method = ask_average_method(self)
-        if method is None:
-            return
         controller = self.controller
+        request = ask_average_method(self, controller,
+                                     self.dls_module.average_prompt_sources())
+        if request is None:
+            return
+        method = request.method
         # Ask-first (Settings checkbox) before a Run that would replace a pick;
         # with it off, the summary still discloses the replacement (tier rule:
         # SampleResult docstring). Best-effort resolution: a selection spanning
@@ -1416,7 +1456,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, 'Cannot average derived results', str(exc))
 
         if not runner().try_submit(
-                lambda: controller.average_dls_results(ids, method),
+                lambda: controller.average_dls_results(ids, method,
+                                                       **request.run_kwargs()),
                 done, fail, description='replicate averaging'):
             self._busy_guard()
 
@@ -1478,7 +1519,7 @@ class MainWindow(QtWidgets.QMainWindow):
             s = ws.samples.get(sid)
             if s is None:
                 continue
-            labels.append(self._sample_label(s))
+            labels.append(sample_display_name(s))
             all_meas += list(s.dls_item_ids) + list(s.sls_item_ids)
             if s.solvent_reference_item_id:
                 all_meas.append(s.solvent_reference_item_id)
@@ -1662,6 +1703,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # idempotent, so an action that already refreshed one may still call this.
         self.utilities_module.refresh_traces()
         self.data_module.set_measurement(self.current_item)
+        # The third panel that reads trace state: the Derived Intensity sub-tab lists
+        # unattached traces, so a trace loaded, removed, attached or detached must
+        # reach it too (idempotent, like the two above).
+        self.sls_module.derived.show_active_sample(self.active_sample_id)
 
     # ------------------------------------------------------ sidebar scope ---
     @QtCore.Slot(int)
@@ -1865,7 +1910,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refused_session_reason = str(exc)
             self._refused_session_notice_pending = True
             return
-        except Exception:                          # noqa: BLE001 - anything else: start empty
+        except Exception:                          # noqa: BLE001 — anything else: start empty
             return
         ids = list(self.controller.workspace.measurements.keys())
         self.current_item = ids[0] if ids else None
@@ -1949,7 +1994,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.controller.save_session(path)
                 s.last_session_path = path
                 self.controller.settings.save()
-        except Exception:                          # noqa: BLE001 - best effort on exit
+        except Exception:                          # noqa: BLE001 — best effort on exit
             pass
         super().closeEvent(event)
 

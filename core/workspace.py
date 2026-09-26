@@ -40,8 +40,7 @@ import numpy as np
 
 from core.data_models import (
     DLSMeasurement, IntensityTrace, SLSMeasurement,
-    casefold_identity_name, round_temperature_for_identity,
-)
+    casefold_identity_name, round_temperature_for_identity, usable_rate)
 
 
 def _known_only(cls, d: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -68,7 +67,9 @@ _DLS_PARAM_KEYS = (
     # shared-parameter set. The program may OFFER a value -- from a linked
     # count-rate trace or from the instrument file's own scalar -- but it reaches
     # an analysis only through the user's explicit commit, and a hand-entered value
-    # is never overwritten (invariant 3; the source tag below records which).
+    # is never overwritten (invariant 3; the source tag below records which). It
+    # reaches the engine on the measurement object -- `LoadedMeasurement.build()`
+    # reads the COMMITTED value by name, like viscosity -- and nowhere else.
     'mean_count_rate_cps',
     # Optional, hand-entered (like dn/dc on the SLS side): consumed only by the
     # out-of-Rayleigh (RDG) distribution reweighting; blank for pure DLS runs.
@@ -93,6 +94,15 @@ _SLS_PARAM_KEYS = (
     # a per-series link; it is an item_id, never a filename, so a rename cannot
     # break it. Stored on the CONSUMER because one blank serves many series.
     'solvent_blank_item_id',
+    # OPTIONAL, hand-entered (like dn/dc -- never proposed, defaulted or estimated,
+    # invariant 3): the solvent's intensity AT 90 degrees, in the loaded intensity
+    # column's own units before dark-count subtraction -- the SLS calibration panel's
+    # dark-count convention, which it is compared against, NOT the Data tab's
+    # unit-converted `intensity` quantity. Consulted ONLY where
+    # `solvent_reference_for` returns no blank; a measured blank always wins. Empty and
+    # zero both mean no solvent subtraction. A run using it is flagged on every output
+    # (sls.RayleighRatioResult.blank_measured).
+    'solvent_blank_intensity_90deg',
 )
 
 # Sidecar provenance tags for solvent-property autofill: which SOURCE produced the
@@ -116,6 +126,7 @@ _PROVENANCE_KEYS = frozenset({
     #   'trace:mean'           -- the plain mean of the linked count-rate trace
     #   'trace:sigma_clipped'  -- that trace's 3-sigma-clipped mean
     #   'vendor'               -- the instrument file's own scalar
+    #   'generator'            -- a synthetic draw's own rate (its noise model's input)
     #   'user'                 -- typed by hand; never silently overwritten
     # The method rides inside the tag rather than in a second sidecar key, so the
     # two can never drift out of sync; the family is the part before the colon.
@@ -177,7 +188,9 @@ class LoadedMeasurement:
     """
     item_id: str
     kind: str                          # 'dls' or 'sls'
-    raw: Dict[str, List[float]]        # the raw arrays (lists, for serialization)
+    # The raw arrays (lists, for serialization) and the one scalar instrument fact beside
+    # them, the run duration `duration_s` (seconds) when the file states it.
+    raw: Dict[str, Any]
     working_params: Dict[str, Any]
     committed_params: Dict[str, Any]
     source_path: Optional[str] = None
@@ -246,6 +259,19 @@ class LoadedMeasurement:
                 # Forward-ready (depolarized dynamic analysis); .get keeps it from
                 # being dropped once the VV/VH tagging is wired through the params.
                 analyzer_geometry=p.get('analyzer_geometry'),
+                # The fit's instrument inputs. The per-channel sample time is a
+                # parser-written instrument fact kept in `raw` beside the lags (absent
+                # when the file states none: the engine derives a stand-in and says so).
+                # The count rate is the user's COMMITTED, provenance-tagged parameter;
+                # anything that is not a usable rate -- nothing committed, a legacy 0.0
+                # -- goes as None, the classical limit the fit result discloses, never
+                # as a value the data model would refuse.
+                sample_times_s=(np.asarray(self.raw['sample_times_s'], dtype=float)
+                                if self.raw.get('sample_times_s') is not None else None),
+                mean_count_rate_cps=usable_rate(p.get('mean_count_rate_cps')),
+                # The third instrument input, a parser-written fact in `raw` like the
+                # sample times: absent when the file states no run duration.
+                duration_s=self.raw.get('duration_s'),
             )
         elif self.kind == 'sls':
             return SLSMeasurement(
@@ -429,10 +455,12 @@ class SampleResult:
       overwritten except by the user.
     * A 'picked' value is a choice of SOURCE among results the program computed:
       it is inert against a passive refresh, and is replaced or cleared by a
-      deliberate act -- an explicit Run, or one of the two clear-and-warn
-      Settings switches (cumulant method; SE estimator) taking the source it
-      names. Exactly those two switches clear picks, and this sentence names
-      them rather than a class of settings: a wider "any settings change that
+      deliberate act -- an explicit Run, or one of the three clear-and-warn
+      Settings switches taking the source it names: the cumulant inputs (method,
+      fit cutoff, residual weighting; the order clears the narrower set fitted at
+      it), the skipped lag channels (every DLS kind), and the SE estimator.
+      Exactly those three switches clear picks, and this sentence names them
+      rather than a class of settings: a wider "any settings change that
       invalidates" form would promise clears the program does not perform
       (owner-ruled). Where a deliberate act destroys a pick, the user is asked
       first and can back out.
@@ -443,8 +471,9 @@ class SampleResult:
         passive refresh  | replaced   | spared                      | spared
           (auto_select_* on a Cross-Sample refresh)
         deliberate act   | replaced   | replaced or cleared; asked  | spared
-          (an explicit Run; the cumulant-method    first where a clear
-           or SE-estimator switch)                 destroys the pick
+          (an explicit Run; the cumulant-input,    first where a clear
+           skipped-channels or SE-estimator        destroys the pick
+           switch)
         user action      | replaced   | replaced                    | replaced
           (a fresh pick; a manual entry)
 
@@ -669,7 +698,38 @@ class MeasurementResultRow:
     Keyed by (item_id, method, peak_index). Distribution methods write one row
     per resolved peak (peak_index 0, 1, ...); parametric methods write a single
     row (peak_index 0). Per-measurement DLS is always APPARENT -- a single q and
-    a single concentration, neither extrapolated (invariant 7)."""
+    a single concentration, neither extrapolated (invariant 7).
+
+    NOT CARRIED HERE, by design: the analysis choices behind a cumulant row -- the
+    amplitude cutoff and the residual weighting (`CumulantResult.fit_cutoff`,
+    `CumulantResult.weighting`). They are Settings, not session state, so a row computed
+    under one value and reloaded under another does not say which produced it; the
+    correlogram-fit export is where a per-fit choice is named in the affected columns'
+    Comments cells (`exporting.export`). Persisting them here would change the session
+    format for a value the summary table never displays.
+
+    That exclusion is about the SETTINGS specifically, and it still stands. It is not a
+    refusal to carry fit quantities: `fit_details` below persists the fitted values the
+    summary table does display, which is the distinction the clause above turns on.
+
+    `fit_details` holds a parametric fit's remaining quantities -- Gamma, the moments, the
+    order, the baseline, beta, the amplitude fractions, the stretch -- keyed by the display
+    name in the detail spec beside `_DLS_PARAM_SPECS` (app/controller.py), which is the one
+    place they are named. A MAPPING rather than a dozen method-specific optional fields: a
+    method contributes only its own keys, the dataclass stays flat as quantities are added,
+    and an older session simply arrives without the key (`_known_only` reads it as absent,
+    which is why no session version bump is owed). Values are the fit's OWN -- the raw
+    method string, the raw success bool -- never a rendered cell.
+
+    `passive_notes` holds the fit's passive notices (`notes` on a DLS result: dead channels,
+    a baseline or a moment resting on its bound), keyed by the result attribute each is
+    about, '' for one about the whole fit. A mapping here rather than the engine's
+    index-aligned `notes`/`note_targets` pair, because a persisted record has no
+    shared-contract reason to carry parallel arrays and a mapping cannot fall out of step.
+    It differs from `reliability_note` in TIER, not merely in content: that one says a
+    precondition failed (a red flag), these say how the fit was obtained (a neutral
+    qualifier), and a surface must never paint one at the other's level (ui_style_guide
+    section 5)."""
     item_id: str
     method: str                          # cumulant/single/double/kww/nnls/contin/lognormal
     peak_index: int = 0
@@ -689,6 +749,12 @@ class MeasurementResultRow:
     # one token is
     # greppable from analysis/ through core/ to exporting/, and the flag is DERIVED from
     # the note (flagged iff non-empty) rather than tracked beside it.
+
+    # The parametric fit's remaining quantities, keyed by display name; and its passive
+    # notices, keyed by the result attribute each is about ('' = about the whole fit).
+    # See the class docstring for both shapes and why each is a mapping.
+    fit_details: Dict[str, Any] = field(default_factory=dict)
+    passive_notes: Dict[str, List[str]] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

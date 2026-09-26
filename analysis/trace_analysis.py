@@ -1498,7 +1498,7 @@ def preload_stationarity_backend() -> bool:
     try:
         import statsmodels.tsa.stattools  # noqa: F401
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001 — import probe, docstring
         return False
 
 
