@@ -8,8 +8,9 @@ from a paired VV (polarized) and VH (depolarized) intensity measurement.
 
 This is Phase 1 of the depolarized-light-scattering module (CLAUDE.md -> Planned
 -> DPLS). It is the STATIC side: it works from time-averaged intensities, not
-correlograms. The DYNAMIC side (rotational diffusion D_r from the VV/VH
-correlation-function decay rates) is a later phase and lives elsewhere.
+correlograms. The DYNAMIC side, rotational diffusion D_r from the VV/VH
+correlogram decay rates (`assemble_ddls_rate_points`, `analyze_ddls`) and the shape
+models built on D_t and D_r, sits further down this module.
 
 What it computes
 ----------------
@@ -57,8 +58,8 @@ References (in project knowledge)
 
 Design contract
 ---------------
-Every function is PURE: it takes intensities (and parameters) and returns a result
-object or a number. No plotting, no file I/O, no mutation of inputs.
+Every function is PURE: it takes intensities, decay rates or correlograms (and
+parameters) and returns a result object or a number. No plotting, no file I/O, no mutation of inputs.
 
 Change history
 --------------
@@ -71,20 +72,24 @@ Change history
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from dataclasses import dataclass, replace
+from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy import optimize
 
+from analysis import dls
 from analysis import uncertainty as unc
+from core.data_models import DLSMeasurement
+from core.note_registry import DECAY_BEARING_CODES
+from core.notes import WHERE, WHERE_UNIT, Note, RefusedInputs, find_notes
 from physics import constants as phys
 from physics.constants import (
     depolarization_ratio_unpolarized,
     cabannes_isotropic_factor,
     optical_anisotropy_squared,
     stokes_einstein_rh,
-    _RHO_V_DEPOLARIZATION_LIMIT,
+    RHO_V_DEPOLARIZATION_LIMIT,
 )
 
 
@@ -98,10 +103,11 @@ class DepolarizationResult:
 
     All quantities assume VERTICALLY polarized incident light (the modern default).
     `physically_valid` is False when rho_v falls outside [0, 3/4); in that case the
-    derived quantities are clamped/NaN and `note` explains why, rather than the
-    analysis raising -- a slightly-out-of-range rho_v is usually instrumental
-    (stray depolarized light from polarizer/analyzer leakage, reflections, or an
-    over-subtracted dark count), which is a data-quality flag, not a crash.
+    derived quantities are clamped/NaN and `notes` holds the `rho_v_out_of_range`
+    precondition, rather than the analysis raising -- a slightly-out-of-range rho_v is
+    usually instrumental (stray depolarized light from polarizer/analyzer leakage,
+    reflections, or an over-subtracted dark count), which is a data-quality flag, not a
+    crash.
     """
     # primary observable
     rho_v: float                       # I_VH / I_VV (vertical incident)
@@ -116,7 +122,7 @@ class DepolarizationResult:
     dark_count: float                  # dark count subtracted from each
     # quality
     physically_valid: bool             # 0 <= rho_v < 3/4
-    note: str = ''
+    notes: Tuple[Note, ...] = ()
     # uncertainty (None unless replicate SEs were supplied)
     rho_v_se: Optional[float] = None
 
@@ -195,13 +201,13 @@ def analyze_depolarization(
 
     Notes
     -----
-    rho_v outside [0, 3/4) does not raise: it sets physically_valid=False, records
-    why in `note`, and leaves delta^2 = nan (and the Cabannes factor still computed
-    from the linear form, which stays finite). rho_v <= 0 means no resolvable
-    depolarization; rho_v >= 3/4 is unphysical for an anisotropic scatterer -- at
-    the limit itself the isotropic Rayleigh contribution vanishes (Cabannes factor
-    f = 0) and delta^2 is undefined, and above it it signals instrumental stray
-    depolarized light.
+    rho_v outside [0, 3/4) does not raise: it sets physically_valid=False, notes it
+    (`rho_v_out_of_range`, with rho_v), and leaves delta^2 = nan (and the Cabannes
+    factor still computed from the linear form, which stays finite). rho_v <= 0 means
+    no resolvable depolarization; rho_v >= 3/4 is unphysical for an anisotropic
+    scatterer -- at the limit itself the isotropic Rayleigh contribution vanishes
+    (Cabannes factor f = 0) and delta^2 is undefined, and above it it signals
+    instrumental stray depolarized light.
     """
     rho_v = depolarization_ratio(i_vv, i_vh, dark_count=dark_count)
     vv = i_vv - dark_count
@@ -211,37 +217,30 @@ def analyze_depolarization(
     # limit itself is excluded: at rho_v = 3/4 the Cabannes factor is exactly 0
     # (R_iso vanishes) and delta^2 is undefined, so the limit is not a value the
     # method can meaningfully produce -- it takes the same branch as rho_v > 3/4.
-    physically_valid = (0.0 <= rho_v < _RHO_V_DEPOLARIZATION_LIMIT)
-    notes = []
+    physically_valid = (0.0 <= rho_v < RHO_V_DEPOLARIZATION_LIMIT)
+    # One precondition for every way out of the range -- at or above the limit, negative,
+    # or not a number -- each case readable off rho_v itself.
+    notes: Tuple[Note, ...] = () if physically_valid else (
+        Note('rho_v_out_of_range', ('rho_v',),
+             {'rho_v': rho_v, 'lo': 0.0, 'hi': RHO_V_DEPOLARIZATION_LIMIT}),)
 
     # Natural-light equivalent and optical anisotropy. Guard the closed forms,
     # which are only defined on the physical range, so an out-of-range rho_v
     # degrades gracefully to a flag instead of a raised exception.
-    if 0.0 <= rho_v <= _RHO_V_DEPOLARIZATION_LIMIT:
+    if 0.0 <= rho_v <= RHO_V_DEPOLARIZATION_LIMIT:
         rho_u = depolarization_ratio_unpolarized(rho_v)
     else:
         rho_u = float('nan')
 
-    if 0.0 <= rho_v < _RHO_V_DEPOLARIZATION_LIMIT:
+    if 0.0 <= rho_v < RHO_V_DEPOLARIZATION_LIMIT:
         delta_sq = optical_anisotropy_squared(rho_v)
     else:
         delta_sq = float('nan')
-        if rho_v >= _RHO_V_DEPOLARIZATION_LIMIT:
-            notes.append(
-                f"rho_v = {rho_v:.4g} is at/above the depolarization limit 3/4; the "
-                f"isotropic scattering vanishes and delta^2 diverges -- check for "
-                f"stray depolarized light (polarizer/analyzer leakage, reflections)."
-            )
-    if rho_v < 0.0:
-        notes.append(
-            f"rho_v = {rho_v:.4g} is negative -- I_VH below the dark count or an "
-            f"over-subtracted baseline; no resolvable depolarization."
-        )
 
     # Cabannes factor uses the linear form 1 - (4/3) rho_v, finite for any rho_v;
     # clamp the call to the valid range so it does not raise, but report the raw
     # (possibly >1 or <0) factor for transparency when invalid.
-    if 0.0 <= rho_v <= _RHO_V_DEPOLARIZATION_LIMIT:
+    if 0.0 <= rho_v <= RHO_V_DEPOLARIZATION_LIMIT:
         f_iso = cabannes_isotropic_factor(rho_v)
     else:
         f_iso = 1.0 - (4.0 / 3.0) * rho_v  # raw linear value, outside guaranteed [0,1]
@@ -250,9 +249,6 @@ def analyze_depolarization(
     # Uncertainty: only when both intensity SEs are supplied (replicates). The
     # dark count is treated as exact here; rho_v = vh/vv with independent vh, vv.
     rho_v_se = unc.ratio_se(vh, i_vh_se, vv, i_vv_se)
-
-    if not physically_valid and not notes:
-        notes.append(f"rho_v = {rho_v:.4g} outside the physical range [0, 3/4].")
 
     return DepolarizationResult(
         rho_v=rho_v,
@@ -264,7 +260,7 @@ def analyze_depolarization(
         i_vh=vh,
         dark_count=dark_count,
         physically_valid=physically_valid,
-        note=' '.join(notes),
+        notes=notes,
         rho_v_se=rho_v_se,
     )
 
@@ -309,25 +305,42 @@ def isotropic_rayleigh_ratio(r_vv: float, rho_v: float) -> float:
 # `analyze_ddls`. IMPORTANT: Gamma is the FIELD rate; a homodyne intensity correlogram
 # decays at 2*Gamma.
 
-# qL above which the single-exponential VH form starts to break (higher rotational
-# modes / intramolecular interference appear). Zero & Pecora 1982: clean below ~3,
-# a <10% correction to ~5. A function-parameter default, not a system constant.
+# qL above which the single-exponential VH form starts to break (additional
+# exponentials arise from intramolecular interference). Zero & Pecora 1982, p. 88: the
+# single-exponential pair for qL <= 3, the additional amplitudes under 10% of the total
+# up to about qL = 5; they cite Berne & Pecora 1976 for both the pair and the cause.
+# Guarding at 3 rather than 5 is this program's conservative choice. A
+# function-parameter default, not a system constant.
 _DDLS_QL_SINGLE_EXP_LIMIT: float = 3.0
+
+# The preconditions of a VH replicate's fit that bear on its decay rate: the decay-bearing
+# roster less its two size-range codes. A VH rate carries rotation (Gamma_VH = q^2 D_t +
+# 6 D_r), so the Stokes-Einstein radius a VH fit's size check reads is no size, and a
+# check on it says nothing about the rate.
+_VH_DECAY_BEARING_CODES: frozenset[str] = DECAY_BEARING_CODES - {'rh_above_ceiling',
+                                                                'rh_below_floor'}
 
 
 @dataclass
 class DDLSRatePoint:
     """One angle's fitted FIELD decay rates for the polarized/depolarized pair.
 
-    Built by the controller from a VV and a VH correlogram measured at the same
-    angle (each fitted with the cumulant engine to its field rate Gamma). The pure
-    analysis below consumes these; it never touches a correlogram or a fitter, so
-    it stays decoupled from analysis.dls and is trivially testable.
+    Built by `assemble_ddls_rate_points` from the VV and VH correlograms measured at
+    the same angle (each fitted with the cumulant engine to its field rate Gamma).
+    `analyze_ddls` consumes these; it never touches a correlogram or a fitter, so it
+    is trivially testable from hand-built points.
     """
     angle_deg: float
     q_m_inv: float                 # scattering vector magnitude, m^-1
     gamma_vv_s_inv: float          # field decay rate Gamma_VV (g1), s^-1
     gamma_vh_s_inv: float          # field decay rate Gamma_VH (g1), s^-1
+    # The precondition notes of each VV replicate whose rate entered `gamma_vv_s_inv`, one
+    # tuple per replicate, as its fit carried them; () from a caller that fitted none.
+    # D_t's and D_r's verdicts read them (`analyze_ddls`); they change no rate.
+    vv_preconditions: Tuple[Tuple[Note, ...], ...] = ()
+    # The same for each VH replicate whose rate entered `gamma_vh_s_inv`; D_r's verdict
+    # reads them.
+    vh_preconditions: Tuple[Tuple[Note, ...], ...] = ()
 
 
 @dataclass
@@ -362,15 +375,29 @@ class DDLSResult:
     n_angles: int
     method: str                        # 'multi-angle' | 'single-angle'
     single_exponential_valid: Optional[bool]
-    notes: str = ''
-    # The D_r verdict as a FLAG plus its own sentence, alongside the joined `notes`
-    # prose. Consumers that ACT on the verdict (the export Comments cell, the GUI warning
-    # tier) read the flag; only the human-facing surfaces read the sentence, so a reword
-    # cannot disarm them and no consumer re-derives the condition for itself.
+    notes: Tuple[Note, ...] = ()
+    # The D_r verdict as a FLAG, its causes as precondition notes in `notes`. Consumers
+    # that ACT on the verdict (the export Comments cell, the GUI warning tier) read the
+    # flag; only the human-facing surfaces read the notes, so a reword cannot disarm them
+    # and no consumer re-derives the condition for itself. D_r = (Gamma_VH - Gamma_VV)/6 is
+    # formed from both rates, so beside its own causes it fails through
+    # `dr_inputs_flagged_decay`, over the VV and VH replicates whose own fit carries a
+    # precondition bearing on its decay rate (`analyze_ddls`).
     d_r_reliable: bool = True
-    reliability_note: str = ''
+    # The D_t verdict. D_t is the through-origin line on the VV rates, and it reads their
+    # decay causes as `analysis.dls.angular.analyze_gamma_q2`'s `rh_reliable` reads its
+    # angles': through `inputs_flagged_decay`, over the VV replicates whose own fit carries
+    # a precondition in `core.note_registry.DECAY_BEARING_CODES`. Rh_t, Stokes-Einstein on
+    # D_t, shares it. It does NOT judge the line's own linearity through the origin, the
+    # sibling's `is_diffusive`, which the anisotropic VV term (Berne & Pecora 2000,
+    # Eq. 7.3.17) can fail: a VV intercept leaves D_t high and this flag True. It moves
+    # no value, and a fallback weight, a record, is never read by it.
+    d_t_reliable: bool = True
     se_estimator: str = 'hc3'          # covariance estimator behind d_t_se (the only
     #                                    regression SE here; d_r_se is a replicate SEM)
+    # What d_r_se IS: the SEM of the per-angle D_r values, which no regression estimator
+    # produced, so `core.notes.qualifiers` names no estimator about it.
+    d_r_se_kind: str = 'replicate_sem'
     # The (T, eta) THIS result was computed with. Carried rather than looked up again,
     # because the shape models (below) need the same pair: rh_t_nm here and the models'
     # radii are both kT / 6 pi eta D, so two independent lookups can disagree and report
@@ -380,13 +407,14 @@ class DDLSResult:
     viscosity_Pa_s: Optional[float] = None
 
 
-def rotational_diffusion_from_rates(gamma_vv_s_inv: float,
-                                    gamma_vh_s_inv: float) -> float:
+def rotational_diffusion_from_rates(gamma_vv_s_inv: float | np.ndarray,
+                                    gamma_vh_s_inv: float | np.ndarray) -> float | np.ndarray:
     """Rotational diffusion coefficient D_r from one VV/VH field-rate pair.
 
         D_r = (Gamma_VH - Gamma_VV) / 6
 
-    Both inputs are FIELD (g1) decay rates in s^-1. The combined VV/VH pair is Berne &
+    Both inputs are FIELD (g1) decay rates in s^-1, as floats or as equal-length arrays
+    (one pair per angle; the result is then elementwise). The combined VV/VH pair is Berne &
     Pecora 2000, Eqs. 7.3.17-7.3.18 p.122; Zero & Pecora 1982, Eqs. III.1/III.2 is the
     rod-specific restatement. (NB Pecora 1964 gives the translational and rotational
     broadening only as SEPARATE limits, not this combined pair.) The result is in rad^2/s. A
@@ -411,7 +439,8 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
     points : sequence of DDLSRatePoint
         One per angle (>= 1). Each carries q and the two field decay rates.
     temperature_K, viscosity_Pa_s : float
-        For the Stokes-Einstein radius Rh_t from D_t. Always user-supplied.
+        For the Stokes-Einstein radius Rh_t from D_t. Always user-supplied. Without a
+        usable viscosity Rh_t is NaN and the result carries the `no_viscosity` note.
     rod_length_nm : float, optional
         Rod length L, used only to evaluate qL for the single-exponential guard.
         Omit if unknown (then single_exponential_valid is None).
@@ -435,18 +464,31 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
     standard error, each Gamma coming from a single correlogram (Schaetzel 1990). Across
     MULTIPLE angles the points are independent measurements, so the through-origin
     regression SE on D_t and the spread (SD/sqrt(n)) of the per-angle D_r are legitimate
-    ensemble uncertainties -- the same basis as the multi-angle Zimm SE and the ISO 22412
-    replicate SE -- and are reported with that label.
+    ensemble uncertainties -- the same basis as the multi-angle Zimm SE and the replicate
+    SE (the GUM's standard error of the mean, sec. 4.2.3; ISO 22412 states precision from
+    repeats as a standard deviation) -- and are reported with that label.
 
-    Reliability of D_r (invariant 4): `d_r_reliable` is False, with `reliability_note`
-    naming each cause independently, when a per-angle rate is unphysical
-    (Gamma_VH <= Gamma_VV) OR when an angle had no VH rate at all (a NaN Gamma_VH from a
-    failed per-angle VH fit). The second cause matters because the mean tolerates it --
-    `replicate_mean_se` averages the angles that remain -- so a flag that could not see
-    the drop once let an all-NaN VH set ship D_r = NaN as reliable with an empty note.
-    The guard is sized to the operation it protects: whatever the mean silently drops,
-    the flag names. Flag-not-refuse: D_r stays the mean over the surviving angles, and
-    the note says how many contributed.
+    Reliability of D_r (invariant 4): `d_r_reliable` is False, with a precondition note
+    for each cause independently (`dr_nonpositive`, `vh_rate_missing`), when a per-angle
+    rate is unphysical (Gamma_VH <= Gamma_VV) OR when an angle had no VH rate at all (a
+    NaN Gamma_VH from a failed per-angle VH fit). The second cause matters because the
+    mean tolerates it -- `replicate_mean_se` averages the angles that remain -- so a flag
+    that could not see the drop once let an all-NaN VH set ship D_r = NaN as reliable
+    with an empty note. The guard is sized to the operation it protects: whatever the
+    mean silently drops, the flag names. Flag-not-refuse: D_r stays the mean over the
+    surviving angles, and the note counts the angles without a VH rate. D_r also fails,
+    as D_t does, when a replicate behind one of its two rates carries a precondition
+    bearing on its decay rate: a VV replicate by `core.note_registry.DECAY_BEARING_CODES`,
+    a VH replicate by that roster less its two size-range codes (`_VH_DECAY_BEARING_CODES`);
+    `dr_inputs_flagged_decay` counts them over both channels, the first one's own reason
+    beside it.
+
+    Reliability of D_t: `d_t_reliable` is False when a VV replicate behind a point's rate
+    carries a precondition bearing on its decay rate (`DDLSRatePoint.vv_preconditions`,
+    `core.note_registry.DECAY_BEARING_CODES`), the decay rule `analyze_gamma_q2` applies to
+    its angles: `inputs_flagged_decay` counts them, the first one's own reason beside it.
+    The line's linearity through the origin, that sibling's `is_diffusive`, is not judged
+    here. D_t and every other value stay as computed.
     """
     pts = sorted(points, key=lambda p: p.angle_deg)
     if len(pts) == 0:
@@ -490,9 +532,9 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
             "every Gamma_VH must be positive and finite; NaN from a failed per-angle VH "
             "fit is tolerated and that angle is dropped from D_r.")
     q2 = q * q
-    d_r_per_angle = (g_vh - g_vv) / 6.0
+    d_r_per_angle = rotational_diffusion_from_rates(g_vv, g_vh)
     n = len(pts)
-    notes: List[str] = []
+    notes: List[Note] = []
 
     # D_t from the VV channel: Gamma_VV = q^2 D_t, slope through the origin.
     if n >= 2:
@@ -503,6 +545,22 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
         d_t = float(g_vv[0] / q2[0])
         d_t_se = None                       # one correlogram -> no SE (Schaetzel)
         method = 'single-angle'
+    # D_t's verdict, the pooled lines' rule (one treatment): how many VV replicates carry a
+    # decay-bearing precondition, then the first one's own reason where it was found.
+    replicates = [(float(p.angle_deg), pre) for p in pts for pre in p.vv_preconditions]
+    decay_flagged = [(a, kept) for a, pre in replicates
+                     for kept in (tuple(n for n in pre if n.code in DECAY_BEARING_CODES),)
+                     if kept]
+    d_t_reliable = not decay_flagged
+    if decay_flagged:
+        d_t_about = ('d_t_m2_s', 'rh_t_nm')
+        notes.append(Note('inputs_flagged_decay', d_t_about, {
+            'k': len(decay_flagged), 'n': len(replicates), 'inputs': 'replicates',
+            WHERE: tuple(dict.fromkeys(a for a, _pre in decay_flagged)), WHERE_UNIT: 'deg'}))
+        first_at, first = decay_flagged[0]
+        notes.extend(replace(n, about=d_t_about,
+                             values={**n.values, WHERE: (first_at,), WHERE_UNIT: 'deg'})
+                     for n in first)
 
     # D_r from the per-angle differences (independent estimates of one rate).
     d_r_stats = unc.replicate_mean_se(list(d_r_per_angle))
@@ -513,33 +571,36 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
     # must be physical (Gamma_VH > Gamma_VV), and it must exist at all (a NaN is the
     # angle `replicate_mean_se` silently drops -- see the Notes above for why the flag
     # must see it). The NaN-vs-inf split of the guard above is kept: the unphysical
-    # sentence is about Gamma_VH <= Gamma_VV, so a dropped angle must not fire it, and
+    # note is about Gamma_VH <= Gamma_VV, so a dropped angle must not fire it, and
     # +inf must. Consumers read the FLAG; the controller's shape-model entry guard
     # deliberately re-checks positivity on the AGGREGATE D_r instead (coarser: a flagged
     # mean keeps computing, caveat in Comments -- owner-ruled 2026-08-10).
-    unphysical = bool(np.any((d_r_per_angle <= 0) | np.isinf(d_r_per_angle)))
+    n_unphysical = int(np.count_nonzero((d_r_per_angle <= 0) | np.isinf(d_r_per_angle)))
     n_dropped = int(np.count_nonzero(np.isnan(d_r_per_angle)))
-    d_r_reliable = (not unphysical) and n_dropped == 0
-    # The word "unphysical" is pinned by test_pathology_surfaces_at_the_export_layer.
-    d_r_reasons: List[str] = []
-    if unphysical:
-        d_r_reasons.append(
-            "at least one angle has Gamma_VH <= Gamma_VV (D_r <= 0), which is "
-            "unphysical for an anisotropic scatterer -- check the VV/VH pairing, "
-            "the signal-to-noise, or whether the particle is optically isotropic.")
-    if n_dropped == n:
-        d_r_reasons.append(
-            f"no angle has a VH decay rate (the VH cumulant fit failed at all {n} "
-            f"angle{'s' if n != 1 else ''}), so there is no D_r -- refit the VH "
-            f"correlograms or check the VH channel's signal.")
-    elif n_dropped:
-        d_r_reasons.append(
-            f"{n_dropped} of {n} angles had no VH decay rate (the VH cumulant fit "
-            f"failed there) and were dropped, so D_r and its SE are the mean over the "
-            f"remaining {n - n_dropped} angle{'s' if n - n_dropped != 1 else ''}.")
-    d_r_note = ' '.join(d_r_reasons)
-    if d_r_note:
-        notes.append(d_r_note)
+    d_r_reliable = n_unphysical == 0 and n_dropped == 0
+    if n_unphysical:
+        notes.append(Note('dr_nonpositive', ('d_r_rad2_s',),
+                          {'n': n_unphysical, 'limit': 0.0}))
+    if n_dropped:
+        notes.append(Note('vh_rate_missing', ('d_r_rad2_s',),
+                          {'n_missing': n_dropped, 'n': n}))
+    # D_r's inputs, D_t's rule over both rates (one treatment): how many VV and VH
+    # replicates carry a decay-bearing precondition, then the first one's own reason.
+    rate_inputs = ([(a, pre, DECAY_BEARING_CODES) for a, pre in replicates]
+                   + [(float(p.angle_deg), pre, _VH_DECAY_BEARING_CODES)
+                      for p in pts for pre in p.vh_preconditions])
+    rate_flagged = [(a, kept) for a, pre, codes in rate_inputs
+                    for kept in (tuple(n for n in pre if n.code in codes),) if kept]
+    d_r_reliable = d_r_reliable and not rate_flagged
+    if rate_flagged:
+        d_r_about = ('d_r_rad2_s',)
+        notes.append(Note('dr_inputs_flagged_decay', d_r_about, {
+            'k': len(rate_flagged), 'n': len(rate_inputs),
+            WHERE: tuple(dict.fromkeys(a for a, _pre in rate_flagged)), WHERE_UNIT: 'deg'}))
+        first_at, first = rate_flagged[0]
+        notes.extend(replace(n, about=d_r_about,
+                             values={**n.values, WHERE: (first_at,), WHERE_UNIT: 'deg'})
+                     for n in first)
 
     # Stokes-Einstein radius from D_t (translational), and the VH relaxation time.
     # isfinite as well as > 0: +inf passes a bare `> 0` and Stokes-Einstein would return a
@@ -547,6 +608,11 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
     # a non-finite D, so without this gate the refusal would escape as a ValueError.
     rh_t_nm = (stokes_einstein_rh(d_t, temperature_K, viscosity_Pa_s) * 1e9
                if (have_t_and_eta and math.isfinite(d_t) and d_t > 0) else float('nan'))
+    if not (viscosity_Pa_s is not None and math.isfinite(viscosity_Pa_s)
+            and viscosity_Pa_s > 0):
+        # Rh_t is blank for the one cause the DLS arms name the same way: D_t and D_r
+        # need no viscosity, Stokes-Einstein does.
+        notes.append(Note('no_viscosity', ('rh_t_nm', 'rh_t_se')))
     # Rh_t inherits d_t_se by the exact fractional relation (Rh_t ∝ D_t^-1), the same
     # already-validated reciprocal pass-through used for GammaQ2Result.rh_se (invariant 8;
     # no separate MC gate needed -- see power_law_se's carve-out note). None when d_t_se is.
@@ -562,17 +628,8 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
         qL = q * (rod_length_nm * 1e-9)     # q[m^-1] * L[m] -> dimensionless
         single_exp_valid = bool(np.all(qL < qL_limit))
         if not single_exp_valid:
-            notes.append(
-                f"qL reaches {float(np.max(qL)):.2f} (>= {qL_limit}); above ~3 the "
-                f"VH correlogram is no longer a single exponential (higher "
-                f"rotational modes / intramolecular interference) and D_r from the "
-                f"simple difference is biased -- drop the high-angle points or model "
-                f"the extra modes (Zero & Pecora 1982).")
-
-    if method == 'single-angle':
-        notes.append(
-            "single angle: no uncertainty is reported (one correlogram per channel; "
-            "a ± needs repeats or multiple angles, per ISO 22412 / Schaetzel 1990).")
+            notes.append(Note('ql_above_limit', ('d_r_rad2_s',),
+                              {'ql': float(np.max(qL)), 'limit': float(qL_limit)}))
 
     return DDLSResult(
         angles_deg=angles, q2_m2=q2, gamma_vv_s_inv=g_vv, gamma_vh_s_inv=g_vh,
@@ -581,9 +638,131 @@ def analyze_ddls(points: Sequence[DDLSRatePoint], *,
         d_r_rad2_s=d_r, d_r_se=d_r_se,
         rh_t_nm=rh_t_nm, rh_t_se=rh_t_se, rotational_time_s=rotational_time_s,
         n_angles=n, method=method, single_exponential_valid=single_exp_valid,
-        notes=' '.join(notes), d_r_reliable=d_r_reliable, reliability_note=d_r_note,
+        notes=tuple(notes), d_r_reliable=d_r_reliable, d_t_reliable=d_t_reliable,
         se_estimator=estimator,
         temperature_K=temperature_K, viscosity_Pa_s=viscosity_Pa_s)
+
+
+@dataclass(frozen=True)
+class DDLSRateAssembly:
+    """Each paired angle's VV and VH field decay rates, averaged over its replicate
+    correlograms' cumulant fits, with what entered each mean and what did not.
+
+    The six per-angle fields hold one entry per paired angle, in the order the caller
+    gave, a left-out angle included; `points` holds only the angles that kept a VV
+    rate, and `entered_runs` only their runs. `temperature_K` and `viscosity_Pa_s` are
+    read from those runs, None when no angle kept a rate.
+    """
+    points: Tuple[DDLSRatePoint, ...]
+    # The (run, fit) pairs whose rate entered the angle's mean, in the caller's run order.
+    vv_entered: Tuple[Tuple[Tuple[DLSMeasurement, dls.CumulantResult], ...], ...]
+    vh_entered: Tuple[Tuple[Tuple[DLSMeasurement, dls.CumulantResult], ...], ...]
+    # The runs whose fit refused its inputs, each with the refusal's own notes
+    # (`core.notes.RefusedInputs.notes`; () for a refusal that names no cause).
+    vv_refused: Tuple[Tuple[Tuple[DLSMeasurement, Tuple[Note, ...]], ...], ...]
+    vh_refused: Tuple[Tuple[Tuple[DLSMeasurement, Tuple[Note, ...]], ...], ...]
+    # The runs whose fit returned but whose rate did not enter: not a success, or a rate
+    # that is non-finite or at or below zero.
+    vv_unusable: Tuple[Tuple[DLSMeasurement, ...], ...]
+    vh_unusable: Tuple[Tuple[DLSMeasurement, ...], ...]
+    angles_left_out: Tuple[float, ...]       # the paired angles with no VV rate
+    temperature_K: Optional[float]
+    viscosity_Pa_s: Optional[float]
+    entered_runs: Tuple[DLSMeasurement, ...]
+
+
+def assemble_ddls_rate_points(
+        vv_runs: Mapping[float, Sequence[Tuple[DLSMeasurement, Mapping[str, Any]]]],
+        vh_runs: Mapping[float, Sequence[Tuple[DLSMeasurement, Mapping[str, Any]]]],
+        paired_angles: Sequence[float], *, tolerate_refusals: bool) -> DDLSRateAssembly:
+    """The `DDLSRatePoint`s `analyze_ddls` takes, from each paired angle's VV and VH
+    replicate correlograms.
+
+    `vv_runs` and `vh_runs` map each angle of `paired_angles` to its runs, each a
+    (measurement, `fit_cumulants` keyword arguments) pair. Every run is fitted once, VV
+    then VH at each angle in the order given, and a channel's field decay rate is the
+    mean over the replicates whose rate entered: a fit that succeeded with a finite rate
+    above zero. The caller settles identity across the whole set; this only averages.
+
+    A fit that refuses its inputs (a `ValueError`) is recorded with its notes and left
+    out of the mean when `tolerate_refusals` is True; when False it propagates
+    unchanged. An angle with no VV rate is left out of `points` and listed in
+    `angles_left_out`. q is read from the optics of the angle's first entered VV run,
+    T from the first entered run, and eta from the first entered run carrying one.
+    """
+    points: List[DDLSRatePoint] = []
+    entered_by_channel: Tuple[list, list] = ([], [])
+    refused_by_channel: Tuple[list, list] = ([], [])
+    unusable_by_channel: Tuple[list, list] = ([], [])
+    entered_runs: List[DLSMeasurement] = []
+    angles_left_out: List[float] = []
+    for a in paired_angles:
+        rates = []
+        for ch, runs in enumerate((vv_runs[a], vh_runs[a])):
+            fits, refused = [], []
+            for m, kw in runs:
+                try:
+                    fits.append((m, dls.fit_cumulants(m, **kw)))
+                except ValueError as exc:
+                    if not tolerate_refusals:
+                        raise
+                    refused.append((m, tuple(exc.notes) if isinstance(exc, RefusedInputs)
+                                    else ()))
+            # DROP the failed replicates and average the rest, which is what the
+            # replicate-averaging path already does. A bare `np.mean` was safe only while
+            # an unfittable correlogram RAISED; now that it returns a flagged NaN, one bad
+            # replicate NaN'd the whole angle, the point was dropped, and a downstream
+            # raise blamed the VV/VH pairing -- naming a cause that was not the one.
+            # NaN when NOTHING survives: an angle with no VV rate is left out below.
+            # A rate at or below zero is no decay rate: `analyze_ddls` refuses one, and
+            # the Gamma-vs-q^2 fits drop one, so it enters no mean here either.
+            entered = [(m, f) for m, f in fits
+                       if f.success and np.isfinite(f.gamma_s_inv) and f.gamma_s_inv > 0]
+            # A fit that returned but did not enter is kept with the refusals, so the
+            # caller can account for every replicate supplied.
+            kept = {id(f) for _m, f in entered}
+            unusable = [m for m, f in fits if id(f) not in kept]
+            gamma = (float(np.mean([float(f.gamma_s_inv) for _m, f in entered]))
+                     if entered else float('nan'))
+            rates.append(gamma)
+            entered_by_channel[ch].append(tuple(entered))
+            refused_by_channel[ch].append(tuple(refused))
+            unusable_by_channel[ch].append(tuple(unusable))
+        g_vv, g_vh = rates
+        vv_in, vh_in = entered_by_channel[0][-1], entered_by_channel[1][-1]
+        if not math.isfinite(g_vv):
+            # D_t is a through-origin fit that drops no point, so an angle with no VV
+            # rate is left out here, for the caller to name, rather than failing the whole
+            # set with a cause that is not the one. A missing VH rate stays: `analyze_ddls`
+            # keeps the angle's VV rate in D_t, drops it from D_r, and flags D_r for it.
+            angles_left_out.append(float(a))
+            continue
+        entered_runs.extend(m for m, _f in vv_in + vh_in)
+        # q from the optics of a run whose rate entered, as T and eta are read below.
+        q = phys.scattering_vector_q_m(
+            a, vv_in[0][0].wavelength_nm, vv_in[0][0].solvent_refractive_index)
+        # Each replicate's own preconditions ride its point for the D_t and D_r
+        # verdicts; the rate is the mean above either way.
+        points.append(DDLSRatePoint(
+            angle_deg=a, q_m_inv=q, gamma_vv_s_inv=g_vv, gamma_vh_s_inv=g_vh,
+            vv_preconditions=tuple(find_notes(f, kind='precondition') for _m, f in vv_in),
+            vh_preconditions=tuple(find_notes(f, kind='precondition') for _m, f in vh_in)))
+
+    # Temperature and viscosity come from the runs that actually enter the fit, not
+    # from whichever correlogram was listed first: a left-out angle's runs and a refused
+    # or unfitted replicate never enter, so their eta has no business setting the
+    # Stokes-Einstein scale for D_t / D_r. (Viscosity is deliberately outside the
+    # identity check -- see check_replicate_identity -- so it can genuinely differ.)
+    t_k = entered_runs[0].temperature_K if entered_runs else None
+    eta = next((m.viscosity_Pa_s for m in entered_runs
+                if m.viscosity_Pa_s is not None), None)
+    return DDLSRateAssembly(
+        points=tuple(points),
+        vv_entered=tuple(entered_by_channel[0]), vh_entered=tuple(entered_by_channel[1]),
+        vv_refused=tuple(refused_by_channel[0]), vh_refused=tuple(refused_by_channel[1]),
+        vv_unusable=tuple(unusable_by_channel[0]), vh_unusable=tuple(unusable_by_channel[1]),
+        angles_left_out=tuple(angles_left_out), temperature_K=t_k, viscosity_Pa_s=eta,
+        entered_runs=tuple(entered_runs))
 
 
 # ===========================================================================
@@ -605,12 +784,20 @@ class SphereShapeResult:
     radius_trans_se: Optional[float]  # inherited from d_t_se (R_trans ∝ D_t^-1)
     sphericity_ratio: float         # radius_rot / radius_trans (1 for a true sphere)
     is_consistent: bool             # |ratio - 1| within tolerance -> sphere plausible
-    note: str = ''
+    interpretation: str = ''        # the reading of is_consistent (guidance, not a note)
+    # The shape-model family's notes field. The sphere fit has no precondition of its
+    # own to fail -- its verdict is `is_consistent` and its reading `interpretation` --
+    # so nothing mints one here.
+    notes: Tuple[Note, ...] = ()
     # The covariance estimator behind `radius_trans_se` -- a strict pass-through of the
     # DDLS `d_t_se`, which is HC3 or the classical-OLS opt-in at the user's choice. The
     # tag travels with the ± onto every surface that prints it (invariant 8 clause A);
     # `radius_rot_se` is a replicate SEM and has no estimator.
     se_estimator: str = 'hc3'
+    # What radius_rot_se IS: the DDLS replicate SEM of D_r carried through R ∝ D_r^(-1/3),
+    # which no regression estimator produced, so `core.notes.qualifiers` names no
+    # estimator about it (`DDLSResult.d_r_se_kind`'s rule).
+    radius_rot_se_kind: str = 'replicate_sem'
 
 
 @dataclass
@@ -624,7 +811,7 @@ class RodShapeResult:
     aspect_ratio_se: Optional[float]
     in_valid_range: bool            # 2 < p < 30 (Tirado fitted range)
     converged: bool                 # a rod reproduces both D_t and D_r
-    note: str = ''
+    notes: Tuple[Note, ...] = ()
     # The covariance estimator behind the DDLS `d_t_se` the Monte Carlo draws from
     # (invariant 8 clause A: the ± travels with the estimator that produced it).
     se_estimator: str = 'hc3'
@@ -646,7 +833,9 @@ class EllipsoidShapeResult:
     1975 (Eq. 9, correcting Perrin 1934). One solution per fitting branch -- a
     given (D_t, D_r) admits up to THREE ellipsoids (1 prolate + 2 oblate; the
     oblate D_perp is non-monotonic), so ellipsoid_dimensions_from_diffusion
-    returns a LIST of these and `degenerate` is set when more than one fits.
+    returns a LIST of these and `degenerate` is set when more than one fits;
+    `n_solutions` is how many do, which `core.notes.qualifiers` reads beside
+    `degenerate` and `is_prolate` to name the degeneracy.
     """
     semi_axis_polar_nm: float           # a (polar / symmetry-axis semi-axis)
     semi_axis_polar_se: Optional[float]
@@ -658,7 +847,8 @@ class EllipsoidShapeResult:
     in_valid_range: bool                # 0.1 < p < 10 (Koenig tabulated range)
     converged: bool                     # an ellipsoid reproduces both D_t and D_r
     degenerate: bool                    # >1 ellipsoid fits this (D_t, D_r)
-    note: str = ''
+    n_solutions: int = 0                # ellipsoids reproducing this (D_t, D_r), 0 to 3
+    notes: Tuple[Note, ...] = ()
     # As on RodShapeResult: the estimator behind the DDLS `d_t_se` the draws come from,
     # and the Monte-Carlo census PER SOLUTION (a draw counts for this branch only when
     # its re-solve has a root nearest this branch's p -- see the matching rule in
@@ -709,15 +899,16 @@ def sphere_dimensions_from_diffusion(
     r_trans_se = (unc.power_law_se(r_trans_nm, d_t_m2_s, d_t_se, -1)
                   if math.isfinite(r_trans_nm) else None)
     consistent = math.isfinite(ratio) and abs(ratio - 1.0) <= sphericity_tol
-    note = ('R from D_r and R from D_t agree -> a sphere is a plausible model.'
-            if consistent else
-            f'R(D_r) = {r_rot_nm:.2f} nm and R(D_t) = {r_trans_nm:.2f} nm disagree '
-            f'(ratio {ratio:.2f}); the particle is not spherical -- prefer the rod '
-            f'model (ratio > 1 is the rod signature).')
+    interpretation = (
+        'R from D_r and R from D_t agree -> a sphere is a plausible model.'
+        if consistent else
+        f'R(D_r) = {r_rot_nm:.2f} nm and R(D_t) = {r_trans_nm:.2f} nm disagree '
+        f'(ratio {ratio:.2f}); the particle is not spherical -- prefer the rod '
+        f'model (ratio > 1 is the rod signature).')
     return SphereShapeResult(
         radius_rot_nm=r_rot_nm, radius_rot_se=unc.se_or_none(r_rot_se),
         radius_trans_nm=r_trans_nm, radius_trans_se=unc.se_or_none(r_trans_se),
-        sphericity_ratio=ratio, is_consistent=consistent, note=note,
+        sphericity_ratio=ratio, is_consistent=consistent, interpretation=interpretation,
         se_estimator=se_estimator)
 
 
@@ -825,7 +1016,8 @@ def rod_dimensions_from_diffusion(
     are given, the dimension SEs are propagated by Monte Carlo: sample D_t, D_r from
     independent normals, invert each, and take the spread (the sampling SD -- no
     linearization) over the draws a rigid rod reproduces. That census is recorded on
-    the result (`mc_n_draws`, `mc_n_used`, `mc_seed`) because it is part of what the
+    the result (`mc_n_draws`, `mc_n_used`, `mc_seed`, and the `mc_census` record note
+    about the three ±) because it is part of what the
     ± means: a draw is lost only where the pair leaves the rod model altogether (a
     negative rate, or a D_r faster than any cylinder with that D_t admits -- the p -> 1
     limit), not to the old aspect-ratio window; the surviving bracket end is a float
@@ -844,8 +1036,7 @@ def rod_dimensions_from_diffusion(
             length_nm=float('nan'), length_se=None, diameter_nm=float('nan'),
             diameter_se=None, aspect_ratio_p=float('nan'), aspect_ratio_se=None,
             in_valid_range=False, converged=False,
-            note='No rigid rod reproduces both D_t and D_r -- the rod model does not '
-                 'fit (the particle may be flexible, branched, or non-rod-like).',
+            notes=(Note('no_shape_solution', (), {'model': 'rigid rod'}),),
             se_estimator=se_estimator)
     length_nm, diameter_nm, p, in_range = solved
 
@@ -870,16 +1061,18 @@ def rod_dimensions_from_diffusion(
             diameter_se = unc.se_or_none(float(np.std(ds, ddof=1)))
             p_se = unc.se_or_none(float(np.std(ps, ddof=1)))
 
-    note = ''
-    if not in_range:
-        note = (f'aspect ratio p = {p:.2f} is outside the Tirado (1984) fitted range '
-                f'2 < p < 30; L and d are extrapolated and should be treated with '
-                f'caution.')
+    notes: Tuple[Note, ...] = () if in_range else (
+        Note('aspect_ratio_out_of_range', ('aspect_ratio_p',),
+             {'p': p, 'lo': phys.ROD_ASPECT_RATIO_MIN, 'hi': phys.ROD_ASPECT_RATIO_MAX,
+              'model': 'rod'}),)
+    if n_draws > 0:
+        notes += (Note('mc_census', ('length_se', 'diameter_se', 'aspect_ratio_se'),
+                       {'used': n_used, 'n': n_draws, 'seed': mc_seed}),)
     return RodShapeResult(
         length_nm=length_nm, length_se=length_se,
         diameter_nm=diameter_nm, diameter_se=diameter_se,
         aspect_ratio_p=p, aspect_ratio_se=p_se,
-        in_valid_range=in_range, converged=True, note=note,
+        in_valid_range=in_range, converged=True, notes=notes,
         se_estimator=se_estimator,
         mc_n_draws=n_draws, mc_n_used=n_used, mc_seed=mc_seed)
 
@@ -977,7 +1170,8 @@ def ellipsoid_dimensions_from_diffusion(
     independent normals, re-solve, match each draw's roots to the nearest base
     solution by p, take the spread) -- the same MC pattern as the rod, locked per
     solution so the branches do not cross-contaminate. Each solution records its own
-    census (`mc_n_draws`, `mc_n_used`, `mc_seed`): a draw counts for a branch only
+    census (`mc_n_draws`, `mc_n_used`, `mc_seed`, and the `mc_census` record note about
+    its ±): a draw counts for a branch only
     when its re-solve has a root nearest that branch, so a branch that exists for a
     minority of draws reports a ± over that minority and says so. The brackets are
     the full p > 0 domain of the Perrin factors, so a draw is lost to the model's own
@@ -994,9 +1188,8 @@ def ellipsoid_dimensions_from_diffusion(
             equatorial_radius_nm=float('nan'), equatorial_radius_se=None,
             axial_ratio_p=float('nan'), axial_ratio_se=None,
             is_prolate=False, in_valid_range=False, converged=False,
-            degenerate=False,
-            note='No ellipsoid of revolution reproduces both D_t and D_r -- the '
-                 'ellipsoid model does not fit (try the rod or sphere models).',
+            degenerate=False, n_solutions=0,
+            notes=(Note('no_shape_solution', (), {'model': 'ellipsoid of revolution'}),),
             se_estimator=se_estimator)]
 
     degenerate = len(solved) > 1
@@ -1039,26 +1232,25 @@ def ellipsoid_dimensions_from_diffusion(
                           unc.se_or_none(float(np.std(arr[:, 1], ddof=1))),
                           unc.se_or_none(float(np.std(arr[:, 2], ddof=1))))
 
+    # The degeneracy is a qualifier, read off `degenerate`, `n_solutions` and
+    # `is_prolate` by `core.notes.qualifiers`; only the range precondition is minted.
     results = []
     for (a_nm, b_nm, p, is_pro, in_range), (a_se, b_se, p_se), used in zip(
             solved, ses, n_used, strict=True):
-        note = ''
-        if not in_range:
-            note = (f'axial ratio p = {p:.2f} is outside Koenig (1975) tabulated '
-                    f'range 0.1 < p < 10; the dimensions are extrapolated and '
-                    f'should be treated with caution.')
-        if degenerate:
-            kind = 'prolate' if is_pro else 'oblate'
-            note = ((note + ' ' if note else '')
-                    + f'this (D_t, D_r) is also consistent with '
-                      f'{len(solved) - 1} other ellipsoid'
-                      f'{"s" if len(solved) > 2 else ""} '
-                      f'({kind} solution shown).')
+        notes: Tuple[Note, ...] = () if in_range else (
+            Note('aspect_ratio_out_of_range', ('axial_ratio_p',),
+                 {'p': p, 'lo': phys.ELLIPSOID_ASPECT_RATIO_MIN,
+                  'hi': phys.ELLIPSOID_ASPECT_RATIO_MAX, 'model': 'ellipsoid'}),)
+        if n_draws > 0:
+            notes += (Note('mc_census', ('semi_axis_polar_se', 'equatorial_radius_se',
+                                         'axial_ratio_se'),
+                           {'used': used, 'n': n_draws, 'seed': mc_seed}),)
         results.append(EllipsoidShapeResult(
             semi_axis_polar_nm=a_nm, semi_axis_polar_se=a_se,
             equatorial_radius_nm=b_nm, equatorial_radius_se=b_se,
             axial_ratio_p=p, axial_ratio_se=p_se,
             is_prolate=is_pro, in_valid_range=in_range, converged=True,
-            degenerate=degenerate, note=note, se_estimator=se_estimator,
+            degenerate=degenerate, n_solutions=len(solved), notes=notes,
+            se_estimator=se_estimator,
             mc_n_draws=n_draws, mc_n_used=used, mc_seed=mc_seed))
     return results

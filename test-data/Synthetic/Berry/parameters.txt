@@ -16,9 +16,9 @@ WHAT THE SETS ACTUALLY DO -- measured on these exact files, not predicted:
 
   set             estimator   Rg (nm)     vs truth   A2           vs truth
   coil Rg 80nm    Zimm        96.1        1.20x      4.11e-05     1.03x
-                  Berry       73.0        0.91x      2.88e-05     0.72x
+                  Berry       74.9        0.94x      3.45e-05     0.86x
   coil Rg 150nm   Zimm        214.4       1.43x      2.09e-05     1.05x
-                  Berry       106.8       0.71x      1.18e-05     0.59x
+                  Berry       111.0       0.74x      1.65e-05     0.83x
 
 Berry is the better estimator of Rg here, which is what the set is for. It does NOT
 "track the truth": it UNDER-reads Rg, and on A2 it is markedly WORSE than Zimm. Neither

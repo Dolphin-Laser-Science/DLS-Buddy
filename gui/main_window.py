@@ -35,41 +35,21 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from app.version import __version__
 from app.controller import Controller
+from app.loading import load_dls_files, load_sls_files
 from core.naming import (UNCONFIRMED_SAMPLE, measurement_display_name,
                          measurement_hover_card, sample_display_name)
-from core.workspace import _DLS_PARAM_KEYS, _SLS_PARAM_KEYS, seed_vendor_records
-from parsers.autodetect import autodetect
-from parsers.base_parser import (MalformedDataError, ParseError,
-                                 collect_parse_notes)
-from parsers.brookhaven_dat import BrookhavenDATParser, BrookhavenDATPreview
-from parsers.brookhaven_dls import BrookhavenDLSParser
-from parsers.brookhaven_sls import BrookhavenSLSParser, BrookhavenSLSScanParser
-from parsers.alv_asc import ALVCorrelatorParser
-from parsers.panta_xlsx import PantaXlsxParser
-from parsers.zetasizer_clipboard import ZetasizerClipboardParser
-from parsers.zetasizer_export import ZetasizerExportParser
+# The generic DLS fallback (`_try_generic_dls`) parses here, behind its units prompt;
+# the instrument parsers and the load itself are `app/loading.py`'s.
+from parsers.base_parser import MalformedDataError, ParseError
 from parsers.generic_dls import GenericDLSParser
-from parsers.generic_sls import GenericSLSParser
 
-# Instrument-specific parsers tried, in order, by the format auto-detection on load.
-# Each sniffs its own format and raises ParseError when the file is not its own, so
-# the first that succeeds is the right one. The lenient *generic* parsers are NOT
-# here (they would match almost anything); they are tried only as an explicit
-# fallback after instrument detection fails -- the load button declares the data
-# kind, and generic DLS prompts for its delay unit + data form.
-_DLS_PARSERS = [ALVCorrelatorParser, ZetasizerClipboardParser,
-                ZetasizerExportParser, BrookhavenDLSParser, BrookhavenDATParser,
-                PantaXlsxParser]
-# The two Brookhaven SLS entries read the instrument's two .CSV layouts (concentration
-# series / single angular scan). Their sniffs are mutually exclusive by construction, so
-# the order between them carries no meaning.
-_SLS_PARSERS = [BrookhavenSLSParser, BrookhavenSLSScanParser]
 _DELAY_UNITS = ['s', 'ms', 'us', 'ns']
 _DATA_FORMS = [('g2(τ) − 1', 'g2m1'), ('g2(τ)', 'g2'), ('g1(τ)', 'g1')]
 
 from gui.data_module import DataModule
-from gui.dls_module import DLSModule, ask_average_method, show_average_summary
-from gui.sls_module import SLSModule
+from gui.dls.module import DLSModule
+from gui.dls.averaging import ask_average_method, show_average_summary
+from gui.sls.module import SLSModule
 from gui.cross_module import CrossSampleModule
 from gui.utilities_module import UtilitiesModule
 from gui.settings_module import SettingsModule
@@ -80,7 +60,7 @@ from gui.help import install_tooltip_gate, set_tooltips_enabled, section_header
 from gui.theme import ThemedLabel, color as theme_color, retheme, is_dark
 from gui.widgets import (roomy_tabs, EmptyState, show_parse_notes,
                          confirm_regroup_losses)
-from gui.worker import runner, run_when_idle
+from gui.worker import RunSlot, runner, run_when_idle
 from plotting.plots import (
     set_palette, set_plot_units, set_onscreen_plot_theme, apply_figure_theme)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -182,7 +162,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _report_settings_problems(self) -> None:
         """Surface the invalid-settings reversions collected at load. Mirrors the
-        load-notes pattern in `_on_load_sls`: a non-blocking notice that names each field, its
+        load-notes pattern in `_finish_load`: a non-blocking notice that names each field, its
         rejected value, and the default now in effect."""
         problems = self.controller.settings_load_problems
         if not problems:
@@ -227,20 +207,19 @@ class MainWindow(QtWidgets.QMainWindow):
         side.addWidget(section_header(
             'Workspace', 'Your loaded data, grouped into samples:',
             bullets=[
-                'Click a measurement to load it into the tabs.',
-                'Click a <b>heading</b> (sample, or DLS/SLS) to select everything '
-                'under it — handy for a one-shot parameter edit.',
-                '<b>Right-click</b> a heading or selection to remove, move to '
-                'another sample, or average replicates (source runs only — an '
-                'average is never averaged again).',
-                'Stored results follow a regrouped sample; you are asked first '
-                'if a merge would drop a hand-entered or picked value.',
-                'Tick measurements in the DLS tab to overlay/fit several at once.',
-                'A <b>count-rate trace</b> recorded beside a DLS run appears under '
-                'that measurement; unattached traces sit in the <b>Traces</b> list '
-                'at the bottom.',
-                '<b>Right-click a trace</b> to attach it to a DLS measurement, '
-                'detach it, export it, or remove it.',
+                'Click a measurement to load it into the tabs; to overlay/fit '
+                'several, tick them in the DLS tab.',
+                'Click a <b>heading</b> (sample, DLS or SLS) to select everything '
+                'under it, for a one-shot parameter edit.',
+                '<b>Right-click</b> a selection to move, remove or average it '
+                '(source runs only), or a heading to remove it.',
+                'A replicate just across a 0.1 °C boundary forms its own sample '
+                '(User-Manual §7.1.1).',
+                'Stored results follow a regrouped sample; a merge asks before '
+                'dropping hand-entered or picked values.',
+                'A <b>count-rate trace</b> sits under its measurement, or in '
+                '<b>Traces</b> at the bottom; <b>right-click</b> it to attach, '
+                'detach, export or remove it.',
             ]))
         self.tree = QtWidgets.QTreeWidget()
         self.tree.setHeaderHidden(True)
@@ -344,6 +323,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tabs.addTab(wrapper, title)
         self.tabs.setMovable(True)               # drag to reorder main tabs
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        # The (theme, plot_match_theme) pair `_apply_theme` last applied; None before.
+        self._applied_theme: Optional[tuple] = None
         self._apply_theme(self.controller.settings.theme)   # honor saved theme
         set_palette(self.controller.settings.plot_palette)  # and saved plot palette
         set_plot_units(self.controller.settings.plot_units)  # and saved plot units
@@ -357,6 +338,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # cursor (BusyCursor, not WaitCursor — the window stays interactive) and
         # a status-bar message. One analysis in flight app-wide.
         runner().busy_changed.connect(self._on_busy_changed)
+        self._average_slot = RunSlot()       # a busy replicate average is refused
 
     @QtCore.Slot(bool, str)
     def _on_busy_changed(self, busy: bool, description: str) -> None:
@@ -428,10 +410,9 @@ class MainWindow(QtWidgets.QMainWindow):
             stack.setCurrentIndex(1 if has_data else 0)
 
     # ------------------------------------------------------------- loading ---
-    # NB there is no `_autodetect` here: the loop lives in parsers/autodetect.py, because
-    # `main_window` imports `utilities_module` and so a helper here could never be reached
-    # from the trace loader. No thin shim was left behind either -- a shim is a second,
-    # quieter copy of the contract.
+    # The load itself is `app/loading.py`'s; the slots here keep the file dialog, the busy
+    # guard and the dialogs, and `_try_generic_dls` is the loader's generic DLS fallback
+    # callback, since its units prompt is a dialog.
 
     def _try_generic_dls(self, path: str):
         """Generic two-column DLS fallback. Returns the previews (arrays converted),
@@ -439,9 +420,10 @@ class MainWindow(QtWidgets.QMainWindow):
         load and the user has already been dealt with inline -- they cancelled the
         prompt, or the unit / data-form they entered was rejected.
 
-        A MalformedDataError PROPAGATES to the caller, which batches it with the
-        instrument routes into one end-of-load dialog. The reverted round added that
-        caller-side handler WITHOUT narrowing the catches here, so it was dead code
+        A MalformedDataError PROPAGATES to the caller (`app/loading.load_dls_files`),
+        which batches it with the instrument routes into one end-of-load dialog. The
+        reverted round added that caller-side handler WITHOUT narrowing the catches
+        here, so it was dead code
         (both reviewers found it independently): MalformedDataError is a ParseError, and
         `except ParseError` below would have swallowed it first.
         """
@@ -545,48 +527,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 beta_v = None                # apply_data_conversion will report it
         return unit.currentText(), data_form, baseline_B, beta_v
 
-    def _apply_dat_baseline_setting(self, previews) -> list:
-        """Seed a Brookhaven .dat correlogram's baseline from Settings.
-
-        The .dat stores raw counts plus both baselines, so a baseline has to be
-        picked before a correlogram exists. A file that names one in its header
-        has already decided and is left alone; the setting fills only the
-        "ask the user" case. Settings strings are deliberately not validated
-        against an allow-list (see app/settings.py), so an unrecognized value
-        falls back to the parser's own default rather than failing the load.
-
-        Returns a list of human-readable strings, one per preview where the
-        requested baseline could NOT be applied. Falling back silently would
-        leave the Settings panel reading "Measured" while the numbers came from
-        the calculated baseline. The default fits absorb that difference, but the
-        linear cumulant does not, so the caller reports these rather than
-        swallowing them.
-        """
-        choice = getattr(self.controller.settings, 'brookhaven_dat_baseline', None)
-        fallbacks = []
-        for preview in previews:
-            if not isinstance(preview, BrookhavenDATPreview):
-                continue
-            if preview.baseline_is_file_specified or not choice:
-                continue
-            if choice == preview.baseline_choice:
-                continue                          # already what the parser applied
-            try:
-                preview.set_baseline_choice(choice)
-            except ParseError as exc:
-                # This arm knowingly absorbs MalformedDataError too, and it is the only
-                # place in the tree that does. set_baseline_choice re-runs apply_data_form,
-                # whose data raises are now the subclass -- but a Settings-driven
-                # re-normalization that will not take belongs in THIS channel (the file
-                # loaded fine under a different baseline), not in the malformed-file dialog
-                # that says nothing was loaded. Stated so the next reviewer sees a decision
-                # rather than a leak.
-                fallbacks.append(
-                    f'{os.path.basename(preview.source_file or "?")}: could not use '
-                    f'the {choice!r} baseline ({exc}). Used the '
-                    f'{preview.baseline_choice} baseline instead.')
-        return fallbacks
-
     @QtCore.Slot()
     def _on_load_dls(self) -> None:
         if self._busy_guard():
@@ -598,81 +538,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not paths:
             return
         remember_open_dir(self.controller, paths[0])
-        first_id, n_files, n_meas, unreadable = None, 0, 0, []
-        baseline_fallbacks = []
-        parse_notes = []                     # passive load-time ⓘ notices from parsers
-        malformed = []                       # recognised, but its data is unusable
-        for path in paths:
-            # Instrument-agnostic: auto-detect (ALV, Zetasizer, Brookhaven…), then
-            # fall back to a plain two-column generic file (with a units prompt).
-            det = autodetect(path, _DLS_PARSERS)
-            previews = det.previews
-            if not previews:
-                if det.malformed is not None:
-                    # A parser RECOGNISED this file and diagnosed its data. Its message is
-                    # the answer, so it goes to the user rather than being swallowed --
-                    # and we do NOT fall through to the generic parser, which would either
-                    # re-fail with a worse message or, worse, accept an instrument file as
-                    # a plain two-column table behind a units prompt and load it wrongly.
-                    malformed.append(det.reason(os.path.basename(path)))
-                    continue
-                try:
-                    previews = self._try_generic_dls(path)
-                except MalformedDataError as exc:
-                    malformed.append(f'{os.path.basename(path)}: {exc}')
-                    continue
-            if previews is None:             # canceled the generic prompt -> skip
-                continue
-            if not previews:
-                unreadable.append(os.path.basename(path))
-                continue
-            collect_parse_notes(previews, path, parse_notes)
-            baseline_fallbacks += self._apply_dat_baseline_setting(previews)
-            for preview in previews:
-                raw = {
-                    'delay_times_s': [float(x) for x in preview.delay_times_s],
-                    'correlogram': [float(x) for x in preview.correlogram],
-                }
-                # A per-channel sample time the FILE states (the Brookhaven .dat's
-                # correlator sections) rides in `raw` beside the lags -- an instrument
-                # fact, not a parameter -- and is absent when the format states none.
-                if getattr(preview, 'sample_times_s', None) is not None:
-                    raw['sample_times_s'] = [float(x) for x in preview.sample_times_s]
-                # The run duration, likewise an instrument fact beside the lags, where the
-                # file states it for this correlogram (an ALV one-run acquisition, or a
-                # Brookhaven run length that covers its own live channels).
-                if getattr(preview, 'duration_s', None) is not None:
-                    raw['duration_s'] = float(preview.duration_s)
-                params = {k: getattr(preview, k, None) for k in _DLS_PARAM_KEYS}
-                if isinstance(preview, BrookhavenDATPreview):
-                    # A raw-counts format: which baseline normalized it is absorbed
-                    # by the default fits but not by a zero-baseline one, and the
-                    # workspace stores only the correlogram, so the choice has to be
-                    # recorded here or it is unrecoverable. Provenance, not a param.
-                    params['correlogram_baseline_source'] = preview.baseline_provenance
-                # What the file itself recorded (vendor mean count rate, run
-                # length), where the format carries it -- offered, never applied.
-                seed_vendor_records(params, preview)
-                iid = self.controller.add_loaded('dls', raw, params, source_path=path)
-                # Formats that ship the count-rate trace in the same file (ALV .ASC)
-                # hand it over on the preview; store it linked to the measurement we
-                # just made. This is the confirmation step the trace parsers defer
-                # the measurement_id back-reference to.
-                if getattr(preview, 'trace_preview', None) is not None:
-                    tid = self.controller.add_trace_from_preview(
-                        preview.trace_preview, source_path=path, measurement_id=iid)
-                    # Through attach_trace, so a file-borne link and a hand-made one
-                    # seed the mean count rate by exactly one code path; then commit
-                    # that seed, so a load arrives clean like every other one rather
-                    # than showing "changes pending" before the user has touched it.
-                    self.controller.attach_trace(tid, iid)
-                # Unconditional: a format may record its own mean count rate without
-                # shipping a trace (Brookhaven .dat), and that seed is due at load too.
-                # After the attach above, so a trace still outranks a vendor scalar.
-                self.controller.seed_mean_count_rate_at_load(iid)
-                first_id = first_id or iid
-            n_files += 1
-            n_meas += len(previews)
+        report = load_dls_files(self.controller, paths,
+                                generic_fallback=self._try_generic_dls)
+        baseline_fallbacks = report.baseline_fallbacks
         if baseline_fallbacks:
             QtWidgets.QMessageBox.warning(
                 self, 'Baseline setting not applied',
@@ -681,8 +549,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 'normalized them. The default fits absorb the difference; the '
                 'linear cumulant method does not.'
                 '\n\n  ' + '\n  '.join(baseline_fallbacks))
-        self._finish_load(first_id, n_files, n_meas, unreadable, 'DLS correlogram',
-                          parse_notes=parse_notes, malformed=malformed)
+        self._finish_load(report.first_id, report.n_files, report.n_meas,
+                          report.unreadable, 'DLS correlogram',
+                          parse_notes=report.parse_notes, malformed=report.malformed)
 
     @QtCore.Slot()
     def _on_load_sls(self) -> None:
@@ -694,42 +563,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not paths:
             return
         remember_open_dir(self.controller, paths[0])
-        first_id, n_files, n_meas, unreadable = None, 0, 0, []
-        parse_notes = []                     # passive load-time ⓘ notices from parsers
-        malformed = []                       # recognised, but its data is unusable
-        for path in paths:
-            det = autodetect(path, _SLS_PARSERS)
-            previews = det.previews
-            if not previews:
-                if det.malformed is not None:
-                    malformed.append(det.reason(os.path.basename(path)))
-                    continue
-                try:                         # fall back to a plain two-column table
-                    previews = GenericSLSParser().parse(path)
-                except MalformedDataError as exc:
-                    # MUST precede the ParseError arm. Unlike the generic DLS parser this
-                    # one builds its SLSFilePreview inside parse(), so __post_init__'s
-                    # require_finite_data fires HERE -- a plain SLS file with an inf
-                    # intensity is a live route to this handler, not a defensive one.
-                    malformed.append(f'{os.path.basename(path)}: {exc}')
-                    continue
-                except (ParseError, FileNotFoundError):
-                    previews = None
-            if not previews:
-                unreadable.append(os.path.basename(path))
-                continue
-            for p in previews:
-                raw = {'angles_deg': [float(a) for a in p.angles_deg],
-                       'intensities': [float(x) for x in p.intensities]}
-                params = {k: getattr(p, k, None) for k in _SLS_PARAM_KEYS}
-                iid = self.controller.add_loaded('sls', raw, params, source_path=path)
-                first_id = first_id or iid
-            collect_parse_notes(previews, path, parse_notes)   # e.g. negative intensities
-            n_files += 1
-            n_meas += len(previews)
-        self._finish_load(first_id, n_files, n_meas, unreadable,
-                          'SLS intensity export', warn_blanks=True,
-                          parse_notes=parse_notes, malformed=malformed)
+        report = load_sls_files(self.controller, paths)
+        self._finish_load(report.first_id, report.n_files, report.n_meas,
+                          report.unreadable, 'SLS intensity export', warn_blanks=True,
+                          parse_notes=report.parse_notes, malformed=report.malformed)
 
     def _finish_load(self, first_id, n_files: int, n_meas: int,
                      unreadable: list, kind_desc: str,
@@ -737,18 +574,19 @@ class MainWindow(QtWidgets.QMainWindow):
                      malformed: list = ()) -> None:
         """Shared post-load: select the first new measurement, refresh, report.
 
-        `warn_blanks` (SLS loads only) surfaces a multiple-solvent-blank collision:
-        a DLS load can't create one, so it would only re-nag about a pre-existing
-        collision.
+        `warn_blanks` (SLS loads only) reports solvent blanks in one sample that
+        measurably differ: a DLS load can't add a blank, so it would only repeat the
+        report about a pre-existing one.
 
         `parse_notes` are passive load-time notices (the file loaded; here is something
-        about it). They are rendered here, on the funnel both loaders already call, rather
+        about it), `(file name, note)` pairs from `collect_parse_notes`, each shown with
+        its remedy. They are rendered here, on the funnel both loaders already call, rather
         than in each loader: the two routes are otherwise free to drift apart on whether
         the channel exists at all, and a shared parameter makes that structurally harder to
         recreate than a helper each caller must remember.
 
         `malformed` are files a parser RECOGNISED and then diagnosed -- `'<file>: <why>'`
-        lines, the same shape as `parse_notes` and `baseline_fallbacks`. Deliberately NOT
+        lines, the same shape as `baseline_fallbacks`. Deliberately NOT
         merged into `unreadable`: "no supported format matched this file" tells the user
         to check the format, while "row 7's data cell is blank" tells them where to look
         inside a file the program understood perfectly well. Collapsing the second into the
@@ -788,117 +626,108 @@ class MainWindow(QtWidgets.QMainWindow):
             show_parse_notes(self, parse_notes)
 
     def _warn_solvent_reference_collisions(self) -> None:
-        """If any sample loaded more than one c = 0 solvent blank, tell the user which
-        blank is the active reference and that the extras are kept but unused (A5 --
-        the data model has one reference slot; extras are never silently dropped)."""
+        """Tell the user when the c = 0 solvent blanks loaded into one sample measurably
+        differ, since the excess Rayleigh ratio then depends on which blank a series is
+        referenced against.
+
+        The ratio and the verdict are the controller's (`solvent_blank_verdict`); the
+        shell writes the sentence. Only a ``'differ'`` verdict opens the box. An
+        ``'agree'`` verdict and no comparison are silent: a check that did not fail is
+        not shown (`ui_style_guide.md` § 5, "Hazards the program cannot verify"), and
+        the sidebar's "extra blank" mark and the Data tab's "Solvent blank" row already
+        show the pairing."""
         collisions = self.controller.workspace.solvent_reference_collisions()
         if not collisions:
             return
-        n_extra = sum(len(v) for v in collisions.values())
-
-        # How far apart the blanks actually are, not merely that there are several. An
-        # angular-scan file carries its own blank, so pooling several of them references
-        # every series against the first-loaded one; when those blanks genuinely differ
-        # that is a proportional error in the excess Rayleigh ratio, hence in Mw, A2 and
-        # Rg. Reporting the ratio turns a bookkeeping notice into a warning. Worst case
-        # across samples, because one bad pairing is enough to matter.
-        # Ratio AND verdict from the controller -- see `solvent_blank_verdict`; the
-        # shell only writes the sentence.
-        worst, verdict = self.controller.solvent_blank_verdict(collisions)
-        if verdict == 'differ':
-            measured = (
-                f'\n\nThese blanks are NOT interchangeable: they differ by up to '
-                f'{worst:.3g}x, so which blank a series is referenced against moves '
-                f'its excess Rayleigh ratio — and the Mw, A₂ and Rg computed from it — '
-                f'by about that factor. Each series is paired with the blank from its '
-                f'own file automatically; a series whose file carried no blank falls '
-                f'back to the sample reference. Check or change the pairing in the '
-                f'"Solvent blank" row of the Data tab.')
-        elif verdict == 'agree':
-            measured = (f'\n\nThe blanks agree to within {worst:.3g}x, so which one is '
-                        f'the reference makes little difference here.')
-        else:
-            measured = ''
-
+        # Each sample's own verdict, so a sample whose blanks agree is never counted.
+        differ = [sid for sid in collisions
+                  if self.controller.solvent_blank_verdict([sid])[1] == 'differ']
+        if not differ:
+            return
+        worst, _verdict = self.controller.solvent_blank_verdict(differ)
+        n = len(differ)
+        # The ratio compares the blanks; no factor is claimed for the result
+        # (`Controller.solvent_blank_disagreement`).
         QtWidgets.QMessageBox.information(
             self, 'Multiple solvent blanks',
-            f'{n_extra} extra solvent-blank (c = 0) series in '
-            f'{len(collisions)} sample(s) were loaded beyond the one reference each '
-            'sample uses. The FIRST-loaded blank is the sample reference; each series '
-            'is referenced against the blank from its own source file when there is '
-            'one, else against that reference (the "Solvent blank" row of the Data tab '
-            'shows and overrides the pairing). Every blank beyond the reference is kept; '
-            'the sidebar marks it "extra blank" because it is not the sample '
-            'reference, not because no series uses it.\n\nTwo common '
-            'causes. Several angular-scan files were loaded into one sample: each '
-            'carries its own solvent blank. Or several acquisitions '
-            'were merged into one sample — if those are different molecular weights of '
-            'the same polymer, tag each series with an Mw fraction on the Data tab, '
-            'otherwise their concentrations pool into one Zimm/Debye fit.' + measured)
+            f'The solvent blanks loaded into {n} sample{"s" if n > 1 else ""} differ by '
+            f'up to {worst:.3g}x. The excess '
+            'Rayleigh ratio, and the Mw, A₂ and Rg computed from it, depend on which '
+            'blank a series is referenced against. Each series uses the blank from its '
+            'own file when it has one; the "Solvent blank" row of the Data tab shows '
+            'and changes the pairing (User-Manual §5.4).')
 
     # ------------------------------------------------------------- sidebar ---
     def _refresh_sidebar(self) -> None:
         """Rebuild the samples/measurements tree from the workspace."""
-        # Block signals during the rebuild so clear()/add don't fire
-        # itemSelectionChanged and re-enter _set_current mid-rebuild.
-        self.tree.blockSignals(True)
-        self.tree.clear()
-        self._leaf_items = {}
-        for s in self.controller.samples():
-            name = sample_display_name(s)
-            parent = QtWidgets.QTreeWidgetItem([name])
-            parent.setToolTip(0, name)                     # full name if clipped
-            parent.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-            # A role marker (a tuple) distinguishes structural nodes from measurement
-            # leaves (whose role is the bare item_id string). This drives the
-            # header-aware context menu and "click a header → select its children".
-            parent.setData(0, QtCore.Qt.ItemDataRole.UserRole,
-                           ('sample', s.sample_id))
-            # Status annotation: an unconfirmed sample (identity not yet set in the Data
-            # tab) reads amber, so it's obvious which samples still need confirming.
-            # PREFIX, not equality: `sample_display_name` appends whatever identity IS
-            # set, so a real load reads `(unconfirmed sample: 323.15 K)` and equality
-            # stopped tinting the case every file load produces while still firing on
-            # the all-empty case the fixtures use. `UNCONFIRMED_SAMPLE[:-1]` is the
-            # prefix that builder guarantees, composing the richer form from it.
-            if name.startswith(UNCONFIRMED_SAMPLE[:-1]):
-                parent.setForeground(0, theme_color(self.tree, 'pending'))
-            self.tree.addTopLevelItem(parent)
-            parent.setExpanded(True)
-            # Group the two measurement kinds under labeled, non-selectable headers
-            # so DLS and SLS are visually delineated within a sample.
-            if s.dls_item_ids:
-                dls_group = self._group_header(parent, 'DLS',
-                                               ('group', 'dls', s.sample_id))
-                for iid in s.dls_item_ids:
-                    leaf = self._add_meas_item(dls_group, iid)
-                    self._leaf_items[iid] = leaf
-                    # A count-rate trace recorded beside this run hangs off it. Done
-                    # here rather than inside _add_meas_item because the SLS branch
-                    # below shares that builder and must not gain trace children.
-                    for t in self.controller.traces_for_measurement(iid):
-                        self._add_trace_leaf(leaf, t)
-                    leaf.setExpanded(True)
-            sls = ([(s.solvent_reference_item_id, 'solvent ref')]
-                   if s.solvent_reference_item_id else [])
-            sls += [(iid, '') for iid in s.sls_item_ids]
-            # Extra c = 0 blanks beyond the single reference slot: show them so they
-            # stay visible (never silently dropped -- A5). Marked 'extra', never
-            # 'unused': each series is referenced against the blank from its own file
-            # (`Controller.solvent_blank_status`), so such a blank is in use.
-            sls += [(iid, 'extra blank')
-                    for iid in s.extra_solvent_reference_item_ids]
-            if sls:
-                sls_group = self._group_header(parent, 'SLS',
-                                               ('group', 'sls', s.sample_id))
-                for iid, marker in sls:
-                    self._leaf_items[iid] = self._add_meas_item(sls_group, iid, marker)
-        self._add_trace_nodes()
-        self.tree.blockSignals(False)
+        # Updates stay off through the rebuild and the mirror: with the tree visible,
+        # the mirror's per-leaf setFont makes the ResizeToContents header relayout once
+        # per leaf, which dominated the rebuild's cost. The finally re-enables them on
+        # every exit, so an exception cannot leave the tree frozen.
+        self.tree.setUpdatesEnabled(False)
+        try:
+            # Block signals during the rebuild so clear()/add don't fire
+            # itemSelectionChanged and re-enter _set_current mid-rebuild.
+            self.tree.blockSignals(True)
+            self.tree.clear()
+            self._leaf_items = {}
+            for s in self.controller.samples():
+                name = sample_display_name(s)
+                parent = QtWidgets.QTreeWidgetItem([name])
+                parent.setToolTip(0, name)                     # full name if clipped
+                parent.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+                # A role marker (a tuple) distinguishes structural nodes from measurement
+                # leaves (whose role is the bare item_id string). This drives the
+                # header-aware context menu and "click a header → select its children".
+                parent.setData(0, QtCore.Qt.ItemDataRole.UserRole,
+                               ('sample', s.sample_id))
+                # Status annotation: an unconfirmed sample (identity not yet set in the Data
+                # tab) reads amber, so it's obvious which samples still need confirming.
+                # PREFIX, not equality: `sample_display_name` appends whatever identity IS
+                # set, so a real load reads `(unconfirmed sample: 323.15 K)` and equality
+                # stopped tinting the case every file load produces while still firing on
+                # the all-empty case the fixtures use. `UNCONFIRMED_SAMPLE[:-1]` is the
+                # prefix that builder guarantees, composing the richer form from it.
+                if name.startswith(UNCONFIRMED_SAMPLE[:-1]):
+                    parent.setForeground(0, theme_color(self.tree, 'pending'))
+                self.tree.addTopLevelItem(parent)
+                parent.setExpanded(True)
+                # Group the two measurement kinds under labeled, non-selectable headers
+                # so DLS and SLS are visually delineated within a sample.
+                if s.dls_item_ids:
+                    dls_group = self._group_header(parent, 'DLS',
+                                                   ('group', 'dls', s.sample_id))
+                    for iid in s.dls_item_ids:
+                        leaf = self._add_meas_item(dls_group, iid)
+                        self._leaf_items[iid] = leaf
+                        # A count-rate trace recorded beside this run hangs off it. Done
+                        # here rather than inside _add_meas_item because the SLS branch
+                        # below shares that builder and must not gain trace children.
+                        for t in self.controller.traces_for_measurement(iid):
+                            self._add_trace_leaf(leaf, t)
+                        leaf.setExpanded(True)
+                sls = ([(s.solvent_reference_item_id, 'solvent ref')]
+                       if s.solvent_reference_item_id else [])
+                sls += [(iid, '') for iid in s.sls_item_ids]
+                # Extra c = 0 blanks beyond the single reference slot: show them so they
+                # stay visible (never silently dropped -- A5). Marked 'extra', never
+                # 'unused': each series is referenced against the blank from its own file
+                # (`Controller.solvent_blank_status`), so such a blank is in use.
+                sls += [(iid, 'extra blank')
+                        for iid in s.extra_solvent_reference_item_ids]
+                if sls:
+                    sls_group = self._group_header(parent, 'SLS',
+                                                   ('group', 'sls', s.sample_id))
+                    for iid, marker in sls:
+                        self._leaf_items[iid] = self._add_meas_item(sls_group, iid, marker)
+            self._add_trace_nodes()
+            self.tree.blockSignals(False)
 
-        if self.current_item in self._leaf_items:
-            self._leaf_items[self.current_item].setSelected(True)
-        self._apply_selection_mirror()   # tint rows selected in the active tab
+            if self.current_item in self._leaf_items:
+                self._leaf_items[self.current_item].setSelected(True)
+            self._apply_selection_mirror()   # tint rows selected in the active tab
+        finally:
+            self.tree.setUpdatesEnabled(True)
         self._refresh_empty_state()      # CTA vs content on the data tabs
 
     # ------------------------------------------------ selection mirror ---
@@ -1236,6 +1065,14 @@ class MainWindow(QtWidgets.QMainWindow):
             menu.addSeparator()
             act_avg_corr = menu.addAction(
                 f'Average correlation functions → new measurement ({n})')
+            # Calculation nuance, so a passive tooltip (ui_style_guide R6.9: a menu shows
+            # its actions' tooltips only once told to).
+            act_avg_corr.setToolTip(
+                'Averages the runs channel by channel into a new measurement, which '
+                'records their temperatures and the spread of their amplitudes on its '
+                'hover card (Theory-and-Equations-Guide §6.4), and carries their mean '
+                'count rate when every run has one.')
+            menu.setToolTipsVisible(True)
             act_avg_res = menu.addAction(f'Average derived results… ({n})')
 
         menu.addSeparator()
@@ -1412,7 +1249,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Fit each selected replicate, report mean +/- SD/sqrt(N), write Rh to
         the sample. The method prompt stays before dispatch (dialogs are
         main-thread); the N replicate fits run on the worker."""
-        if self._busy_guard():        # before the prompts: a confirmed action must run
+        # Refused before the prompts: a confirmed action must run.
+        if self._average_slot.hold(target=None, queue=False,
+                                   notice=lambda: self._busy_guard()):
             return
         controller = self.controller
         request = ask_average_method(self, controller,
@@ -1444,22 +1283,26 @@ class MainWindow(QtWidgets.QMainWindow):
                     if resp != QtWidgets.QMessageBox.StandardButton.Yes:
                         return
 
-        def done(summary: dict) -> None:
+        def done(summary: dict, _token) -> None:
             show_average_summary(self, summary)
             self._refresh_sidebar()
             self.cross_module.refresh()
 
-        def fail(exc: BaseException) -> None:
+        def fail(exc: BaseException, _token) -> None:
             if not isinstance(exc, ValueError):
                 raise exc
+            # A refusal withdraws the average it would have replaced
+            # (`Controller._withdraw_on_refusal`), so what `done` refreshes is refreshed.
+            self._refresh_sidebar()
+            self.cross_module.refresh()
             QtWidgets.QMessageBox.warning(
                 self, 'Cannot average derived results', str(exc))
 
-        if not runner().try_submit(
-                lambda: controller.average_dls_results(ids, method,
-                                                       **request.run_kwargs()),
-                done, fail, description='replicate averaging'):
-            self._busy_guard()
+        self._average_slot.submit(
+            lambda: controller.average_dls_results(ids, method, **request.run_kwargs()),
+            done, fail, target=None, queue=False,
+            notice=lambda: self._busy_guard(),
+            description='replicate averaging', paint=False)
 
     @QtCore.Slot()
     def _on_delete_key(self) -> None:
@@ -1483,6 +1326,10 @@ class MainWindow(QtWidgets.QMainWindow):
             f' Their {n_traces} linked count-rate trace'
             f'{"s are" if n_traces > 1 else " is"} deleted too.'
             if n_traces else '')
+        # A removed blank silently re-pairs the series it served, so the confirm names
+        # each series that switches (Controller.blank_switches_on_removal).
+        switch_text = self.controller.blank_switch_message(
+            self.controller.blank_switches_on_removal(item_ids))
         resp = QtWidgets.QMessageBox.question(
             self, 'Remove from workspace',
             f'Remove {n} measurement{"s" if n > 1 else ""} from the workspace? '
@@ -1490,7 +1337,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'R\u2095 rows built from them (replicate average, \u0393 vs q\u00b2, '
             'D vs c) \u2014 press Run again to rebuild those from what is left.'
             f'{trace_clause} The source files on disk are '
-            'not touched.',
+            'not touched.' + (f'\n\n{switch_text}' if switch_text else ''),
             QtWidgets.QMessageBox.StandardButton.Yes
             | QtWidgets.QMessageBox.StandardButton.No,
             QtWidgets.QMessageBox.StandardButton.No)
@@ -1805,6 +1652,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # don't reliably auto-refresh from a stylesheet — see gui.theme.retheme).
         retheme(self)
         self._apply_plot_theme()
+        self._applied_theme = (theme, self.controller.settings.plot_match_theme)
 
     def _apply_plot_theme(self) -> None:
         """Theme the ON-SCREEN plots to match the app theme when the user opted in and
@@ -2003,7 +1851,11 @@ class MainWindow(QtWidgets.QMainWindow):
         """Settings changed: re-theme, re-palette, and re-seed the module controls
         (the new defaults; existing results are untouched). The palette applies to
         plots drawn afterwards (the Utilities trace re-renders here)."""
-        self._apply_theme(self.controller.settings.theme)
+        s = self.controller.settings
+        # The theme path re-runs only when its inputs moved, or under 'system', where
+        # each Apply re-reads the OS colour scheme.
+        if s.theme == 'system' or self._applied_theme != (s.theme, s.plot_match_theme):
+            self._apply_theme(s.theme)
         self._apply_ui_density()                                # font size (5.5)
         set_palette(self.controller.settings.plot_palette)
         set_plot_units(self.controller.settings.plot_units)     # plot-axis units

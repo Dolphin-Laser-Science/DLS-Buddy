@@ -40,7 +40,8 @@ tab height):
   hand-entered value. **A₂ is picker-only** — a solvent/T-specific coefficient with
   no external standard, and the very y-axis the A₂–Mw plot fits. Candidates are
   grouped by result type with the single-condition tail behind a "show all" toggle;
-  Mw/A₂ carry an uncalibrated badge (scale-dependent; Rg is not). The value combos
+  each row's ⚠ badge marks the lines in the panel's notes block about its chosen value
+  (an arbitrary scale reaches Mw/A₂ only; Rg is scale-independent). The value combos
   elide when the panel is narrow (the full text stays in the dropdown popup).
 * Bottom strip, right — an **Interpretation** context panel: a `QStackedWidget`
   (`_build_context_panel`) whose page follows the active inner tab — the ρ
@@ -53,32 +54,35 @@ setters). No analysis or physics here — the tab only displays and chooses.
 
 Apparent vs thermodynamic is shown per row: ρ is "apparent" if either Rg or Rh is
 an apparent (single-condition) value, never silently mixed with a thermodynamic
-one.
+one. Each Source Selection row's label carries the words of the value it holds.
 """
 
 from __future__ import annotations
 
+import html
 import math
 from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from core.naming import sample_display_name
 from plotting.plots import plot_scaling
-from gui.plot_controls import make_canvas_expanding
+from gui.plot_controls import LazyCanvas, make_canvas_expanding
 from gui.export_helper import confirm_overwrite, export_to_csv
+from gui.field_labels import CHAIN_TYPE_LABELS, has_honest_se
 from gui.help import section_header, add_help_to_groupbox, HelpBadge
+from core.note_registry import REGISTRY
+from gui.notes_block import NotesBlock, qualifier_tooltip, qualifier_words
 from gui.theme import ThemedLabel
 from gui.widgets import roomy_tabs, RichTextHeaderView
 from gui.worker import busy_notice, run_when_idle, runner
-from core.workspace import DELIBERATE_TIERS, is_arbitrary_scale, result_key_matches
-from analysis.utilities import interpret_scaling_exponent, select_default_candidate
-from analysis.uncertainty import (format_fixed_sig, format_pm,
-                                  format_value_at_uncertainty)
-from app import units as U
+from core.workspace import DELIBERATE_TIERS, result_key_matches
+from core.formatting import (format_fixed_sig, format_pm, pdg_erases_value,
+                             format_value_at_uncertainty)
+from core.notes import Note, render, vocabulary
+from core import units as U
 
 
 # Architecture-table columns. Rg/Rh carry a unit that follows the global Display-units
@@ -98,7 +102,7 @@ _BRANCHING_MODEL_CHOICES = [
     ('Random tetra-functional (f=4)', 'random_tetra'),
 ]
 _BRANCHING_MODEL_LABELS = {key: text for text, key in _BRANCHING_MODEL_CHOICES}
-_CHAIN_DISPLAY = {'linear': 'Linear', 'branched': 'Branched'}   # stored -> shown
+_CHAIN_DISPLAY = CHAIN_TYPE_LABELS   # stored -> shown
 
 # The overview badge's ρ-band hint. Every band it names is one of the engine's bands in
 # `analysis.utilities._rho_band`, and the pin test reads this string, so a re-cut of any
@@ -106,10 +110,8 @@ _CHAIN_DISPLAY = {'linear': 'Linear', 'branched': 'Branched'}   # stored -> show
 _RHO_HINT = (
     '<b>ρ = Rg/Rh</b> hints at architecture (≈0.78 sphere, ≈1.0 dendrimer / soft sphere, '
     '≈1.1–1.4 branched/star, ≈1.5–1.8 linear coil, ≈1.9–2.1 a broad or swollen coil, '
-    'above ≈2.2 rod-like) — a '
-    'qualitative guide; needs both an SLS Rg and a DLS Rh per sample. The coil and '
-    'branched/star values are tabulated ones a real measurement reads ≈10–14 % below, so a '
-    'sample can land one band low; the Architecture panel says so on the reading itself.')
+    'above ≈2.2 rod-like), a qualitative guide (Theory-and-Equations-Guide §5.1); it '
+    'needs an SLS Rg and a DLS Rh per sample.')
 _EMPTY = '—'                        # single not-applicable placeholder (+ a reason tooltip)
 _MANUAL_LABEL = 'Manual entry…'
 
@@ -145,12 +147,18 @@ _KIND_GROUP = {
 _HEADER_SENTINEL = '__HEADER__'
 
 
-def _model_dep_mark(text: str, model_dependent: bool) -> str:
-    """Append a neutral ⓘ to a displayed Rg value that came from a form-factor P(q) fit
-    (assumes a particle shape). A passive qualifier, NOT an alarm — the full "— model-
-    dependent (…)" note rides in the cell tooltip via rg_label (ui_style_guide ⓘ tier).
-    No mark for a missing value ('n/a'/blank)."""
-    return f'{text} ⓘ' if (model_dependent and text not in ('n/a', _EMPTY)) else text
+def _with_words(text: str, words: List[str]) -> str:
+    """A shown value with its qualifier words (`gui.notes_block.qualifier_words`),
+    `40.5 (model-dependent)`: vocabulary, never an alarm (ui_style_guide §5). A missing
+    value ('n/a', '—') takes none."""
+    if not words or text in ('n/a', _EMPTY):
+        return text
+    return f'{text} ({", ".join(words)})'
+
+
+# The Rg / Rh cells name what a value assumes (a shape, a degenerate pick); apparent
+# against thermodynamic is the Type column's word, read off the row's ρ.
+_CELL_WORDS_EXCLUDE = ('apparent',)
 
 
 class CrossSampleModule(QtWidgets.QWidget):
@@ -208,16 +216,13 @@ class CrossSampleModule(QtWidgets.QWidget):
             'Samples (Include / Exclude)',
             'Compare results across samples:',
             bullets=[
-                'Tick the samples to include in the Architecture table and scaling '
-                'plots.',
+                'Tick the samples to include in the Architecture table and the scaling '
+                'plots; pick each one\'s sources in the Source Selection panel below.',
                 _RHO_HINT,
-                '<b>Branching g / h</b>: tag samples <b>Linear</b> / <b>Branched</b> '
-                'with the Chain type control on the Data tab to compare a branched '
-                'Rg / Rh with the linear Rg–Mw / Rh–Mw laws.',
+                '<b>Branching g / h</b>: tag samples <b>Linear</b> or <b>Branched</b> '
+                'with the Chain type control on the Data tab.',
                 '<b>Scaling</b> fits Rg–Mw and A₂–Mw power laws across the included '
                 'samples.',
-                'Tick to include in the views; choose the focused sample and its '
-                'Rg / Rh / Mw / A₂ sources with the panel below (its Sample selector).',
             ]))
         self.sample_list = QtWidgets.QListWidget()
         self.sample_list.setMinimumWidth(240)
@@ -258,34 +263,18 @@ class CrossSampleModule(QtWidgets.QWidget):
         rl = QtWidgets.QVBoxLayout(rho_tab)
         rl.addWidget(section_header(
             'Architecture — ρ, shape, and branching factors g / h',
-            'ρ = Rg/Rh plus the branching contraction factors g and h — how compact a '
-            'branched chain is versus a linear chain at the same Mw. Guides, not hard '
-            'numbers.',
+            'One row per included sample and Mw fraction.',
             bullets=[
                 'Tag samples <b>Linear</b> (≥2 at different Mw) and <b>Branched</b> with '
-                'the <b>Chain type</b> control on the <b>Data tab</b>. The linear Rg–Mw '
-                'and Rh–Mw power laws are fit to the Linear samples and read at each '
-                'branched Mw.',
-                '<b>g</b> = (Rg<sub>br</sub>/Rg<sub>lin</sub>)² (needs Rg); <b>h</b> = '
-                'Rh<sub>br</sub>/Rh<sub>lin</sub> (needs Rh). Both &lt; 1 mean more '
-                'compact; a star gives <b>h &gt; g</b>.',
-                'A cell shows <b>—</b> where it can’t be computed (a missing radius); '
-                'hover for why. Select a row to see its readout and the g-vs-h note below.',
-                'The <b>Branching model</b> selector sets how g is read: a regular-star '
-                '<b>arm number</b>, or a random tri-/tetra-functional <b>branching '
-                'density n</b> (the <b>n (branch)</b> column). Model-dependent — the same '
-                'g gives a different n under a different model.',
-                'The <b>coil, branched/star and dendrimer</b> ρ values are <b>tabulated</b> '
-                'theoretical ones (Theory-and-Equations-Guide §5.1), and measured ρ runs '
-                'about <b>10–14 % below</b> '
-                'them, so a real sample can read <b>one band low</b> — a narrow θ-solvent '
-                'coil (tabulated 1.50) often measures 1.29–1.35 and reads as branched/star. '
-                'Broad samples offset this, because polydispersity pushes ρ back up. The '
-                '<b>hard sphere</b> (exact geometry) and <b>microgel</b> (measured range) '
-                'values do not carry the offset.',
-                'A <b>±</b> appears only from replicate branched measurements; a single '
-                'measurement carries none. g and h are scale-independent (ratios of '
-                'radii). See the Theory-and-Equations-Guide.',
+                'the <b>Chain type</b> control on the <b>Data tab</b>; g needs an Rg, h '
+                'an Rh.',
+                'A cell shows <b>—</b> where it can’t be computed; hover for why. Select '
+                'a row for its readout below.',
+                'An R<sub>g</sub> or R<sub>h</sub> that failed a check carries ⚠ and its '
+                'line\'s letter; click the line under the table for the fix.',
+                'A <b>±</b> on g or h appears only with replicate branched measurements.',
+                'What ρ, its bands, g and h mean: Theory-and-Equations-Guide §5.1 and '
+                '§5.3–5.4.',
             ]))
         # Branching-model selector: how the measured g is READ. Regular star -> an arm
         # number (f_eff); random tri/tetra -> a branching density n (Zimm & Stockmayer
@@ -298,27 +287,20 @@ class CrossSampleModule(QtWidgets.QWidget):
         for text, _key in _BRANCHING_MODEL_CHOICES:
             self.branching_model_combo.addItem(text)
         self.branching_model_combo.setToolTip(
-            'How to read the measured g. Regular star → an effective arm number f_eff '
-            '(g = (3f−2)/f²); Random tri-/tetra-functional → a branching density n '
-            '(branch units per molecule, θ solvent). The same g gives a different n under '
-            'a different model, so the reading is model-dependent — it names the '
-            'assumption. g itself is unchanged. See the Theory-and-Equations-Guide §5.3.1.')
+            'The reading is model-dependent: the same g gives a different n under a '
+            'different model, and f_eff is a regular-star equivalent, not a literal arm '
+            'count (Theory-and-Equations-Guide §5.3 and §5.3.1).')
         self.branching_model_combo.currentIndexChanged.connect(
             self._on_branching_model_changed)
         model_row.addWidget(self.branching_model_combo)
         model_row.addWidget(HelpBadge(
-            'How a measured g &lt; 1 (a more compact branched chain) is read — it depends '
-            'on the architecture you assume:',
+            'Choose the architecture a measured g is read against:',
             bullets=[
-                '<b>Regular star</b> — inverts g = (3f−2)/f² to an <b>effective arm '
-                'number</b> f_eff (a regular-star equivalent, not a literal count).',
-                '<b>Random tri-/tetra-functional</b> — inverts a random-branching '
-                '<b>fraction</b> relation to a <b>branching density n</b> (average branch '
-                'units per molecule), for 3- or 4-functional branch units.',
-                'The reading is <b>model-dependent</b>: the same g gives a different n '
-                'under a different model (and a different f_eff as a star), so the readout '
-                'names the model. These are the <b>θ-solvent</b> forms; g itself is '
-                'model-free. See the Theory-and-Equations-Guide §5.3.1.',
+                '<b>Regular star</b>: an <b>effective arm number</b> f_eff.',
+                '<b>Random tri-/tetra-functional</b>: a <b>branching density n</b>, the '
+                'average branch units per molecule for 3- or 4-functional branch units, in '
+                'the <b>n (branch)</b> column.',
+                'g itself does not change; the readout names the model it assumed.',
             ]))
         model_row.addStretch(1)
         rl.addLayout(model_row)
@@ -346,15 +328,19 @@ class CrossSampleModule(QtWidgets.QWidget):
         # re-point the source panel (focus is the Sample/Fraction combos only).
         self.table.itemSelectionChanged.connect(self._on_arch_row_selected)
         rl.addWidget(self.table, 1)
+        # The preconditions of the values the table shows, one line per cause, pinned
+        # under the table (R8.6); a marked cell opens its line's popup on a click.
+        self.arch_block = NotesBlock(what='samples')
+        self.arch_block.watch(self.table)
+        rl.addWidget(self.arch_block, 0)
         # Linear-reference provenance (the fitted Rg-Mw / Rh-Mw laws) + Export.
         self.arch_caption = ThemedLabel(self._ARCH_HINT, role='muted', size=11)
         self.arch_caption.setWordWrap(True)
         self.arch_caption.setToolTip(
-            'g and h compare a Branched sample against the linear Rg–Mw / Rh–Mw laws '
-            'fit to the samples you tag Linear (on the Data tab), read at the branched '
-            'Mw. Tag samples with the Chain type control on the Data tab. A g/h ± comes '
-            'from replicate branched measurements only and excludes the reference-law '
-            'fit uncertainty (Theory-and-Equations-Guide §5.3–5.4).')
+            'g and h compare a Branched sample with the linear Rg–Mw / Rh–Mw laws fit to '
+            'the Linear samples, read at its Mw. Their ± comes from replicate branched '
+            'measurements only and excludes the reference-law fit uncertainty '
+            '(Theory-and-Equations-Guide §5.3–5.4, §6.4).')
         rl.addWidget(self.arch_caption, 0)
         exp_row = QtWidgets.QHBoxLayout()
         exp_row.addStretch(1)
@@ -379,17 +365,16 @@ class CrossSampleModule(QtWidgets.QWidget):
                 'One point per (sample, Mw fraction) that has an Mw (a '
                 'hand-entered Mw wins) and a positive value — others are '
                 'counted as excluded.',
-                '<b>Linear</b> samples fit the line, <b>Branched</b> samples '
-                'are plotted hollow and left out of the fit.',
+                '<b>Branched</b> samples are plotted hollow and left out of the fit; '
+                'the others fit the line.',
                 '<b>Show Rh–Mw</b> swaps the top plot\'s size axis between Rg '
                 '(SLS) and Rh (DLS).',
-                'The ± on ν is a regression SE (statistical only).',
                 'The readout below names excluded points and flags '
                 'arbitrary-scale or model-dependent values.',
                 'See the Theory-and-Equations-Guide §5.2.',
             ]))
         self.scaling_fig = Figure(figsize=(4.3, 4.8))
-        self.scaling_canvas = make_canvas_expanding(FigureCanvas(self.scaling_fig))
+        self.scaling_canvas = make_canvas_expanding(LazyCanvas(self.scaling_fig))
         self.ax_rg = self.scaling_fig.add_subplot(2, 1, 1)
         self.ax_a2 = self.scaling_fig.add_subplot(2, 1, 2)
         sl.addWidget(self.scaling_canvas, 1)
@@ -461,6 +446,9 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.scaling_note = ThemedLabel('', role='muted', size=12)
         self.scaling_note.setWordWrap(True)
         spv.addWidget(self.scaling_note)
+        # The plotted points' scale gates, one line per cause with its points named.
+        self.scaling_block = NotesBlock(what='points')
+        spv.addWidget(self.scaling_block)
         spv.addStretch(1)
         self.context_stack.addWidget(scaling_page)
 
@@ -555,21 +543,13 @@ class CrossSampleModule(QtWidgets.QWidget):
         if not parts:
             self.arch_caption.setText(data.message or self._ARCH_HINT)
             return
-        # "arbitrary scale", not "uncalibrated": the flag behind it is
-        # `mw_is_arbitrary_scale`, which fires for a missing dn/dc as well as a missing
-        # calibration, and naming only the one would send the user to fix the other.
-        uncal = ('  ⚠ Mw on an arbitrary scale (fine if the scale is consistent across '
-                 'the tagged samples)' if data.any_uncalibrated_mw else '')
-        # Neutral qualifier (a form-factor Mw/Rg feeds a g/h factor or reference law), not an alarm;
-        # a degenerate pick is disclosed one tier stronger (still ⓘ).
-        if data.any_degenerate:
-            mdep = ('  ⓘ includes a user-selected degenerate (form-factor) solution '
-                    'the scattering data cannot distinguish')
-        elif data.any_model_dependent:
-            mdep = '  ⓘ includes a model-dependent (form-factor) value'
-        else:
-            mdep = ''
-        self.arch_caption.setText('Linear reference: ' + ' · '.join(parts) + uncal + mdep)
+        # What the laws rest on is the readout's own vocabulary (a model-dependent or
+        # degenerate contributing value, R5.6); a contributing Mw on an arbitrary scale is a
+        # line of the block under the table, its cause and its samples named (data.notes).
+        words = qualifier_words(data)
+        self.arch_caption.setText('Linear reference: ' + ' · '.join(parts)
+                                  + (f'  ({", ".join(words)})' if words else ''))
+        self.arch_caption.setToolTip(qualifier_tooltip(data))
 
     def _gh_cell_text(self, res, value_attr: str) -> str:
         """Format a g or h cell: format_pm with the replicate ±, else fixed-sig."""
@@ -602,15 +582,9 @@ class CrossSampleModule(QtWidgets.QWidget):
             rho = self.controller.compute_sample_rho(sid, fraction)
         except Exception as exc:  # noqa: BLE001 — surfaced as the detail text
             return str(exc), ''
-        flag = ('  [apparent ρ — at least one input is a single-condition '
-                'value]' if rho.is_apparent else '')
-        # Passive ⓘ notices from the underlying RhoResult (e.g. Rg/Rh keys disagree);
-        # normally empty here since the pair comes from one sample. One ⓘ heads the
-        # note block, matching the set_flag(problem=False) convention the SLS/DLS
-        # notes surfaces use. Same text also emitted via warnings.warn (keep-both).
-        note_lines = getattr(rho, 'notes', ())
-        notes = ('\nⓘ ' + '\n'.join(note_lines)) if note_lines else ''
-        return f'{rho.interpretation}{flag}{notes}', rho.shape
+        # The headline names what this ρ is (its qualifier words, e.g. 'apparent'); a
+        # precondition of the ρ is the Architecture block's line, never this panel's.
+        return rho.interpretation, _with_words(rho.shape, qualifier_words(rho))
 
     def _on_arch_row_selected(self) -> None:
         """Show the selected row's detail in the Interpretation panel: a branched row's
@@ -651,10 +625,11 @@ class CrossSampleModule(QtWidgets.QWidget):
                 and g_res.branching_index is not None
                 and math.isfinite(g_res.branching_index)):
             model = _BRANCHING_MODEL_LABELS[self._branching_model]
-            lines.append(f'{model}: n ≈ {g_res.branching_index:.1f} branch units/molecule '
-                         '— model-dependent (a different model gives a different n).')
-        if arow.compare_note:
-            lines.append(arow.compare_note)
+            words = qualifier_words(g_res, ('branching_index',), whole=False)
+            lines.append(f'{model}: n ≈ {g_res.branching_index:.1f} branch units/molecule'
+                         + (f' ({", ".join(words)})' if words else ''))
+        if arow.g_h_comparison:
+            lines.append(arow.g_h_comparison)
         primary = arow.g_result or arow.h_result
         if primary is not None and primary.mw_in_range is False:
             lines.append('ⓘ the branched Mw is out of the linear-reference range '
@@ -670,9 +645,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         header.addWidget(QtWidgets.QLabel('Sample:'))
         self.sample_combo = QtWidgets.QComboBox()
         self.sample_combo.setMinimumWidth(200)
-        self.sample_combo.setToolTip(
-            'Which included sample this panel edits. Explicit — the Workspace tree '
-            'only mirrors this choice; it does not drive it.')
+        self.sample_combo.setToolTip('The included sample this panel edits.')
         self.sample_combo.currentIndexChanged.connect(self._on_sample_combo)
         header.addWidget(self.sample_combo, 1)
         self.fraction_label = QtWidgets.QLabel('Fraction:')
@@ -686,100 +659,111 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.fraction_combo.currentIndexChanged.connect(self._on_fraction_combo)
         header.addWidget(self.fraction_combo)
         header.addStretch(1)
-        grid.addLayout(header, 0, 0, 1, 5)
+        grid.addLayout(header, 0, 0, 1, 6)
+
+        # Each row's label names its quantity and carries the qualifier words of the value
+        # the sample stores for it (`_show_row_words`).
+        self.rg_row_label = QtWidgets.QLabel()
+        self.rh_label = QtWidgets.QLabel()
+        self.mw_row_label = QtWidgets.QLabel()
+        self.a2_row_label = QtWidgets.QLabel()
+        self._row_labels = {
+            'rg': (self.rg_row_label, 'R<sub>g</sub> (SLS'),
+            'rh': (self.rh_label, 'R<sub>h</sub> (DLS'),
+            'mw': (self.mw_row_label, 'M<sub>w</sub> (SLS'),
+            'a2': (self.a2_row_label, 'A₂ (SLS')}
+        self._show_row_words(None)
+
+        # Column 2 holds each row's badge, right after the combo whose chosen value it
+        # marks: the marker of the lines in `source_block` about that value (`⚠ᵃ`, the
+        # line's letter), the error tier (bold red ⚠) keeping colour and glyph together as
+        # the SLS and DLS tabs mark a value (R5.2).
+        self.rg_badge = ThemedLabel('', role='error', size=11, bold=True)
+        self.rh_badge = ThemedLabel('', role='error', size=11, bold=True)
+        self.mw_badge = ThemedLabel('', role='error', size=11, bold=True)
+        self.a2_badge = ThemedLabel('', role='error', size=11, bold=True)
 
         # Rg row: a combo of SLS candidates + Manual; a manual entry beside it.
-        grid.addWidget(QtWidgets.QLabel('R<sub>g</sub> (SLS):'), 1, 0)
+        grid.addWidget(self.rg_row_label, 1, 0)
         self.rg_combo = QtWidgets.QComboBox()
         self.rg_combo.activated.connect(lambda i: self._on_source_chosen('rg', i))
         grid.addWidget(self.rg_combo, 1, 1)
+        grid.addWidget(self.rg_badge, 1, 2)
         self.rg_manual = QtWidgets.QLineEdit()
         self.rg_manual.setPlaceholderText(self._radius_unit())
         self.rg_manual.setFixedWidth(70)
-        grid.addWidget(self.rg_manual, 1, 2)
+        grid.addWidget(self.rg_manual, 1, 3)
         self.rg_manual_apparent = QtWidgets.QCheckBox('apparent')
-        grid.addWidget(self.rg_manual_apparent, 1, 3)
+        grid.addWidget(self.rg_manual_apparent, 1, 4)
         rg_set = QtWidgets.QPushButton('Set')
         rg_set.clicked.connect(lambda: self._on_manual('rg'))
-        grid.addWidget(rg_set, 1, 4)
+        grid.addWidget(rg_set, 1, 5)
 
         # Rh row: a combo of DLS candidates + Manual; a manual entry beside it.
         # (Disabled for an SLS-only sample — no DLS data to pick from.)
-        self.rh_label = QtWidgets.QLabel('R<sub>h</sub> (DLS):')
         grid.addWidget(self.rh_label, 2, 0)
         self.rh_combo = QtWidgets.QComboBox()
         self.rh_combo.activated.connect(lambda i: self._on_source_chosen('rh', i))
         grid.addWidget(self.rh_combo, 2, 1)
+        grid.addWidget(self.rh_badge, 2, 2)
         self.rh_manual = QtWidgets.QLineEdit()
         self.rh_manual.setPlaceholderText(self._radius_unit())
         self.rh_manual.setFixedWidth(70)
-        grid.addWidget(self.rh_manual, 2, 2)
+        grid.addWidget(self.rh_manual, 2, 3)
         self.rh_manual_apparent = QtWidgets.QCheckBox('apparent')
-        grid.addWidget(self.rh_manual_apparent, 2, 3)
+        grid.addWidget(self.rh_manual_apparent, 2, 4)
         rh_set = QtWidgets.QPushButton('Set')
         rh_set.clicked.connect(lambda: self._on_manual('rh'))
-        grid.addWidget(rh_set, 2, 4)
+        grid.addWidget(rh_set, 2, 5)
         self._rh_widgets = [self.rh_combo, self.rh_manual,
                             self.rh_manual_apparent, rh_set]
 
         # Mw row (feeds the scaling plots): SLS candidates + Manual. No "apparent"
         # box -- a hand-entered Mw is treated as a trusted (calibrated) value.
-        # Column 3 carries a calibration badge (Mw is scale-dependent).
-        grid.addWidget(QtWidgets.QLabel('M<sub>w</sub> (SLS):'), 3, 0)
+        grid.addWidget(self.mw_row_label, 3, 0)
         self.mw_combo = QtWidgets.QComboBox()
         self.mw_combo.activated.connect(lambda i: self._on_source_chosen('mw', i))
         grid.addWidget(self.mw_combo, 3, 1)
+        grid.addWidget(self.mw_badge, 3, 2)
         self.mw_manual = QtWidgets.QLineEdit()
         self.mw_manual.setPlaceholderText(self._mw_unit())
         self.mw_manual.setFixedWidth(70)
-        grid.addWidget(self.mw_manual, 3, 2)
-        # Uncalibrated = arbitrary scale is a genuine problem, not a "pending" state:
-        # the error tier (bold red ⚠) matches the SLS tab's treatment of the identical
-        # condition and keeps color aligned with the ⚠ glyph (style guide §5 R5.2).
-        self.mw_badge = ThemedLabel('', role='error', size=11, bold=True)
-        self.mw_badge.setToolTip(
-            'Mw is scale-dependent: an uncalibrated fit gives an arbitrary-scale Mw.')
-        grid.addWidget(self.mw_badge, 3, 3)
+        grid.addWidget(self.mw_manual, 3, 3)
         mw_set = QtWidgets.QPushButton('Set')
         mw_set.clicked.connect(lambda: self._on_manual('mw'))
-        grid.addWidget(mw_set, 3, 4)
+        grid.addWidget(mw_set, 3, 5)
 
         # A2 row (feeds the A2-Mw scaling plot): a picker over fit-derived candidates
         # ONLY (Zimm/Berry, and the apparent single-angle ladder) — no manual entry. A2 is a solvent/T-specific interaction
         # coefficient (no external "standard" as Mw has) and is the y-axis the scaling
         # plot fits, so a hand-typed value would invite circularity. Scale-dependent,
         # so it carries a calibration badge like Mw.
-        grid.addWidget(QtWidgets.QLabel('A₂ (SLS):'), 4, 0)
+        grid.addWidget(self.a2_row_label, 4, 0)
         self.a2_combo = QtWidgets.QComboBox()
         self.a2_combo.setToolTip(
-            'A₂ from the Zimm/Berry double extrapolation (thermodynamic), or from a '
-            'single-angle ladder (apparent — angle-contingent, and never selected for '
-            'you). Calibration-dependent — an uncalibrated A₂ is on an arbitrary scale '
-            '(see the Theory-and-Equations-Guide, SLS section). No manual entry: A₂ is a '
-            'solvent/temperature-specific interaction coefficient with no external '
-            'standard, and it is the y-axis the A₂–Mw plot fits.')
+            'A₂ from the Zimm/Berry double extrapolation (thermodynamic) or a single-angle '
+            'ladder (apparent, angle-contingent). Calibration-dependent: an uncalibrated '
+            'A₂ is on an arbitrary scale (Theory-and-Equations-Guide §1.7.1).')
         self.a2_combo.activated.connect(lambda i: self._on_source_chosen('a2', i))
         grid.addWidget(self.a2_combo, 4, 1)
+        grid.addWidget(self.a2_badge, 4, 2)
         self.a2_unit_label = QtWidgets.QLabel('mol·mL/g²')
-        grid.addWidget(self.a2_unit_label, 4, 2)
-        self.a2_badge = ThemedLabel('', role='error', size=11, bold=True)
-        self.a2_badge.setToolTip(
-            'A₂ is scale-dependent: an uncalibrated fit gives an arbitrary-scale A₂.')
-        grid.addWidget(self.a2_badge, 4, 3)
+        grid.addWidget(self.a2_unit_label, 4, 3)
 
         # "Show all" reveals the single-condition tail (per-angle cumulants, per-conc
-        # Debye/Guinier) hidden by default to keep the pickers scannable.
+        # Debye/Guinier) the pickers leave out to stay scannable; a value never selected
+        # for you is always listed (`_fill_candidate_combo`).
         self.show_all_check = QtWidgets.QCheckBox('Show all single-condition results')
         self.show_all_check.setToolTip(
-            'Reveal the per-angle / per-concentration apparent results hidden by '
-            'default. The best-tier value stays selected either way.')
+            'Reveal the per-angle / per-concentration apparent results the pickers leave '
+            'out.')
         self.show_all_check.toggled.connect(self._on_show_all_toggled)
-        grid.addWidget(self.show_all_check, 5, 1, 1, 4)
+        grid.addWidget(self.show_all_check, 5, 1, 1, 5)
 
-        # Panel-level banner: fires when the chosen Mw and/or A2 is uncalibrated.
-        self.cal_banner = ThemedLabel('', role='error', size=11)
-        self.cal_banner.setWordWrap(True)
-        grid.addWidget(self.cal_banner, 6, 0, 1, 5)
+        # The chosen values' failed preconditions (`_show_value_notes`): one line per cause,
+        # its remedy on a click; empty and hidden while the stored values failed none.
+        self.source_block = NotesBlock()
+        grid.addWidget(self.source_block, 6, 0, 1, 6)
 
         grid.setColumnStretch(1, 1)
         # Let the long-content value combos shrink and elide rather than dictate the
@@ -792,42 +776,26 @@ class CrossSampleModule(QtWidgets.QWidget):
             _c.setMinimumContentsLength(10)
         add_help_to_groupbox(
             self.source_box,
-            'Choose which fitted value represents this sample in the ρ table and the '
-            'scaling plots.',
+            'Pick the value each quantity uses (User-Manual §10.1.2–10.1.3):',
             bullets=[
-                '<b>Sample / Fraction</b>: pick the sample and Mw fraction to edit. '
-                'Explicit here — the Workspace tree only mirrors this choice.',
-                '<b>Rg / Rh / Mw / A₂</b>: pick the fit that feeds each analysis; the '
-                'best-tier result is selected by default.',
-                '<b>How long a pick lasts</b>: a passive refresh never touches it. '
-                'Two runs replace picks: a Zimm/Berry run replaces a picked '
-                'Rg/Mw/A₂, and averaging replicates replaces a picked Rh — the run '
-                'reports it, and Settings can ask first. Other runs (Debye, '
-                'Guinier, Γ vs q², D vs c, distributions, form factors) offer their '
-                'new fit here instead of replacing your pick. Switching the '
-                'cumulant method or the SE estimator clears a pick with the results '
-                'it came from, after you confirm. A hand-entered value is never '
-                'replaced by any run.',
-                '<b>ⓘ model-dependent</b>: a form-factor P(q) fit (sphere / coil / '
-                'ellipsoid / Mie / core–shell) also offers an Rg (and calibrated Mw). '
-                'It assumes a particle shape, so it is flagged and is <i>never</i> the '
-                'automatic default over a slope-based Rg (Zimm/Guinier) at the same tier '
-                '— select it deliberately if the shape fits. It appears only while its '
-                'fit is current; after a mask / calibration / estimator change, re-run it '
-                'on the SLS tab to refresh the option.',
-                '<b>Single-angle ladder</b>: a concentration series read at one angle '
-                'offers an apparent Mw and A₂ under <i>Single-angle ladder (apparent)</i>, '
-                'one entry per angle you ran, each naming its own θ. At one angle there is '
-                'no q → 0 extrapolation, so these are apparent — they are offered but are '
-                '<i>never</i> selected for you, because only you can say which angle should '
-                'represent the sample.',
-                '<b>Show all single-condition results</b>: reveal the per-angle / '
-                'per-concentration apparent values hidden by default.',
-                '<b>⚠ badges</b>: Mw and A₂ are scale-dependent — an uncalibrated fit '
-                'is on an arbitrary scale. Rg is scale-independent, so it never badges.',
-                '<b>Manual entry</b> (Rg / Rh / Mw): type a trusted external value. A₂ '
-                'has no manual entry — it is solvent/temperature-specific with no '
-                'external standard.',
+                '<b>Rg, Rh, Mw, A₂</b>: the best-tier value is the default; a word beside '
+                'the row\'s name says what the chosen value is.',
+                '<b>Flagged candidates</b>: one whose fit failed a check shows the cause '
+                'after its label, and once chosen is marked ⚠; click its line below for '
+                'the fix.',
+                '<b>Listed but never selected for you</b>, among others: an Rg, Mw or A₂ '
+                "failing a check other than scale, a distribution peak at the Rh grid's "
+                "end, a mode family's Rh.",
+                '<b>Model-dependent</b>: a form-factor Rg or Mw carries the word '
+                '<i>model-dependent</i> and is never the default over a slope-based value '
+                'at the same tier.',
+                '<b>Single-angle ladder</b>: an apparent Mw and A₂ per angle you ran, '
+                'never selected for you, since the angle is your choice.',
+                '<b>Show all single-condition results</b>: reveals the hidden per-angle '
+                'and per-concentration values; one never selected for you is always '
+                'listed.',
+                '<b>Manual entry</b>: a trusted external Rg, Rh or Mw no run replaces; A₂ '
+                'has none.',
             ])
         self.source_box.setEnabled(False)
         return self.source_box
@@ -917,14 +885,23 @@ class CrossSampleModule(QtWidgets.QWidget):
         unit change is a pure linear scale, so the σ converts with the value and the
         place stays correct. With no honest σ, fall back to the documented
         fixed-sig precision (Settings → no-uncertainty precision); we never fabricate a ±.
+
+        A σ that would round the value itself to zero is shown beside it instead,
+        ``4 ± 60`` (ui_style_guide §4), the one case the cell prints a ±; the callers
+        give that ± its estimator's word.
         """
         if x is None or not (isinstance(x, (int, float)) and math.isfinite(x)):
             return 'n/a'
         v_disp = U.from_canonical('radius', x, runit)
-        if se is not None and math.isfinite(se) and se > 0:
+        sig = self.controller.settings.no_uncertainty_sig_figs
+        if has_honest_se(se):
             se_disp = U.from_canonical('radius', se, runit)
+            if pdg_erases_value(v_disp, se_disp):
+                # Two sig figs on the spread so a leading-1 σ is not coarsened (invariant
+                # 8's must-not-under-report rule), as `gui/dls_module.py`'s shape cells.
+                return f'{format_fixed_sig(v_disp, sig)} ± {format_fixed_sig(se_disp, 2)}'
             return format_value_at_uncertainty(v_disp, se_disp)
-        return format_fixed_sig(v_disp, self.controller.settings.no_uncertainty_sig_figs)
+        return format_fixed_sig(v_disp, sig)
 
     def _unit_label(self, sample, fraction: Optional[str]) -> str:
         base = sample_display_name(sample)
@@ -950,57 +927,75 @@ class CrossSampleModule(QtWidgets.QWidget):
             for frac in self.controller.sample_fractions_any(sid):
                 self._row_units.append((sid, frac))
         self.table.setRowCount(len(self._row_units))
+        rho_cells = []                   # (row label, its ρ, the ρ cell) for the block
+        radius_cells = []                # (the Rg or Rh cell, its stored notes, its field)
         for row, (sid, frac) in enumerate(self._row_units):
             label = self._unit_label(samples[sid], frac)   # samples: the sid→Sample map
             chain = _CHAIN_DISPLAY.get(self.controller.sample_chain_type(sid), _EMPTY)
+            res = samples[sid].result_for(frac)
             try:
                 rho = self.controller.compute_sample_rho(sid, frac)
             except Exception:  # noqa: BLE001 — row isolation, cell left blank
                 rho = None
             if rho is not None:
-                # The estimator marker is IN the cell, not only in the (gated) tooltip: an
-                # OLS ± must never show without saying so (invariant 8 clause A). The
-                # interpretive "statistical SE, excludes systematics" caveat stays on the
-                # hover (ui_style_guide §5 names this tooltip as that tier's precedent),
-                # and the column header carries the always-visible "statistical" word.
-                est_note = ' [SE: classical OLS]' if rho.se_estimator == 'ols' else ''
-                rho_text = (format_pm(rho.rho, rho.rho_se) + est_note
-                            if rho.rho_se is not None
-                            else format_fixed_sig(rho.rho, sig))
-                rho_tip = (rho.interpretation if rho.rho_se is None else
-                           rho.interpretation + '\n(± = statistical SE, from the '
-                           'Rg and Rh regression fits; excludes systematics.'
-                           + est_note + ')')
+                # The ± words ride IN the cell, so an OLS ± never shows unlabeled
+                # (invariant 8 clause A); the header's "± statistical" holds for every
+                # row, and the tooltip carries each word's clause.
+                rho_text, rho_tip = format_fixed_sig(rho.rho, sig), rho.interpretation
+                if rho.rho_se is not None:
+                    rho_text = _with_words(
+                        format_pm(rho.rho, rho.rho_se),
+                        qualifier_words(rho, ('rho_se',), whole=False,
+                                        exclude=('se_regression',)))
+                    rho_tip += '\n' + qualifier_tooltip(rho, ('rho_se',), whole=False)
                 rg_txt = self._disp_radius(rho.rg_nm, rho.rg_se, runit)
                 rh_txt = self._disp_radius(rho.rh_nm, rho.rh_se, runit)
-                rg_disp = _model_dep_mark(rg_txt, rho.rg_model_dependent)
+                rg_tip = rho.rg_label if rg_txt != 'n/a' else 'no Rg (SLS) for this sample'
+                rh_tip = rho.rh_label if rh_txt != 'n/a' else 'no Rh (DLS) for this sample'
                 cells = {
-                    _C_RG: (rg_disp, rho.rg_label if rg_txt != 'n/a' else 'no Rg (SLS) for this sample'),
-                    _C_RH: (rh_txt, rho.rh_label if rh_txt != 'n/a' else 'no Rh (DLS) for this sample'),
                     _C_RHO: (rho_text, rho_tip),
                     _C_SHAPE: (rho.shape, rho.interpretation),
-                    _C_TYPE: ('apparent' if rho.is_apparent else 'thermodynamic', ''),
+                    _C_TYPE: (', '.join(qualifier_words(rho)) or 'thermodynamic',
+                              qualifier_tooltip(rho)),
                 }
             else:
                 # No ρ (a radius is missing) -> ρ/Shape/Type blank, but show whichever
                 # radius the sample DOES carry (an SLS-only sample still has its Rg, and
                 # still gets g from `arch` below); only the missing radius shows —.
-                res = samples[sid].result_for(frac)
                 have_rg = res.rg_nm is not None and math.isfinite(res.rg_nm)
                 have_rh = res.rh_nm is not None and math.isfinite(res.rh_nm)
                 rg_txt = self._disp_radius(res.rg_nm, res.rg_se, runit) if have_rg else _EMPTY
                 rh_txt = self._disp_radius(res.rh_nm, res.rh_se, runit) if have_rh else _EMPTY
-                rg_disp = _model_dep_mark(rg_txt, have_rg and getattr(res, 'rg_model_dependent', False))
+                rg_tip = (res.rg_label or '') if have_rg else 'no Rg (SLS) for this sample'
+                rh_tip = (res.rh_label or '') if have_rh else 'no Rh (DLS) for this sample'
                 _rho_tip = 'ρ needs both an SLS Rg and a DLS Rh'
                 cells = {
-                    _C_RG: (rg_disp, res.rg_label or '' if have_rg
-                            else 'no Rg (SLS) for this sample'),
-                    _C_RH: (rh_txt, res.rh_label or '' if have_rh
-                            else 'no Rh (DLS) for this sample'),
                     _C_RHO: (_EMPTY, _rho_tip),
                     _C_SHAPE: (_EMPTY, _rho_tip),
                     _C_TYPE: (_EMPTY, _rho_tip),
                 }
+            # Each radius takes the qualifier words of the stored value it shows.
+            for col, txt, tip, attr in ((_C_RG, rg_txt, rg_tip, 'rg_nm'),
+                                        (_C_RH, rh_txt, rh_tip, 'rh_nm')):
+                words = qualifier_words(res, (attr,), whole=False,
+                                        exclude=_CELL_WORDS_EXCLUDE)
+                clauses = qualifier_tooltip(res, (attr,), whole=False,
+                                            exclude=_CELL_WORDS_EXCLUDE)
+                # A ± shows only beside an erased value (`_disp_radius`). It reads
+                # "± statistical only" (ui_style_guide §5), and an OLS one also names its
+                # estimator (invariant 8 clause A), read off the per-quantity tag the
+                # stored radius carries.
+                se_attr = attr[:2] + '_se'
+                if '±' in txt:
+                    pm = [Note('se_regression', (se_attr,))]
+                    if getattr(res, se_attr + '_estimator', None) == 'ols':
+                        pm.append(Note('se_ols', (se_attr,)))
+                    words = [vocabulary(n) for n in pm] + words
+                    clauses = '\n'.join(t for t in [render(n, counted=True) for n in pm]
+                                        + [clauses] if t)
+                shown = _with_words(txt, words)
+                cells[col] = (shown, '\n'.join(t for t in (tip, clauses) if t)
+                              if shown != txt else tip)
             cells[_C_SAMPLE] = (label, '')
             cells[_C_CHAIN] = (chain, 'Tag on the Data tab (Chain type)'
                                if chain == _EMPTY else 'Set on the Data tab')
@@ -1022,6 +1017,24 @@ class CrossSampleModule(QtWidgets.QWidget):
                 if tip:
                     item.setToolTip(tip)
                 self.table.setItem(row, col, item)
+                if col == _C_RHO and rho is not None:
+                    rho_cells.append((label, rho, item))
+                if col in (_C_RG, _C_RH) and text not in (_EMPTY, 'n/a'):
+                    field = 'rg_nm' if col == _C_RG else 'rh_nm'
+                    radius_cells.append((item, self._stored_value_notes(res, (field,)),
+                                         field))
+        # One source: the readout's relayed scale gates name their own samples (`where`).
+        self.arch_block.show_notes(self._arch.notes if self._arch is not None else ())
+        for _lbl, r, item in rho_cells:
+            self.arch_block.mark_item(item, r, ('rho', 'rho_se'))
+        # A radius shown marks its stored value's failed checks, as its source row does, the
+        # lines after the readout's; ρ and the shape built from it carry no marker of them.
+        self.arch_block.append_notes(tuple(n for _i, notes, _f in radius_cells for n in notes))
+        for item, notes, field in radius_cells:
+            tip = item.toolTip()
+            if self.arch_block.mark_item(item, notes, (field,), whole=False) and tip:
+                item.setToolTip(item.toolTip() + '<hr>'
+                                + html.escape(tip).replace('\n', '<br>'))
         self._suppress = False
 
     def _gh_missing_tip(self, sid: str, which: str) -> str:
@@ -1034,12 +1047,6 @@ class CrossSampleModule(QtWidgets.QWidget):
 
     _SCALE_NAMES = {'rg': 'Rg–Mw', 'rh': 'Rh–Mw', 'a2': 'A₂–Mw'}
     _SCALE_NEEDS = {'rg': 'Rg', 'rh': 'Rh', 'a2': 'positive A₂'}
-    # Which plotted quantities the arbitrary-scale caveat can be about, per axis. Mw is every
-    # plot's X axis; the A₂ axis adds its own scale-bearing ordinate (Rg and Rh carry no scale
-    # flags — the scale cancels in both). The flag is a plot-scoped OR over the points, so it
-    # cannot say WHICH of the two fired — hence the candidates, not a claim.
-    _SCALE_ARB = {'rg': 'Mw', 'rh': 'Mw', 'a2': 'Mw or A₂'}
-
     def _on_swap_size(self) -> None:
         """Toggle the top scaling plot between Rg–Mw and Rh–Mw."""
         self._size_quantity = 'rh' if self._size_quantity == 'rg' else 'rg'
@@ -1054,7 +1061,7 @@ class CrossSampleModule(QtWidgets.QWidget):
             run_when_idle(self._refresh_scaling)
             return
         included = [sid for sid, inc in self._included.items() if inc]
-        heads, notes = [], []
+        heads, notes, head_tips, scale_notes = [], [], [], []
         sig = self.controller.settings.no_uncertainty_sig_figs
         # Top plot is the chosen size axis (Rg or Rh); bottom is always A2.
         for ax, q in ((self.ax_rg, self._size_quantity), (self.ax_a2, 'a2')):
@@ -1064,22 +1071,13 @@ class CrossSampleModule(QtWidgets.QWidget):
                          branched_x=sd.branched_mw, branched_y=sd.branched_y,
                          branched_labels=sd.branched_labels)
             name = self._SCALE_NAMES[q]
-            # All three qualifiers are about a plotted VALUE, not about the fit, so they are
-            # built BEFORE the branch and appended to both: an invalid fit still draws its
-            # points, and a qualifier that waits for a slope is missing exactly when the user is
-            # reading raw values off the plot. Kept together because the producer sets all
-            # three per plotted point and calls them symmetric -- that is a claim about THIS
-            # surface, and splitting them here is what makes it false.
-            qual = (f'  ⚠ {self._SCALE_ARB[q]} on an arbitrary scale'
-                    if sd.any_arbitrary_scale else '')
-            if sd.any_degenerate:
-                # Stronger qualifier: an input rests on a user-selected solution the data
-                # cannot distinguish (still neutral ⓘ, not an alarm).
-                qual += ('  ⓘ includes a user-selected degenerate (form-factor) solution '
-                         'the scattering data cannot distinguish')
-            elif sd.any_model_dependent:
-                # Neutral qualifier (a form-factor Mw/Rg assumes a shape), not an alarm.
-                qual += '  ⓘ includes a model-dependent (form-factor) value'
+            # What the plotted VALUES are, not the fit: built BEFORE the branch and appended
+            # to both, since an invalid fit still draws its points. The model-dependence and
+            # degenerate words are the plot's qualifiers (R5.6); a point on an arbitrary
+            # scale is a line of the block below, its points named (sd.notes).
+            words = qualifier_words(sd)
+            qual = f'  ({", ".join(words)})' if words else ''
+            scale_notes.extend(sd.notes)
             if sd.fit.fit_valid:
                 # 'ν' is the size exponent (Rg/Rh ~ Mw^ν); for A₂ the log–log slope
                 # is the raw exponent (A₂ ~ Mw^slope, negative in a good solvent).
@@ -1089,16 +1087,16 @@ class CrossSampleModule(QtWidgets.QWidget):
                 exp_text = (format_pm(sd.fit.exponent, sd.fit.exponent_se)
                             if sd.fit.exponent_se is not None else
                             format_fixed_sig(sd.fit.exponent, sig))
-                # The ± is a regression SE: say so, and name the estimator when it is the
-                # classical-OLS opt-in -- on the headline, the one always-visible surface
-                # this fit has (invariant 8 clause A; the ρ cell's wording).
+                # A shown ± carries the fit's ± words (statistical only; OLS when the
+                # estimator is the opt-in) on the headline, the one always-visible surface
+                # this fit has (invariant 8 clause A); their clauses are its tooltip.
                 if sd.fit.exponent_se is not None:
-                    exp_text += ' (± statistical only)'
-                    if getattr(sd.fit, 'se_estimator', 'hc3') == 'ols':
-                        exp_text += ' [SE: classical OLS]'
+                    exp_text = _with_words(exp_text,
+                                           qualifier_words(sd.fit, ('exponent_se',)))
+                    head_tips.append(qualifier_tooltip(sd.fit, ('exponent_se',)))
                 heads.append(f'{name}: {sym} = {exp_text}')          # glanceable
                 bullet = f'• {name} ({len(sd.mw)} pts): ' \
-                         + interpret_scaling_exponent(sd.fit.exponent, q)
+                         + self.controller.interpret_exponent(sd.fit.exponent, q)
                 if sd.branched_mw:
                     bullet += (f'  [{len(sd.branched_mw)} branched point(s) shown '
                                'hollow, excluded from the fit]')
@@ -1115,8 +1113,11 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.scaling_fig.tight_layout()
         self.scaling_canvas.draw_idle()
         self.scaling_headline.setText(' · '.join(heads))
+        self.scaling_headline.setToolTip('\n'.join(dict.fromkeys(
+            line for tip in head_tips for line in tip.splitlines())))
         self.scaling_headline.setVisible(bool(heads))
         self.scaling_note.setText('\n'.join(notes))
+        self.scaling_block.show_notes(tuple(scale_notes))
 
     @QtCore.Slot()
     def _on_export_scaling(self) -> None:
@@ -1213,6 +1214,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         if not included:
             self._current_unit = None
             self.source_box.setEnabled(False)
+            self._show_row_words(None)
             self._set_interp('')
             self.selectionChanged.emit()             # clear the tree mirror
             return
@@ -1297,6 +1299,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         write to a stale sample) but explains why."""
         self._current_unit = None
         self.source_box.setEnabled(False)
+        self._show_row_words(None)
         sample = self.controller.workspace.samples.get(sid)
         label = sample_display_name(sample) if sample is not None else sid
         self._set_interp(
@@ -1387,13 +1390,8 @@ class CrossSampleModule(QtWidgets.QWidget):
             self.rh_combo.addItem('— no DLS data for this sample —')
             self.rh_combo.blockSignals(False)
 
-        # Calibration surfacing: badge the scale-dependent rows (Mw, A2) when the
-        # chosen candidate is uncalibrated; Rg is scale-independent (no badge).
-        self._set_cal_badge(self.mw_badge, r.calibrated, r.mw_source, r.mw_g_per_mol,
-                            r.dn_dc_supplied)
-        self._set_cal_badge(self.a2_badge, r.a2_calibrated, r.a2_source,
-                            r.a2_mol_mL_per_g2, r.a2_dn_dc_supplied)
-        self._update_cal_banner(r)
+        self._show_value_notes(r)
+        self._show_row_words(r)
 
         # "Show all" reveals the hidden single-condition tail; annotate its count.
         base = 'Show all single-condition results'
@@ -1405,53 +1403,37 @@ class CrossSampleModule(QtWidgets.QWidget):
         self.source_box.setTitle('Source Selection')
         self._set_interp(*self._rho_interp(sid, fraction))
 
-    def _set_cal_badge(self, badge: ThemedLabel, calibrated: Optional[bool],
-                       source: str, value: Optional[float],
-                       dn_dc_supplied: Optional[bool] = None) -> None:
-        """Show a colorblind-safe (symbol + text) badge when a chosen, scale-dependent
-        value (Mw/A2) is on an arbitrary scale. Blank when the scale is known, unknown,
-        hand-entered (trusted), or absent. The verdict is `is_arbitrary_scale` — the
-        one predicate — so this badge and the banner below can never disagree about
-        the same number (rule 10).
+    def _show_value_notes(self, r) -> None:
+        """The failed preconditions of the four values the sample stores, as every result
+        surface shows a value's: one line per cause in `source_block`, and each row's badge
+        the marker of the lines about its value (`⚠ᵃ`, `⚠ᵃᵇ` for two causes), its hover the
+        lines' popup (ui_style_guide §5). The lines are the Mw and A2's scale gates
+        (`SampleResult.scale_notes`, read through `is_arbitrary_scale`), then the notes the
+        stored values carry from the candidates or runs that wrote them (`set_value_notes`);
+        a legacy note from an older session marks no value and is not shown."""
+        notes = (tuple(r.scale_notes())
+                 + self._stored_value_notes(r, tuple(self._STORED_VALUE_FIELD.values())))
+        self.source_block.show_notes(notes)
+        for badge, quantity in ((self.rg_badge, 'rg'), (self.rh_badge, 'rh'),
+                                (self.mw_badge, 'mw'), (self.a2_badge, 'a2')):
+            value_field = (self._STORED_VALUE_FIELD[quantity],)
+            codes = self.source_block.codes_for(notes, value_field, whole=False)
+            badge.setText(self.source_block.marker(notes, value_field, whole=False))
+            badge.setToolTip(self.source_block.popup_for(codes))
 
-        The badge names WHICH scale is missing rather than always saying
-        “uncalibrated”: the two causes are independent, and a user sent to calibrate
-        when the real gap is a missing dn/dc would do the work and still see the badge.
-        """
-        if not is_arbitrary_scale(value, source, calibrated, dn_dc_supplied):
-            badge.setText('')
-            return
-        causes = []
-        if calibrated is False:
-            causes.append('uncalibrated')
-        if dn_dc_supplied is False:
-            causes.append('no usable dn/dc')
-        badge.setText('⚠ ' + ', '.join(causes))
-
-    def _update_cal_banner(self, r) -> None:
-        which = []
-        if r.mw_is_arbitrary_scale():
-            which.append('Mw')
-        if r.a2_is_arbitrary_scale():
-            which.append('A₂')
-        if not which:
-            self.cal_banner.setText('')
-            return
-        # Name the cause AND match the remedy to it: "calibrate" is wrong advice when
-        # the missing input is a refractive-index increment, which is entered on the
-        # Data tab and cannot be obtained by calibrating.
-        uncal = r.calibrated is False or r.a2_calibrated is False
-        no_dndc = r.dn_dc_supplied is False or r.a2_dn_dc_supplied is False
-        causes, fixes = [], []
-        if uncal:
-            causes.append('UNCALIBRATED')
-            fixes.append('calibrate on the SLS tab')
-        if no_dndc:
-            causes.append('no usable dn/dc')
-            fixes.append('enter a usable dn/dc on the Data tab')
-        self.cal_banner.setText(
-            f'⚠ {" and ".join(which)} are {" + ".join(causes)} (arbitrary scale) — '
-            f'{", or ".join(fixes)}, or select another fit.')
+    def _show_row_words(self, r) -> None:
+        """Each source row's label with the qualifier words of the value the sample stores
+        for its quantity, `A₂ (SLS, apparent):`, their clauses the label's passive tooltip
+        (ui_style_guide §5): what the chosen value is stays in view however far the combo
+        beside it elides its label. A row with no stored value, or no panel focus (`r` None),
+        shows the bare name."""
+        for quantity, (label, name) in self._row_labels.items():
+            field = self._STORED_VALUE_FIELD[quantity]
+            value = getattr(r, field, None) if r is not None else None
+            stored = isinstance(value, (int, float)) and math.isfinite(value)
+            words = qualifier_words(r, (field,), whole=False) if stored else []
+            label.setText(f'{name}{"".join(", " + w for w in words)}):')
+            label.setToolTip(qualifier_tooltip(r, (field,), whole=False) if words else '')
 
     def _fill_candidate_combo(self, combo: QtWidgets.QComboBox, candidates, *,
                               current_result, result_quantity: str,
@@ -1478,7 +1460,7 @@ class CrossSampleModule(QtWidgets.QWidget):
         is NOT the `quantity` argument beside it, which picks display units."""
         current_label = getattr(current_result, f'{result_quantity}_label', '')
         current_source = getattr(current_result, f'{result_quantity}_source', 'computed')
-        default = select_default_candidate(list(candidates))
+        default = self.controller.default_candidate(list(candidates))
         combo.blockSignals(True)
         combo.clear()
         model = combo.model()
@@ -1622,6 +1604,15 @@ class CrossSampleModule(QtWidgets.QWidget):
     # sample's Rh. A missing key now raises instead of quietly answering with Rh.
     _STORED_VALUE_FIELD = {'rg': 'rg_nm', 'mw': 'mw_g_per_mol',
                            'a2': 'a2_mol_mL_per_g2', 'rh': 'rh_nm'}
+
+    @staticmethod
+    def _stored_value_notes(result, fields) -> tuple:
+        """The failed preconditions `result` stores about the value fields `fields`, written
+        by the candidate or run that stored each value (`set_value_notes`); a legacy note
+        from an older session marks no value and is left out."""
+        return tuple(n for n in result.notes
+                     if set(n.about) & set(fields) and REGISTRY.get(n.code) is not None
+                     and REGISTRY[n.code].kind == 'precondition')
 
     @classmethod
     def _stored_value(cls, result, result_quantity: str) -> Optional[float]:

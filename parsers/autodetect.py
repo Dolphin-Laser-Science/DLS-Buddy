@@ -90,12 +90,11 @@ def autodetect(path: str, parser_classes: Sequence[type], *,
         this list -- they match anything, so they are the explicit fallback each caller
         applies afterwards.
     skip_missing_file
-        The trace loader has always swallowed `FileNotFoundError` here and the DLS/SLS
-        routes have always let it propagate (pinned by
-        `tests/test_parser_conversions.py::test_missing_file_raises_file_not_found`). That
-        divergence is pre-existing and out of scope; this flag makes it a DECLARED
-        parameter at one site instead of an implicit difference between two `except`
-        tuples that nobody was comparing.
+        Whether a parser's `FileNotFoundError` is skipped like a refusal (True) or
+        propagates (False, the default). The trace route passes True
+        (`app/loading.py::detect_trace`); the DLS and SLS loaders keep the default. The
+        flag's two arms are pinned by `tests/test_autodetect.py`; each route's choice is
+        its own call.
 
     Returns
     -------

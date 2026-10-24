@@ -43,7 +43,8 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from analysis.dls._common import _apply_tau_window, _live_channels
+from analysis.dls._common import apply_tau_window, live_channels
+from core.notes import Note
 
 #: The fits that re-express the region as a subtracted value or a floating-baseline span.
 PARAMETRIC_METHODS = ('cumulant', 'single', 'double', 'kww')
@@ -87,16 +88,13 @@ class RegionState:
         """
         return (self.window(), self.span())
 
-    def is_set(self) -> bool:
-        return self.window() is not None or self.span() is not None
-
 
 def _fit_channels(tau: np.ndarray, g2m1: np.ndarray, window,
                   skip_initial_channels: int) -> Optional[np.ndarray]:
     """Boolean mask over the RAW axis of the channels a fit reads: past the skipped
     leading channels, inside `window`, and live.
 
-    Computed through the engine's own `_apply_tau_window` and `_live_channels`, so the
+    Computed through the engine's own `apply_tau_window` and `live_channels`, so the
     count a span is judged by is the count the fit takes (rule 12: one computation). The
     window is run over the channel INDICES, which comes back as the indices it keeps.
     None when the engine refuses the window or the skip outright -- the fit then raises
@@ -104,14 +102,14 @@ def _fit_channels(tau: np.ndarray, g2m1: np.ndarray, window,
     """
     tmin, tmax = window if window is not None else (None, None)
     try:
-        _t, idx = _apply_tau_window(tau, np.arange(tau.size, dtype=float), tmin, tmax,
+        _t, idx = apply_tau_window(tau, np.arange(tau.size, dtype=float), tmin, tmax,
                                     min_points=0,
                                     skip_initial_channels=skip_initial_channels)
     except ValueError:
         return None
     mask = np.zeros(tau.size, dtype=bool)
     kept = idx.astype(int)
-    mask[kept] = _live_channels(g2m1[kept])
+    mask[kept] = live_channels(g2m1[kept])
     return mask
 
 
@@ -161,40 +159,22 @@ def region_fit_kwargs(tau, g2m1, method: str, region: Optional[RegionState], *,
     return kw
 
 
-def _seconds(x: float) -> str:
-    return f'{float(x):.4g} s'
-
-
-#: How every region note begins -- the one spelling a recorded mode set finds the map's
-#: region note by, so the writer and the reader cannot drift apart.
-REGION_NOTE_PREFIX = "Read the Correlogram tab's delay window and baseline"
-
-
-def describe_region(region: Optional[RegionState]) -> str:
-    """What a checked run read, in one sentence: the delay window and the baseline span
-    it was sent, or that each was not set. '' for None (the box unticked), which runs on
-    each run's own defaults exactly as before the box existed -- the silent default.
+def region_note(region: Optional[RegionState]) -> Optional[Note]:
+    """What a checked run read, as the registry's `region` record: the delay window and the
+    baseline span it was sent, in seconds, or the words saying each was not set. None for
+    None (the box unticked), which runs on each run's own defaults exactly as before the
+    box existed -- the silent default.
 
     ONE computation for every result's note, so a result, its export and a mode set
-    recorded from it cannot describe the region differently."""
+    recorded from it cannot describe the region differently; a reader finds it by its
+    code, never by its wording."""
     if region is None:
-        return ''
+        return None
     window, span = region.window(), region.span()
-    if window is None and span is None:
-        return (f"{REGION_NOTE_PREFIX}: neither is set there, so each run used its own "
-                f"full lag range and its fit's own baseline estimate.")
-    if window is None:
-        wtxt = 'window not set (each run used its full lag range)'
-    else:
-        lo = '—' if window[0] is None else _seconds(window[0])
-        hi = '—' if window[1] is None else _seconds(window[1])
-        wtxt = f'window {lo} to {hi}'
-    if span is None:
-        btxt = "baseline not placed (each fit used its own estimate)"
-    else:
-        btxt = (f'baseline measured over {_seconds(span[0])} to {_seconds(span[1])} '
-                f'where that lies inside each run\'s delay window')
-    return f"{REGION_NOTE_PREFIX}: {wtxt}; {btxt}."
+    shown_window = ('not set' if window is None else
+                    tuple('—' if x is None else float(x) for x in window))
+    shown_span = 'not placed' if span is None else (float(span[0]), float(span[1]))
+    return Note('region', (), {'window': shown_window, 'baseline': shown_span})
 
 
 def region_summary(region: Optional[RegionState]) -> str:

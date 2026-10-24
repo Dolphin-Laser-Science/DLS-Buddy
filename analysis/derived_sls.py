@@ -67,6 +67,7 @@ from core.data_models import (DLSMeasurement, casefold_identity_name,
                               polarization_state, round_angle_for_identity,
                               round_concentration_for_identity,
                               round_temperature_for_identity, usable_rate)
+from core.notes import Note
 from analysis.dls.replicate import check_replicate_identity
 from analysis.uncertainty import replicate_mean_se
 
@@ -106,8 +107,8 @@ class DerivedPoint:
     """One angle of the derived series, with the runs that produced it.
 
     ``intensity_se_cps`` is the standard error of the mean over the runs averaged
-    into this point, from their spread (the ISO 22412 repeat-measurement
-    uncertainty, :func:`analysis.uncertainty.replicate_mean_se` -- the platform's
+    into this point, from their spread (the repeat-measurement uncertainty, GUM
+    sec. 4.2.3, :func:`analysis.uncertainty.replicate_mean_se` -- the platform's
     one licensed single-sample DLS-side +/-). It is ``None`` for a single run,
     where no spread exists and none is invented (invariant 8), and ``None`` for a
     zero spread, by that function's own rule. It is a RECORD of the point's
@@ -133,8 +134,10 @@ class DerivedStaticSeries:
     the pipeline needs only that every intensity -- sample, solvent and calibrant
     -- share one unit, because the calibration constant k_c = R_standard /
     I_calibrant cancels it exactly. Nothing downstream can CHECK that the other
-    intensities share it, so ``notes`` always carries one sentence naming the unit
-    and what a calibrant entered in kcps would cost.
+    intensities share it, so ``notes`` always carries one record naming the unit
+    (a calibrant entered in kcps would scale Mw by 1000).
+
+    ``notes`` holds every record of the derivation as `core.notes.Note`.
     """
     angles_deg: np.ndarray
     intensities: np.ndarray
@@ -149,7 +152,7 @@ class DerivedStaticSeries:
     points: Tuple[DerivedPoint, ...] = ()
     # Defaults to the empty tuple like every other result dataclass carrying notes,
     # so the warnings bridge can read the family uniformly (tests/test_notes_bridge.py).
-    notes: Tuple[str, ...] = ()
+    notes: Tuple[Note, ...] = ()
 
     @property
     def source_item_ids(self) -> Tuple[str, ...]:
@@ -165,6 +168,21 @@ class DerivedStaticSeries:
                 if tag not in seen:
                     seen.append(tag)
         return tuple(seen)
+
+
+#: How far apart repeats' mean count rates may lie, in `pairwise_rate_spread`'s form,
+#: and still be read as one intensity scale: `derive_static_series`' `rate_rel_tol`
+#: default (its docstring holds the rationale).
+RATE_REL_TOL = 0.05
+
+
+def pairwise_rate_spread(rates) -> float:
+    """(max - min) / min of a set of positive count rates: the highest against the lowest,
+    the pairwise relative difference. Kept pairwise rather than a half-range about the mean,
+    which is about half as sensitive, so `RATE_REL_TOL` keeps the sensitivity it was set at.
+    Every rate must be positive (`core.data_models.usable_rate`), so the minimum divides."""
+    lo, hi = min(rates), max(rates)
+    return (hi - lo) / lo
 
 
 def require_one_polarization_state(measurements) -> None:
@@ -217,7 +235,7 @@ def _require_usable_rate(entry: DerivedIntensityInput) -> float:
 
 def derive_static_series(
     entries: Sequence[DerivedIntensityInput],
-    *, rtol: float = 1e-6, rate_rel_tol: float = 0.05,
+    *, rtol: float = 1e-6, rate_rel_tol: float = RATE_REL_TOL,
 ) -> DerivedStaticSeries:
     """Collate DLS runs' committed mean count rates into one static series.
 
@@ -237,11 +255,12 @@ def derive_static_series(
         before the averaged point is DISCLOSED as built from runs that disagree.
         The identity check compares the runs' parameters,
         not their intensities; this is the sibling comparison the Data tab's
-        `mean_count_rate_status` already makes between a committed rate and its
-        trace, at the same default and with the same rationale -- repeats at one
-        setting agree to about 0.5 %, and the failures worth catching are gross
-        (a changed pinhole or attenuator is a factor of several; a kHz/cps slip a
-        factor of 1000). A disclosure, never a refusal; the value is unchanged.
+        `mean_count_rate_status` makes between a committed rate and its own trace, at
+        the same default. The failures it is set to catch are gross (a changed pinhole
+        or attenuator is a factor of several; a kHz/cps slip a factor of 1000), but
+        repeats at one angle can differ by more than it (0.8-13 % pairwise on the
+        bundled ALV ten-run set), so the note states the spread and names no cause. A
+        disclosure, never a refusal; the value is unchanged.
 
     Raises
     ------
@@ -273,31 +292,28 @@ def derive_static_series(
         )
 
     first = entries[0].measurement
-    notes: List[str] = []
+    notes: List[Note] = []
 
     # --- disclosure: inherited identity and optical constants (doctrine rule 2) ---
     # Nothing here is averaged across angles, so a disagreement is reported and the
     # first run's value is used -- the same "garbage in, garbage out, and the
     # parameters are the user's" stance the replicate average takes for the fields
     # it deliberately does not compare.
-    for label, getter, form in (
-        ('polymer name', lambda m: m.polymer_name, casefold_identity_name),
-        ('solvent name', lambda m: m.solvent_name, casefold_identity_name),
-        ('temperature', lambda m: m.temperature_K, round_temperature_for_identity),
-        ('wavelength', lambda m: m.wavelength_nm, lambda v: round(float(v), 6)),
-        ('solvent refractive index',
+    for label, unit, getter, form in (
+        ('polymer name', '', lambda m: m.polymer_name, casefold_identity_name),
+        ('solvent name', '', lambda m: m.solvent_name, casefold_identity_name),
+        ('temperature', 'K', lambda m: m.temperature_K, round_temperature_for_identity),
+        ('wavelength', 'nm', lambda m: m.wavelength_nm, lambda v: round(float(v), 6)),
+        ('solvent refractive index', '',
          lambda m: m.solvent_refractive_index, lambda v: round(float(v), 9)),
-        ('molecular-weight fraction', lambda m: m.mw_fraction, lambda v: v),
-        ('analyzer geometry', lambda m: m.analyzer_geometry, lambda v: v),
+        ('molecular-weight fraction', '', lambda m: m.mw_fraction, lambda v: v),
+        ('analyzer geometry', '', lambda m: m.analyzer_geometry, lambda v: v),
     ):
         seen = {form(getter(e.measurement)) if getter(e.measurement) is not None
                 else None for e in entries}
         if len(seen) > 1:
-            notes.append(
-                "The collated runs do not all share one {0}; the derived series "
-                "uses the first run's value ({1!r}). Correct the run parameters "
-                "if that is not what you meant.".format(label, getter(first))
-            )
+            notes.append(Note('runs_differ', (),
+                              {'field': label, 'value': getter(first), 'unit': unit}))
 
     # --- collate: one point per angle bucket ---
     by_angle: Dict[float, List[DerivedIntensityInput]] = {}
@@ -318,19 +334,27 @@ def derive_static_series(
             # rule would make the result depend on load order -- the same defect
             # shape a first-loaded solvent blank has been measured to produce
             # elsewhere in the program.
-            check_replicate_identity([e.measurement for e in group], rtol=rtol)
+            # Temperature is recorded, not refused (combination doctrine rule 2): a
+            # nonzero span joins the averaging note below.
+            identity = check_replicate_identity(
+                [e.measurement for e in group], rtol=rtol)
             # The point's precision from the replicate spread (n >= 2; None on a
             # zero spread by replicate_mean_se's rule). A single run gets None: no
-            # spread exists and none is invented (invariant 8). Surfaced on the
-            # averaging note -- which reaches the tab, the provenance and the export
-            # -- so the record the guides describe is one the user can read.
+            # spread exists and none is invented (invariant 8). Recorded beside the
+            # averaging -- which reaches the tab, the provenance and the export -- so
+            # the record the guides describe is one the user can read; a nonzero
+            # temperature span is its own record.
             se = replicate_mean_se(values).sem
-            notes.append(
-                '{0} runs at {1:g} deg were averaged into one point{2}.'.format(
-                    len(group), angle,
-                    '' if se is None else
-                    ' (standard error of the mean from their spread: \u00b1 {0:.3g} '
-                    'cps)'.format(se)))
+            notes.append(Note('runs_averaged', ('intensities',),
+                              {'n': len(group), 'angle': float(angle)}))
+            if se is not None:
+                notes.append(Note('averaged_point_sem', ('intensities',),
+                                  {'sem': float(se), 'angle': float(angle)}))
+            if identity.temperature_span_K != 0.0:
+                lo, hi = (float(min(identity.temperatures_K)),
+                          float(max(identity.temperatures_K)))
+                notes.append(Note('temperature_span', (),
+                                  {'lo': lo, 'hi': hi, 'span': hi - lo}))
             # The identity check passed on the PARAMETERS; now the INTENSITIES: two
             # runs that share angle, temperature and fraction but not a pinhole or
             # attenuator pass every identity field and are not on one scale
@@ -339,18 +363,14 @@ def derive_static_series(
             # so the shared default keeps the sensitivity it was calibrated on (a
             # half-range about the mean is about half as sensitive); every rate is
             # positive (`_require_usable_rate`), so the minimum is a valid divisor.
-            lo, hi = min(values), max(values)
-            spread = (hi - lo) / lo
+            spread = pairwise_rate_spread(values)
             if spread > rate_rel_tol:
-                notes.append(
-                    'The {0} runs at {1:g} deg do not agree: their mean count rates '
-                    'run from {2:.4g} to {3:.4g} cps, {4:.0f} % apart (runs {5}). '
-                    'Repeats at one setting agree to well within {6:.0f} %, so a '
-                    'spread this large usually means a different pinhole, attenuator '
-                    'or laser power; the averaged point is used as is.'.format(
-                        len(group), angle, lo, hi, 100.0 * spread,
-                        ', '.join(e.name for e in group),
-                        100.0 * rate_rel_tol))
+                # The fact, named by run, never a cause (ui_style_guide R5.7): a changed
+                # pinhole, dust or drift between runs all read the same. The averaged
+                # point is used as is.
+                notes.append(Note('rate_spread', ('intensities',), {
+                    'runs': tuple(e.name for e in group), 'angle': float(angle),
+                    'spread': float(spread), 'limit': float(rate_rel_tol)}))
         points.append(DerivedPoint(
             angle_deg=float(angle),
             intensity_cps=intensity,
@@ -360,15 +380,11 @@ def derive_static_series(
         ))
 
     # --- disclosure: the unit, on every series (doctrine rule 2) ---
-    # A file-loaded SLS series keeps its own file's unit, and one session calibrant
-    # intensity is applied to it and to this one alike, so a unit mismatch is
-    # invisible to the engine -- it can only be stated.
-    notes.append(
-        'Derived intensities are count rates in cps (a kcps or kHz reading was '
-        'converted on load). k_c cancels the unit only when the calibrant '
-        'intensity and every SLS file in the same session are in cps too; a '
-        'calibrant entered in kcps would scale Mw by 1000.'
-    )
+    # A file-loaded SLS series keeps its own file's unit (a kcps or kHz reading was
+    # converted on load), and one session calibrant intensity is applied to it and to
+    # this one alike, so a unit mismatch is invisible to the engine -- it can only be
+    # stated.
+    notes.append(Note('derived_cps_unit', ('intensities',)))
 
     return DerivedStaticSeries(
         angles_deg=np.array([p.angle_deg for p in points], dtype=float),

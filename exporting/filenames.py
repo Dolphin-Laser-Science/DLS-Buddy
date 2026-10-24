@@ -268,7 +268,11 @@ def measurement_export_name(sample: Optional[Tuple[str, str]], analysis: str,
                             name: str, *, angle_deg: Optional[float] = None,
                             method: Optional[str] = None,
                             ext: str = 'csv') -> str:
-    """The one-measurement rule for a single file: the whole name, no fan-out."""
+    """The one-measurement rule for a single file: the whole name, no fan-out.
+
+    A one-member convenience over `batch_export_names`, which holds the rule: its
+    one-member case returns this name as the dialog name with an empty suffix.
+    """
     return batch_export_names(
         sample, analysis, [ExportMember('', name, angle_deg, method)], ext)[0]
 

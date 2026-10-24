@@ -106,6 +106,7 @@ from parsers.base_parser import (
     MalformedDataError,
     ParseError,
     SLSFilePreview,
+    read_text_lines,
 )
 
 # ---------------------------------------------------------------------------
@@ -184,17 +185,9 @@ def _read_rows(file_path: str) -> List[Tuple[str, str]]:
     FileNotFoundError
         If the file does not exist.
     ParseError
-        If the file cannot be read with the expected encoding.
+        If the file cannot be read (``read_text_lines``).
     """
-    if not os.path.isfile(file_path):
-        raise FileNotFoundError(f"File not found: {file_path!r}")
-    try:
-        with open(file_path, encoding=_ENCODING, newline='') as fh:
-            raw_lines = [line.rstrip('\r\n') for line in fh]
-    except (UnicodeDecodeError, OSError) as exc:
-        raise ParseError(
-            f"Could not read {file_path!r} with encoding {_ENCODING!r}: {exc}"
-        ) from exc
+    raw_lines = read_text_lines(file_path, (_ENCODING,))
 
     rows: List[Tuple[str, str]] = []
     for line in raw_lines:

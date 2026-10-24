@@ -33,14 +33,16 @@ from __future__ import annotations
 
 import copy
 import math
-from dataclasses import dataclass, field, fields, asdict, MISSING
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field, fields, asdict, replace, MISSING
+from typing import AbstractSet, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from core.data_models import (
     DLSMeasurement, IntensityTrace, SLSMeasurement,
     casefold_identity_name, round_temperature_for_identity, usable_rate)
+from core.note_registry import REGISTRY
+from core.notes import Note, render
 
 
 def _known_only(cls, d: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -52,13 +54,75 @@ def _known_only(cls, d: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return {k: v for k, v in (d or {}).items() if k in known}
 
 
+# ---------------------------------------------------------------------------
+# A note in the session file: `[code, about, values]`
+# ---------------------------------------------------------------------------
+
+def _json_value(value: Any) -> Any:
+    """A note value as JSON: a tuple becomes a list, recursively; a scalar is itself."""
+    if isinstance(value, tuple):
+        return [_json_value(v) for v in value]
+    return value
+
+
+def note_to_json(note: Note) -> List[Any]:
+    """One `core.notes.Note` as the session file stores it: `[code, about, values]`."""
+    return [note.code, list(note.about),
+            {k: _json_value(v) for k, v in note.values.items()}]
+
+
+def notes_to_json(notes) -> List[List[Any]]:
+    return [note_to_json(n) for n in notes]
+
+
+def legacy_note(text: str, about: Tuple[str, ...] = ()) -> Note:
+    """A sentence from a session older than the codes, kept as the registry's `legacy`
+    note so it is shown rather than dropped."""
+    return Note('legacy', about, {'text': str(text)})
+
+
+def note_from_json(item: Any) -> Note:
+    """The inverse of `note_to_json`. A list comes back as the Note it was (a value that
+    was a tuple comes back a tuple, `core.notes.NoteValues` restores it); a plain string
+    is a version-2 sentence and comes back as a `legacy` note. Anything else is not a
+    note this build wrote, and is refused rather than misread: a shape this build does
+    not write, a code its registry does not hold, or values its clause cannot be read
+    from. A session saved by a build whose notes registry differs is therefore refused
+    whole, never half-read (the owner's decision, 2026-10-15: starting a new session is
+    the lighter cost)."""
+    if isinstance(item, str):
+        return legacy_note(item)
+    if (isinstance(item, list) and len(item) == 3 and isinstance(item[0], str)
+            and isinstance(item[1], list) and isinstance(item[2], dict)):
+        note = Note(item[0], tuple(item[1]), item[2])
+        if note.code not in REGISTRY:
+            raise ValueError(
+                f'This session holds a note this build does not know ({note.code!r}): it '
+                f'was saved by a build whose notes differ. Start a new session here.')
+        try:
+            render(note, surface='export')
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                f'This session holds a {note.code!r} note this build cannot read (its '
+                f'values lack {exc}): it was saved by a build whose notes differ. Start a '
+                f'new session here.') from None
+        return note
+    raise ValueError(f'Not a note this build can read: {item!r}')
+
+
+def notes_from_json(items) -> Tuple[Note, ...]:
+    """Every stored note, in order; a blank version-2 sentence is no note."""
+    return tuple(note_from_json(i) for i in (items or ())
+                 if not (isinstance(i, str) and not i.strip()))
+
+
 # ===========================================================================
 # Loaded measurement: raw data + editable parameters (working / committed)
 # ===========================================================================
 
 # The physical parameters a user confirms or edits for a measurement. Kept as a
 # plain dict so change-tracking is a dict comparison and serialization is trivial.
-_DLS_PARAM_KEYS = (
+DLS_PARAM_KEYS = (
     'label',
     'polymer_name', 'solvent_name', 'concentration_g_per_mL', 'temperature_K',
     'angle_deg', 'wavelength_nm', 'solvent_refractive_index', 'viscosity_Pa_s',
@@ -76,7 +140,7 @@ _DLS_PARAM_KEYS = (
     'solute_refractive_index',
     'mw_fraction', 'analyzer_geometry', 'chain_type',
 )
-_SLS_PARAM_KEYS = (
+SLS_PARAM_KEYS = (
     'label',
     'polymer_name', 'solvent_name', 'concentration_g_per_mL', 'temperature_K',
     'wavelength_nm', 'solvent_refractive_index', 'dn_dc_mL_per_g',
@@ -112,13 +176,13 @@ _SLS_PARAM_KEYS = (
 # invariant-3 linchpin), and are rejected by set_param/set_shared_param. They ride
 # in the param dicts only via the dedicated controller writers, and are excluded
 # from dirty-tracking below so a source-only flip never raises a phantom pending.
-_PROVENANCE_KEYS = frozenset({
+PROVENANCE_KEYS = frozenset({
     'solvent_refractive_index_source', 'viscosity_Pa_s_source',
     # Which baseline normalized a raw-counts correlogram into g2-1, and what the
     # alternative was. Written at load time by the Brookhaven .dat path (the only
     # format that ships raw counts plus two baselines); absent for every other
     # format, whose files already store g2-1. It is here rather than in
-    # _DLS_PARAM_KEYS because it is a record of what happened, not a knob: editing
+    # DLS_PARAM_KEYS because it is a record of what happened, not a knob: editing
     # the string would not re-derive anything, since the workspace keeps the
     # correlogram and not the raw counts it came from.
     'correlogram_baseline_source',
@@ -127,9 +191,9 @@ _PROVENANCE_KEYS = frozenset({
     #   'trace:sigma_clipped'  -- that trace's 3-sigma-clipped mean
     #   'vendor'               -- the instrument file's own scalar
     #   'generator'            -- a synthetic draw's own rate (its noise model's input)
+    #   'replicate:mean'       -- an average's: its runs' mean rate, when every run has one
     #   'user'                 -- typed by hand; never silently overwritten
-    # The method rides inside the tag rather than in a second sidecar key, so the
-    # two can never drift out of sync; the family is the part before the colon.
+    # The method rides in the tag, not a second key that could drift; family = before ':'.
     'mean_count_rate_cps_source',
     # What the instrument FILE said, kept verbatim as a record even when the user
     # commits a different value: the vendor's own mean count rate (cps) and the
@@ -146,6 +210,27 @@ _PROVENANCE_KEYS = frozenset({
     # a source run never re-derives it, so nothing here would recompute if changed.
     'derived_intensity_source',
     'derived_intensity_notes',
+    # How a REPLICATE AVERAGE's temperature was made: every source run's committed
+    # temperature (a list, selection order) and their span (max - min, K), written by
+    # `Controller.average_dls_correlograms` from `check_replicate_identity`'s report.
+    # Temperature is recorded across replicates, never refused (combination doctrine
+    # rule 2, core/data_models.py); the average's own `temperature_K` is the first
+    # run's. Records, not knobs: rendered by `core.naming.replicate_temperature_text`.
+    'replicate_temperatures_K',
+    'replicate_temperature_span_K',
+    # How far each run's HEIGHT sat from the average it entered: the sample SD of the
+    # per-run amplitudes a_i (mean 1 by construction; `average_replicate_correlograms`)
+    # and the run furthest from 1, as [its name, a_i - 1]. A datum, never a flag. Records,
+    # not knobs: rendered by `core.naming.replicate_amplitude_text`.
+    'replicate_amplitude_spread',
+    'replicate_amplitude_worst',
+    # What a REPLICATE AVERAGE did with its runs' committed mean count rates: each run's
+    # usable rate (None where it had none, selection order) and, when every run had one,
+    # their pairwise spread, (max - min) / min; the average then carries their mean,
+    # tagged 'replicate:mean'. Records, not knobs: rendered by
+    # `core.naming.replicate_count_rate_text`.
+    'replicate_count_rates_cps',
+    'replicate_count_rate_spread',
 })
 # HOW a series' solvent blank was chosen ('auto:same-file' / 'auto:sample' / 'user')
 # is deliberately NOT a stored sidecar: it is a pure function of the committed
@@ -155,7 +240,7 @@ _PROVENANCE_KEYS = frozenset({
 
 # The vendor RECORD fields a parser preview can carry into a measurement's params.
 # A roster, so a loader copies the family rather than a hand-listed pair (rule 11).
-_PREVIEW_RECORD_KEYS = ('vendor_mean_count_rate_cps', 'vendor_duration_s')
+PREVIEW_RECORD_KEYS = ('vendor_mean_count_rate_cps', 'vendor_duration_s')
 
 
 def seed_vendor_records(params: Dict[str, Any], preview: Any) -> Dict[str, Any]:
@@ -170,7 +255,7 @@ def seed_vendor_records(params: Dict[str, Any], preview: Any) -> Dict[str, Any]:
 
     Mutates and returns `params`.
     """
-    for key in _PREVIEW_RECORD_KEYS:
+    for key in PREVIEW_RECORD_KEYS:
         value = getattr(preview, key, None)
         if value is not None:
             params[key] = value
@@ -206,18 +291,18 @@ class LoadedMeasurement:
     def is_dirty(self) -> bool:
         """True if any non-provenance working parameter differs from committed.
 
-        Provenance source tags (_PROVENANCE_KEYS) are ignored: a re-derive that
+        Provenance source tags (PROVENANCE_KEYS) are ignored: a re-derive that
         only flips a source tag must not raise a phantom "changes pending".
         """
-        keys = (set(self.working_params) | set(self.committed_params)) - _PROVENANCE_KEYS
+        keys = (set(self.working_params) | set(self.committed_params)) - PROVENANCE_KEYS
         return any(self.working_params.get(k) != self.committed_params.get(k)
                    for k in keys)
 
     def dirty_keys(self) -> List[str]:
         """The parameter names whose working value differs from committed.
 
-        Excludes provenance source tags (_PROVENANCE_KEYS)."""
-        keys = (set(self.working_params) | set(self.committed_params)) - _PROVENANCE_KEYS
+        Excludes provenance source tags (PROVENANCE_KEYS)."""
+        keys = (set(self.working_params) | set(self.committed_params)) - PROVENANCE_KEYS
         return sorted(k for k in keys
                       if self.working_params.get(k) != self.committed_params.get(k))
 
@@ -375,15 +460,67 @@ def blank_label(lm: 'LoadedMeasurement') -> str:
 
     A basename alone cannot discriminate in the layout this exists for -- one
     angular-scan export per sample folder, every one named the same -- and two
-    components are short enough for a Comments cell. Used by the Data tab's dropdown
-    and by the export's per-series blank record, so the two always agree.
+    components are short enough for a Comments cell. The one-member case of
+    `blank_labels`, which every surface naming a blank within its sample's roster
+    calls, so the dropdown, the export and the removal confirm always agree.
     """
-    if lm.source_path:
-        norm = str(lm.source_path).replace('\\', '/').rstrip('/')
-        parts = [p for p in norm.split('/') if p]
-        if parts:
-            return '/'.join(parts[-2:])
+    parts = _blank_path_parts(lm)
+    if parts:
+        return '/'.join(parts[-2:])
     return lm.committed_params.get('label') or lm.item_id
+
+
+def _blank_path_parts(lm: 'LoadedMeasurement') -> List[str]:
+    """A blank's source path split on both separators, [] when it has none."""
+    if not lm.source_path:
+        return []
+    norm = str(lm.source_path).replace('\\', '/').rstrip('/')
+    return [p for p in norm.split('/') if p]
+
+
+def blank_labels(blanks: Sequence['LoadedMeasurement']) -> Dict[str, str]:
+    """item_id -> a label for every blank in one roster, distinct within it.
+
+    Starts from `blank_label` (the last two path components) and, while two labels
+    collide, extends the colliding ones by one more leading component, so
+    `Batch A/run1/SLS.csv` and `Batch B/run1/SLS.csv` stay apart where both print
+    `run1/SLS.csv` alone. A label already unique is left byte-identical. Blanks that
+    extension cannot separate -- one full path shared (a file loaded twice, a file
+    carrying several blanks), a path with no component left, or no path at all -- end
+    with the item id in brackets, the Data tab dropdown's own suffix
+    (`run1/SLS.csv [m0003]`), so every label in the roster is distinct.
+    """
+    parts = {b.item_id: _blank_path_parts(b) for b in blanks}
+    # One entry per distinct path: blanks sharing a full path cannot be told apart
+    # by extension and are bracketed below. A path-less blank keys on its label.
+    key_of = {b.item_id: (tuple(parts[b.item_id]) if parts[b.item_id]
+                          else ('', blank_label(b))) for b in blanks}
+    label_of = {key_of[b.item_id]: blank_label(b) for b in blanks}
+    depth = {k: 2 for k in label_of}
+    while True:
+        by_label: Dict[str, List[Tuple[str, ...]]] = {}
+        for k, lab in label_of.items():
+            by_label.setdefault(lab, []).append(k)
+        grew = False
+        for ks in by_label.values():
+            if len(ks) < 2:
+                continue
+            for k in ks:
+                if k[0] != '' and depth[k] < len(k):
+                    depth[k] += 1
+                    label_of[k] = '/'.join(k[-depth[k]:])
+                    grew = True
+        if not grew:
+            break
+    counts: Dict[str, int] = {}
+    for b in blanks:
+        lab = label_of[key_of[b.item_id]]
+        counts[lab] = counts.get(lab, 0) + 1
+    out: Dict[str, str] = {}
+    for b in blanks:
+        lab = label_of[key_of[b.item_id]]
+        out[b.item_id] = f'{lab} [{b.item_id}]' if counts[lab] > 1 else lab
+    return out
 
 
 def is_arbitrary_scale(value: Optional[float], source: str,
@@ -512,10 +649,14 @@ class SampleResult:
     #                                     rg_model_dependent, flagged one tier stronger (review-01; rule 10)
     a2_mol_mL_per_g2: Optional[float] = None
     a2_source: str = 'computed'
+    a2_apparent: Optional[bool] = None  # True = single-angle ladder (angle-contingent); False = Zimm/Berry
     a2_label: str = ''                  # plain-language provenance of a2_mol_mL_per_g2 (shown in Cross-Sample)
     a2_se: Optional[float] = None
     a2_se_estimator: Optional[str] = None  # covariance estimator behind a2_se (copied from source; None if no SE)
     a2_calibrated: Optional[bool] = None  # whether the SLS run that filled A2 was calibrated (A2 is scale-dependent)
+    a2_standard_index_known: Optional[bool] = None  # False = that run applied k_c with the standard's
+    #                                     refractive index blank, the cause of its a2_calibrated=False
+    #                                     (see `standard_index_known`)
     a2_dn_dc_supplied: Optional[bool] = None  # whether that run had a dn/dc (K=1 -> arbitrary optical scale)
     rh_nm: Optional[float] = None       # from DLS (infinite-dilution if available)
     rh_source: str = 'computed'
@@ -526,12 +667,20 @@ class SampleResult:
     #                                        (gamma_q2/conc_extrap); None for the replicate-average SEM
     #                                        (not a regression SE) or a hand-entered Rh
     calibrated: Optional[bool] = None   # whether the SLS run that filled Mw was calibrated
+    # Which cause a `calibrated = False` had, copied from that run's fit: False when k_c was
+    # applied with the standard's refractive index blank (`no_standard_index`), True otherwise.
+    # None = a run recorded no cause (a session saved before the field): `scale_notes` then
+    # names it `uncalibrated`, as that session did.
+    standard_index_known: Optional[bool] = None
     # The second, INDEPENDENT scale flag on Mw: whether that run had a refractive-index
     # increment. Without one K is 1, so Mw is on an arbitrary OPTICAL scale even when the
     # run was fully calibrated. Spelled asymmetrically from its A2 sibling for the same
     # reason `calibrated`/`a2_calibrated` are (see is_arbitrary_scale).
     dn_dc_supplied: Optional[bool] = None
-    notes: str = ''
+    # Notes about the stored values (`core.notes.Note`), each about the field it explains:
+    # a session older than the codes loads its sentence here as a `legacy` note, and a
+    # provenance key that no candidate can be matched to again carries one about the key.
+    notes: Tuple[Note, ...] = ()
     # ---- the provenance KEY: which result is this value? ----
     # Machine-readable identity beside each `<q>_label`. `<q>_kind` names the producing
     # analysis ('dls_cumulant', 'sls_zimm', 'user'); `<q>_source_id` names the record within
@@ -576,12 +725,46 @@ class SampleResult:
         return is_arbitrary_scale(self.a2_mol_mL_per_g2, self.a2_source,
                                   self.a2_calibrated, self.a2_dn_dc_supplied)
 
+    def scale_notes(self) -> Tuple[Note, ...]:
+        """The scale gates of the stored Mw and A2, as the precondition notes the SLS fit
+        that produced each carried (`analysis.sls.scale_notes`), relayed from the flags the
+        promotion stored. For a value `is_arbitrary_scale` judges arbitrary:
+        `no_standard_index` when its run applied k_c with the standard's refractive index
+        blank (`standard_index_known` False), `uncalibrated` when that run was otherwise
+        uncalibrated (a cause no run recorded, None, included), and `no_dn_dc` when it had no
+        dn/dc, each about the value. A surface showing the stored value shows why its scale
+        is unknown."""
+        out = []
+        for value_field, arbitrary, calibrated, index_known, dn_dc in (
+                ('mw_g_per_mol', self.mw_is_arbitrary_scale(), self.calibrated,
+                 self.standard_index_known, self.dn_dc_supplied),
+                ('a2_mol_mL_per_g2', self.a2_is_arbitrary_scale(), self.a2_calibrated,
+                 self.a2_standard_index_known, self.a2_dn_dc_supplied)):
+            if not arbitrary:
+                continue
+            if calibrated is False:
+                out.append(Note('no_standard_index', (value_field,)) if index_known is False
+                           else Note('uncalibrated', (value_field,)))
+            if dn_dc is False:
+                out.append(Note('no_dn_dc', (value_field,)))
+        return tuple(out)
+
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(replace(self, notes=()))
+        d['notes'] = notes_to_json(self.notes)
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'SampleResult':
-        return cls(**_known_only(cls, d))
+        """A stored result; `notes` is a list of `[code, about, values]`, or, in a
+        version-2 session, one sentence, which loads as a `legacy` note."""
+        kw = _known_only(cls, d)
+        raw = kw.pop('notes', ())
+        if isinstance(raw, str):
+            kw['notes'] = (legacy_note(raw),) if raw.strip() else ()
+        else:
+            kw['notes'] = notes_from_json(raw)
+        return cls(**kw)
 
 
 # ---------------------------------------------------------------------------
@@ -595,13 +778,13 @@ RESULT_QUANTITIES = ('mw', 'rg', 'a2', 'rh')
 RESULT_VALUE_FIELDS = {'mw': 'mw_g_per_mol', 'rg': 'rg_nm',
                        'a2': 'a2_mol_mL_per_g2', 'rh': 'rh_nm'}
 
-# Mw's two scale flags predate the uniform `<q>_` prefix convention, so they are bare
+# Mw's scale flags predate the uniform `<q>_` prefix convention, so they are bare
 # field names that reflection over `mw_*` cannot find. Spelled ONCE here because two
 # separate places must special-case them -- clearing a bundle and merging one across a
 # regroup -- and a flag left behind by either is exactly the stale-flag-beside-a-new-
-# value defect invariant 8 forbids. Their A2 siblings need no entry: `a2_calibrated`
-# and `a2_dn_dc_supplied` already carry the prefix.
-MW_BARE_SCALE_FLAGS = ('calibrated', 'dn_dc_supplied')
+# value defect invariant 8 forbids. Their A2 siblings need no entry: `a2_calibrated`,
+# `a2_standard_index_known` and `a2_dn_dc_supplied` already carry the prefix.
+MW_BARE_SCALE_FLAGS = ('calibrated', 'standard_index_known', 'dn_dc_supplied')
 
 # Each quantity's display name, spelled once for every dialog/label that names
 # one (the SLS tab's confirms and the regroup ask both render these; two
@@ -621,6 +804,28 @@ def set_result_key(result: 'SampleResult', quantity: str,
         raise ValueError(f"quantity must be one of {RESULT_QUANTITIES}, got {quantity!r}.")
     setattr(result, f'{quantity}_kind', kind)
     setattr(result, f'{quantity}_source_id', source_id)
+    # A note about the key it replaces (one no candidate matched again) goes with it.
+    _drop_notes_about(result, {f'{quantity}_source_id'})
+
+
+def _drop_notes_about(result: 'SampleResult', names) -> None:
+    """Remove every note of `result` about any of the fields `names`."""
+    result.notes = tuple(n for n in result.notes if not set(n.about) & set(names))
+
+
+def set_value_notes(result: 'SampleResult', quantity: str, notes) -> None:
+    """Replace the notes about one quantity's stored value with `notes`, re-aimed at its value
+    field: the failed preconditions behind the label the writer stores beside it.
+
+    The single writer of those notes, called by every writer of a quantity (with no notes
+    for a value that failed none, a hand-entered one included), so a note never outlives
+    the value it was about; the Cross-Sample rows mark the stored value from them."""
+    if quantity not in RESULT_QUANTITIES:
+        raise ValueError(f"quantity must be one of {RESULT_QUANTITIES}, got {quantity!r}.")
+    _drop_notes_about(result, _quantity_fields(quantity))
+    value_field = RESULT_VALUE_FIELDS[quantity]
+    result.notes = tuple(result.notes) + tuple(replace(n, about=(value_field,))
+                                               for n in notes)
 
 
 def reset_result_quantity(result: 'SampleResult', quantity: str) -> None:
@@ -633,10 +838,11 @@ def reset_result_quantity(result: 'SampleResult', quantity: str) -> None:
     to a hand-picked "empty" state: `<q>_source` is a plain str defaulting to
     'computed', so writing None here would leave the sample in a shape a fresh one
     never has. The bundle is every `<q>_`-prefixed field, plus MW_BARE_SCALE_FLAGS for
-    Mw (its two scale flags predate the prefix convention)."""
+    Mw (its bare scale flags predate the prefix convention)."""
     if quantity not in RESULT_QUANTITIES:
         raise ValueError(f"quantity must be one of {RESULT_QUANTITIES}, got {quantity!r}.")
     prefix = f'{quantity}_'
+    bundle = set()
     for f in fields(result):
         if (f.name.startswith(prefix)
                 or (quantity == 'mw' and f.name in MW_BARE_SCALE_FLAGS)):
@@ -644,6 +850,8 @@ def reset_result_quantity(result: 'SampleResult', quantity: str) -> None:
             # this from writing the MISSING sentinel if one ever gains a mutable default.
             setattr(result, f.name,
                     f.default if f.default is not MISSING else f.default_factory())
+            bundle.add(f.name)
+    _drop_notes_about(result, bundle)      # a note about a cleared field goes with it
 
 
 def result_key_matches(result: 'SampleResult', quantity: str,
@@ -700,17 +908,15 @@ class MeasurementResultRow:
     row (peak_index 0). Per-measurement DLS is always APPARENT -- a single q and
     a single concentration, neither extrapolated (invariant 7).
 
-    NOT CARRIED HERE, by design: the analysis choices behind a cumulant row -- the
-    amplitude cutoff and the residual weighting (`CumulantResult.fit_cutoff`,
-    `CumulantResult.weighting`). They are Settings, not session state, so a row computed
-    under one value and reloaded under another does not say which produced it; the
-    correlogram-fit export is where a per-fit choice is named in the affected columns'
-    Comments cells (`exporting.export`). Persisting them here would change the session
-    format for a value the summary table never displays.
+    `fit_inputs` holds what the fit USED, as values: the cumulant's amplitude cutoff
+    (`fit_cutoff`), the leading channels skipped (`n_skipped`) and the residual weighting
+    that ran (`weighting`), each key present only where the method has it. A user's setting
+    is never a cause (the owner's ruling, 2026-10-16; its home is ui_style_guide.md §5):
+    what a fit used travels on this durable row and into the Summary export as values, no
+    note names it, and nothing in the program reads it back.
 
-    That exclusion is about the SETTINGS specifically, and it still stands. It is not a
-    refusal to carry fit quantities: `fit_details` below persists the fitted values the
-    summary table does display, which is the distinction the clause above turns on.
+    `fit_details` below persists the fitted values the summary table displays, a different
+    thing from the inputs above.
 
     `fit_details` holds a parametric fit's remaining quantities -- Gamma, the moments, the
     order, the baseline, beta, the amplitude fractions, the stretch -- keyed by the display
@@ -721,15 +927,20 @@ class MeasurementResultRow:
     which is why no session version bump is owed). Values are the fit's OWN -- the raw
     method string, the raw success bool -- never a rendered cell.
 
-    `passive_notes` holds the fit's passive notices (`notes` on a DLS result: dead channels,
-    a baseline or a moment resting on its bound), keyed by the result attribute each is
-    about, '' for one about the whole fit. A mapping here rather than the engine's
-    index-aligned `notes`/`note_targets` pair, because a persisted record has no
-    shared-contract reason to carry parallel arrays and a mapping cannot fall out of step.
-    It differs from `reliability_note` in TIER, not merely in content: that one says a
-    precondition failed (a red flag), these say how the fit was obtained (a neutral
+    `notes` holds the fit's notes as `core.notes.Note`, each about the attribute of the FIT
+    it explains (the key `DLS_DETAIL_SPECS`' note-target column matches, so a note reaches
+    the Summary cell it is about; '' for the whole fit): the precondition notes behind a
+    flagged value, and the passive ones the fit's surfaces showed, qualifiers included. The
+    two differ in TIER, not merely in content: a note behind the flag (`is_row_flag`) says
+    a precondition failed (a red flag), a passive one how the fit was obtained (a neutral
     qualifier), and a surface must never paint one at the other's level (ui_style_guide
-    section 5)."""
+    section 5). The row is flagged iff a note behind its flag is present, derived from the
+    notes rather than tracked beside them.
+
+    A version-2 session stored a row's flag and its passive notes as sentences, under the
+    keys `reliability_note` and `passive_notes`; each sentence loads as a `legacy` note, the
+    flag sentence about `_ROW_FLAG_FIELD`, so a flagged row stays flagged, and a passive
+    sentence about the attribute it was filed under."""
     item_id: str
     method: str                          # cumulant/single/double/kww/nnls/contin/lognormal
     peak_index: int = 0
@@ -740,28 +951,51 @@ class MeasurementResultRow:
     rh_fast_nm: Optional[float] = None    # double-exponential fast mode
     rh_slow_nm: Optional[float] = None    # double-exponential slow mode
     is_apparent: bool = True
-    label: str = ''                       # short provenance, e.g. 'NNLS peak 2'
-    reliability_note: str = ''            # why this row's value is flagged; '' = unflagged
-    # NOT carried on `label`. That field is short provenance and feeds the DLS-summary
-    # export's `From` column, declared "contributing measurements / method", where a
-    # consumer expects a short categorical string rather than a multi-sentence physics
-    # warning. The name matches CumulantResult / ZimmBerryResult / _reliability_comment, so
-    # one token is
-    # greppable from analysis/ through core/ to exporting/, and the flag is DERIVED from
-    # the note (flagged iff non-empty) rather than tracked beside it.
-
-    # The parametric fit's remaining quantities, keyed by display name; and its passive
-    # notices, keyed by the result attribute each is about ('' = about the whole fit).
-    # See the class docstring for both shapes and why each is a mapping.
+    # Short provenance, e.g. 'NNLS peak 2', which feeds the DLS-summary export's `From`
+    # column ("contributing measurements / method"); the flag's reason is never put here.
+    label: str = ''
+    # The parametric fit's remaining quantities, keyed by display name (the class
+    # docstring says why a mapping).
     fit_details: Dict[str, Any] = field(default_factory=dict)
-    passive_notes: Dict[str, List[str]] = field(default_factory=dict)
+    notes: Tuple[Note, ...] = ()
+    # What the fit used: `fit_cutoff`, `n_skipped`, `weighting` (the class docstring). A
+    # session written before it existed loads {}, "this row names no fit inputs".
+    fit_inputs: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(replace(self, notes=()))
+        d['notes'] = notes_to_json(self.notes)
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'MeasurementResultRow':
-        return cls(**_known_only(cls, d))
+        """A stored row; `notes` is a list of `[code, about, values]`. A version-2 row
+        carries `reliability_note` and `passive_notes` instead, which load as `legacy`
+        notes (the class docstring)."""
+        d = dict(d or {})
+        flag = d.pop('reliability_note', '') or ''
+        passive = d.pop('passive_notes', None) or {}
+        kw = _known_only(cls, d)
+        notes = list(notes_from_json(kw.pop('notes', ())))
+        if str(flag).strip():
+            notes.append(legacy_note(flag, (_ROW_FLAG_FIELD,)))
+        for target, sentences in passive.items():
+            notes.extend(legacy_note(s, (target,) if target else ())
+                         for s in sentences if str(s).strip())
+        return cls(**kw, notes=tuple(notes))
+
+
+# The `about` a version-2 row's flag sentence loads under: the key it was stored under. A
+# persisted token: version-3 session files carry it on such a note, so it never changes.
+_ROW_FLAG_FIELD = 'reliability_note'
+
+
+def is_row_flag(note: Note) -> bool:
+    """A note behind a Summary row's flag: a precondition, or a version-2 flag sentence."""
+    if note.code == 'legacy':
+        return _ROW_FLAG_FIELD in note.about
+    spec = REGISTRY.get(note.code)
+    return spec is not None and spec.kind == 'precondition'
 
 
 @dataclass
@@ -775,7 +1009,14 @@ class SampleRhRow:
     'label|fraction'). The apparent/thermodynamic distinction is carried
     explicitly so it is never conflated downstream (invariant 7), and these
     rows are shaped to feed rho = Rg/Rh later (rh_nm/rh_se/is_apparent map
-    onto ResultCandidate)."""
+    onto ResultCandidate).
+
+    `notes` holds the precondition notes of the result the row records, each about the
+    row's `rh_nm` or `rh_se`: those failing the Rh's verdicts and those about the value or
+    its ± (a replicate average fitted beside its own sources among them), so the flag
+    travels with the value into Table 2, its export and a candidate built from the row.
+    The row is flagged iff one is present, derived from the notes as the Table-1 row's is
+    (`is_row_flag`). A session written before the field existed loads ()."""
     sample_id: str
     source_kind: str                      # 'replicate_avg' | 'gamma_q2' | 'conc_extrap' | 'mode_family'
     source_set: str                       # disambiguator: method/fraction/etc.
@@ -789,13 +1030,18 @@ class SampleRhRow:
     #                                       regression source (gamma_q2/conc_extrap);
     #                                       None for the replicate-average SEM (not a
     #                                       regression SE, so estimator-independent).
+    notes: Tuple[Note, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(replace(self, notes=()))
+        d['notes'] = notes_to_json(self.notes)
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'SampleRhRow':
-        return cls(**_known_only(cls, d))
+        kw = _known_only(cls, d)
+        kw['notes'] = notes_from_json(kw.pop('notes', ()))
+        return cls(**kw)
 
 
 # ===========================================================================
@@ -1005,7 +1251,7 @@ def _is_default_result(r: SampleResult) -> bool:
     return asdict(r) == asdict(SampleResult())
 
 
-def _absent(value) -> bool:
+def absent(value) -> bool:
     """True when a stored result value carries no number: ``None`` OR a non-finite
     float. The value fields are NaN-capable (``run_zimm`` stores ``res.rg_nm``
     unconditionally, and a non-positive angular slope makes it NaN), so a guard
@@ -1027,7 +1273,7 @@ def _quantity_fields(quantity: str) -> List[str]:
             if f.name == RESULT_VALUE_FIELDS[quantity]
             or f.name.startswith(quantity + '_')]
     if quantity == 'mw':
-        mine.extend(MW_BARE_SCALE_FLAGS)   # the two unprefixed scale flags
+        mine.extend(MW_BARE_SCALE_FLAGS)   # the unprefixed scale flags
     return mine
 
 
@@ -1049,14 +1295,14 @@ def _merge_fraction_results(dst: Dict[Optional[str], SampleResult],
             continue
         for q in RESULT_QUANTITIES:
             s_val = getattr(s_res, RESULT_VALUE_FIELDS[q])
-            if _absent(s_val):
+            if absent(s_val):
                 continue
             d_val = getattr(d_res, RESULT_VALUE_FIELDS[q])
             s_tier = getattr(s_res, q + '_source')
             d_tier = getattr(d_res, q + '_source')
-            src_wins = _absent(d_val) or (_TIER_RANK.get(s_tier, 0)
+            src_wins = absent(d_val) or (_TIER_RANK.get(s_tier, 0)
                                           > _TIER_RANK.get(d_tier, 0))
-            if losses is not None and not _absent(d_val):
+            if losses is not None and not absent(d_val):
                 loser_res, loser_sid = ((d_res, dst_sid) if src_wins
                                         else (s_res, src_sid))
                 winner_res, winner_sid = ((s_res, src_sid) if src_wins
@@ -1071,8 +1317,13 @@ def _merge_fraction_results(dst: Dict[Optional[str], SampleResult],
                         kept_value=getattr(winner_res, RESULT_VALUE_FIELDS[q]),
                         kept_tier=getattr(winner_res, q + '_source')))
             if src_wins:
-                for f in _quantity_fields(q):
+                moved = _quantity_fields(q)
+                for f in moved:
                     setattr(d_res, f, getattr(s_res, f))
+                # The notes about the moved fields move with them, as they stand.
+                _drop_notes_about(d_res, moved)
+                d_res.notes = tuple(d_res.notes) + tuple(
+                    n for n in s_res.notes if set(n.about) & set(moved))
 
 
 # ===========================================================================
@@ -1080,6 +1331,11 @@ def _merge_fraction_results(dst: Dict[Optional[str], SampleResult],
 # ===========================================================================
 
 SESSION_FORMAT = 'ls_session'
+
+# Design constraint (CLAUDE.md, "Sessions", which also names the one earlier exception): a
+# schema change may refuse an older session with a message rather than migrate it; a save never
+# overwrites or deletes a file the program did not create; a load never silently misreads a file.
+
 # Bumped 1 -> 2 when the solvent vocabulary was deleted and temperature grouping widened to
 # 0.1 K. Both change what sample_group_key returns, and sample_id values derived from it are
 # written into the session file. A version-1 session is therefore REFUSED, not migrated:
@@ -1088,7 +1344,14 @@ SESSION_FORMAT = 'ls_session'
 # value survives?) would be decided by code instead of the user who owns the values.
 # Deliberately no migration or repair path (owner-ruled; the regroup result-carry moves
 # state between ids -- it cannot re-decide what the old key semantics meant).
-SESSION_VERSION = 2
+
+# Bumped 2 -> 3 when the stored notes became `core.notes.Note` records (`note_to_json`),
+# so a build that reads version 2 refuses a file whose notes it would misread. A version-2
+# session still LOADS here: each of its note sentences becomes a `legacy` note, kept and
+# shown rather than dropped (`MeasurementResultRow.from_dict`, `SampleResult.from_dict`).
+SESSION_VERSION = 3
+# The versions this build reads: the current one, and version 2 through its legacy notes.
+READABLE_SESSION_VERSIONS = (2, SESSION_VERSION)
 
 
 @dataclass
@@ -1231,7 +1494,7 @@ class Workspace:
                 for q in RESULT_QUANTITIES:
                     val = getattr(r, RESULT_VALUE_FIELDS[q])
                     tier = getattr(r, q + '_source')
-                    if not _absent(val) and tier in DELIBERATE_TIERS:
+                    if not absent(val) and tier in DELIBERATE_TIERS:
                         losses.append(RegroupLoss(
                             sample_id=old_sid, fraction=frac, quantity=q,
                             value=val, tier=tier,
@@ -1262,7 +1525,7 @@ class Workspace:
                 for q in RESULT_QUANTITIES:
                     val = getattr(r, RESULT_VALUE_FIELDS[q])
                     tier = getattr(r, q + '_source')
-                    if (not _absent(val) and tier in DELIBERATE_TIERS
+                    if (not absent(val) and tier in DELIBERATE_TIERS
                             and (frac, q) not in covered):
                         losses.append(RegroupLoss(
                             sample_id=old_sid, fraction=frac, quantity=q,
@@ -1425,7 +1688,8 @@ class Workspace:
                 return sid
         return None
 
-    def solvent_reference_for(self, item_id: str, *, use_working: bool = False
+    def solvent_reference_for(self, item_id: str, *, use_working: bool = False,
+                              without: AbstractSet[str] = frozenset()
                               ) -> Tuple[Optional[LoadedMeasurement], str]:
         """The solvent blank THIS series is referenced against, and how it was chosen.
 
@@ -1451,12 +1715,17 @@ class Workspace:
 
         The sample-level slot stays the answer for sample-scoped questions (axis grids,
         collision reporting); only per-series subtraction resolves through here.
+
+        `without` resolves as if those measurements were already removed: the three rules
+        run over the blanks that remain, and a removed reference slot is refilled the way
+        `regroup` refills it, by the first remaining blank in load order. It is how a
+        removal is planned before the act (`Controller.blank_switches_on_removal`).
         """
         lm = self.measurements.get(item_id)
         sid = self.sample_id_of(item_id)
         if lm is None or sid is None:
             return None, 'auto:sample'
-        candidates = self.blank_candidates(sid)
+        candidates = [b for b in self.blank_candidates(sid) if b.item_id not in without]
         by_id = {b.item_id: b for b in candidates}
         params = lm.working_params if use_working else lm.committed_params
         wanted = params.get('solvent_blank_item_id')
@@ -1466,16 +1735,18 @@ class Workspace:
             for b in candidates:
                 if b.item_id != item_id and b.source_path == lm.source_path:
                     return b, 'auto:same-file'
-        return self.solvent_reference(sid), 'auto:sample'
+        slot = self.solvent_reference(sid)
+        if slot is not None and slot.item_id in without:
+            slot = candidates[0] if candidates else None
+        return slot, 'auto:sample'
 
     def solvent_reference_collisions(self) -> Dict[str, List[str]]:
         """sample_id -> the extra c = 0 solvent-blank series that did NOT get the
         single reference slot, for every sample that loaded more than one blank.
 
-        Empty when no sample has a collision (the common case). The GUI reads this
-        to warn the user that a second blank isn't the active reference -- the model
-        keeps the first-loaded one, and the extras stay here so they are never
-        silently dropped."""
+        Empty when no sample has a collision (the common case). The model keeps the
+        first-loaded blank as the reference, and the extras stay here so they are
+        never silently dropped; whether they differ is `Controller.solvent_blank_verdict`'s."""
         return {sid: list(s.extra_solvent_reference_item_ids)
                 for sid, s in self.samples.items()
                 if s.extra_solvent_reference_item_ids}
@@ -1546,8 +1817,7 @@ class Workspace:
             raise ValueError(
                 f"Not an {SESSION_FORMAT} file (format={d.get('format')!r})."
             )
-        if d.get('version') != SESSION_VERSION:
-            # forward-compatible read could go here; for now, be explicit.
+        if d.get('version') not in READABLE_SESSION_VERSIONS:
             raise ValueError(
                 f"Unsupported session version {d.get('version')!r}; this build "
                 f"reads version {SESSION_VERSION}."
@@ -1567,9 +1837,9 @@ class Workspace:
             ws.dls_result_rows[ws._meas_row_key(
                 row.item_id, row.method, row.peak_index)] = row
         for rd in d.get('sample_rh_rows', []):
-            row = SampleRhRow.from_dict(rd)
+            rh_row = SampleRhRow.from_dict(rd)
             ws.sample_rh_rows[ws._sample_row_key(
-                row.sample_id, row.source_kind, row.source_set)] = row
+                rh_row.sample_id, rh_row.source_kind, rh_row.source_set)] = rh_row
         ws._counter = int(d.get('counter', len(ws.measurements)))
         # Rebuild samples from the stored sample dicts (keeps results + slots),
         # falling back to a regroup if none were stored.

@@ -38,15 +38,17 @@ This project is **correctness-first**, and the domain is physical:
 1. Implement a focused unit of work.
 2. **Validate** against synthetic ground truth and/or real test data.
 3. Keep modules independently testable.
-4. When user-facing behavior changes, keep the in-program help and the guide PDFs current.
+4. When user-facing behavior changes, keep the in-program help current and describe the
+   change for the guides (their sources are maintained outside this distribution; `docs/`
+   ships the built PDFs).
 
 **In-program help rule (not optional):** whenever a change adds, renames, moves, or
 alters the behaviour of a user-facing control, update its help in the same change — the
 section's `?` `HelpBadge` (`gui/help.py`: `section_header` / `add_help_to_groupbox`)
 and/or its passive `setToolTip`. *How-to-use* help is the visible `?` badge (concise,
 lists over paragraphs, no citations); *calculation nuance* is a brief tooltip that points
-to the Theory-and-Equations-Guide. Tooltips honour the global Settings "Show tooltips" gate; `?`
-badges always work on click.
+to the Theory-and-Equations-Guide. Tooltips honour the global Settings "Show tooltips on
+hover" gate; `?` badges always work on click.
 
 ---
 
@@ -64,13 +66,18 @@ badges always work on click.
    viscosity, dn/dc, angle), and every such parameter is user-owned. The program may
    *offer* a physical value as a convenience — the solvent-property library proposes
    refractive index and viscosity from a chosen solvent, temperature, and wavelength,
-   for solvents whose sources meet its dense-data grade (lower-grade solvents surface
-   their values for reference without proposing them) —
+   for solvents in its primary tier (lower-tier solvents surface their values for
+   reference without proposing them) —
    but only as a transparent, provenance-tagged, freely-overridable default that reaches
-   the analysis solely through the user's explicit commit. **dn/dc is never proposed,
-   defaulted, or guessed** — it is strictly hand-entered. It may be left absent: the SLS
-   engine then computes on a disclosed arbitrary optical scale (K = 1) with every
-   scale-dependent output flagged unreliable — absence is honest, a guessed value never is.
+   the analysis solely through the user's explicit commit; the engine never receives a
+   value the user has not confirmed, and no solvent constant is baked into an analysis
+   function. **dn/dc follows the same mechanism:** no library exists yet, and when one does
+   its value is keyed by polymer, solvent, wavelength and temperature, provenance-tagged,
+   freely overridable, reaches the engine only through the user's commit, and travels to
+   the export beside Mw with its source named. dn/dc may be left absent: the SLS engine
+   then computes on a disclosed arbitrary optical scale (K = 1) with every scale-dependent
+   output flagged unreliable — absence is honest, an unsourced value never is. Any offered
+   default is science-based, never tuned to a particular instrument or lab (see #9).
 4. **Diagnostic flags come from general light-scattering criteria**, never system-specific
    thresholds. Where a threshold is needed it is a function parameter with a sensible,
    documented default — not a magic number for one solvent.
@@ -103,43 +110,59 @@ badges always work on click.
    (polymer, solvent, concentration, temperature) to enable ρ = Rg/Rh.
 7. **Apparent vs thermodynamic** results are always distinguished and never conflated
    (single-angle/single-concentration = apparent; fully extrapolated = thermodynamic).
-   Likewise DLS **z-average** (cumulants) vs **distribution-weighted** (CONTIN/NNLS) is
-   always flagged.
+   Likewise DLS **cumulant** results and **distribution-weighted** (CONTIN/NNLS) results
+   are never conflated: each is named by its method on screen and in exports, and the
+   average each method reports is defined in the Theory-and-Equations Guide. The cumulant
+   size is ISO 22412's intensity-weighted *harmonic* mean, so the product never labels it a
+   "z-average" (the guide quotes ISO's name once).
 8. **Uncertainty is part of the analysis — neither over- nor under-reported, and omitted
    when none is honest.** Report the **statistical** (regression) SE only where the fitted
    points are genuinely independent, and label it as **excluding** calibration/dn-dc
    systematics. Use the shared `analysis/uncertainty.py` toolkit (HC3
-   heteroscedasticity-consistent covariance; delta-method propagation; `format_pm`
-   display). The default reporting is **conservative** — HC3 never anti-conservative under
-   non-uniform precision; a less-robust classical **OLS** SE is offered only as a labelled,
+   heteroscedasticity-consistent covariance; delta-method propagation) and
+   `core/formatting.py`'s `format_pm` display. The default reporting is **conservative** —
+   HC3 never anti-conservative under non-uniform precision; a less-robust classical **OLS** SE is offered only as a labelled,
    opt-in choice for literature comparability, and the chosen estimator is recorded on the
    result and emitted in exports. Do **NOT** report a ± from a **single correlogram** (its lag
-   channels are correlated, Schätzel 1990 → OLS under-reports; ISO 22412 uses repeats). No SE
+   channels are correlated, Schätzel 1990 → OLS under-reports; ISO 22412 uses repeats); that
+   uncertainty ships only through the replicate-averaging path. No SE
    for NNLS/CONTIN (ill-posed) or single-angle Mw (one datum). Every SE that propagates through
-   a **nonlinear** transform must be **Monte-Carlo-validated** against the sampling SD before it
-   ships (a linear pass-through of an already-validated covariance inherits that validation).
+   a **nonlinear** transform must be **Monte-Carlo-validated** against the sampling SD, drawn
+   in a regime that stresses the approximation, before it ships; a linear pass-through of an
+   already-validated covariance inherits that validation (say so; do not re-run it).
    Where a single-shot SE rests on **few, high-leverage points** (a short concentration
    ladder, a ratio of two fitted coefficients), no residual-based estimator is unbiased: the
-   honest target is HC3's **conservative** SE, disclosed as such, with more points or
-   replicates as the route to an unbiased ±. When adding or
-   modifying ANY analysis, state how it treats uncertainty and document the formula in the
-   Theory-and-Equations-Guide (numbered LaTeX), exactly as the analysis itself is documented.
+   honest target is HC3's **conservative** SE (meet or exceed the sampling spread, never
+   under-report), disclosed as such, its direction and rough magnitude noted in the guide and
+   a passive tooltip, with more points or replicates as the route to an unbiased ±; its
+   Monte-Carlo gate asserts the conservative-safe property (at or above the sampling SD, not
+   grossly over), not a symmetric tolerance — the calibration-free 2·A₂·Mw is the current
+   instance. When adding or
+   modifying ANY analysis, state how it treats uncertainty and document the formula with the
+   analysis itself; the Theory-and-Equations-Guide (numbered LaTeX) is where the shipped
+   formulas are documented, and its sources are maintained outside this distribution, so a
+   contributor proposes the equation text alongside the change.
 9. **No owner-machine specifics in the product or docs.** The program (code, config,
    defaults) must never hard-code or assume a particular computer setup — file paths,
    usernames, drive layout, or sync mechanism; anything machine-specific stays
-   user-supplied or generalized.
+   user-supplied or generalized. Nothing about the maintainer personally or their setup
+   appears in user-facing documentation, the author's name and professional contact the
+   sole exception.
 
 ## Physics that must be enforced in code
 
 - Scattering vector `q = (4π n / λ) sin(θ/2)`; n and λ always explicit.
 - Stokes–Einstein `Rh = kT / (6π η D)`; T and η always required, never assumed.
-- `(n_solvent / n_standard)²` correction is **mandatory** on excess Rayleigh ratios
-  whenever the solvent differs from the calibration standard.
+- The refractive-index correction `(n_solvent / n_standard)^x` is **mandatory** on excess
+  Rayleigh ratios whenever the solvent differs from the calibration standard. The exponent
+  depends on the detection optics (1 ≤ x ≤ 2, Chu 1991 Eq. 8.4.19; x = 1 for slit
+  detection). The program ships x = 2 (Coumou 1960); when x becomes settable it is
+  user-owned under invariant 3 and recorded on the result.
 - Toluene Rayleigh ratio is **always computed from Sivokhin & Kazantsev (2021)** via
   `physics/constants.py`, with an explicit **geometry** (VU / VV / VH). Never use a
   vendor/instrument-stored Rayleigh value. Key facts: `R_VV(532 nm, 25 °C) = 2.34e-5
   cm⁻¹` (Takahashi et al. 2019); `R_VU = R_VV·(1 + ρv)`, `R_VH = R_VV·ρv`; the
-  temperature coefficient is **positive** (~+0.43 %/°C).
+  temperature coefficient is **positive** (+0.421 %/°C, Sivokhin & Kazantsev 2021, Eq. 9).
 - Cumulant PDI > 0.3 → flag as unreliable.
 - **Mw and absolute A₂ require calibration.** If a run is uncalibrated, flag those two as
   unreliable — but **Rg survives** (slope/intercept, the unknown scale cancels) and so
@@ -148,15 +171,19 @@ badges always work on click.
 ## Domain gotchas that drive code decisions
 
 - **dn/dc is the central vulnerability** of low-contrast systems: a small value means weak
-  scattering, and the error enters Mw squared. Treat it as user-supplied and important;
-  never guess it.
+  scattering, and the error enters Mw squared, exactly as the solvent refractive index does.
+  Its data is what differs: it belongs to the polymer and solvent pair at a wavelength and
+  temperature, tabulated values for one pair scatter by several percent between sources, and
+  a co-solvent system's measured value can differ from any table. So a value always carries
+  its source, wavelength and temperature; it is never unsourced.
 - **Vendor calibration constants are display-only.** They go stale after a re-alignment
   and often carry outdated Rayleigh ratios. The program computes its own k_c from one
   calibrant point (intensity, angle, standard + geometry).
 - Some systems have **Mw biased by preferential co-solvent adsorption**, so a trustworthy
   Mw may be characterized in a different solvent and **entered by hand**. `SampleResult`
-  tracks Mw provenance ('computed' vs 'user'); a user Mw must never be overwritten by a
-  re-analysis, and scaling plots should prefer it.
+  tracks Mw provenance in three tiers, 'computed' | 'picked' | 'user' (the rule's home is its
+  docstring in `core/workspace.py`); a user Mw must never be overwritten by a re-analysis, and
+  scaling plots should prefer it.
 - Dust in high-viscosity media sits still and causes persistent intensity offsets, not
   transient spikes; relevant if cleanliness diagnostics are added.
 
@@ -165,15 +192,17 @@ badges always work on click.
 ## Package layout
 
 Top-level packages (each with an `__init__.py`) using top-level package imports
-(`from core.data_models import …`, `from analysis.dls import …`). Default branch `Main`.
+(`from core.data_models import …`, `from analysis.dls import …`).
 
 ```
 <repo root>/
 ├── CLAUDE.md                 # this file — agent/contributor orientation + invariants
-├── README.md                 # front door (license pointer)
+├── README.md                 # front door (features, how to run, docs index, license)
 ├── PATCH_NOTES.md            # per-release changes + known issues
 ├── LICENSE                   # GPLv3
 ├── requirements.txt          # pinned deps (Python 3.13 venv)
+├── Launch DLS Buddy (Windows).bat      # double-click launchers: create the venv on first
+├── Launch DLS Buddy (MacOS).command    #   run, install requirements.txt, start the app
 ├── docs/                     # user-facing docs: 1. Quickstart-Guide.pdf, 2. User-Manual.pdf,
 │                             #   3. Theory-and-Equations-Guide.pdf, 4. Code-Map.md,
 │                             #   5. Citation-Index.md (generated citation index),
@@ -190,12 +219,14 @@ Python's standard-library `io` and breaks imports. Use `exporting/`.
 
 ## Environment / dependencies
 
-- Python 3.10+ source (uses `from __future__ import annotations`). The working venv is
-  **Python 3.13** — PySide6 has no 3.14 wheels yet, so avoid 3.14 for now.
+- The source is Python 3.10-compatible (uses `from __future__ import annotations`), but the
+  pinned dependencies need 3.11 or later. The tested interpreter is **Python 3.13**; 3.14 is
+  untested.
 - Runtime: `numpy`, `scipy` (optimize/nnls/curve_fit), `statsmodels` (ADF test in
   utilities), `matplotlib`, `PySide6`, `openpyxl` (the Panta `.xlsx` loader — a hard
   import-time dependency). Pinned in `requirements.txt`.
-- Recreate the venv with `py -3.13 -m venv .venv` then `pip install -r requirements.txt`;
+- Recreate the venv with `py -3.13 -m venv .venv` (Windows) or `python3.13 -m venv .venv`
+  (macOS) then `pip install -r requirements.txt`;
   point your interpreter at `.venv\Scripts\python.exe` (Windows) or `.venv/bin/python`
   (macOS). (`.venv/` is gitignored.) The double-click launchers bootstrap the venv on
   first run and launch the app: `Launch DLS Buddy (Windows).bat` and
@@ -204,13 +235,15 @@ Python's standard-library `io` and breaks imports. Use `exporting/`.
 ## How to run / validate
 
 - The GUI runs with `python -m gui.main` from the repo root.
-- The program is developed against a pytest regression suite (maintained in the
-  development repository, not part of this distribution — nothing in it is needed to
+- The program is developed against a pytest regression suite (kept outside this
+  distribution — nothing in it is needed to
   run the app). Everything is checked against **ground truth**: the program's own
   forward model (a closed round-trip) and the committed real datasets — the DLS engine
   against a real correlogram + the ALV replicate set, the SLS engine + controller
   against the real polystyrene/toluene Zimm set (reproduces Mw ≈ 1.01e6 / Rg ≈ 40.5 nm);
-  physics constants asserted analytically. Sessions round-trip to 1e-9. The GUI is
+  physics constants asserted analytically. Sessions round-trip to 1e-9; a manually
+  entered Mw survives re-analysis; the replicate-averaging ± is Monte-Carlo-validated
+  (ratio 1.006 against the sampling SD). The GUI is
   validated headless (real widgets under Qt's offscreen platform) plus real-platform
   screenshot review.
 - Plotting is validated by rendering to PNG and inspecting, never by a blocking `show()`.
@@ -219,8 +252,9 @@ Python's standard-library `io` and breaks imports. Use `exporting/`.
 
 ## Current state
 
-**Complete and validated:** data model; all parsers (Brookhaven DLS/SLS/trace + raw `.dat`, generic
-DLS/SLS/trace, Zetasizer clipboard + export, ALV .ASC multi-angle + single-angle, NanoTemper Panta `.xlsx`); physics
+**Complete and validated:** data model; all parsers (Brookhaven DLS/SLS/trace + raw `.dat` + the
+single-angular-scan SLS export, generic
+DLS/SLS/trace, Zetasizer clipboard + export, ALV .ASC multi-angle + single-angle + trace, NanoTemper Panta `.xlsx`); physics
 constants (geometry-aware Rayleigh) + solvent property library; utilities + synthetic generator; DLS engine; SLS engine
 (unified calibration, Debye, Zimm/Berry, calibration-free A₂); Origin export; matplotlib
 plotting; workspace + controller (grouping, commit/working state, sessions). The
@@ -239,15 +273,15 @@ replicate averaging with the platform's first single-sample dynamic ±, and the
 Correlogram / Distribution / Γ vs q² / D vs c / Mode Map / DDLS / Summary sub-tabs — the Γ vs q²
 and D vs c views being the extrapolated, thermodynamic-tier paths). **SLS** (per-sample
 calibration panel → k_c; Zimm / Berry /
-Debye / Guinier / single-angle / calibration-free A₂ / Rayleigh / Form factor P(q);
+Debye / Guinier / single-angle Mw + A₂ ladder (apparent) / calibration-free A₂ / Rayleigh / Form factor P(q);
 manual-Mw override; data
 masking; a Depolarization calculator; Derived Intensity and Mode-Resolved sub-tabs —
-SLS points built from a sample's DLS runs, whole-run or per-mode). **Cross-Sample** (ρ = Rg/Rh table + an
-**Architecture** sub-tab — branching contraction factors g and h, chain type, and the
-random-branching index — + Rg–Mw / A₂–Mw
-log–log scaling; provenance-aware source pickers). **Utilities** (Traces store with
+SLS points built from a sample's DLS runs, whole-run or per-mode). **Cross-Sample** (an
+**Architecture** sub-tab — the ρ = Rg/Rh table with branching contraction factors g and h,
+chain type, and the random-branching index — and a **Scaling** sub-tab — Rg or Rh vs Mw and
+A₂ vs Mw log–log scaling; provenance-aware source pickers). **Utilities** (Traces store with
 diagnostics; I·sin θ check; synthetic generator; Solvent Explorer sub-tab). **Settings** (seed defaults +
-light/dark theme + plot palette + input/display units via `app/units.py`).
+light/dark theme + plot palette + input/display units via `core/units.py`).
 
 **Depolarized scattering (DPLS/DDLS)** is built and feature-complete, validated headless
 against synthetic VV/VH ground truth and published tables: static depolarization
@@ -274,24 +308,36 @@ VH (analyzer) acquisition path remains hardware-gated.
 - **Hybrid workspace grouping**: auto-propose by sample key (polymer, solvent,
   rounded-temperature) + manual override (sidebar right-click).
 - **Calibration is a visible panel in the SLS section.**
-- **Threading: enabled for the heavy calls.** Each expensive analysis call is dispatched to
-  a single worker thread (one job in flight app-wide); the controller stays Qt-free. The GUI
-  shows a busy cursor + status message while a fit runs and refuses workspace mutations
-  (commit/load/mask/settings) during it. Fast ops (cumulant/exp fit, preview, commits) stay
+- **Loading is instrument-agnostic:** the load buttons carry no vendor name.
+  `parsers/autodetect.py` tries each strict instrument parser (the roster is
+  `parsers/roster.py`'s `DLS_PARSERS` / `SLS_PARSERS`) until exactly one recognises the
+  file, then falls back to the generic plain-text parsers, which stay out of auto-detect
+  because they match anything (the generic DLS path prompts for the delay unit and data
+  form; generic SLS loads directly), and only then reports an unrecognised format.
+- **Threading: enabled for the heavy calls** (`gui/worker.py`). Each expensive analysis call
+  is dispatched to a single worker thread (one job in flight app-wide); the controller stays
+  Qt-free. The GUI shows a busy cursor + status message while a fit runs and refuses
+  workspace mutations (commit/load/mask/settings) during it; a superseded result is dropped
+  by a per-tab epoch guard. Fast ops (cumulant/exp fit, the k_c preview, commits) stay
   synchronous. There is no Cancel (a running scipy call can't be safely interrupted).
 - **Flags are GUI-owned overlays**, never baked into matplotlib figures or export data.
   Saved plot images must be clean. In exports, an uncalibrated result writes "uncalibrated,
-  arbitrary scale" into the **Comments** cell of the affected columns only.
+  arbitrary scale" into the **Comments** cell of the affected columns only, with no change
+  to the row count, so the Origin import stays intact; "calibrated" is the silent default.
 - **Sessions: self-contained JSON** (embeds the data; also stores source paths for
-  optional reload-from-source). Not pickle.
+  optional reload-from-source), never pickle. A schema change may refuse an older session
+  with a message rather than migrate it (version 1 is refused; version 2 loads with its
+  notes carried as legacy text); a save never overwrites or deletes a file the program did
+  not create; a load never silently misreads a file. One known earlier exception: v1.20.0's
+  marker for non-finite values, which a build older than v1.20.0 loads as an object where a
+  number belongs.
 
 ## Planned (recorded, not yet built)
 
 - Reload-from-source; a visual
   peak picker in the DLS distribution view (the backend peak-averaging exists and is
   report-only; the click-to-pick UI is not built); packaging. (Session files are
-  **versioned**: a session saved by an older schema is refused with a clear message,
-  deliberately without a migration path — re-analysis from source data is the recovery
-  route.)
-- A real VH (analyzer) depolarized acquisition path (hardware-gated — the development
-  instrument is VU geometry, with no analyzer).
+  **versioned**: a schema the program no longer reads is refused with a clear message
+  rather than migrated — re-analysis from source data is the recovery route.)
+- A real VH (analyzer) depolarized acquisition path (hardware-gated: VU-only instruments
+  have no analyzer).

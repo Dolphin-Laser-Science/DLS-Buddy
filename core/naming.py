@@ -52,6 +52,9 @@ import math
 import os
 from typing import Any, Optional, Sequence
 
+from core.data_models import usable_rate
+from core.formatting import format_fixed_sig
+
 # The separator between the axes and the name, and between the axes themselves. One
 # constant so a test can assert the format without re-spelling it.
 SEP = ' · '
@@ -89,6 +92,108 @@ def _is_replicate_average(lm) -> bool:
 def _replicate_count(lm) -> int:
     """How many measurements a replicate average was built from (0 if unrecorded)."""
     return len(getattr(lm, 'derived_from', None) or []) if _is_replicate_average(lm) else 0
+
+
+def replicate_temperature_span_text(span_K: Any) -> str:
+    """``T span 0.010 K`` -- the one spelling of a replicate set's temperature span,
+    shared by the full record below and the written replicate-average Rh's label."""
+    return f'T span {float(span_K):.3f} K'
+
+
+def replicate_temperature_text(lm) -> str:
+    """``T 298.090–298.100 K, span 0.010 K`` for a replicate average, '' otherwise.
+
+    The pooled temperatures a correlogram average recorded as provenance
+    (`replicate_temperatures_K`, `replicate_temperature_span_K`; the replicates'
+    temperatures are recorded, never refused -- `check_replicate_identity`). Every
+    average carries it, a zero span included, because it is a record and not a
+    warning. ONE text behind both surfaces that render it, the hover card and the
+    export's Comments note, so the two cannot disagree. An average made before the
+    record existed has no keys and reads ''.
+    """
+    p = getattr(lm, 'committed_params', None) or {}
+    temps = [float(t) for t in (p.get('replicate_temperatures_K') or ()) if _finite(t)]
+    span = p.get('replicate_temperature_span_K')
+    if not temps or span is None or not _finite(span):
+        return ''
+    lo, hi = min(temps), max(temps)
+    shown = f'{lo:.3f} K' if lo == hi else f'{lo:.3f}–{hi:.3f} K'
+    return f'T {shown}, span {float(span):.3f} K'
+
+
+def replicate_amplitude_text(lm) -> str:
+    """``amplitude spread 16 % (Noisy050Latex0004_0001 at +45 %)`` for a replicate
+    average, '' otherwise.
+
+    The per-run amplitudes a correlogram average recorded (`replicate_amplitude_spread`,
+    the sample SD of a_i; `replicate_amplitude_worst`, the run furthest from 1 and its
+    a_i - 1), as percentages at two significant figures. A datum with a number and a
+    locus, no verdict: no threshold, no tier. An average made before the record existed
+    has no keys and reads ''.
+    """
+    p = getattr(lm, 'committed_params', None) or {}
+    spread = p.get('replicate_amplitude_spread')
+    worst = list(p.get('replicate_amplitude_worst') or [])
+    if spread is None or not _finite(spread) or len(worst) != 2 or not _finite(worst[1]):
+        return ''
+    dev = 100.0 * float(worst[1])
+    return (f'amplitude spread {_percent(100.0 * float(spread))} % '
+            f'({worst[0]} at {"+" if dev >= 0.0 else ""}{_percent(dev)} %)')
+
+
+def _percent(value: float) -> str:
+    """A percentage at two significant figures, never in scientific notation at 100 % or
+    more ('400', not '4e+02'): the house fixed-figure formatter."""
+    return format_fixed_sig(value, 2)
+
+
+def replicate_count_rate_text(lm) -> str:
+    """What a replicate average did with its runs' committed mean count rates, '' when
+    no run had one or the measurement is not an average.
+
+    ``mean count rate: replicate mean of 3 runs, 1e+05–5e+05 cps, 400 % apart`` when the
+    average carries their mean (its tag `replicate:mean`); ``no mean count rate: 1 of 3
+    runs had none`` when some run had no usable rate. Read off the records
+    `average_dls_correlograms` wrote (`replicate_count_rates_cps`,
+    `replicate_count_rate_spread`) and the average's own tag, never re-decided here.
+
+    A usable rate committed under another tag since (typed by the user, or from a linked
+    trace) is the average's own: the record then describes the runs alone (``the runs'
+    mean count rates were …``). An average whose rate was cleared reads ``no mean count
+    rate: the runs' rates are …``.
+    """
+    p = getattr(lm, 'committed_params', None) or {}
+    rates = p.get('replicate_count_rates_cps') or ()
+    if not rates:
+        return ''
+    spread = p.get('replicate_count_rate_spread')
+    runs = ('' if spread is None or not _finite(spread) or not all(map(_finite, rates)) else
+            f"{min(rates):.3g}–{max(rates):.3g} cps, {_percent(100.0 * float(spread))} % apart")
+    if p.get('mean_count_rate_cps_source') == 'replicate:mean':
+        return f'mean count rate: replicate mean of {len(rates)} runs' + (
+            f', {runs}' if runs else '')
+    has_rate = usable_rate(p.get('mean_count_rate_cps')) is not None
+    missing = sum(1 for r in rates if not _finite(r))
+    if missing:
+        return (f'{missing} of {len(rates)} runs had no mean count rate' if has_rate
+                else f'no mean count rate: {missing} of {len(rates)} runs had none')
+    if not runs:
+        return ''
+    lead = "the runs' mean count rates were" if has_rate else (
+        "no mean count rate: the runs' rates are")
+    return f"{lead} {runs}"
+
+
+def replicate_record_text(lm) -> str:
+    """Everything a replicate average records about its set, joined with ' · ': the
+    temperatures (`replicate_temperature_text`), the amplitudes
+    (`replicate_amplitude_text`) and the count rates (`replicate_count_rate_text`). ''
+    for a measurement that is not an average or records nothing. ONE text behind both
+    surfaces that render it, the hover card's "Averaged from" line and the export's
+    Comments note."""
+    return ' · '.join(t for t in (replicate_temperature_text(lm),
+                                  replicate_amplitude_text(lm),
+                                  replicate_count_rate_text(lm)) if t)
 
 
 def source_file_name(lm) -> str:
@@ -203,7 +308,9 @@ def measurement_hover_card(lm, *, sample: Optional[str] = None,
         lines.append(f'Temperature: {float(p["temperature_K"]):g} K')
     n = _replicate_count(lm)
     if n:
-        lines.append(f'Averaged from: {n} measurements')
+        record = replicate_record_text(lm)
+        lines.append(f'Averaged from: {n} measurements'
+                     + (f' · {record}' if record else ''))
     lines.append(f'{_ID_FIELD}: {lm.item_id}')
     return '\n'.join(lines)
 

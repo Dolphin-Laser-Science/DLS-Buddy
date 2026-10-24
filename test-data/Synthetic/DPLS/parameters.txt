@@ -14,7 +14,7 @@ measured), and D_r from Gamma_VH - Gamma_VV. Fitting D_t as the SLOPE
 of Gamma_VH vs q^2 is ill-conditioned when rotation dominates (the
 slope is tiny next to the 6 D_r intercept), so it degrades fast under
 VH noise; the intercept (6 D_r) stays robust.
-  Refs: Zero & Pecora 1982 (Eqs. III.1/III.2); Pecora 1964;
+  Refs: Zero & Pecora 1982 (Eqs. III.1/III.2); Berne & Pecora 2000;
         rod D_t,D_r from Tirado & Garcia de la Torre 1984.
 
 Scatterer: rigid rod (optically anisotropic).
@@ -46,7 +46,7 @@ Files:
   DDLS VV.ASC          polarized correlograms, all angles (clean)
   DDLS VH.ASC          depolarized correlograms, all angles (clean)
   DDLS VH (noisy).ASC  depolarized with weak-signal noise (g2-1 sigma = 0.02); VH is intrinsically weak (Zero &
-                       Pecora needed ~10x longer counting for VH).
+                       Pecora: a few minutes per VV set, 5-10 h per VH set).
   NB: ALV .ASC carries no polarization field; VV/VH is in the file
       NAME here. DLSMeasurement gains analyzer_geometry in Phase 2.
 

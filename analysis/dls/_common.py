@@ -15,13 +15,16 @@ or arrays; none plot, write files, or mutate inputs.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import Optional, Tuple
 
 import numpy as np
 
 from core.data_models import DLSMeasurement
-from physics.constants import scattering_vector_q_m, stokes_einstein_rh
+from core.notes import Note, RefusedInputs
+from physics.constants import (scattering_vector_q_m, stokes_einstein_diffusion_coefficient,
+                               stokes_einstein_rh)
 from analysis import uncertainty as unc
 # The exact-in-Gamma noise model (Biganzoli & Ferri 2018 Eq. (9)) and the axis-derived
 # sample time live with the synthetic generator and are IMPORTED here, not
@@ -42,24 +45,25 @@ def _measurement_q_m(measurement: DLSMeasurement) -> float:
     )
 
 
-# The reason string every degrading fit attaches to its blank Rh when viscosity is
-# absent, so the NaN says why on each display/export surface. One home for the wording,
-# shared by the cumulant and exponential arms so they cannot drift apart.
-NO_VISCOSITY_NOTE = (
-    "Rh is not computed: this measurement has no viscosity, which Stokes-Einstein "
-    "needs. Set viscosity on the measurement to get Rh; the decay rate and "
-    "diffusion coefficient do not need it."
-)
+def _no_viscosity_note(about: Tuple[str, ...] = ('rh_nm',)) -> Note:
+    """The note every degrading fit attaches to its blank Rh when viscosity is absent, so
+    the NaN says why on each display and export surface: one home, shared by every arm
+    and the pooled fits so they cannot drift apart. `about` names the carrying class's
+    own Rh attribute(s)."""
+    return Note('no_viscosity', about)
 
 
 def _require_viscosity(measurement: DLSMeasurement) -> float:
     """Return the measurement viscosity (Pa.s), or raise if it is missing.
 
     Viscosity is needed only to convert a decay rate to a hydrodynamic radius
-    (Stokes-Einstein). Decay rates and diffusion coefficients do not need it.
+    (Stokes-Einstein). Decay rates and diffusion coefficients do not need it. The
+    refusal is a `RefusedInputs` carrying the `no_viscosity` note, so a caller that
+    relays it names the cause.
     """
     if measurement.viscosity_Pa_s is None:
-        raise ValueError(
+        raise RefusedInputs(
+            (_no_viscosity_note(),),
             "This measurement has no viscosity, which is required to compute a "
             "hydrodynamic radius (Rh). Set viscosity_Pa_s on the measurement, or "
             "use the decay rate / diffusion coefficient outputs, which do not "
@@ -68,8 +72,19 @@ def _require_viscosity(measurement: DLSMeasurement) -> float:
     return measurement.viscosity_Pa_s
 
 
-# The fraction of its initial amplitude that a correlogram's RETAINED fit range must fall
-# to for ISO 22412:2017 to call the delay range correct. Annex A.1.2 (printed p. 20) fixes
+class _WeightNotFormed(ValueError):
+    """The sourced residual weight was not formed, and why: `cause` is the key of the
+    refusal's cause in the minting module's table of fallback causes (None when the
+    refusal named none), the message the refusal's own. A `ValueError`, so a caller that
+    catches one still catches it; it never leaves a fit, which falls back on it."""
+
+    def __init__(self, cause: Optional[str], message: str) -> None:
+        super().__init__(message)
+        self.cause = cause
+
+
+# The fraction of its initial amplitude that ISO 22412:2017 requires a correlogram's
+# RETAINED fit range to reach. Annex A.1.2 (printed p. 20) fixes
 # the range kept for the cumulant fit as [G2(tau_1) - A] > [G2(tau_j) - A] > a hundredth of
 # [G2(tau_1) - A], "with at least one value smaller than" a FIFTIETH of it. The 1/50 is the
 # binding half -- the point the range must REACH, where the /100 only bounds where it may
@@ -108,6 +123,17 @@ MAX_RETAINED_ACF_RATIO = 1.0 / _ISO_RETAINED_RANGE_DECAY_FACTOR
 # echoes what it used onto its result.
 DIFFUSIVE_R2_MIN = 0.98
 DIFFUSIVE_INTERCEPT_REL_MAX = 0.1
+
+
+def _not_diffusive_note(r_squared: float, intercept_relative: float) -> Note:
+    """The `not_diffusive` precondition note a through-origin line carries when its
+    `is_diffusive` verdict goes False on the criteria above: the fitted R^2 and relative
+    intercept the verdict read, about the verdict and the slope and size read from the
+    line (a Gamma not linear through the origin makes them apparent). One home for every
+    line that judges it. A line that was never fitted (fewer than two usable angles)
+    carries `too_few_points` instead, never this."""
+    return Note('not_diffusive', ('is_diffusive', 'd_m2_s', 'rh_nm', 'd_se', 'rh_se'),
+                {'r2': float(r_squared), 'rel': float(intercept_relative)})
 
 
 def _lowest_observed_acf_ratio(g2m1) -> float:
@@ -171,8 +197,10 @@ def _lowest_observed_acf_ratio(g2m1) -> float:
 def _observed_decay_check(
     ratio: float,
     max_ratio: float = MAX_RETAINED_ACF_RATIO,
-) -> Tuple[bool, str]:
-    """(rh_reliable, reliability_note) for one fit's `_lowest_observed_acf_ratio`.
+    about: Tuple[str, ...] = ('rh_nm',),
+) -> Tuple[bool, Optional[Note]]:
+    """(rh_reliable, the `decay_incomplete` note or None) for one fit's
+    `_lowest_observed_acf_ratio`; `about` names the carrying class's attributes.
 
     Same shape and same disposition as `_decay_completeness_check` -- flags, never rejects
     -- so every arm reads one shape whichever question it had to ask. A NaN ratio is left
@@ -187,16 +215,9 @@ def _observed_decay_check(
     case in the file, and only the two-sided smoke test caught it.
     """
     if math.isnan(ratio) or ratio <= max_ratio:
-        return True, ''
-    return False, (
-        f'This correlogram did not finish decaying inside its delay window: at no measured lag '
-        f'does it fall below {ratio:.3g} of its starting amplitude, against the '
-        f'{max_ratio:.3g} that ISO 22412:2017 (Annex A.1.2) requires a retained fit range '
-        f'to reach. The relaxation time, and any size derived from '
-        f'it, is an extrapolation past the end of the measurement rather than a measured '
-        f'value. Measure a longer lag range; a static or aggregated sample is the usual '
-        f'cause.'
-    )
+        return True, None
+    return False, Note('decay_incomplete', about, {
+        'quantity': 'lowest g2-1 ratio', 'value': ratio, 'op': '>', 'limit': max_ratio})
 
 
 def _decay_completeness(gamma_s_inv: float, tau_span_s: float) -> float:
@@ -218,7 +239,7 @@ def _decay_completeness(gamma_s_inv: float, tau_span_s: float) -> float:
     square trap does not arise -- this is a product of two independent quantities, never
     `x ** 2` -- but the same rule applies to the operands: a non-finite or non-positive
     Gamma or span has no completeness to report and returns NaN, which the predicate reads
-    as "unanswerable, do not flag" the way `_size_range_check` reads a non-finite Rh.
+    as "unanswerable, do not flag" the way `size_range_check` reads a non-finite Rh.
     """
     if not (math.isfinite(gamma_s_inv) and gamma_s_inv > 0):
         return float('nan')
@@ -227,18 +248,56 @@ def _decay_completeness(gamma_s_inv: float, tau_span_s: float) -> float:
     return gamma_s_inv * tau_span_s
 
 
+def _fitted_tau_span(fit_tau_s) -> float:
+    """The lag span of a fit's own windowed tau array, or NaN when there is none.
+
+    Mirrors `exponentials._tau_span_s` for the readers that take the array off a RESULT
+    (which may be empty on a degenerate fit) rather than holding the array they just
+    windowed; what it returns feeds the one `_decay_completeness`.
+    """
+    tau = np.asarray(fit_tau_s, dtype=float)
+    return float(tau[-1] - tau[0]) if tau.size >= 2 else float('nan')
+
+
+def _grid_end_check(node_index: int, n_nodes: int, rh_node_nm: float,
+                    about: Tuple[str, ...] = ('mean_rh_nm',)) -> Tuple[bool, Optional[Note]]:
+    """(rh_reliable, the `grid_end` note or None) for a lobe whose maximum is node
+    `node_index` of an Rh-ascending grid of `n_nodes` nodes, `rh_node_nm` that node's Rh;
+    `about` names the carrying class's size attribute.
+
+    The source is ISO 22412:2017 sec. 10.2.1 c) (printed p. 14): a valid result has "no
+    peaks at the extremes of the chosen size range". A maximum on the grid's first or last
+    node is such a peak, and the grid then does not contain the population the lobe
+    stands for, whatever the lobe's mean reads. Flags, never refuses (invariant 4): the
+    peak is reported with its flag, and widening the grid is the user's remedy.
+
+    One predicate for every lobe a distribution yields, an automatic peak or a manual
+    interval, so the peak table and the mode map cannot disagree about one lobe. No threshold: the test reads the node's index, never its size.
+
+    Inputs not prescribed by the source: the test's form, the lobe's maximum sitting on
+    the grid's first or last node, which is this program's reading of "at the extremes";
+    a one-node grid's only node reads as the first.
+    """
+    if n_nodes < 1 or not (node_index == 0 or node_index == n_nodes - 1):
+        return True, None
+    return False, Note('grid_end', about, {
+        'end': 'first' if node_index == 0 else 'last', 'rh': rh_node_nm})
+
+
 def _decay_completeness_check(
     completeness: float,
     min_completeness: float = MIN_DECAY_COMPLETENESS,
-) -> Tuple[bool, str]:
-    """(rh_reliable, reliability_note) for one mode's `_decay_completeness`.
+    about: Tuple[str, ...] = ('rh_nm',),
+) -> Tuple[bool, Optional[Note]]:
+    """(rh_reliable, the `decay_incomplete` note or None) for one mode's
+    `_decay_completeness`; `about` names the carrying class's attributes.
 
     A pure predicate on an ALREADY-COMPUTED quantity, deliberately: the guard and the
     operation it protects are then the same number, so there is no second expression to size
     against the first (rule 12's "one computation" remedy). Callers compute the completeness
     once, record it on the mode, and pass it here.
 
-    FLAGS rather than rejects, matching `cumulants._size_range_check`'s shape so every arm
+    FLAGS rather than rejects, matching `cumulants.size_range_check`'s shape so every arm
     reads one shape -- and for the same reason: the fitted rate is real output of a real
     correlogram, and what the user needs is to be told it is an extrapolation, not to have
     it withheld (invariant 4's flag-not-refuse rule: a computed value is always reported,
@@ -257,34 +316,26 @@ def _decay_completeness_check(
     something ISO prints per mode.
 
     A NaN completeness is left unflagged: `success` already carries a failed fit, exactly as
-    `_size_range_check` leaves a non-finite Rh alone. An infinite one passes -- it is a decay
+    `size_range_check` leaves a non-finite Rh alone. An infinite one passes -- it is a decay
     that finished many times over.
 
-    NOTE PRECEDENCE. Where a caller has both this note and `NO_VISCOSITY_NOTE` to attach,
-    THIS one wins. It is the stronger statement: a missing viscosity says only that Gamma
-    could not be turned into a radius, while an undecayed mode says the Gamma itself is
-    extrapolated. Both set `rh_reliable = False`, so the flag never under-reports either way
-    -- only the sentence differs.
+    Where a caller has both this note and the missing-viscosity one to attach, both are
+    kept (`_result_flags`): an undecayed mode says the Gamma itself is extrapolated, a
+    missing viscosity only that Gamma could not be turned into a radius, and neither
+    implies the other. Both set `rh_reliable = False`.
     """
     if not math.isfinite(completeness) or completeness >= min_completeness:
-        return True, ''
-    return False, (
-        f'This decay did not finish inside the delay window: the measured lag range '
-        f'spans only {completeness:.3g} of its relaxation time 1/Gamma, against the '
-        f'{min_completeness:.3g} that ISO 22412:2017 (Annex A.1.2) requires of a retained '
-        f'fit range -- its rule that the range must reach 1/{_ISO_RETAINED_RANGE_DECAY_FACTOR:.0f} '
-        f'of the initial amplitude is 2*Gamma*delta_tau = ln '
-        f'{_ISO_RETAINED_RANGE_DECAY_FACTOR:.0f}. The decay rate of this mode, and any size '
-        f'derived from it, is an extrapolation past the end of the measurement rather than '
-        f'a measured value. Measure a longer lag range; a static or aggregated sample is '
-        f'the usual cause.'
-    )
+        return True, None
+    return False, Note('decay_incomplete', about, {
+        'quantity': 'Γ·Δτ', 'value': completeness, 'op': '<', 'limit': min_completeness})
 
 
-def _result_flags(*notes: str) -> tuple:
-    """Roll several precondition verdicts up to one (rh_reliable, reliability_note).
+def _result_flags(*notes) -> Tuple[bool, Tuple[Note, ...]]:
+    """Roll several precondition notes up to one verdict: (reliable, the live notes).
 
-    A DISJUNCTION: the result is unreliable when ANY of its notes is live. That direction
+    Each argument is a `Note`, a tuple of them, or a falsy placeholder (None) for a
+    precondition that held. A DISJUNCTION: the result is unreliable when ANY note is
+    live, and the flag is computed here, never read back off the notes. That direction
     is chosen deliberately -- a display or export surface that reads only the rolled-up
     flag then over-flags a healthy neighbouring mode rather than clearing an unreliable
     one, and a missing flag is the failure that matters. Per-cell surfaces read the
@@ -301,54 +352,57 @@ def _result_flags(*notes: str) -> tuple:
     from a measurement that had both, so a blank Rh stated a reason that was not why it
     was blank.
 
-    Duplicates collapse: a cause shared by two modes (a missing viscosity) would
-    otherwise print its sentence twice in one note.
+    Duplicates collapse: notes of one code and one set of values are one fact, kept once
+    and about every attribute any copy named (a missing viscosity shared by two modes is
+    one note about both).
     """
-    live = [n for n in notes if n]
-    return (not live), ' '.join(dict.fromkeys(live))
+    live = _distinct(_flatten(notes))
+    return (not live), live
 
 
-def _keyed_notes(*pairs) -> Tuple[tuple, tuple]:
-    """``(notes, note_targets)`` from ``(target, text)`` pairs, dropping empty texts.
-
-    The passive-note twin of ``_result_flags`` above: that one rolls precondition
-    verdicts up to a single flag, this one keeps passive notices apart and says what
-    each is ABOUT, so a display surface can put a note on the cell it explains instead
-    of on the fit as a whole.
-
-    ``target`` names the RESULT ATTRIBUTE the note concerns -- ``'baseline'``,
-    ``'pdi'``, ``'mu4_s_inv4'`` -- or is ``''`` for a note about the whole fit. The
-    dead-channel note is the standing ``''`` case and not an oversight: a sixth of the
-    delay window collecting no coincidence is not a statement about one fitted number.
-    Attribute names, never display strings, so no GUI vocabulary reaches an analysis
-    function (architecture invariant 1); the join from attribute to on-screen column is
-    the Summary table's column spec, one hop away and testable.
-
-    ONE computation builds both tuples, which is the whole reason this is a helper and
-    not two comprehensions at each call site: readers index ``notes`` and
-    ``note_targets`` together, and a second comprehension is free to drop a note,
-    reorder one, or forget an arm (the one-computation shape CLAUDE.md rule 12
-    prescribes for exactly this pairing). A caller cannot produce a misaligned pair
-    through this function.
-
-    ``notes`` is unchanged by any of it -- same field, same tuple of plain sentences,
-    same pairing with the ``warnings.warn`` at the sites that warn. The targets ride
-    alongside. That is deliberate and owner-ruled (2026-09-19, this docstring being the
-    ruling's home): ``notes`` is a contract shared by every note-bearing result class
-    across ``analysis/`` and ``parsers/``, held to one shape by a reflection family gate
-    in the suite, so reshaping it to carry keys would be a change to all of them for a
-    benefit two of the families want.
-
-    Results whose producer has not been taught targets keep the empty default, and a
-    reader that finds the two tuples unequal in length must treat every note as
-    fit-level rather than guess: an unkeyed note on the wrong cell is worse than an
-    unkeyed note on the fit.
-    """
-    kept = [(target, text) for target, text in pairs if text]
-    return tuple(text for _target, text in kept), tuple(target for target, _text in kept)
+def _all_notes(*parts) -> Tuple[Note, ...]:
+    """A result's `notes`: every Note among `parts` (Notes, tuples of them, None), in order,
+    each (code, values) once -- the preconditions `_result_flags` returned first by
+    convention, then the records."""
+    return _distinct(_flatten(parts))
 
 
-def _d_from_gamma(gamma_s_inv: float, q_m_inv: float) -> float:
+def _flatten(notes) -> list:
+    """The Notes among `notes`, in order: a tuple or list of them is read through, and a
+    falsy placeholder (None) dropped."""
+    out = []
+    for n in notes:
+        if isinstance(n, (tuple, list)):
+            out.extend(_flatten(n))
+        elif n:
+            out.append(n)
+    return out
+
+
+def _distinct(notes) -> Tuple[Note, ...]:
+    """`notes` with each (code, values) kept once, in first-seen order, about the union of
+    the attributes its copies named."""
+    merged: dict = {}
+    for n in notes:
+        key = (n.code, n.values)
+        have = merged.get(key)
+        merged[key] = (n if have is None else dataclasses.replace(
+            have, about=tuple(dict.fromkeys(have.about + n.about))))
+    return tuple(merged.values())
+
+
+def _lifted(notes, attr: str) -> Tuple[Note, ...]:
+    """A nested result's notes as the result holding it carries them: a note about the
+    nested result's own attributes becomes a note about `attr`, the field that holds it
+    (an exponential fit's `mode1`), and a note about the whole fit stays one, so `about`
+    always names an attribute of the class carrying the note."""
+    return tuple(dataclasses.replace(n, about=(attr,)) if n.about else n for n in notes)
+
+
+# What a note is, as data, and what `about` names: `core/notes.py`'s module docstring.
+
+
+def d_from_gamma(gamma_s_inv: float, q_m_inv: float) -> float:
     """Translational diffusion coefficient D = Gamma / q^2, or NaN when it is unanswerable.
 
     The one place that division is written, because it needs TWO guards and every inline
@@ -379,8 +433,8 @@ def _d_from_gamma(gamma_s_inv: float, q_m_inv: float) -> float:
     **The last guard is on the RESULT, and neither input guard can replace it.** Two
     positive finite inputs still make an unusable quotient at the ends of the range:
 
-        _d_from_gamma(2e3,    2e-153)  ->  q2 = 4e-306, finite and positive  ->  D = inf
-        _d_from_gamma(2e-297, 2e+15)   ->  both finite and positive          ->  D = 0.0
+        d_from_gamma(2e3,    2e-153)  ->  q2 = 4e-306, finite and positive  ->  D = inf
+        d_from_gamma(2e-297, 2e+15)   ->  both finite and positive          ->  D = 0.0
 
     The first is exactly the `D = +inf` this helper's second paragraph says it exists to
     prevent, riding out to `d_m2_s` on CumulantResult/ExponentialMode; the second reaches
@@ -443,7 +497,7 @@ def _decay_rate_to_rh_nm(
     to warn anyone (2026-07-31 spec-01). A non-finite q is caught for the same reason --
     it makes D non-finite by the division rather than by the numerator.
 
-    Both guards come from `_d_from_gamma`, which this delegates to. They were duplicated
+    Both guards come from `d_from_gamma`, which this delegates to. They were duplicated
     here, and the duplicate then had to be corrected twice in a row (the q**2 underflow,
     then the q**2 OVERFLOW that the first correction introduced). Two copies of a guard
     is two chances to size it wrong; one delegation is none (rule 12).
@@ -455,7 +509,7 @@ def _decay_rate_to_rh_nm(
     the one downstream is what rule 12 asks for; the test that the two agree is the ladder
     in tests/test_positivity_guard_family.py.
     """
-    d_m2_s = _d_from_gamma(gamma_s_inv, q_m_inv)
+    d_m2_s = d_from_gamma(gamma_s_inv, q_m_inv)
     if not (math.isfinite(d_m2_s) and d_m2_s > 0):
         return float('nan')
     rh_m = stokes_einstein_rh(d_m2_s, temperature_K, viscosity_Pa_s)
@@ -469,7 +523,7 @@ def _rms_error(residuals: np.ndarray) -> float:
     return float(np.sqrt(np.mean(residuals ** 2)))
 
 
-def _apply_tau_window(
+def apply_tau_window(
     tau: np.ndarray,
     g2m1: np.ndarray,
     tau_min_s: Optional[float],
@@ -515,7 +569,9 @@ def _apply_tau_window(
     ------
     ValueError
         If skip_initial_channels is invalid, tau_min_s >= tau_max_s, or fewer
-        than min_points survive.
+        than min_points survive; the last two shortfalls (the skip removing every
+        channel, too few channels left in the window) as a `RefusedInputs` carrying the
+        `window_too_few_channels` note, which states the count, never the setting.
     """
     # 1. Leading-channel skip (by index), validated.
     if skip_initial_channels is None:
@@ -529,7 +585,9 @@ def _apply_tau_window(
         )
     skip = int(skip_initial_channels)
     if skip >= tau.size:
-        raise ValueError(
+        raise RefusedInputs(
+            (Note('window_too_few_channels', (),
+                  {'n': 0, 'channels': 'channel(s)', 'need': int(min_points)}),),
             f"skip_initial_channels ({skip}) removes the whole correlogram "
             f"({tau.size} channels). Reduce it."
         )
@@ -551,7 +609,9 @@ def _apply_tau_window(
     t = tau[mask]
     y = g2m1[mask]
     if t.size < min_points:
-        raise ValueError(
+        raise RefusedInputs(
+            (Note('window_too_few_channels', (),
+                  {'n': int(t.size), 'channels': 'channel(s)', 'need': int(min_points)}),),
             f"Only {t.size} points remain after skipping the first {skip} "
             f"channel(s) and applying the delay window [{tau_min_s}, {tau_max_s}] s; "
             f"this fit needs at least {min_points}. Reduce skip_initial_channels "
@@ -560,7 +620,7 @@ def _apply_tau_window(
     return t, y
 
 
-def _live_channels(g2m1) -> np.ndarray:
+def live_channels(g2m1) -> np.ndarray:
     """Boolean mask of the channels that collected coincidence: `g2 - 1 > -1`.
 
     An intensity autocorrelation cannot be negative, so `g2 <= 0` (stored as `g2 - 1 <=
@@ -587,21 +647,24 @@ def _apply_tau_window_live(
     min_points: int,
     skip_initial_channels: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """`_apply_tau_window`, then the live-channel mask over the windowed arrays.
+    """`apply_tau_window`, then the live-channel mask over the windowed arrays.
 
     Returns `(tau, g2m1, alive)` -- the WINDOWED arrays (so a caller can still draw its
     curve across a dead tail) and the mask it fits on. The minimum-points guard is sized
     to the operation (rule 12): it counts LIVE channels, since those are what the fit
-    receives, and refuses naming the dead-channel cause. The cumulant arms do not use this
-    wrapper -- they own a withheld-result shape for the same shortfall (owner decision D2)
-    -- but they read the same `_live_channels` mask.
+    receives, and refuses as a `RefusedInputs` carrying `window_too_few_channels` with the
+    live count, the message naming the dead-channel cause. The cumulant arms do not use
+    this wrapper -- they own a withheld-result shape for the same shortfall (owner decision
+    D2) -- but they read the same `live_channels` mask.
     """
-    tau, g2m1 = _apply_tau_window(tau, g2m1, tau_min_s, tau_max_s, min_points,
+    tau, g2m1 = apply_tau_window(tau, g2m1, tau_min_s, tau_max_s, min_points,
                                   skip_initial_channels=skip_initial_channels)
-    alive = _live_channels(g2m1)
+    alive = live_channels(g2m1)
     n_live = int(np.count_nonzero(alive))
     if n_live < min_points:
-        raise ValueError(
+        raise RefusedInputs(
+            (Note('window_too_few_channels', (),
+                  {'n': n_live, 'channels': 'live channel(s)', 'need': int(min_points)}),),
             f"Only {n_live} of the {tau.size} channels in the delay window collected any "
             f"coincidence (g2 = 0 on the rest), fewer than the {min_points} this fit "
             f"needs. Widen the delay window past the dead channels, or use a longer run."
@@ -669,7 +732,7 @@ def channel_sample_times(delay_times_s: np.ndarray) -> np.ndarray:
     lag-to-spacing ratio is not finite, which only an infinite lag can give.
 
     RUN THIS ON THE FULL `DLSMeasurement.delay_times_s`, never on a windowed axis, and
-    cut the result to the fitted channels with the same `_apply_tau_window` call the
+    cut the result to the fitted channels with the same `apply_tau_window` call the
     data goes through. Deriving after windowing hands the LAST windowed channel its
     backward neighbour's spacing, which is the wrong block's sample time whenever the
     window ends on a block's first channel (half, on the printed layout). The axis is
@@ -708,7 +771,7 @@ def _pinned_offset(baseline: Optional[float]) -> float:
     return offset
 
 
-def _estimate_baseline(tau: np.ndarray, g2m1: np.ndarray,
+def _estimate_baseline(g2m1: np.ndarray,
                        tail_fraction: float = 0.25) -> float:
     """Estimate a residual baseline offset from the long-delay tail.
 
@@ -802,7 +865,6 @@ def _build_rh_gamma_grid(
     proportional to Rh, the gamma grid is descending where rh ascends; both are
     returned in Rh-ascending order.
     """
-    from physics.constants import stokes_einstein_diffusion_coefficient
     rh_grid_nm = np.geomspace(rh_min_nm, rh_max_nm, n_grid)
     if rh_grid_nm.size == 0:
         return rh_grid_nm, np.array([])
@@ -815,7 +877,7 @@ def _build_rh_gamma_grid(
     # `q_m_inv * q_m_inv`, never `** 2`: `**` binds tighter than `*`, so the square is
     # evaluated as a PYTHON float before any array arithmetic, and there it RAISES
     # OverflowError at q ~ 1e155 rather than saturating (measured, out of the NNLS/CONTIN
-    # grid builder). Same trap as `_d_from_gamma`'s note above, but on a FACTOR of a `*`
+    # grid builder). Same trap as `d_from_gamma`'s note above, but on a FACTOR of a `*`
     # rather than the divisor of a `/`.
     gamma_grid = d0 * (rh_grid_nm[0] / rh_grid_nm) * (q_m_inv * q_m_inv)
     return rh_grid_nm, gamma_grid

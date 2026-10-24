@@ -11,6 +11,61 @@ window title.
 
 ---
 
+## 1.22.0 — Replicate averaging, analyses that say what they need, click-to-mask, and help rewritten (2026-10-23)
+
+> **Important.** Some numbers move in this release, so re-run a stored analysis rather than
+> compare across versions. Every **Berry** *M*<sub>w</sub>, *R*<sub>g</sub> and *A*₂ moves
+> (the fit gains its cross term; Zimm is unchanged). A **distribution peak** is reported at
+> its geometric mean rather than at the grid point with the most weight. The **Guinier qRg
+> validity limit** defaults to 1.0 (was 1.3) and now judges Zimm, Debye and Guinier fits
+> alike. Cross-Sample defaults to Zimm before Berry and never to a flagged value. Sessions
+> saved by this release do not open in an earlier build; earlier sessions still open here.
+
+### DLS
+
+- **Replicate averaging does more and says more.** Replicates whose temperatures differ
+  slightly can be averaged; an averaged correlogram records its runs' amplitude and
+  count-rate spread; an average is no longer pooled beside its own source runs by default;
+  and an average of flagged fits says so, with each cause once.
+- **Distribution peaks are reported at their geometric mean** on every surface, with a ±
+  from replicates where the runs agree on the grid, and every peak and mode point carries a
+  size verdict (grid end, size range, incomplete decay).
+- **An analysis the ticked measurements cannot run is grayed and says what is missing**
+  under "Needs:", before Run, on every DLS sub-tab.
+- **Results match their inputs.** A refused Run, a regroup or a removal takes the stale
+  result off the screen instead of leaving it drawn.
+
+### SLS
+
+- **The Berry fit gains its *q*²*c* cross term**, and every Berry result moves (on the
+  PS/toluene set, *M*<sub>w</sub> 9.28e5 → 9.83e5 g/mol).
+- **One qRg limit judges Zimm, Debye and Guinier**, flagging *M*<sub>w</sub> as well as
+  *R*<sub>g</sub> past it; a Berry fit past it is labeled *past the Zimm limit* rather than
+  flagged.
+- **A fit the sample cannot run is grayed with its reason**, and Run follows the selection.
+- **The Calibration panel reads as your reading, then the standard**, refuses impossible
+  entries as you type them, and names a blank standard refractive index as such instead of
+  "uncalibrated".
+- **Click-to-mask follows what the fit uses**, and calibration-free *A*₂ runs with its lowest
+  concentration hidden.
+
+### Everywhere
+
+- **Every note is one clause, the same wherever it appears**, with a letter at the value and
+  one line per cause; what a number is reads on its label (*apparent*, *± statistical only*);
+  exports carry each caveat in its column's Comments cell.
+- **Cross-Sample labels say what a value is and, when flagged, why**, and every Source
+  Selection row marks a flagged choice.
+- **Help is shorter and checked against the code**: every badge and tooltip fits a word
+  budget, and load notices point at the User Manual section for the file format.
+- **Faster.** The sidebar, the trace view and hidden plots no longer stall the window, and
+  the DDLS shape models arrive with their fit.
+- **Guides.** New equations for the replicate amplitude spread, the grid-resolution term and
+  the peak geometric mean; attributions narrowed to what each cited page prints; the Manual
+  gains tables of what every analysis needs to run.
+
+---
+
 ## 1.21.0 — Sourced noise weights for every DLS fit, the single-angle ladder, and rewritten guides (2026-09-25)
 
 > **Important.** DLS numbers move in this release — re-run a stored analysis rather than
@@ -880,7 +935,8 @@ The analysis engine and application were built and validated module by module be
   same run can still differ by that region — now visible beside the box rather than hidden.
 - **Ethanol's displayed viscosity uncertainty below ≈ −8 °C may be optimistic.** Two published reference correlations diverge toward the cold edge of ethanol's supported range, reaching ≈5 % against the displayed 3 % band at −20 °C; the comparison correlation is extrapolating below its own fitted data range there, so which side errs is unsettled. Affects the displayed uncertainty (and the suggested rounding of a proposed viscosity) only — no fitted result.
 - **DPLS/DDLS not yet tested on real depolarized data** — validated only against synthetic ground truth so far.
+- **A DDLS D_t does not yet check that the VV rates lie on a line through the origin.** Its verdict reads the VV fits' decay checks, but not the linearity a Γ-vs-q² line is judged on. An optically anisotropic particle adds a rotational term to the VV decay, which gives Γ_VV vs q² an intercept; D_t then reads high, and Rh_t and D_r low, with the verdict still clean.
 - **Visual peak picker** in the DLS distribution view is planned (peaks are already offered as *R*<sub>h</sub> sources elsewhere, but not click-selectable in the plot).
-- **Session files carry a schema version but are not migrated** — a session written by an older schema is refused with a message rather than converted; re-analyse from the source files.
+- **Session files carry a schema version but are not migrated** — a session written by a schema this build no longer reads is refused with a message rather than converted (a version-2 session still loads, its notes carried as plain text); re-analyse from the source files.
 - A few library PDFs are **citation "promotion candidates"** not yet formally cited.
 - **A general lack of polish** — rough edges in wording, layout, and visual finish remain throughout; the science is the priority, and the surface is still catching up.

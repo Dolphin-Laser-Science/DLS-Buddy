@@ -46,6 +46,15 @@ Unit conversion helpers
     convert_viscosity       convert viscosity from mPa.s or Pa.s to Pa.s
     convert_count_rate      convert a count rate from kcps/Mcps/Hz to cps
     convert_trace_times     convert trace elapsed times from ms/min/h to s
+    KCPS_TO_CPS             counts per second in one kcps (a kHz photon rate is the same)
+
+Shared text-file read
+    read_text_lines         a text file's lines, line endings stripped, trying the
+                            caller's encodings in turn
+
+Shared plain-table helpers (the generic parsers)
+    detect_delimiter        ',' or tab, from a table's first data line
+    MAX_BAD_ROW_FRACTION    the malformed-row share above which a table is refused
 
 Correlogram form conversion
     apply_data_form         convert a raw second column (g1 / un-normalized g2 /
@@ -93,7 +102,14 @@ import numpy as np
 
 # We import the final data model classes so that preview.build() can
 # construct them. The parsers themselves never import analysis modules.
-from core.data_models import DLSMeasurement, IntensityTrace, SLSMeasurement
+from core.data_models import (
+    KELVIN_AT_ZERO_CELSIUS,
+    DLSMeasurement,
+    IntensityTrace,
+    SLSMeasurement,
+)
+# A load-time notice is a record note (core/notes.py), its words the registry's.
+from core.notes import Note
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +133,7 @@ _DELAY_TIME_FACTORS = {
 
 _CONCENTRATION_FACTORS = {
     'g/ml':  1.0,
-    'g/mL':  1.0,
     'mg/ml': 1.0e-3,
-    'mg/mL': 1.0e-3,
 }
 
 _VISCOSITY_FACTORS = {
@@ -131,12 +145,15 @@ _VISCOSITY_FACTORS = {
     'cp':    1.0e-3,   # centipoise; 1 cP = 1 mPa.s exactly
 }
 
+# Counts per second in one kcps; a kHz photon count rate is the same quantity.
+KCPS_TO_CPS = 1.0e3
+
 _COUNT_RATE_FACTORS = {
     'cps':      1.0,
     'counts/s': 1.0,
     'hz':       1.0,    # photon counts per second
-    'kcps':     1.0e3,
-    'khz':      1.0e3,
+    'kcps':     KCPS_TO_CPS,
+    'khz':      KCPS_TO_CPS,
     'mcps':     1.0e6,
     'mhz':      1.0e6,
 }
@@ -224,7 +241,7 @@ def convert_temperature(
     """
     unit = from_unit.strip().lower()
     if unit in ('c', 'celsius', '°c'):
-        temp_K = value + 273.15
+        temp_K = value + KELVIN_AT_ZERO_CELSIUS
     elif unit in ('k', 'kelvin'):
         temp_K = float(value)
     else:
@@ -264,19 +281,13 @@ def convert_concentration(
     ValueError
         If from_unit is not recognized, or if the value is negative.
     """
-    key = from_unit.strip()
-    # Try case-insensitive match
-    matched = None
-    for k in _CONCENTRATION_FACTORS:
-        if k.lower() == key.lower():
-            matched = k
-            break
-    if matched is None:
+    key = from_unit.strip().lower()
+    if key not in _CONCENTRATION_FACTORS:
         raise ValueError(
             f"Unrecognized concentration unit {from_unit!r}. "
             f"Accepted: {list(_CONCENTRATION_FACTORS)}."
         )
-    result = float(value) * _CONCENTRATION_FACTORS[matched]
+    result = float(value) * _CONCENTRATION_FACTORS[key]
     if not (math.isfinite(result) and result >= 0):
         raise ValueError(
             f"Concentration must be a finite number, zero or positive, "
@@ -442,6 +453,74 @@ class MalformedDataError(ParseError):
 
 
 # ---------------------------------------------------------------------------
+# Shared text-file read
+# ---------------------------------------------------------------------------
+
+def read_text_lines(file_path: str, encodings: Tuple[str, ...]) -> List[str]:
+    """Read a text file into a list of lines, each with its line ending stripped.
+
+    The file is opened with an empty ``newline`` argument, so line endings reach this
+    function untranslated, and each line has its trailing carriage returns and line feeds
+    removed. The encodings are tried in the order given, and a ``UnicodeDecodeError``
+    moves on to the next one. There is no default order: which encodings a format may
+    arrive in is that format's fact, so every caller names its own.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``file_path`` is not an existing file.
+    ParseError
+        If the OS refuses the read (a file another program still holds open, a share the
+        user can list but not read), or if no encoding in ``encodings`` decodes the file.
+        A plain ParseError, never the malformed-data subclass: no format decision has been
+        made yet, and a plain ParseError is the class ``autodetect`` skips past.
+    """
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File not found: {file_path!r}")
+    last_exc: Optional[UnicodeDecodeError] = None
+    for encoding in encodings:
+        try:
+            with open(file_path, encoding=encoding, newline='') as fh:
+                return [line.rstrip('\r\n') for line in fh]
+        except UnicodeDecodeError as exc:
+            last_exc = exc
+            continue
+        except OSError as exc:
+            raise ParseError(f"Could not read {file_path!r}: {exc}") from exc
+    raise ParseError(
+        f"Could not decode {file_path!r} with any of {encodings}: {last_exc}"
+    ) from last_exc
+
+
+# ---------------------------------------------------------------------------
+# Shared plain-table helpers (the generic parsers)
+# ---------------------------------------------------------------------------
+
+# Maximum fraction of rows allowed to be malformed before a parser raises rather than
+# silently discarding them. Above it the file almost certainly has headers or is the
+# wrong format.
+MAX_BAD_ROW_FRACTION = 0.05
+
+
+def detect_delimiter(first_line: str) -> str:
+    """Return ',' or '\\t' based on the first data line, or raise ParseError."""
+    if '\t' in first_line and ',' not in first_line:
+        return '\t'
+    if ',' in first_line and '\t' not in first_line:
+        return ','
+    if ',' in first_line and '\t' in first_line:
+        # Both present — comma-separated files sometimes contain tabs in
+        # labels. Count occurrences and pick the majority.
+        if first_line.count(',') >= first_line.count('\t'):
+            return ','
+        return '\t'
+    raise ParseError(
+        f"Cannot detect delimiter in first data line: {first_line!r}. "
+        f"The file must be comma- or tab-delimited."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shared data-column validation
 # ---------------------------------------------------------------------------
 
@@ -539,21 +618,21 @@ G1_PEAK_FLOOR = 1.0e-2
 
 def carried_run_duration(vendor_duration_s: Optional[float],
                          delay_s: np.ndarray,
-                         live: np.ndarray,
-                         source_phrase: str) -> Tuple[Optional[float], str]:
-    """`(duration_s, note)` -- the run duration T to carry onto a measurement, or why not.
+                         live: np.ndarray) -> Tuple[Optional[float], Optional[Note]]:
+    """`(duration_s, note)` -- the run duration T to carry onto a measurement, or the
+    `parser.duration_withheld` record of why not (None when T is carried or absent).
 
     ONE rule for every format that states a run length, because there is one reason it
     can be used: Biganzoli & Ferri Eq. (9)'s `1/(M - k) = Delta_t / (T - tau)` needs a T
     longer than every lag the fit will reach, and the engine refuses the weight outright
     when it is not. A file whose header disagrees with its own data is not a guess this
     layer is entitled to resolve, so T is withheld, the weight takes its documented
-    `T -> infinity` form, and a passive note says what was seen.
+    `T -> infinity` form, and a record note says what was seen.
 
     The test is on the LIVE lags, not the declared delay range. A layout whose channels
     run past the end of the acquisition is ordinary: those channels collect nothing,
     arrive as `g2 - 1 = -1` exactly, and every DLS fitter drops them before it fits
-    (`analysis.dls._common._live_channels`), so no lag past T ever reaches the weight;
+    (`analysis.dls._common.live_channels`), so no lag past T ever reaches the weight;
     that property is pinned over the committed corpus by
     `tests/test_parsers.py::test_every_committed_brookhaven_dat_fills_its_run_duration_or_says_why`
     rather than restated as a count here.
@@ -562,7 +641,7 @@ def carried_run_duration(vendor_duration_s: Optional[float],
     a raw channel count above zero, or `g2 - 1 > -1` where a format ships that directly.
     The two spellings are the same predicate (`g2 - 1 = (raw - B)/B` with `B > 0`), and
     their agreement is asserted on the committed corpus in `tests/test_parsers.py` rather
-    than argued here. `source_phrase` names, for the note, where the header stated T.
+    than argued here.
 
     The predicate is the quantifier "every live lag lies inside T", so a correlogram with
     no live channel at all satisfies it vacuously and T is carried. Such a file has no fit
@@ -570,18 +649,15 @@ def carried_run_duration(vendor_duration_s: Optional[float],
     nothing a user sees.
     """
     if vendor_duration_s is None:
-        return None, ''
+        return None, None
     live = np.asarray(live, dtype=bool)
     if not live.any():
-        return float(vendor_duration_s), ''
+        return float(vendor_duration_s), None
     last_live_s = float(np.asarray(delay_s, dtype=float)[live].max())
     if last_live_s < vendor_duration_s:
-        return float(vendor_duration_s), ''
-    return None, (
-        f'the header states a run duration of {vendor_duration_s:.4g} s '
-        f'({source_phrase}), but channels out to {last_live_s:.4g} s collected '
-        f'coincidences, so the two disagree; no run duration is carried and the cumulant '
-        f'fit takes its T -> infinity form.')
+        return float(vendor_duration_s), None
+    return None, Note('parser.duration_withheld', ('duration_s',),
+                      {'duration': float(vendor_duration_s), 'last_lag': last_live_s})
 
 
 def apply_data_form(
@@ -807,11 +883,12 @@ class DLSFilePreview:
     # place, so that a standalone solvent or calibrant trace is representable too.
     trace_preview: Optional['TraceFilePreview'] = None
 
-    # --- passive load-time notices ---
-    # Glyph-less, human-readable notes the parser attaches (e.g. a record column that had
-    # a header but no data and was not loaded). The load flow surfaces these as a passive
-    # ⓘ message; the parser also emits the same text via warnings.warn (keep-both).
-    notes: tuple = ()
+    # --- load-time notices ---
+    # Record notes the parser attaches (`parser.<name>` codes, e.g. a record column that
+    # had a header but no data and was not loaded). The load flow renders them into a
+    # passive ⓘ message (`collect_parse_notes`); the parser also emits each note's export
+    # clause via warnings.warn (keep-both).
+    notes: Tuple[Note, ...] = ()
 
     def missing_required_fields(self) -> List[str]:
         """Return a list of required field names that are still None."""
@@ -914,12 +991,12 @@ class TraceFilePreview:
     sample_label: Optional[str] = None
     measurement_id: Optional[str] = None                # optional back-reference
 
-    # --- passive load-time notices ---
+    # --- load-time notices ---
     # See DLSFilePreview.notes. Carried here for the same reason the finiteness roster is:
     # the three preview types are one family with three loaders, and wiring two of three is
     # the shape that leaves the third silently opted out (rule 10) -- which is exactly what
     # the reverted round did with the autodetect loops one file over.
-    notes: tuple = ()
+    notes: Tuple[Note, ...] = ()
 
     # See DLSFilePreview._DATA_ARRAY_FIELDS for why this roster is declared, not inline.
     _DATA_ARRAY_FIELDS = ('times_s', 'count_rates_cps')
@@ -1000,11 +1077,10 @@ class SLSFilePreview:
     standard_rayleigh_ratio_file: Optional[float] = None
     standard_refractive_index: Optional[float] = None
 
-    # --- passive load-time notices ---
-    # Glyph-less, human-readable notes the parser attaches (e.g. negative intensities
-    # after background subtraction). The load flow surfaces these as a passive ⓘ
-    # message; the parser also emits the same text via warnings.warn (keep-both).
-    notes: tuple = ()
+    # --- load-time notices ---
+    # Record notes the parser attaches (e.g. negative intensities after background
+    # subtraction); see DLSFilePreview.notes.
+    notes: Tuple[Note, ...] = ()
 
     # See DLSFilePreview._DATA_ARRAY_FIELDS for why this roster is declared, not inline.
     _DATA_ARRAY_FIELDS = ('angles_deg', 'intensities')
@@ -1073,16 +1149,19 @@ class SLSFilePreview:
 
 
 def collect_parse_notes(previews, file_path: str, into: list) -> None:
-    """Append each preview's passive notes to `into` as file-prefixed lines, ONCE each.
+    """Append each preview's notes to `into` as `(file name, note)` pairs, ONCE each.
 
-    The load flow renders `into` as a single passive ⓘ box, so this is the point where the
-    three loaders (DLS, SLS, trace) share one behaviour instead of three copies -- the same
-    rule-10 reasoning as `require_finite_data`.
+    The load flow shows `into` in a single passive ⓘ box (`gui.widgets.show_parse_notes`,
+    which renders each note's clause and its remedy), so this is the point where the three
+    loaders (DLS, SLS, trace) share one behaviour instead of three copies -- the same
+    rule-10 reasoning as `require_finite_data`. The note itself travels, never its words:
+    the clause is the registry's and the remedy the GUI's.
 
     De-duplication is not cosmetic. A note describes the FILE, and a multi-record parser
     hands the same note to every preview it returns (a preview must not disagree with its
-    own file's parse), so a twenty-record clipboard paste would otherwise render the same
-    sentence nineteen times.
+    own file's parse), so a twenty-record clipboard paste would otherwise show the same
+    note nineteen times. A pair is one file and one note (equal code, attributes and
+    values).
 
     `getattr(p, 'notes', ())` rather than `p.notes`: a hand-built preview in a test, or a
     future preview type that has not been enrolled, degrades to "no notes" instead of
@@ -1091,9 +1170,9 @@ def collect_parse_notes(previews, file_path: str, into: list) -> None:
     base = os.path.basename(file_path)
     for p in previews:
         for note in getattr(p, 'notes', ()):
-            line = f'{base}: {note}'
-            if line not in into:
-                into.append(line)
+            pair = (base, note)
+            if pair not in into:
+                into.append(pair)
 
 
 # ---------------------------------------------------------------------------

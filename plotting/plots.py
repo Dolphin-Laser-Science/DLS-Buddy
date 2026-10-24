@@ -48,7 +48,7 @@ pinned per plot function by
   - The SLS result fields keep nm-based storage (``q2_nm2``, ``q_nm_inv``) BY
     DECISION (stage 2's canonical-unit call, owner-signed 2026-07-24): the
     plotters convert from that declared source unit via `display_factor_from`
-    (→ ``app.units.convert``), whose same-unit factor is exactly 1.0 — so on
+    (→ ``core.units.convert``), whose same-unit factor is exactly 1.0 — so on
     the default nm⁻² choice the drawn q² arrays are bit-identical to the
     unscaled draw. A full-SI field migration remains open as its own spec.
   - `plot_zimm`'s abscissa q² + k·c is a q²-unit quantity: it is computed
@@ -102,6 +102,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from analysis import form_factor as ff
 from analysis.dls import distribution_axis
+from analysis.dls.modes import plotted_gamma_s_inv
 from physics import constants as phys
 
 
@@ -340,8 +341,8 @@ def save_figure_white(fig, path: str) -> str:
 # Plots store/compute in canonical units but DISPLAY in human-scale units (µs, kcps,
 # nm⁻², µm²/s, mg/mL, ...). The active choice is a module-level dict mutated by
 # set_plot_units (mirroring set_palette); each plot scales its canonical arrays and
-# labels its axes via _disp(). app.units is a pure (GUI-free) boundary helper.
-from app import units as _U
+# labels its axes via _disp(). core.units is a pure (GUI-free) boundary helper.
+from core import units as _U
 
 _PLOT_QUANTITIES = ('time', 'intensity', 'scattering_q2', 'diffusion',
                     'decay_rate', 'radius', 'molar_mass', 'concentration')
@@ -384,7 +385,7 @@ def display_factor_from(quantity: str, source_unit: str) -> float:
     one: the SLS result fields keep q² in nm⁻² by decision (spec
     engineering-04 stage 2), so their axes route through here instead of
     `display_factor`. When the active unit IS the source unit the factor is
-    exactly 1.0 (`app.units.convert`'s identity guarantee), which is what
+    exactly 1.0 (`core.units.convert`'s identity guarantee), which is what
     makes default-unit SLS rendering bit-identical to the unscaled draw."""
     unit = PLOT_UNITS.get(quantity, _U.canonical_unit(quantity))
     return float(_U.convert(quantity, 1.0, source_unit, unit))
@@ -949,7 +950,7 @@ def plot_lcurve(lcurve, ax: Optional[Any] = None, method: str = 'lcurve',
     CONTIN result on a shared ``ax`` (the chosen-alpha marker takes the same color,
     so several sweeps stay legible). ``mark_ceiling=True`` / ``mark_floor=True`` ring
     the pick with the same edge-class warning halo (the alpha landed on a sweep edge;
-    the wording for each edge is the result's own ``reliability_note``, not repeated
+    the wording for each edge is the result's own precondition note, not repeated
     here). Flags stay GUI-owned overlays: nothing is baked into a saved figure.
 
     Raises ``ValueError`` when ``method`` is not one of ``{'lcurve','gcv','ftest'}``
@@ -1119,8 +1120,11 @@ def plot_mode_map(points, ax: Optional[Any] = None) -> PlotHandles:
 
       * FILL for amplitude -- hollow means below the ~2 % floor, so the rate and
         amplitude are imprecise;
-      * SHAPE for the lag window -- a square means the mode never finished
-        decaying inside the measured lags, so its rate is an extrapolation.
+      * SHAPE for the point's size verdict -- a square means a precondition of the
+        point failed: the mode never finished decaying inside the measured lags, so its
+        rate is an extrapolation, or its lobe's maximum sits on the Rh grid's first or
+        last point, so the grid does not hold the population. One shape for either; the
+        legend names the causes present.
 
     A hollow square is both. Only the combinations actually present are drawn.
     """
@@ -1128,22 +1132,39 @@ def plot_mode_map(points, ax: Optional[Any] = None) -> PlotHandles:
     qfac, q_unit = display_factor('scattering_q2'), display_unit('scattering_q2')
     gfac, g_unit = display_factor('decay_rate'), display_unit('decay_rate')
     q2 = np.array([p.q2_m2 for p in points], dtype=float)
-    gamma = np.array([p.gamma_s_inv for p in points], dtype=float)
+    # The point's position (a distribution lobe's geometric mean), not the node its pick
+    # is keyed on -- the Gamma the family fit regresses on.
+    gamma = np.array([plotted_gamma_s_inv(p) for p in points], dtype=float)
     low = np.array([p.low_amplitude for p in points], dtype=bool)
     # getattr, not attribute access: the map is also drawn from RECORDED snapshots and
-    # from test doubles built before this flag existed; an absent flag means "no verdict",
-    # which draws as an ordinary point.
+    # from test doubles built before these flags existed; an absent flag means "no
+    # verdict", which draws as an ordinary point.
     undecayed = np.array([getattr(p, 'decay_incomplete', False) for p in points],
                          dtype=bool)
+    grid_end = np.array([getattr(p, 'grid_end', False) for p in points], dtype=bool)
+    flagged = undecayed | grid_end
+
+    def square_label(sel, alone: str, named: str) -> str:
+        """The square group's legend entry, naming the causes among its points: `alone`
+        where every one is undecayed, else `named` with the causes present."""
+        causes = [cause for cause, has in (('undecayed', undecayed),
+                                           ("at the Rh grid's end", grid_end))
+                  if (sel & has).any()]
+        return alone if causes == ['undecayed'] else named.format(' or '.join(causes))
+
     artists = {}
     if q2.size:
+        # The square groups' keys name the first of their causes; each holds every
+        # flagged point of its fill.
         for key, sel, marker, hollow, label in (
-            ('modes', ~low & ~undecayed, 'o', False, 'extracted modes'),
-            ('low', low & ~undecayed, 'o', True, 'low-amplitude mode (imprecise)'),
-            ('undecayed', ~low & undecayed, 's', False,
-             'undecayed mode (rate extrapolated)'),
-            ('low_undecayed', low & undecayed, 's', True,
-             'low-amplitude AND undecayed'),
+            ('modes', ~low & ~flagged, 'o', False, 'extracted modes'),
+            ('low', low & ~flagged, 'o', True, 'low-amplitude mode (imprecise)'),
+            ('undecayed', ~low & flagged, 's', False,
+             square_label(~low & flagged, 'undecayed mode (rate extrapolated)',
+                          'mode {}')),
+            ('low_undecayed', low & flagged, 's', True,
+             square_label(low & flagged, 'low-amplitude AND undecayed',
+                          'low-amplitude AND {}')),
         ):
             if not sel.any():
                 continue
@@ -1230,11 +1251,14 @@ def plot_amplitude_vs_q(result, ax: Optional[Any] = None) -> PlotHandles:
 
 def scale_causes(res) -> list:
     """Which of a result's two scales are unknown, as user-facing nouns (empty = both
-    known). Tolerant getattr so a partially-built stand-in degrades to "scale known"
-    rather than raising inside a paint path."""
+    known): the calibration's named for its cause, no calibration constant or a constant
+    applied with the standard's refractive index blank (`standard_index_known`, the
+    `no_standard_index` gate). Tolerant getattr so a partially-built stand-in degrades to
+    "scale known" rather than raising inside a paint path."""
     causes = []
     if not getattr(res, 'calibrated', True):
-        causes.append('uncalibrated')
+        causes.append('uncalibrated' if getattr(res, 'standard_index_known', True)
+                      else 'no standard refractive index')
     if not getattr(res, 'dn_dc_supplied', True):
         causes.append('no usable dn/dc')
     return causes
@@ -1441,9 +1465,9 @@ def plot_form_factor(result, ax: Optional[Any] = None,
             f"{result.model!r} result list has its own plotter "
             f"(plot_{result.model}_form_factor).")
     # Every P(q) model is meaningless past back-scatter q = 2k — cap the grid
-    # whenever the result carries its optics (every fit echoes them since the
-    # spec-05 review response; the guard covers hand-built stand-ins, which fall
-    # back to the uncapped grid).
+    # whenever the result carries its optics (every fit echoes them; a hand-built
+    # sphere or coil stand-in without them falls back to the uncapped grid, and the
+    # Mie model reads the optics itself).
     k = (phys.optical_wavevector_k(result.wavelength_nm, result.n_medium)
          if result.wavelength_nm and result.n_medium else None)
     qq = _model_q_grid(q, k_nm_inv=k)
@@ -1488,23 +1512,24 @@ def _qrg_max_span(results) -> str:
     return f'{lo:.2f}' if f'{lo:.2f}' == f'{hi:.2f}' else f'{lo:.2f}–{hi:.2f}'
 
 
-def plot_ellipsoid_form_factor(results, ax: Optional[Any] = None,
-                               series_offset: int = 0) -> PlotHandles:
-    """Plot an ellipsoid-of-revolution P(q) fit: Kc/dR vs q^2 with EACH solution's model
-    curve overlaid (a prolate and an oblate ellipsoid can fit the same data -- `results` is
-    the list from ellipsoid_form_factor_analysis). Data points are shared and colored by
-    concentration; each solution's curves use a distinct line style, so degenerate solutions
-    (which nearly overlap -- that is what makes them degenerate) are still distinguishable."""
+def _plot_solution_list_form_factor(results, ax, series_offset, *, title_prefix,
+                                    solution_label) -> PlotHandles:
+    """Shared body of the solution-list form-factor plotters (ellipsoid, core-shell).
+
+    The data are drawn once, coloured by concentration, then EACH solution's model curve
+    per concentration in that concentration's colour and the solution's own line style.
+    ``title_prefix`` opens the legend title (for example ``'Ellipsoid P(q)'``), and
+    ``solution_label(r)`` is one solution's legend line after its line-style glyph."""
     fig, ax = _get_ax(ax)
     first = results[0]
     q = np.asarray(first.q_nm_inv, dtype=float)
     y = np.asarray(first.kc_over_dR, dtype=float)
     c = np.asarray(first.concentrations_g_per_mL, dtype=float)
     artists: Dict[str, Any] = {}
-    # The Pedersen P(q) is analytic at any q, but q > 2k is physically unreachable
-    # for every model — cap like the Mie/coated siblings (spec engineering-05).
-    # The optics fields are always fit-populated; the guard covers hand-built
-    # stand-ins, which fall back to the uncapped grid.
+    # Every P(q) model is meaningless past back-scatter q = 2k, so the grid is capped
+    # whenever the result carries its optics. The fits always populate them; a hand-built
+    # ellipsoid stand-in without them falls back to the uncapped grid, and the core-shell
+    # model reads the optics itself.
     k = (phys.optical_wavevector_k(first.wavelength_nm, first.n_medium)
          if first.wavelength_nm and first.n_medium else None)
     qq = _model_q_grid(q, k_nm_inv=k)
@@ -1512,11 +1537,9 @@ def plot_ellipsoid_form_factor(results, ax: Optional[Any] = None,
     qfac = display_factor_from('scattering_q2', 'nm⁻²')
     uniq_c = np.unique(c)
 
-    # Data once, colored by concentration (fix the color per concentration so every
-    # solution's overlay shares it).
-    # Concentration colours are index-keyed (spec engineering-04); on a fresh
-    # axes this matches the old artist-count order exactly, but it can no longer
-    # shift when a decorative artist is added upstream.
+    # Data once, with the colour fixed per concentration so every solution's overlay
+    # shares it. Colours are keyed by concentration index, so a decorative artist
+    # added upstream cannot shift them.
     conc_color = {}
     artists['series'] = []
     for i, ci in enumerate(uniq_c):
@@ -1538,18 +1561,29 @@ def plot_ellipsoid_form_factor(results, ax: Optional[Any] = None,
             entry['fits'].append(_model_curve(
                 ax, qq, Pm, inv_mw, a2, ci, y_cap, color=conc_color[ci],
                 style=style, x_scale=qfac))
-        kind = 'prolate' if r.is_prolate else 'oblate'
-        sol_labels.append(f'{style}  {kind} p={r.axial_ratio:.2f}, '
-                          f'$R_g$={r.rg_nm:.1f} nm')
+        sol_labels.append(f'{style}  {solution_label(r)}')
 
     regime = 'apparent' if first.is_apparent else 'thermodynamic'
     degen = f' — {len(results)} degenerate solutions' if first.degenerate else ''
     ax.set_xlabel(rf'$q^2$ ({display_unit("scattering_q2")})')
     ax.set_ylabel(r'$Kc/\Delta R$ (mol/g)')
     ax.legend(frameon=False, fontsize=9,
-              title=(f'Ellipsoid P(q), {regime}{degen}\n' + '\n'.join(sol_labels)
+              title=(f'{title_prefix}, {regime}{degen}\n' + '\n'.join(sol_labels)
                      + f'\n($qR_g^{{\\max}}$ = {_qrg_max_span(results)})'))
     return PlotHandles(fig, ax, artists)
+
+
+def plot_ellipsoid_form_factor(results, ax: Optional[Any] = None,
+                               series_offset: int = 0) -> PlotHandles:
+    """Plot an ellipsoid-of-revolution P(q) fit: Kc/dR vs q^2 with EACH solution's model
+    curve overlaid (a prolate and an oblate ellipsoid can fit the same data -- `results` is
+    the list from ellipsoid_form_factor_analysis). Data points are shared and colored by
+    concentration; each solution's curves use a distinct line style, so degenerate solutions
+    (which nearly overlap -- that is what makes them degenerate) are still distinguishable."""
+    return _plot_solution_list_form_factor(
+        results, ax, series_offset, title_prefix='Ellipsoid P(q)',
+        solution_label=lambda r: (f'{"prolate" if r.is_prolate else "oblate"} '
+                                  f'p={r.axial_ratio:.2f}, $R_g$={r.rg_nm:.1f} nm'))
 
 
 def plot_core_shell_form_factor(results, ax: Optional[Any] = None,
@@ -1561,53 +1595,10 @@ def plot_core_shell_form_factor(results, ax: Optional[Any] = None,
     distinguishable. Like the Mie overlay, the model grid is capped at the back-scatter
     bound q = 2k (k = 2*pi*n/lambda) where the coated P(q) stops being defined, so the
     drawn curve tracks the physical range instead of flat-lining past back-scatter."""
-    fig, ax = _get_ax(ax)
-    first = results[0]
-    q = np.asarray(first.q_nm_inv, dtype=float)
-    y = np.asarray(first.kc_over_dR, dtype=float)
-    c = np.asarray(first.concentrations_g_per_mL, dtype=float)
-    artists: Dict[str, Any] = {}
-    k = phys.optical_wavevector_k(first.wavelength_nm, first.n_medium)
-    qq = _model_q_grid(q, k_nm_inv=k)
-    y_cap = _form_factor_y_cap(y)
-    qfac = display_factor_from('scattering_q2', 'nm⁻²')
-    uniq_c = np.unique(c)
-
-    # Concentration colours are index-keyed (spec engineering-04); on a fresh
-    # axes this matches the old artist-count order exactly, but it can no longer
-    # shift when a decorative artist is added upstream.
-    conc_color = {}
-    artists['series'] = []
-    for i, ci in enumerate(uniq_c):
-        col = _series_color(ax, series_offset + i)
-        conc_color[ci] = col
-        m = c == ci
-        pts = ax.scatter(
-            q[m] ** 2 * qfac, y[m], s=36, color=col, zorder=3,
-            label=f'c = {conc_mg_ml_label(ci)}')
-        artists['series'].append(
-            {'concentration_g_per_mL': float(ci), 'data': pts, 'fits': []})
-
-    sol_labels = []
-    for si, r in enumerate(results):
-        Pm, inv_mw, a2 = _model_overlay_params(r, ff.model_P(r, qq))
-        style = _SOLUTION_STYLES[si % len(_SOLUTION_STYLES)]
-        # One fit line per concentration for THIS solution: entry['fits'][si].
-        for entry, ci in zip(artists['series'], uniq_c, strict=True):
-            entry['fits'].append(_model_curve(
-                ax, qq, Pm, inv_mw, a2, ci, y_cap, color=conc_color[ci],
-                style=style, x_scale=qfac))
-        sol_labels.append(f'{style}  $R_{{core}}$={r.r_core_nm:.1f}, '
-                          f'$R_{{outer}}$={r.r_outer_nm:.1f} nm')
-
-    regime = 'apparent' if first.is_apparent else 'thermodynamic'
-    degen = f' — {len(results)} degenerate solutions' if first.degenerate else ''
-    ax.set_xlabel(rf'$q^2$ ({display_unit("scattering_q2")})')
-    ax.set_ylabel(r'$Kc/\Delta R$ (mol/g)')
-    ax.legend(frameon=False, fontsize=9,
-              title=(f'Core–shell P(q), {regime}{degen}\n' + '\n'.join(sol_labels)
-                     + f'\n($qR_g^{{\\max}}$ = {_qrg_max_span(results)})'))
-    return PlotHandles(fig, ax, artists)
+    return _plot_solution_list_form_factor(
+        results, ax, series_offset, title_prefix='Core–shell P(q)',
+        solution_label=lambda r: (f'$R_{{core}}$={r.r_core_nm:.1f}, '
+                                  f'$R_{{outer}}$={r.r_outer_nm:.1f} nm'))
 
 
 def plot_zimm(
@@ -1678,8 +1669,9 @@ def plot_zimm(
         artists['series'].append(
             {'concentration_g_per_mL': r.concentration_g_per_mL, 'data': pts})
 
-    # Both extrapolations come from the global plane fit  ord = a + b q^2 + d c, so
-    # the c->0 line (vs q^2) and the q->0 line (vs k*c) are straight and meet at the
+    # Both extrapolations come from the global fit  ord = a + b q^2 + d c  (Berry adds
+    # e q^2 c, which vanishes on both limit lines), so the c->0 line (vs q^2) and the q->0
+    # line (vs k*c) are straight and meet at the
     # common intercept a (= 1/Mw, or its root for Berry) at x = 0. Continue each line
     # all the way to x = 0 so the extrapolation visibly reaches the axis;
     # the route-specific intercepts stay as markers on the real data range.

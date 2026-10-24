@@ -11,12 +11,21 @@ thunk runs on a single pooled worker thread; ``on_done(result)`` /
 ``on_fail(exception)`` are invoked back on the GUI thread via queued signal
 delivery, so widget code never touches Qt objects from the worker.
 
+Every Run dispatches through its own :class:`RunSlot`, which meets a press made
+while the worker is busy in one of two ways, chosen per Run: **queued**, the press's
+target taking the slot's one pending place (the latest press wins) and retried once
+the worker frees; or **refused**, nothing dispatched or retried. Either way the
+press is told through the slot's ``notice`` hook, on the surface the Run's tab uses.
+The one dispatch that is not a Run's, the Utilities tab's long-trace diagnostics
+(``UtilitiesModule._ensure_focus_diag``), calls ``try_submit`` directly: each busy
+call there queues its own continuation, which one pending place would not keep.
+
 Deliberate non-features (spec boundaries):
 
 - **One job in flight, app-wide.** ``try_submit`` refuses while busy — this is
   the global re-entry guard: controller ``run_*`` methods mutate
   shared state, so two concurrent runs are never allowed, whichever tabs they
-  come from. No queue, no priorities.
+  come from. No job queue, no priorities: a queued press waits in its own slot.
 - **No cancellation.** A running scipy call cannot be safely interrupted; a
   *stale* result (the widget's inputs changed while the job ran) is dropped by
   the caller's epoch check in ``on_done``, not by killing the computation.
@@ -261,7 +270,116 @@ def run_when_idle(callback: Callable[[], None]) -> None:
         callback()
 
 
-BUSY_NOTICE = 'Busy — wait for the running analysis to finish.'
+class RunSlot:
+    """The dispatch state of one Run button: its staleness epoch, and the target of
+    the latest press deferred behind a busy worker.
+
+    ``submit`` dispatches a run through :func:`runner`'s ``try_submit``, which stays
+    the single-flight gate. A press while the worker is busy never touches the epoch
+    (that would drop the run in flight with nothing to replace it): with ``queue``
+    the press's ``target`` takes the pending slot, the latest press winning, and one
+    retry waits for idle; without it the press is refused. ``notice`` reports the busy
+    press either way. The retry re-checks the target with ``available`` and, while it
+    can run, hands it to ``rerun``; a slot built without ``rerun`` never queues.
+    ``hold`` is that busy arm alone, for a Run that must turn a busy press away before
+    it reads its inputs or asks the user anything.
+
+    A dispatch with ``paint`` bumps the epoch and carries it as the run's token; with
+    ``bump=False`` it carries the epoch without moving it; one without ``paint`` (a
+    deferred Run whose target is no longer on screen) carries ``None``.
+    ``done(result, token)`` and ``fail(exc, token)`` always run, so a run lands in its
+    own slot whatever is shown; the caller paints only while ``current(token)``.
+    Anything else that makes an in-flight run's display stale calls ``bump``.
+
+    ``before_delivery``, when given, runs first in every delivery to the caller: before
+    ``done`` and ``fail``, and before a retry hands its target to ``rerun`` (never on a
+    retry that reruns nothing). A DLS sub-tab passes its ``flush_view`` here, so a
+    repaint it owes runs before the landing paints. ``done``, ``fail`` and ``rerun``
+    still run when the hook raises.
+    """
+
+    def __init__(self, *, available: Optional[Callable[[Any], bool]] = None,
+                 rerun: Optional[Callable[[Any], None]] = None,
+                 before_delivery: Optional[Callable[[], None]] = None) -> None:
+        self.epoch = 0
+        self.pending: Any = False
+        self._available = available
+        self._rerun = rerun
+        self._before_delivery = before_delivery
+
+    def bump(self) -> None:
+        """Make every run in flight stale for display."""
+        self.epoch += 1
+
+    def current(self, token: Optional[int]) -> bool:
+        """Whether a run dispatched with ``token`` may still paint."""
+        return token is not None and token == self.epoch
+
+    def hold(self, *, target: Any, queue: bool,
+             notice: Optional[Callable[[], None]] = None) -> bool:
+        """While the worker is busy, queue or refuse the press as ``submit`` does and
+        return True; return False, doing nothing, while it is idle."""
+        if not runner().is_busy:
+            return False
+        if queue:
+            if self._rerun is None:
+                raise ValueError('a RunSlot without a rerun hook cannot queue a press')
+            first = not self.pending
+            self.pending = target
+            if first:
+                run_when_idle(self.flush)
+        if notice is not None:
+            notice()
+        return True
+
+    def submit(self, thunk: Callable[[], Any],
+               done: Callable[[Any, Optional[int]], None],
+               fail: Callable[[BaseException, Optional[int]], None],
+               *, target: Any, queue: bool, busy_widgets: Sequence[Any] = (),
+               notice: Optional[Callable[[], None]] = None,
+               description: str = 'analysis', paint: bool = True,
+               bump: bool = True) -> bool:
+        """Dispatch ``thunk``; returns whether it was dispatched now."""
+        if self.hold(target=target, queue=queue, notice=notice):
+            return False
+        token: Optional[int] = None
+        if paint:
+            if bump:
+                self.epoch += 1
+            token = self.epoch
+        hook = self._before_delivery
+
+        def on_done(res: Any) -> None:
+            try:
+                if hook is not None:
+                    hook()
+            finally:
+                done(res, token)
+
+        def on_fail(exc: BaseException) -> None:
+            try:
+                if hook is not None:
+                    hook()
+            finally:
+                fail(exc, token)
+
+        return runner().try_submit(thunk, on_done, on_fail,
+                                   description=description, busy_widgets=busy_widgets)
+
+    def flush(self) -> None:
+        """The deferred retry: empty the pending slot, and rerun its target while
+        ``available`` says the target can still run."""
+        target, self.pending = self.pending, False
+        if (target and self._rerun is not None
+                and (self._available is None or self._available(target))):
+            try:
+                if self._before_delivery is not None:
+                    self._before_delivery()
+            finally:
+                self._rerun(target)
+
+
+BUSY_NOTICE ='Busy — wait for the running analysis to finish.'
 
 #: Shared tooltip for every Run control that now dispatches to the worker.
 BACKGROUND_RUN_TOOLTIP = (
@@ -289,3 +407,7 @@ def _reset_for_tests() -> None:
         assert _runner.wait_for_idle(), 'AnalysisRunner still busy at reset'
         _runner._idle_queue.clear()
         _runner = None
+        # Collect the garbage left so far while no job runs, rather than leave it to a
+        # later collection that may fall inside another runner's job.
+        import gc
+        gc.collect()

@@ -23,28 +23,91 @@ Nothing here imports analysis/physics — it is pure Qt presentation.
 
 from __future__ import annotations
 
+import html
 from typing import Optional, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from gui.theme import token
 
+# Qt word-wraps a tooltip only when it is rich text, and its own rich-text width is too narrow
+# to read (ui_style_guide R6.10); so a plain tooltip whose longest line is wider than this is
+# shown as a block of this width, and a shorter one as it is.
+TOOLTIP_WRAP_PX = 420
+
+
+def wrapped_tooltip(text: str, font: QtGui.QFont) -> str:
+    """`text` as the tooltip gate shows it: unchanged when it is empty, rich text, or no line
+    of it is wider than `TOOLTIP_WRAP_PX` in `font`; otherwise escaped into a block of that
+    width, its line breaks kept."""
+    if not text or QtGui.Qt.mightBeRichText(text):
+        return text
+    metrics = QtGui.QFontMetrics(font)
+    if max(metrics.horizontalAdvance(line) for line in text.split('\n')) <= TOOLTIP_WRAP_PX:
+        return text
+    body = html.escape(text, quote=False).replace('\n', '<br>')
+    return f'<table width="{TOOLTIP_WRAP_PX}"><tr><td>{body}</td></tr></table>'
+
 
 # ---------------------------------------------------------------------------
 # Global "show passive tooltips" gate
 # ---------------------------------------------------------------------------
+def _hovered_tooltip(obj, event) -> "Optional[tuple]":
+    """(text, widget, rect) of the tooltip Qt would show for this hover, read where Qt reads
+    it: an item view's cell or header section, a menu action, else the widget's own. None
+    where Qt would show nothing here (an empty tooltip propagates to the parent)."""
+    if not isinstance(obj, QtWidgets.QWidget):
+        return None
+    pos = event.pos()
+    view = obj.parentWidget()
+    role = QtCore.Qt.ItemDataRole.ToolTipRole
+    if isinstance(view, QtWidgets.QHeaderView) and obj is view.viewport():
+        section = view.logicalIndexAt(pos)
+        if section < 0 or view.model() is None:
+            return None
+        text = view.model().headerData(section, view.orientation(), role)
+        start, size = view.sectionViewportPosition(section), view.sectionSize(section)
+        rect = (QtCore.QRect(start, 0, size, obj.height())
+                if view.orientation() == QtCore.Qt.Orientation.Horizontal
+                else QtCore.QRect(0, start, obj.width(), size))
+    elif isinstance(view, QtWidgets.QAbstractItemView) and obj is view.viewport():
+        index = view.indexAt(pos)
+        if not index.isValid():
+            return None
+        text, rect = index.data(role), view.visualRect(index)
+    elif isinstance(obj, QtWidgets.QMenu):
+        action = obj.actionAt(pos)
+        # QAction.toolTip() falls back to the action's text; Qt shows only one set explicitly.
+        if (action is None or not obj.toolTipsVisible()
+                or action.toolTip() == action.text().replace('&', '')):
+            return None
+        text, rect = action.toolTip(), obj.actionGeometry(action)
+    else:
+        text, rect = obj.toolTip(), QtCore.QRect()
+    return (text, obj, rect) if isinstance(text, str) and text else None
+
+
 class _TooltipGate(QtCore.QObject):
-    """An application-wide event filter that swallows tooltip events when disabled,
-    so a single setting turns every passive `setToolTip` on/off without touching the
-    individual widgets. `HelpBadge` popups are shown programmatically on click, so
-    they are unaffected by this gate."""
+    """An application-wide event filter over every hover tooltip. When disabled it swallows
+    them, so a single setting turns every passive `setToolTip` on/off without touching the
+    individual widgets; when enabled it shows a long plain tooltip wrapped
+    (`wrapped_tooltip`) and leaves every other one to Qt. `HelpBadge` popups are shown
+    programmatically on click, so they are unaffected by this gate."""
 
     enabled: bool = True
 
     def eventFilter(self, obj, event) -> bool:
-        if (not _TooltipGate.enabled
-                and event.type() == QtCore.QEvent.Type.ToolTip):
+        if event.type() != QtCore.QEvent.Type.ToolTip:
+            return super().eventFilter(obj, event)
+        if not _TooltipGate.enabled:
             return True          # consume → Qt never shows the tooltip
+        hovered = _hovered_tooltip(obj, event)
+        if hovered is not None:
+            text, widget, rect = hovered
+            shown = wrapped_tooltip(text, QtWidgets.QToolTip.font())
+            if shown != text:
+                QtWidgets.QToolTip.showText(event.globalPos(), shown, widget, rect)
+                return True
         return super().eventFilter(obj, event)
 
 

@@ -382,8 +382,8 @@ def mie_P_batch(q_nm_inv: np.ndarray, rg_nm: np.ndarray, m: float, *,
 # Relative floor below which the core-shell net contrast (the total excess scattering length,
 # the denominator of the contrast-weighted Rg^2) counts as "matched" -> Rg is ill-defined and
 # reported as nan. Compared against the sum of the absolute core/shell contrast-volume terms,
-# so it is scale-free (independent of the units of R and the size of m-1). A documented module
-# constant (not a function parameter).
+# so it is scale-free (independent of the units of R and the size of m-1). A documented
+# default of `core_shell_contrast_weighted_rg`'s `contrast_match_rel` (invariant 4).
 _CORE_SHELL_CONTRAST_MATCH_REL = 1.0e-6
 
 
@@ -454,7 +454,9 @@ def core_shell_P_batch(q_nm_inv: np.ndarray, r_core_nm: np.ndarray, r_outer_nm: 
 
 
 def core_shell_contrast_weighted_rg(r_core_nm: float, r_outer_nm: float, m1: float,
-                                    m2: float) -> float:
+                                    m2: float, *,
+                                    contrast_match_rel: float = _CORE_SHELL_CONTRAST_MATCH_REL
+                                    ) -> float:
     """Contrast-weighted radius of gyration Rg (nm) of a core-shell sphere -- the scattering
     Rg the coated P(q) exhibits in its small-q (Guinier) limit, and the size reported by the
     fit for comparison with the model-agnostic Zimm/Guinier Rg.
@@ -469,7 +471,8 @@ def core_shell_contrast_weighted_rg(r_core_nm: float, r_outer_nm: float, m1: flo
 
     The common n_medium factor in each (m_i - 1) = (n_i - n_medium)/n_medium cancels in the
     ratio. Returns ``nan`` when the object is **contrast-matched** (the denominator -- the net
-    excess scattering length -- is negligible vs the magnitude of the two terms) or when
+    excess scattering length -- is below ``contrast_match_rel`` of the magnitude of the two
+    terms) or when
     Rg^2 <= 0 (an opposite-sign core/shell contrast profile whose Guinier Rg is imaginary):
     in both regimes a single scattering Rg is not physically defined, so none is reported.
 
@@ -497,7 +500,7 @@ def core_shell_contrast_weighted_rg(r_core_nm: float, r_outer_nm: float, m1: flo
     den = c1 * r1_3 + c2 * shell_vol
     scale = abs(c1) * r1_3 + abs(c2) * shell_vol          # sum of |contrast * volume| terms
     if (not (math.isfinite(scale) and scale > 0)
-            or abs(den) < _CORE_SHELL_CONTRAST_MATCH_REL * scale):
+            or abs(den) < contrast_match_rel * scale):
         return float('nan')                               # contrast-matched -> Rg undefined
     rg_sq = 0.6 * num / den
     if not (rg_sq > 0 and math.isfinite(rg_sq)):

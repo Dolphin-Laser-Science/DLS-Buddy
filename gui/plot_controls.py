@@ -24,7 +24,7 @@ from typing import Optional
 
 from PySide6 import QtCore, QtWidgets
 from matplotlib.lines import Line2D
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 
 from gui.widgets import GripSplitter
 
@@ -105,6 +105,30 @@ def set_plot_export_dressing(canvas, dressing) -> None:
     every measurement by name.
     """
     canvas._export_dressing = dressing
+
+
+class LazyCanvas(FigureCanvasQTAgg):
+    """The embedded-plot canvas: a `FigureCanvasQTAgg` whose queued redraw waits while
+    the canvas is hidden from its window (a module or sub-tab not in front) and runs
+    once when the canvas is next shown, drawing the figure as it stands then. `draw()`
+    is not gated: an explicit draw, and a save, render at once.
+
+    The gate is `isVisibleTo(window())`, not `isVisible()`: a canvas in the current tab
+    of a window not yet shown still draws, as it does under the offscreen platform."""
+
+    _hidden_draw_pending = False
+
+    def draw_idle(self):
+        if not self.isVisibleTo(self.window()):
+            self._hidden_draw_pending = True
+            return
+        super().draw_idle()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._hidden_draw_pending:
+            self._hidden_draw_pending = False
+            super().draw_idle()
 
 
 def make_canvas_expanding(canvas, min_height: int = 170,

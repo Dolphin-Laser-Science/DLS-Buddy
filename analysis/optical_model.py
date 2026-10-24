@@ -81,7 +81,8 @@ References
     Particles, Ch. 6 (RDG validity criteria, Eqs. 6.2/6.3), Sec. 4.3-4.4 (full Mie).
   Guinier, A., & Fournet, G. (1955); Pedersen, J. S. (1997), Eq. 55 (sphere form factor).
   Wiscombe, W. J. (1980) (Mie numerical algorithm -- via analysis.mie).
-  ISO 22412:2017, Sec. 3 (intensity/volume/number-weighted PSD) + Sec. 9.1 (caution).
+  ISO 22412:2017, Note 1 to entry 3.2, p. 2 (names the intensity-, volume- and
+    number-weighted PSD) + Sec. 9.1, p. 10 (caution).
 """
 
 from __future__ import annotations
@@ -92,9 +93,12 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from core.notes import Note
 from analysis import mie
 from analysis.form_factor import sphere_P_from_u
-from analysis.dls.distributions import DistributionResult, scan_distribution_peaks
+from analysis.dls.distributions import (
+    DistributionResult, lobe_geometric_mean, peak_lobe_geometric_mean_nm,
+    scan_distribution_peaks)
 from physics import constants as phys
 
 
@@ -162,7 +166,7 @@ class WeightedDistributionResult:
     """An intensity distribution re-expressed under a volume/surface/number weighting.
 
     Deliberately carries NO uncertainty (no ``*_se`` / ``se_estimator``) and NO
-    ``*_reliable`` / ``reliability_note`` field: reweighted distributions are report-only
+    ``*_reliable`` field: reweighted distributions are report-only
     (invariant 8 -- ill-posed inversion + small-R noise amplification), so it is excluded
     from the SE / reliability result families by construction. It is a *derived,
     model-dependent* view, distinct from the measured intensity ``DistributionResult`` it
@@ -189,12 +193,21 @@ class WeightedDistributionResult:
     n_medium: Optional[float] = None
     wavelength_nm: Optional[float] = None
     q_m_inv: float = float('nan')
-    # passive, glyph-less notices for the GUI (model-dependence + validity)
-    notes: tuple = ()
+    # Every note of the view, as Notes (the out-of-range bins, the low-contrast record);
+    # its model-dependence is a qualifier read off `weighting` and `optical_model_label`
+    # (core.notes.qualifiers), never a note.
+    notes: Tuple[Note, ...] = ()
     # The SOURCE fit's convergence, copied from DistributionResult.success: the summary
     # values here are re-expressions of that fit's numbers, so the flag must travel with
     # them (a False means the underlying lognormal returned its seed, not a fit).
     source_success: bool = True
+    # The geometric mean of the lobe holding `peak_rh_nm`'s node, under this weighting
+    # (`peak_lobe_geometric_mean_nm`, the intensity result's `peak_mean_rh_nm` re-taken over
+    # the reweighted curve, whose lobes differ from the intensity curve's).
+    peak_mean_rh_nm: float = float('nan')
+    # The display label of `optical_model` (OPTICAL_MODEL_LABELS), '' for the intensity
+    # pass-through: the name the model-dependence qualifier prints.
+    optical_model_label: str = ''
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +305,19 @@ def sphere_validity(
     /I1 reweighting spikes on noise). ``m`` is REQUIRED (the Mie arithmetic uses it). The
     cheaper-limit overlap is surfaced as an informational note, not a refusal.
 
+    Inputs not prescribed by the source: ``mie_p_min`` (default ``DEFAULT_MIE_P_MIN`` =
+    0.01; no source prints a reweighting floor), the values of ``rdg_m1_max`` and
+    ``rdg_2xm1_max`` (0.1 each, this program's reading of the "<< 1" Bohren & Huffman 1983
+    print, p. 159), and stopping the RDG inversion at ``rdg_qr_max`` (default
+    ``SPHERE_FIRST_MINIMUM_QR``, the sphere amplitude's first zero, a mathematical value;
+    gating there is the program's choice); prescribed: the RDG conditions as conditions
+    (Bohren & Huffman 1983 Eqs. 6.2 and 6.3). ``rayleigh_x_max`` (0.1) is this program's
+    reading of the small-particle condition the same book states on p. 136, x much less than
+    1 and |m|x much less than 1 (its chapter on particles small compared with the wavelength
+    opens on p. 130), at the top of the range of the comparison against the exact theory the
+    book reports on that page from Kerker et al. (1978), x from 0.01 to 0.11 (both pages read
+    2026-10-16). Not yet read against a source: the value of ``mie_x_max`` (100).
+
     Raises OpticalModelError for a non-sphere model, or RDG/Mie without ``m``.
     """
     r = np.asarray(r_nm, dtype=float)
@@ -378,6 +404,13 @@ def reweight_distribution(
         them (no silent R^6 -- the flag is the honesty). 'refuse': raise OpticalModelError if
         any bin is out of range. A non-spherical model is refused under BOTH.
 
+    Inputs not prescribed by the source: ``mie_p_min`` (default ``DEFAULT_MIE_P_MIN`` =
+    0.01; no source prints a reweighting floor), the RDG cutoffs' values and the stop at
+    ``rdg_qr_max`` as `sphere_validity` states them, and the out-of-range bins zeroed before
+    the weights are normalised; prescribed: the RDG conditions `sphere_validity` applies, as
+    conditions (Bohren & Huffman 1983 Eqs. 6.2 and 6.3). Not yet read against a source: the
+    values of ``rayleigh_x_max`` and ``mie_x_max``.
+
     Returns
     -------
     WeightedDistributionResult  (report-only; carries no +/-)
@@ -459,7 +492,7 @@ def reweight_distribution(
     out = np.where(valid, out, 0.0)
     weights = _normalise(out)
 
-    note_lines = _model_note(weighting, model, m, valid)
+    note_lines = _model_note(model, m, valid)
     return _assemble(
         distribution, weighting, model, m, rh, weights, valid, n_solute,
         n_medium, wavelength_nm, q_m, note_lines=note_lines)
@@ -476,31 +509,24 @@ def _normalise(w: np.ndarray) -> np.ndarray:
     return w / total if (math.isfinite(total) and total > 0) else w
 
 
-def _model_note(weighting: str, model: Optional[str], m: Optional[float],
-                valid: np.ndarray) -> List[str]:
-    """The one neutral model-dependence note + a validity line when bins are out of range
-    (+ an informational Mie->RDG overlap line when the contrast is within the RDG limit)."""
-    label = WEIGHTING_LABELS[weighting]
-    model_label = OPTICAL_MODEL_LABELS.get(model, model) if model else 'intensity'
-    m_txt = f", m = {m:.4g}" if m is not None else ""
-    lines = [
-        f"{label} weighting is a derived, model-dependent view ({model_label}"
-        f"{m_txt}), not a measurement; it re-weights the same intensity fit and amplifies "
-        f"small-size noise."
-    ]
+def _model_note(model: Optional[str], m: Optional[float],
+                valid: np.ndarray) -> List[Note]:
+    """The notes of a reweighted view: the out-of-range bins when there are any (+ a record
+    of the Mie->RDG overlap when the contrast is within the RDG limit). The view's
+    model-dependence is a qualifier, read off the result's typed fields."""
+    # `model` is a sphere key here: the caller refused None and `sphere_validity` any other.
+    model_label = OPTICAL_MODEL_LABELS[model]
+    notes = []
     n_bad = int((~valid).sum())
     if n_bad:
-        lines.append(
-            f"{n_bad} of {valid.size} size bins fall outside the {model_label} model's "
-            f"validity range and are flagged; treat them as unreliable.")
+        notes.append(Note('bins_outside_model', ('weights',),
+                          {'n_bad': n_bad, 'n': int(valid.size), 'model': model_label}))
     # Informational (not a refusal): Mie is the general case, but where the contrast is low
-    # enough the cheaper RDG limit agrees -- tell the user they need not pay for Mie there.
+    # enough the cheaper RDG limit agrees.
     if model == MIE and m is not None and abs(m - 1.0) <= DEFAULT_MIE_HANDBACK_M1:
-        lines.append(
-            f"This system's contrast is low (|m-1| = {abs(m - 1.0):.3g} <= "
-            f"{DEFAULT_MIE_HANDBACK_M1:g}); the cheaper RDG sphere model agrees with Mie in "
-            "this range for small-to-moderate particles.")
-    return lines
+        notes.append(Note('mie_low_contrast', (),
+                          {'m1': float(abs(m - 1.0)), 'limit': float(DEFAULT_MIE_HANDBACK_M1)}))
+    return notes
 
 
 def _assemble(distribution, weighting, model, m, rh, weights, valid, n_solute,
@@ -510,17 +536,20 @@ def _assemble(distribution, weighting, model, m, rh, weights, valid, n_solute,
     if math.isfinite(total) and total > 0 and rh.size:
         mean_rh = float(np.sum(weights * rh))
         peak_rh = float(rh[int(np.argmax(weights))])
+        peak_mean_rh = peak_lobe_geometric_mean_nm(rh, weights)
     else:
-        mean_rh = peak_rh = float('nan')
+        mean_rh = peak_rh = peak_mean_rh = float('nan')
     return WeightedDistributionResult(
         source_method=distribution.method, weighting=weighting, optical_model=model,
         assumed_shape='sphere', m=m, rh_grid_nm=rh, weights=weights,
         valid_mask=np.asarray(valid, dtype=bool),
-        mean_rh_nm=mean_rh, peak_rh_nm=peak_rh,
+        mean_rh_nm=mean_rh, peak_rh_nm=peak_rh, peak_mean_rh_nm=peak_mean_rh,
         all_valid=bool(np.all(valid)), n_invalid_bins=int(np.sum(~np.asarray(valid, bool))),
         n_solute=n_solute, n_medium=n_medium, wavelength_nm=wavelength_nm, q_m_inv=q_m,
         notes=tuple(note_lines),
-        source_success=getattr(distribution, 'success', True))
+        source_success=getattr(distribution, 'success', True),
+        optical_model_label=(OPTICAL_MODEL_LABELS.get(model, model)
+                             if model and weighting != INTENSITY else ''))
 
 
 # ---------------------------------------------------------------------------
@@ -531,10 +560,15 @@ def _assemble(distribution, weighting, model, m, rh, weights, valid, n_solute,
 class WeightedPeak:
     """One resolved population in a reweighted distribution. ``weight_fraction`` is the
     fraction under that peak's lobe IN THE CHOSEN WEIGHTING (number/volume/surface), not an
-    intensity fraction."""
+    intensity fraction. ``mean_rh_nm`` is the peak's position, the lobe's geometric mean
+    over the reweighted weights (`lobe_geometric_mean`, the intensity peak's own
+    computation); ``rh_nm`` the node with the most weight. NaN and 0 when the producing
+    path predates them (additive fields, defaulted)."""
     rh_nm: float
     weight_fraction: float
     is_dominant: bool
+    mean_rh_nm: float = float('nan')
+    n_weighted_nodes: int = 0
 
 
 def find_weighted_peaks(result: WeightedDistributionResult,
@@ -544,12 +578,16 @@ def find_weighted_peaks(result: WeightedDistributionResult,
     fit did not converge has no peaks, same refusal as find_distribution_peaks."""
     if getattr(result, 'source_success', True) is False:
         return []
-    scanned, rh, _w = scan_distribution_peaks(
+    scanned, rh, w = scan_distribution_peaks(
         result.rh_grid_nm, result.weights, min_weight_fraction)
     if not scanned:
         return []
-    peaks = [WeightedPeak(rh_nm=float(rh[i]), weight_fraction=frac, is_dominant=False)
-             for i, frac, _lo, _hi in scanned]
+    peaks = []
+    for i, frac, lo, hi in scanned:
+        mean = lobe_geometric_mean(rh, w, lo, hi)
+        peaks.append(WeightedPeak(rh_nm=float(rh[i]), weight_fraction=frac,
+                                  is_dominant=False, mean_rh_nm=mean.rh_nm,
+                                  n_weighted_nodes=mean.n_weighted_nodes))
     dominant = max(range(len(peaks)), key=lambda j: peaks[j].weight_fraction)
     peaks[dominant].is_dominant = True
     return peaks

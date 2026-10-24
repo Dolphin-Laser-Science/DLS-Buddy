@@ -15,10 +15,13 @@ Built in passes:
   Pass 3: full Zimm and Berry double extrapolation (Mw, Rg, A2), and the
           calibration-free A2 method.
 
-The basic SLS equation (Zimm; Brookhaven BIZPW manual Eq. 3; Takahashi et al.
-2019 Eq. 4):
+The basic SLS equation, the first-order Zimm equation (Russo et al. 2021, Eq. 13.3,
+p. 501; its origin is Zimm 1948):
 
     K c / dR(theta, c) = (1 / Mw) [1 + q^2 Rg^2 / 3] + 2 A2 c + ...
+
+the small-q form of the general Kc/dR = 1/(Mw P(q)) + 2 A2 c with
+P(q) = 1 - q^2 Rg^2/3 + ... (Chu 1991, Eq. 2.1.8, p. 18).
 
 with the optical constant (VV / vertical polarization, the factor-4 form)
 
@@ -66,14 +69,23 @@ IMPORTANT calibration conventions (enforced here)
   No instrument's stored Rayleigh ratio is trusted as the absolute reference.
 - The (n_solvent / n_standard)^2 refractive-index correction is applied whenever
   the solvent and standard refractive indices differ. It is mandatory.
-- Dark-count subtraction is applied to every intensity; the sin(theta) volume
-  correction applies to the calibration-constant route by default.
+- The dark count is taken off the sample, the solvent reference and the calibrant
+  alike. With a measured blank it cancels in the excess and survives only in k_c,
+  hence in Mw and absolute A2; when no blank was measured it survives in the excess
+  as well (`compute_excess_rayleigh_ratio`, "Where the dark count survives"). The
+  sin(theta) volume correction is always applied, paired with the 1/sin(theta_cal)
+  inside k_c.
 
 References (in project knowledge)
 ---------------------------------
+  Russo et al. 2021, Ch. 13, Eq. 13.3 (p. 501) and Chu 1991, Eq. 2.1.8 (p. 18): the
+      Zimm equation, its origin Zimm 1948 (J. Chem. Phys. 16, 1093 and 1099)
+  Berry 1966, p. 4552, and Podzimek 2011, Eqs. 2.28, 4.11, 4.13: the Berry construction
+      (see zimm_analysis)
   Brookhaven BI-200SM manual, Section VIII (Rayleigh ratios / calibration)
-  Brookhaven BIZPW (Zimm Plot) and Particle Explorer manuals (Zimm equation)
-  Takahashi et al. 2019, Anal. Sci. 35, 1045 (Rayleigh ratio, Zimm/Berry)
+  Brookhaven BIZPW (Zimm Plot) and Particle Explorer manuals: the vendor's Zimm-plot
+      and export software, instrument references only -- never a method's source
+  Takahashi et al. 2019, Anal. Sci. 35, 1045 (Rayleigh ratio)
   Seery et al. 1989 (sin(theta) volume correction, as prose, p. 1198)
   Kerker 1969 / Schaertl 2007 (angle-independent isotropic scattering)
   Sivokhin & Kazantsev 2021 (toluene Rayleigh ratio; via constants.py)
@@ -98,13 +110,14 @@ from __future__ import annotations
 
 import math
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import least_squares
 
 from core.data_models import SLSMeasurement
+from core.notes import Note, render
 from analysis import uncertainty as unc
 from analysis import form_factor as ff
 from physics.constants import (
@@ -115,30 +128,152 @@ from physics.constants import (
 
 
 # ---------------------------------------------------------------------------
-# Numerical-health note (shared wording for the ill-conditioned-fit reliability flag)
+# Notes shared by the SLS fits (the model and its codes: core/notes.py, core/note_registry.py)
 # ---------------------------------------------------------------------------
 
-def _ill_conditioned_note(cond: float) -> str:
-    """Reliability note for a degenerate extrapolation design (see uncertainty.COND_LIMIT).
+def _ill_conditioned_note(cond: float, limit: float, about: Tuple[str, ...]) -> Note:
+    """The precondition note of a degenerate linear extrapolation design (see
+    uncertainty.COND_LIMIT).
 
-    A calibrated fit whose design X is near-singular (clustered angles, two near-equal
+    A fit whose design X is near-singular (clustered angles, two near-equal
     concentrations, or an extreme intensity scale) yields a numerically unreliable
-    1/coefficient Mw/A2 even though the value is finite. This note rides on the result
-    (and into the export Comments cell + a GUI qualifier) so the "why" travels with the
-    suppressed reliability flag — distinct from the uncalibrated arbitrary-scale note.
+    1/coefficient Mw/A2, and a fragile coefficient-ratio Rg, even though each value is
+    finite. `about` names the values of the carrying result that rest on the design.
     """
-    return (f"ill-conditioned fit design (cond={cond:.1e}); Mw/A2 numerically "
-            "unreliable — add concentrations/angles or widen their spread")
+    return Note('ill_conditioned', about, {'cond': float(cond), 'limit': float(limit)})
 
 
-def _non_positive_intercept_note(product: str) -> str:
-    """One wording for the two fits whose 2 A2 Mw = slope/intercept shares the
+def _non_positive_intercept_note(intercept: float, about: Tuple[str, ...]) -> Note:
+    """The precondition note of the two fits whose 2 A2 Mw = slope/intercept shares the
     intercept's sign precondition with Mw = 1/intercept: a non-positive fitted
     intercept means the line the data describe has no physical Mw, so the product
-    built on it is undefined too -- flagged, never withheld."""
-    return (f"non-positive fitted intercept: the line the data describe has 1/Mw <= 0, "
-            f"so {product} = slope/intercept is undefined (an over-corrected blank, or a "
-            f"ladder the linear model does not describe)")
+    built on it is undefined too. The product is flagged and still reported (a zero
+    intercept excepted); the apparent Mw beside it is NaN'd, since a negative or infinite
+    reciprocal is not a molar mass (the single-angle ladder's `mw_app` branch)."""
+    return Note('intercept_nonpositive', about,
+                {'quantity': 'intercept', 'value': float(intercept), 'limit': 0.0})
+
+
+def _no_rg_note(about: Tuple[str, ...], quantity: str, value: float, unit: str,
+                required: str) -> Note:
+    """The precondition note of a fit that extracts no Rg: the quantity the size is read
+    from, its value and the sign the size needs. One code for every linear arm (Debye,
+    Guinier, Zimm/Berry and the mode-resolved amplitude Guinier)."""
+    return Note('no_rg', about, {'quantity': quantity, 'value': float(value),
+                                 'unit': unit, 'required': required})
+
+
+def _qrg_regime_note(about: Tuple[str, ...], qrg_max: float, limit: float,
+                     regime: str) -> Note:
+    """The precondition note of a fit read past its small-qRg regime: the largest fitted
+    q times Rg against the limit the verdict read, named with the regime's form. `about`
+    names what the limit judges, the size and, on the Debye and Zimm fits, the Mw."""
+    return Note('qrg_above_limit', about,
+                {'qrg': float(qrg_max), 'limit': float(limit), 'regime': regime})
+
+
+def scale_notes(rayleigh_result, *, mw: Tuple[str, ...] = (), a2: Tuple[str, ...] = (),
+                scale_free: Tuple[str, ...] = (),
+                excess: Tuple[str, ...] = ()) -> Tuple[Note, ...]:
+    """The scale gates of a fit built on `rayleigh_result`, as precondition notes.
+
+    `rayleigh_result` is one `RayleighRatioResult` (or a stand-in with its fields), or the
+    list or tuple of them the fit's own flags aggregate over (the same set, so a note and
+    the flag it explains are read off one input): `uncalibrated` when any lacks an
+    established absolute scale for want of a calibration constant, `no_standard_index`
+    when any applied one with the standard's refractive index blank, so the (n_s/n_cal)^2
+    step could not be formed (`standard_index_known`), `no_dn_dc` when any lacks a usable
+    dn/dc, `blank_unmeasured` when any lacks a measured solvent blank.
+
+    The two scale gates are about the fit's scale-bearing attributes, `mw` and `a2`, and
+    are not minted when it names none (an estimator both scales cancel in). The blank is
+    additive, so it is also about `scale_free`: the sizes and products the two scales
+    cancel in and the blank does not (RayleighRatioResult's docstring is the ruling's home).
+    `excess` names attributes on the Rayleigh-ratio scale alone, which the calibration and
+    the blank reach and dn/dc does not (dn/dc enters K, not dR): the excess Rayleigh ratio
+    itself, on the series `compute_excess_rayleigh_ratio` returns.
+    """
+    results = (list(rayleigh_result) if isinstance(rayleigh_result, (list, tuple))
+               else [rayleigh_result])
+    scaled = tuple(mw) + tuple(a2)
+    calibration = scaled + tuple(excess)
+    out = []
+    # The calibration's cause, read off the flag the fits' verdicts read, so neither note can
+    # stand beside a `calibrated` that is True: no k_c, or k_c with the index blank.
+    lacking = [r for r in results if not bool(getattr(r, 'calibrated', True))]
+    if calibration and any(bool(getattr(r, 'standard_index_known', True)) for r in lacking):
+        out.append(Note('uncalibrated', calibration))
+    if calibration and not all(bool(getattr(r, 'standard_index_known', True)) for r in lacking):
+        out.append(Note('no_standard_index', calibration))
+    if scaled and not all(bool(getattr(r, 'dn_dc_supplied', True)) for r in results):
+        out.append(Note('no_dn_dc', scaled))
+    if not all(bool(getattr(r, 'blank_measured', True)) for r in results):
+        out.append(Note('blank_unmeasured', calibration + tuple(scale_free)))
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class ModePointCounts:
+    """One mode's counts over the points its partitioned share was built on
+    (`mode_partition.partition_rayleigh`): how many were undecayed in their lag window, how
+    many below their amplitude floor, and at how many it shares one decomposition with an
+    undecayed mode. A mode's fraction is its share of the decomposition at its angle, so an
+    undecayed mode's extrapolated amplitude sits in every fraction's denominator there (the
+    per-angle rule); its own points count as undecayed, a decayed neighbour's as spoiled.
+
+    The grid end follows the same rule (a recommendation the owner accepted, 2026-10-17;
+    this docstring is its home): a mode whose lobe has its maximum on the Rh grid's first or last node stands
+    for a population the grid does not contain, so its own points count as `grid_end` and
+    a neighbour's that are not at the grid's end, at the angles they share one
+    decomposition with it, as `grid_end_spoiled`. The two rules are independent: a point
+    both undecayed and at the grid's end counts under each, and a neighbour of both kinds
+    of mode counts under both spoilers."""
+    label: str
+    points: int
+    undecayed: int = 0
+    low_amplitude: int = 0
+    spoiled: int = 0
+    grid_end: int = 0
+    grid_end_spoiled: int = 0
+
+
+def mode_point_notes(sources, *, about: Tuple[str, ...]) -> Tuple[Note, ...]:
+    """The per-mode preconditions of a fit built on partitioned series, as notes about
+    `about`, the fit's values on that mode's share.
+
+    `sources` is one `RayleighRatioResult` (its `mode_counts`), one `ModePointCounts`, or
+    a list or tuple of either, every series the fit consumed; the counts are summed over
+    them. A fitter folds `not notes` into each verdict the notes' registry rows fail, from
+    this one computation. `()` on a series that is no mode's share."""
+    items = list(sources) if isinstance(sources, (list, tuple)) else [sources]
+    counts = [c for c in (s if isinstance(s, ModePointCounts)
+                          else getattr(s, 'mode_counts', None) for s in items)
+              if c is not None]
+    if not counts:
+        return ()
+    label = counts[0].label
+    total = int(sum(c.points for c in counts))
+    undecayed = int(sum(c.undecayed for c in counts))
+    low = int(sum(c.low_amplitude for c in counts))
+    spoiled = int(sum(c.spoiled for c in counts))
+    at_end = int(sum(c.grid_end for c in counts))
+    end_spoiled = int(sum(c.grid_end_spoiled for c in counts))
+    out = []
+    if undecayed:
+        out.append(Note('points_undecayed_used', about,
+                        {'label': label, 'n': undecayed, 'total': total}))
+    if spoiled:
+        out.append(Note('partition_angle_spoiled', about, {'n': spoiled, 'total': total}))
+    if at_end:
+        out.append(Note('points_grid_end_used', about,
+                        {'label': label, 'n': at_end, 'total': total}))
+    if end_spoiled:
+        out.append(Note('partition_angle_grid_end', about,
+                        {'n': end_spoiled, 'total': total}))
+    if low:
+        out.append(Note('points_low_amplitude_used', about,
+                        {'label': label, 'n': low, 'total': total}))
+    return tuple(out)
 
 
 def _ordinate_scale(y: np.ndarray) -> float:
@@ -199,8 +334,8 @@ class RayleighRatioResult:
       no calibration constant was available (dR on an arbitrary scale), OR the
       calibration standard's refractive index was blank, so the mandatory
       (n_s/n_cal)^2 correction could not be applied and dR is off by that unknown
-      factor. `calibration_note` says which; `k_c_used` records the constant that
-      WAS applied (1.0 only in the first case).
+      factor. `standard_index_known` says which, typed; `calibration_detail` says it in
+      words; `k_c_used` records the constant that WAS applied (1.0 only in the first case).
     * `dn_dc_supplied` -- False when the sample carried no refractive-index
       increment, so K was set to 1 and the Kc/dR ORDINATE is on an arbitrary
       optical scale. dR is unaffected: dn/dc enters K, not the Rayleigh ratio.
@@ -261,7 +396,10 @@ class RayleighRatioResult:
     ri_correction: float               # (n_solvent / n_standard)^2 (1.0 if skipped)
     dark_count_subtracted: float
     sin_theta_applied: bool
-    calibration_note: str = ''
+    # Which scale absence `calibrated` / `dn_dc_supplied` record, in words, for a reader of
+    # this object: provenance, not a note. The fits built on this result state each absence
+    # as a precondition note of their own (`scale_notes`).
+    calibration_detail: str = ''
     # The `calibrated` sibling for the OPTICAL scale: False -> no dn/dc was supplied, so
     # K = 1 and the Kc/dR ordinate is on an arbitrary optical scale. Independent of
     # `calibrated` (which is about dR, and dn/dc does not enter dR). It sits down here
@@ -290,6 +428,25 @@ class RayleighRatioResult:
     # the class docstring. Defaulted True, so a direct engine caller that says nothing
     # keeps today's behaviour (`dn_dc_supplied`'s not-a-verdict direction).
     blank_measured: bool = True
+    # True on a per-mode clone the Sedlák partition builds (`mode_partition.partition_rayleigh`):
+    # dR is then one mode's share of the excess intensity, and every fit built on it carries
+    # the flag forward so the mode-resolved values are named as such (invariant 7).
+    mode_resolved: bool = False
+    # False when a calibration constant was applied with the calibration standard's
+    # refractive index blank, so `calibrated` is False for that cause alone (the scale gates
+    # name it `no_standard_index`). True otherwise, an absent k_c included: the index
+    # corrects a calibration, so without one the scale is arbitrary whatever the index is.
+    standard_index_known: bool = True
+    # On a per-mode clone (`mode_partition.partition_rayleigh`): that mode's counts over
+    # the points its share was built on; None on any other series. A fit that reads them
+    # names and folds them through `mode_point_notes`.
+    mode_counts: Optional[ModePointCounts] = None
+    # The three gates above as precondition notes (`scale_notes`), for a surface that shows
+    # this series itself: no calibration and an unmeasured blank are about dR and the
+    # ordinate, no usable dn/dc about the ordinate alone. Minted by
+    # `compute_excess_rayleigh_ratio` from the flags they restate; a clone (`replace` of
+    # its arrays) keeps both. The fits built on this series mint their own.
+    notes: Tuple[Note, ...] = ()
 
 
 # ===========================================================================
@@ -375,7 +532,8 @@ def compute_excess_rayleigh_ratio(
     """Convert raw intensities to an excess Rayleigh ratio dR(theta).
 
     One unified pipeline for all data sources:
-      1. dark-count subtraction:   I_net = I_raw - dark
+      1. dark-count subtraction:   I_net = I_raw - dark    (sample and solvent alike;
+                                                            see below)
       2. solvent subtraction:      I_excess = I_net,sample - I_net,solvent
       3. volume correction:        x sin(theta)            (always; see below)
       4. absorbance correction:    / transmittance         (if transmittance given;
@@ -386,6 +544,20 @@ def compute_excess_rayleigh_ratio(
     The calibration constant k_c is the single unifying quantity. Compute it from
     a calibrant measurement with `compute_calibration_constant`, or pass a value
     you determined independently. A vendor-stored constant is NEVER used here.
+
+    Where the dark count survives
+    -----------------------------
+    Step 1 takes the same scalar d off the sample and the solvent reference, so against
+    a MEASURED blank it cancels in step 2 and I_excess does not depend on it. It
+    survives only in k_c = R_std / ((I_cal - d) sin(theta_cal)), when k_c was computed
+    with it (`compute_calibration_constant`): a constant scale on dR, so it moves Mw and
+    absolute A2 and leaves Rg, the form-factor sizes and 2 A2 Mw as they are. When no
+    blank was measured it survives in the excess as well, because the reference is
+    built from it. A typed 90 deg blank is d + (I90 - d) / sin(theta)
+    (`app.controller.Controller._typed_blank_for`), which leaves d (1 - sin(theta)) in
+    I_excess sin(theta); with no blank at all the reference is d at every angle, so the
+    sample alone loses it, leaving -d sin(theta). Both terms are angle-dependent, so
+    there d moves the angular shape of dR, and Rg with it, not only its scale.
 
     An absent dn/dc, and why K = 1 rather than a refusal
     ---------------------------------------------------
@@ -459,9 +631,11 @@ def compute_excess_rayleigh_ratio(
         required physical input fails the precondition; the value is still computed
         and reported, never withheld). Before 2026-08-26 this absence only wrote the
         note, and every downstream Mw/A2 still read reliable (+26 % measured for
-        water against a toluene standard).
+        water against a toluene standard). With k_c applied, `standard_index_known`
+        records that the index was the cause, and the scale gates name it.
     dark_count_rate : float
-        Subtracted from sample and solvent intensities. Default 0.
+        Taken off the sample and the solvent reference alike (step 1), so it cancels
+        against a measured blank; see "Where the dark count survives". Default 0.
     transmittance : sequence of float, optional
         Per-angle ROUND-TRIP internal transmittance for absorbing samples: the fraction
         of light surviving the incident path into the scattering volume TIMES the
@@ -627,7 +801,7 @@ def compute_excess_rayleigh_ratio(
         for a in angles
     ], dtype=float)
 
-    return RayleighRatioResult(
+    result = RayleighRatioResult(
         concentration_g_per_mL=c,
         temperature_K=sample.temperature_K,
         wavelength_nm=sample.wavelength_nm,
@@ -645,14 +819,19 @@ def compute_excess_rayleigh_ratio(
         ri_correction=ri_corr,
         dark_count_subtracted=float(dark_count_rate),
         sin_theta_applied=sin_applied,
-        calibration_note=note,
+        calibration_detail=note,
         derived_provenance=str(derived_provenance or ''),
         blank_provenance=str(blank_provenance or ''),
         # Copied through, never read here: this function's arithmetic is identical
         # whichever way the blank was obtained, which is the point -- a typed blank
         # arrives as an ordinary SLSMeasurement and the pipeline gains no branch.
         blank_measured=bool(blank_measured),
+        standard_index_known=not (calibration_constant is not None
+                                  and standard_refractive_index is None),
     )
+    # The ordinate Kc/dR carries both scales, as an Mw does; dR the calibration alone.
+    return replace(result, notes=scale_notes(result, mw=('kc_over_dR_mol_per_g',),
+                                             excess=('excess_rayleigh_cm_inv',)))
 
 
 # ===========================================================================
@@ -664,6 +843,16 @@ def compute_excess_rayleigh_ratio(
 # apparent Mw is never mistaken for the thermodynamic Mw.
 
 
+# The largest q*Rg at which a small-qRg angular expansion is read as holding: the default of
+# every qRg regime verdict in the SLS family, one default for one physics condition (rule 10;
+# `tests/test_sls.py::test_the_qrg_verdicts_and_the_setting_share_one_default` pins its
+# readers, and the controller seeds each call per run from `settings.guinier_qrg_max`, pinned
+# by `tests/test_workspace.py::test_every_controller_qrg_verdict_call_is_seeded_from_the_setting`).
+# The figure the cited source prints for the initial-slope Rg and for Guinier's law alike:
+# qRg < 1 (Theory-and-Equations-Guide §4.4, §4.6). A general criterion (invariant 4).
+QRG_MAX_VALID_DEFAULT = 1.0
+
+
 @dataclass
 class DebyeResult:
     """Single-concentration Debye/Guinier analysis: Kc/dR vs q^2.
@@ -671,6 +860,9 @@ class DebyeResult:
     All quantities are APPARENT (at this finite concentration): the intercept is
     1/Mw + 2 A2 c, not 1/Mw. Rg is the apparent radius of gyration. A full Zimm or
     Berry analysis over several concentrations is needed for thermodynamic values.
+
+    `notes` holds every note of the fit as `core.notes.Note` (its precondition failures and
+    its records), as on every SLS fit result below.
     """
     concentration_g_per_mL: float
     q2_nm2: np.ndarray
@@ -692,18 +884,23 @@ class DebyeResult:
     # near-degenerate angles -> mw_reliable is suppressed (value still shown).
     well_conditioned: bool = True
     cond: float = float('nan')                # condition number of the design
-    reliability_note: str = ''                # ill-conditioned reason, if any
     # The 1/coefficient family flag for the SIZE (rule 10; the shape
     # `mode_partition.AmplitudeGuinierResult` set): Rg^2 = 3*slope/intercept divides
     # by a fitted coefficient of the SAME near-singular solve `well_conditioned` judges,
     # so a degenerate design (or no extractable size) drops this flag -- the value still
     # reports (flag, don't NaN). Scale-free: neither `calibrated` nor `dn_dc_supplied`
-    # enters it.
+    # enters it. It also carries the qRg regime below, as the Zimm Rg's does.
     rg_reliable: bool = True
-    # Passive, glyph-less notices for the GUI ⓘ tier -- today the drop of non-positive
-    # Kc/dR points (an over-subtracted solvent reference), the same text the module
-    # also emits via warnings.warn.
-    notes: tuple = ()
+    # The qRg regime of the first-order angular term (`debye_analysis`), the
+    # `ZimmBerryResult` shape: the largest fitted q times the apparent Rg, the limit it was
+    # judged against (echoed), and whether it held -- False also when no Rg was extracted.
+    # A measured qRg past the limit drops `mw_reliable` as well; no Rg does not.
+    qrg_max: float = float('nan')
+    qrg_max_valid: float = QRG_MAX_VALID_DEFAULT
+    qrg_regime_valid: bool = True
+    # Every note of the fit (preconditions and records), as Notes; the non-positive Kc/dR
+    # drop is also emitted via warnings.warn, its message the note's export clause.
+    notes: Tuple[Note, ...] = ()
     # `calibrated`'s sibling for the OPTICAL scale (see RayleighRatioResult): False ->
     # no dn/dc was supplied, so K was 1 and Mw/A2 here are on an arbitrary optical
     # scale. The angular sizes are untouched -- K multiplies the whole Kc/dR ordinate
@@ -722,6 +919,13 @@ class DebyeResult:
     # reliability verdict on this result, because an additive blank does not cancel the
     # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
     blank_measured: bool = True
+    # Carried from the Rayleigh result(s) this fit consumed: False -> k_c was applied with
+    # the standard's refractive index blank, so `calibrated` is False for that cause alone
+    # (the scale gates name it). See RayleighRatioResult.standard_index_known.
+    standard_index_known: bool = True
+    # Carried from the Rayleigh result: True when it is one mode's share of the excess
+    # intensity (RayleighRatioResult.mode_resolved), so the values here are mode-resolved.
+    mode_resolved: bool = False
 
 
 @dataclass
@@ -744,10 +948,9 @@ class SingleAngleResult:
     # divisor y = Kc/dR loses catastrophic precision in 1/y -> mw_reliable suppressed.
     well_conditioned: bool = True
     cond: float = float('nan')                # NaN: no design matrix for a single datum
-    reliability_note: str = ''                # ill-conditioned reason, if any
-    # Passive ⓘ notices, for a uniform SLS-result surface (this method has no
-    # drop/warn site of its own, so it stays empty). See DebyeResult.notes.
-    notes: tuple = ()
+    # Every note of the fit, as Notes (this method has no drop/warn site of its own, so
+    # only preconditions land here). See DebyeResult.notes.
+    notes: Tuple[Note, ...] = ()
     # `calibrated`'s sibling for the OPTICAL scale (see RayleighRatioResult): False ->
     # no dn/dc was supplied, so K was 1 and Mw/A2 here are on an arbitrary optical
     # scale. The angular sizes are untouched -- K multiplies the whole Kc/dR ordinate
@@ -766,6 +969,10 @@ class SingleAngleResult:
     # reliability verdict on this result, because an additive blank does not cancel the
     # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
     blank_measured: bool = True
+    # Carried from the Rayleigh result(s) this fit consumed: False -> k_c was applied with
+    # the standard's refractive index blank, so `calibrated` is False for that cause alone
+    # (the scale gates name it). See RayleighRatioResult.standard_index_known.
+    standard_index_known: bool = True
 
 
 @dataclass
@@ -779,11 +986,12 @@ class GuinierResult:
     slope of a log-intensity plot, so it is reliable even when the run is
     uncalibrated; only the intercept-derived Mw needs calibration.
 
-    Valid only in the Guinier regime, q*Rg <~ 1.3; `guinier_valid` flags this from
+    Valid only in the Guinier regime, q*Rg < 1 by default (`QRG_MAX_VALID_DEFAULT`);
+    `guinier_valid` flags this from
     the largest q used, against the limit echoed in `qrg_max_valid` (a per-run
     control seeded from Settings -- recorded on the result so every surface names the
     bound the verdict actually read). A False `guinier_valid` always drops `rg_reliable`
-    and names itself in `reliability_note` (invariant 4). It drops `mw_reliable` only
+    and names itself in a precondition note (invariant 4). It drops `mw_reliable` only
     when qRg was MEASURED past the limit: the other cause of a False verdict is a qRg
     that could not be measured at all (a non-negative slope, so no Rg), and an unmeasured
     qRg never exceeded the bound the intercept's precondition names -- see
@@ -811,19 +1019,18 @@ class GuinierResult:
     # near-degenerate angles -> mw_reliable is suppressed (value still shown).
     well_conditioned: bool = True
     cond: float = float('nan')                # condition number of the design
-    reliability_note: str = ''                # ill-conditioned / out-of-regime reason
     # The qRg limit `guinier_valid` was judged against -- echoed, as its sibling
     # `mode_partition.AmplitudeGuinierResult.qrg_max_valid` is, so a display can never
     # print a bound other than the one the predicate read (Settings seed it; the
     # default here matches `guinier_analysis`'s).
-    qrg_max_valid: float = 1.3
+    qrg_max_valid: float = QRG_MAX_VALID_DEFAULT
     # The SIZE's own flag (rule 10; see DebyeResult.rg_reliable): False on a degenerate
     # design, no extractable size, or a fit outside the Guinier regime -- the precondition
     # `guinier_valid` reports. Scale-free.
     rg_reliable: bool = True
-    # Passive ⓘ notices -- today the drop of angles whose excess Rayleigh ratio is not
-    # positive (ln(dR) needs dR > 0). See DebyeResult.notes.
-    notes: tuple = ()
+    # Every note of the fit, as Notes -- the drop of angles whose excess Rayleigh ratio is
+    # not positive (ln(dR) needs dR > 0) among them. See DebyeResult.notes.
+    notes: Tuple[Note, ...] = ()
     # `calibrated`'s sibling for the OPTICAL scale (see RayleighRatioResult): False ->
     # no dn/dc was supplied, so K was 1 and Mw/A2 here are on an arbitrary optical
     # scale. The angular sizes are untouched -- K multiplies the whole Kc/dR ordinate
@@ -842,25 +1049,36 @@ class GuinierResult:
     # reliability verdict on this result, because an additive blank does not cancel the
     # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
     blank_measured: bool = True
+    # Carried from the Rayleigh result(s) this fit consumed: False -> k_c was applied with
+    # the standard's refractive index blank, so `calibrated` is False for that cause alone
+    # (the scale gates name it). See RayleighRatioResult.standard_index_known.
+    standard_index_known: bool = True
+    # Carried from the Rayleigh result (see DebyeResult.mode_resolved).
+    mode_resolved: bool = False
 
 
-def _nonpositive_ordinate_note(label: str, n_drop: int, ordinate: str) -> str:
-    """One wording for every linear-SLS arm that drops non-positive points.
+def _nonpositive_ordinate_note(n_drop: int, ordinate: str,
+                               about: Tuple[str, ...] = ()) -> Note:
+    """One note for every SLS arm that drops non-positive points.
 
     A negative excess Rayleigh ratio (hence a negative Kc/dR) is the ordinary
     signature of an over-subtracted solvent blank -- common at high angle in the
     low-contrast systems this program targets -- and no linear model here has a
     meaning for it: a solution cannot scatter less than its own solvent. Every arm
-    (Debye, Guinier, Zimm, Berry and the three form-factor models) drops such points
-    and says so on the
-    result's `notes` (and via warnings.warn), where before only Berry did (the
-    square root forced it) and the others fitted them silently -- Debye reported an
-    11.5x wrong apparent Mw as reliable on one measured input.
+    (Debye, Guinier, Zimm, Berry, the ladder, the calibration-free A2 and the three
+    form-factor models) drops such points and records it on the result's `notes`, and
+    via warnings.warn with the note's export clause as the message, where before only
+    Berry did (the square root forced it) and the others fitted them silently -- Debye
+    reported an 11.5x wrong apparent Mw as reliable on one measured input.
     """
-    return (f"{label} analysis dropped {n_drop} point(s) with a non-positive "
-            f"{ordinate} (noise or an over-subtracted solvent reference) before "
-            f"the fit; a solution cannot scatter less than its own solvent. If this "
-            f"removes too many points, check the solvent blank.")
+    return Note('nonpositive_points_dropped', about,
+                {'n': int(n_drop), 'ordinate': ordinate})
+
+
+def _warn_note(note: Note, stacklevel: int) -> None:
+    """Emit a note as a RuntimeWarning for a headless caller, its message the note's
+    export clause, so the warning and the note keep one source."""
+    warnings.warn(render(note, surface='export'), RuntimeWarning, stacklevel=stacklevel + 1)
 
 
 def _drop_nonpositive_ordinate(label: str, q2, c, y, notes: list):
@@ -884,20 +1102,23 @@ def _drop_nonpositive_ordinate(label: str, q2, c, y, notes: list):
             "non-positive; a solution cannot scatter less than its own solvent. "
             "Check the solvent blank."
         )
-    msg = _nonpositive_ordinate_note(label, n_drop, 'Kc/dR')
-    notes.append(msg)
-    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+    note = _nonpositive_ordinate_note(n_drop, 'Kc/ΔR')
+    notes.append(note)
+    _warn_note(note, stacklevel=4)   # through _form_factor_inputs to the entry point's caller
     return q2[good], c[good], y[good]
 
 
 def _shared_derived_provenance(rayleigh_results) -> str:
-    """The derivation provenance the whole set agrees on, or a mixed-set statement.
+    """The derivation provenance the whole set agrees on, or a mixed-set statement and
+    every distinct record.
 
-    A fit's provenance describes every point that went into it, so a specific one is
-    stated only when every contributing result carries the SAME one. Two counts are
-    needed and they answer different questions -- how many DISTINCT strings there
-    are, and how many results CARRY one -- because deduplicating collapses the
-    second.
+    A fit's provenance describes every point that went into it, so one record is stated
+    alone only when every contributing result carries the SAME one. Otherwise the set
+    says it is mixed and then names every distinct record, joined, so each derived
+    point's runs and its count-rate spread survive the pooling (the way
+    `_shared_blank_provenance` names every blank). Two counts are needed and they answer
+    different questions -- how many DISTINCT strings there are, and how many results
+    CARRY one -- because deduplicating collapses the second.
 
     Takes a SEQUENCE only. A single result reads its own field directly at the call
     site -- one input shape, so there is no type test here to mis-size (the first
@@ -913,7 +1134,7 @@ def _shared_derived_provenance(rayleigh_results) -> str:
                   if str(getattr(r, 'derived_provenance', '') or ''))
     if len(seen) == 1 and carried == len(items):
         return seen.pop()
-    return 'some points derived from DLS count rates'
+    return '; '.join(('some points derived from DLS count rates', *sorted(seen)))
 
 
 def _shared_blank_provenance(rayleigh_results) -> str:
@@ -927,17 +1148,33 @@ def _shared_blank_provenance(rayleigh_results) -> str:
 
 def debye_analysis(rayleigh_result: RayleighRatioResult,
                    estimator: str = 'hc3',
-                   cond_limit: float = unc.COND_LIMIT) -> DebyeResult:
+                   cond_limit: float = unc.COND_LIMIT,
+                   qrg_max_valid: float = QRG_MAX_VALID_DEFAULT) -> DebyeResult:
     """Single-concentration Debye plot: linear fit of Kc/dR vs q^2.
 
     Gives the apparent molecular weight (from the intercept) and apparent radius
     of gyration (from the slope-to-intercept ratio) at one concentration. Results
     are flagged apparent: the intercept is 1/Mw + 2 A2 c, not 1/Mw.
 
+    Inputs not prescribed by the source: the conditioning ceiling ``cond_limit`` (default
+    ``COND_LIMIT``, a numerical-health bound), the two-angle minimum (the line's mathematical
+    minimum), the drop of a non-positive Kc/dR (stated on ``notes``) and the weighting
+    (equal weights on every retained point); prescribed: the qRg regime ``qrg_max_valid``
+    reads (Russo et al. 2021, pp. 517-518; Takahashi et al. 2019, pp. 1045-1046).
+
     Parameters
     ----------
     rayleigh_result : RayleighRatioResult
         One concentration's calibrated data (>= 2 angles).
+    qrg_max_valid : float
+        Upper q*Rg for the first-order angular term the apparent Rg and Mw rest on, the
+        same term the Zimm plot reads (default `QRG_MAX_VALID_DEFAULT`; the controller seeds
+        it from the one Setting). Past it ``rg_reliable`` and ``mw_reliable`` drop and one
+        ``qrg_above_limit`` note about both names the failed precondition: the sources put
+        the size under qRg < 1 (Russo et al. 2021, pp. 517-518) and the molecular weight
+        too, in the Rayleigh region Rgq < 1 (Takahashi et al. 2019, p. 1045; p. 1046 places
+        the Zimm plot's M at Rgq << 1). A fit with no extractable Rg has no qRg to judge, so
+        its Mw verdict is not touched by the limit.
 
     Returns
     -------
@@ -959,9 +1196,9 @@ def debye_analysis(rayleigh_result: RayleighRatioResult,
     notes: list = []
     n_drop = int((finite & ~good).sum())
     if n_drop:
-        msg = _nonpositive_ordinate_note('Debye', n_drop, 'Kc/dR')
-        notes.append(msg)
-        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        drop = _nonpositive_ordinate_note(n_drop, 'Kc/ΔR')
+        notes.append(drop)
+        _warn_note(drop, stacklevel=2)
     q2, y = q2[good], y[good]
     if q2.size < 2:
         raise ValueError(
@@ -1002,18 +1239,44 @@ def debye_analysis(rayleigh_result: RayleighRatioResult,
     # Numerical health of the Kc/dR-vs-q^2 design: a near-degenerate angle set makes
     # 1/intercept fragile even when calibrated and intercept>0 -> suppress mw_reliable
     # and carry the reason (value still shown; Rg from the slope-ratio stays reported).
-    reasons = []
+    reasons = list(scale_notes(rayleigh_result, mw=('mw_apparent_g_per_mol',),
+                               scale_free=('rg_apparent_nm',)))
     if not fit.well_conditioned:
-        reasons.append(_ill_conditioned_note(fit.cond))
+        reasons.append(_ill_conditioned_note(
+            fit.cond, cond_limit, ('mw_apparent_g_per_mol', 'rg_apparent_nm')))
+    # The apparent Mw is withheld for its cause, the intercept, and otherwise for its own
+    # non-finite reciprocal; the no-Rg note below names the size alone.
+    if not (math.isfinite(intercept) and intercept > 0):
+        reasons.append(_non_positive_intercept_note(intercept, ('mw_apparent_g_per_mol',)))
+    elif not math.isfinite(mw_app):
+        reasons.append(Note('mw_not_finite', ('mw_apparent_g_per_mol',)))
+    partition = mode_point_notes(rayleigh_result,
+                                 about=('mw_apparent_g_per_mol', 'rg_apparent_nm'))
+    reasons += partition
     if not (math.isfinite(rg_app) and rg_app > 0):
-        # The size's own failed precondition, named (invariant 4): the slope/intercept
-        # ratio is not positive, so there is no Rg to report -- an angular dependence
-        # inside the noise, or an over-corrected blank. Mw from the intercept is
-        # untouched by it.
-        reasons.append("no extractable Rg: the Kc/dR-vs-q^2 slope-to-intercept ratio "
-                       "is not positive (the angular dependence is inside the noise, or "
-                       "the blank is over-corrected), so no size is reported")
-    note = '; '.join(reasons)
+        # The size's own failed precondition, named (invariant 4): there is no Rg to
+        # report -- the slope/intercept ratio is not positive (an angular dependence
+        # inside the noise, or an over-corrected blank), or the intercept the ratio
+        # divides by is not. Mw from the intercept is untouched by it.
+        if math.isfinite(intercept) and intercept > 0:
+            reasons.append(_no_rg_note(('rg_apparent_nm',), 'slope/intercept', ratio,
+                                       'nm²', 'positive'))
+        else:
+            reasons.append(_no_rg_note(('rg_apparent_nm',), 'intercept', intercept,
+                                       'mol/g', 'positive'))
+    # The qRg regime over the points fitted, keyed as `zimm_analysis` keys it: a NaN qRg
+    # (no Rg) is said above, and +inf falls on the flagging side (rule 12). `regime_valid`
+    # is the size's verdict, False with no Rg as well; `regime_failed` is a MEASURED qRg past
+    # the limit, the one predicate behind the note and the Mw's verdict alike, since no Rg
+    # is no failed precondition of the intercept.
+    qrg_max = (float(math.sqrt(float(np.max(q2))) * rg_app) if math.isfinite(rg_app)
+               else float('nan'))
+    regime_valid = bool(math.isfinite(qrg_max) and qrg_max <= qrg_max_valid)
+    regime_failed = (not math.isnan(qrg_max)) and not (qrg_max <= qrg_max_valid)
+    if regime_failed:
+        reasons.append(_qrg_regime_note(('rg_apparent_nm', 'mw_apparent_g_per_mol'),
+                                        qrg_max, qrg_max_valid, 'Debye'))
+    notes += reasons
     # The blank gate, read defensively like the provenance records beside it, so a
     # hand-built RayleighRatioResult from before this field existed reads as measured.
     blank_ok = bool(getattr(rayleigh_result, 'blank_measured', True))
@@ -1029,28 +1292,34 @@ def debye_analysis(rayleigh_result: RayleighRatioResult,
         derived_provenance=str(getattr(rayleigh_result, 'derived_provenance', '') or ''),
         blank_provenance=str(getattr(rayleigh_result, 'blank_provenance', '') or ''),
         blank_measured=blank_ok,
+        standard_index_known=bool(getattr(rayleigh_result, 'standard_index_known', True)),
         # intercept > 0 as well as calibrated: mw_app was already NaN'd for a
         # non-positive intercept above, so it must not read reliable either (keeps
         # the sign guard and the reliability flag consistent). well_conditioned adds
         # the numerical-degeneracy gate (invariant 4: scale-invariant, not a magnitude);
         # math.isfinite closes the float-overflow edge (consistent with Guinier/Zimm).
-        # dn_dc_supplied is the second SCALE gate beside `calibrated` -- with K = 1 the
-        # intercept 1/Mw_app is on an arbitrary optical scale. Rg is gated by neither
-        # SCALE gate: it is slope/intercept, where a multiplicative scale cancels.
+        # dn_dc_supplied is the second SCALE gate beside `calibrated` (K = 1 puts 1/Mw_app
+        # on an arbitrary optical scale); Rg, a slope/intercept ratio, takes neither. A
+        # measured qRg past the limit fails the intercept as it fails the slope.
         mw_reliable=(rayleigh_result.calibrated
                      and rayleigh_result.dn_dc_supplied and blank_ok
                      and bool(math.isfinite(intercept) and intercept > 0)
-                     and fit.well_conditioned and math.isfinite(mw_app)),
+                     and fit.well_conditioned and math.isfinite(mw_app)
+                     and not partition and not regime_failed),
         # The size shares the design's conditioning verdict (it is a ratio of the same
         # two coefficients) but neither scale gate; NaN'd sizes are not reliable. It
         # DOES take the blank gate: an absent or assumed blank is ADDITIVE, so it
         # survives the ratio the scales cancel in.
         rg_reliable=bool(math.isfinite(rg_app) and rg_app > 0
-                         and fit.well_conditioned and blank_ok),
+                         and fit.well_conditioned and blank_ok and regime_valid
+                         and not partition),
+        qrg_max=qrg_max, qrg_max_valid=float(qrg_max_valid),
+        qrg_regime_valid=regime_valid,
         mw_apparent_se=mw_se, rg_apparent_se=rg_se,
         se_estimator=estimator,
-        well_conditioned=fit.well_conditioned, cond=fit.cond, reliability_note=note,
+        well_conditioned=fit.well_conditioned, cond=fit.cond,
         notes=tuple(notes),
+        mode_resolved=bool(getattr(rayleigh_result, 'mode_resolved', False)),
     )
 
 
@@ -1103,14 +1372,16 @@ def single_angle_mw(rayleigh_result: RayleighRatioResult, angle_deg: float) -> S
     # Every not-well_cond branch carries a note (the "well_conditioned=False => note
     # present" contract the export/GUI surfacing relies on): a non-positive divisor
     # (over-subtracted solvent -> Mw undefined) vs. a subnormal divisor (finite but
-    # numerically unreliable). A healthy result has no note.
+    # numerically unreliable). A healthy result has only its scale notes, if any.
+    notes = list(scale_notes(rayleigh_result, mw=('mw_apparent_g_per_mol',)))
     if well_cond:
-        note = ''
+        pass
     elif not y_ok:
-        note = 'non-positive Kc/dR; Mw = 1/(Kc/dR) is undefined (over-subtracted solvent)'
+        notes.append(Note('kc_dr_nonpositive', ('mw_apparent_g_per_mol',),
+                          {'value': float(y), 'limit': 0.0}))
     else:
-        note = ('subnormal divisor Kc/dR; Mw = 1/(Kc/dR) is numerically unreliable '
-                '(catastrophic precision loss at an extreme intensity scale)')
+        notes.append(Note('subnormal_divisor', ('mw_apparent_g_per_mol',),
+                          {'value': float(y), 'limit': tiny}))
     return SingleAngleResult(
         concentration_g_per_mL=c, angle_deg=float(rayleigh_result.angles_deg[i]),
         q2_nm2=float(rayleigh_result.q2_nm2[i]),
@@ -1120,6 +1391,7 @@ def single_angle_mw(rayleigh_result: RayleighRatioResult, angle_deg: float) -> S
         derived_provenance=str(getattr(rayleigh_result, 'derived_provenance', '') or ''),
         blank_provenance=str(getattr(rayleigh_result, 'blank_provenance', '') or ''),
         blank_measured=bool(getattr(rayleigh_result, 'blank_measured', True)),
+        standard_index_known=bool(getattr(rayleigh_result, 'standard_index_known', True)),
         # Mw_app = dR/(K c) here, so it is the one apparent quantity that consumes dn/dc
         # DIRECTLY rather than through a ratio -- there is no angular information for a
         # scale to cancel in. Both scale gates apply, and so does the blank gate: dR at
@@ -1128,7 +1400,7 @@ def single_angle_mw(rayleigh_result: RayleighRatioResult, angle_deg: float) -> S
                      and rayleigh_result.dn_dc_supplied
                      and bool(getattr(rayleigh_result, 'blank_measured', True))
                      and well_cond),
-        well_conditioned=well_cond, reliability_note=note,
+        well_conditioned=well_cond, notes=tuple(notes),
     )
 
 
@@ -1206,9 +1478,9 @@ def single_angle_ladder(
     good = finite & (y > 0)
     n_drop = int((finite & ~good).sum())
     if n_drop:
-        msg = _nonpositive_ordinate_note('Single-angle ladder', n_drop, 'Kc/dR')
-        notes.append(msg)
-        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        drop = _nonpositive_ordinate_note(n_drop, 'Kc/ΔR')
+        notes.append(drop)
+        _warn_note(drop, stacklevel=2)
     if not good.all():
         conc, y, q2s = conc[good], y[good], q2s[good]
         sources = [src for src, keep in zip(sources, good, strict=True) if keep]
@@ -1248,12 +1520,23 @@ def single_angle_ladder(
             jac = [-slope / unc.power_or_nan(intercept, 2), 1.0 / intercept]
             two_se = unc.se_or_none(unc.propagate(jac, fit.cov))
 
-    reasons = []
+    scaled = ('mw_apparent_g_per_mol', 'a2_apparent_mol_mL_per_g2')
+    reasons = list(scale_notes(sources, mw=scaled[:1], a2=scaled[1:],
+                               scale_free=('two_a2_mw',)))
     if not fit.well_conditioned:
-        reasons.append(_ill_conditioned_note(fit.cond))
+        reasons.append(_ill_conditioned_note(fit.cond, cond_limit,
+                                             scaled + ('two_a2_mw',)))
     if not intercept_ok:
-        reasons.append(_non_positive_intercept_note('the product 2 A2 Mw'))
-    note = '; '.join(reasons)
+        reasons.append(_non_positive_intercept_note(intercept, scaled + ('two_a2_mw',)))
+    else:
+        # A value withheld past the intercept's sign: its own reciprocal or ratio overflowed.
+        if not math.isfinite(mw_app):
+            reasons.append(Note('mw_not_finite', scaled[:1]))
+        if not math.isfinite(two_a2_mw):
+            reasons.append(Note('two_a2_mw_not_finite', ('two_a2_mw',)))
+    if not math.isfinite(a2_app):
+        reasons.append(Note('a2_not_finite', scaled[1:]))
+    notes += reasons
     all_calibrated = all(bool(getattr(r, 'calibrated', True)) for r in sources)
     all_dn_dc = all(bool(getattr(r, 'dn_dc_supplied', True)) for r in sources)
     all_blank = all(bool(getattr(r, 'blank_measured', True)) for r in sources)
@@ -1268,6 +1551,8 @@ def single_angle_ladder(
         is_apparent=True, n_conc=int(conc.size),
         calibrated=all_calibrated, dn_dc_supplied=all_dn_dc,
         blank_measured=all_blank,
+        standard_index_known=all(bool(getattr(r, 'standard_index_known', True))
+                                 for r in sources),
         # Both SCALE gates (Kc/dR carries k_c through dR and K through dn/dc), the
         # blank gate, the sign guard, the design's health and finiteness -- the
         # ZimmBerryResult predicate, one angle down.
@@ -1283,7 +1568,7 @@ def single_angle_ladder(
                             and math.isfinite(two_a2_mw)),
         mw_apparent_se=mw_se, a2_apparent_se=a2_se, two_a2_mw_se=two_se,
         se_estimator=estimator,
-        well_conditioned=fit.well_conditioned, cond=fit.cond, reliability_note=note,
+        well_conditioned=fit.well_conditioned, cond=fit.cond,
         notes=tuple(notes),
         derived_provenance=_shared_derived_provenance(sources),
         blank_provenance=_shared_blank_provenance(sources),
@@ -1291,7 +1576,7 @@ def single_angle_ladder(
 
 
 def guinier_analysis(rayleigh_result: RayleighRatioResult,
-                     qrg_max_valid: float = 1.3,
+                     qrg_max_valid: float = QRG_MAX_VALID_DEFAULT,
                      estimator: str = 'hc3',
                      cond_limit: float = unc.COND_LIMIT) -> GuinierResult:
     """Single-concentration Guinier plot: linear fit of ln(dR) vs q^2.
@@ -1303,16 +1588,17 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
     used (ln requires dR > 0).
 
     The Guinier approximation is due to Guinier & Fournet (1955; originally
-    Guinier 1939); see Chu (1991) and Russo et al. (2021, Ch. 13) for accessible
-    derivations of the plot.
+    Guinier 1939); Russo et al. (2021, Ch. 13, Guinier's law, Eq. 13.41) derive the
+    plot, and Chu (1991, p. 18) prints the small-q expansion P = 1 - q^2 Rg^2/3 + ...
+    it rests on, not the plot.
 
     Parameters
     ----------
     rayleigh_result : RayleighRatioResult
         One concentration's data (>= 2 angles with dR > 0).
     qrg_max_valid : float
-        Upper q*Rg for the Guinier approximation (default 1.3, a general
-        criterion, not system-specific). `guinier_valid` reflects this.
+        Upper q*Rg for the Guinier approximation (default `QRG_MAX_VALID_DEFAULT`, a
+        general criterion, not system-specific). `guinier_valid` reflects this.
 
     Returns
     -------
@@ -1333,10 +1619,9 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
     notes: list = []
     n_drop = int((finite & ~good).sum())
     if n_drop:
-        msg = _nonpositive_ordinate_note('Guinier', n_drop,
-                                         'excess Rayleigh ratio (ln(dR) needs dR > 0)')
-        notes.append(msg)
-        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        drop = _nonpositive_ordinate_note(n_drop, 'excess Rayleigh ratio')
+        notes.append(drop)
+        _warn_note(drop, stacklevel=2)
     q2g, qg, dRg = q2[good], q[good], dR[good]
     if q2g.size < 2:
         raise ValueError(
@@ -1352,22 +1637,11 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
     # Rg from the slope: slope = -Rg^2/3  (q^2 in nm^-2 -> Rg in nm).
     rg = math.sqrt(-3.0 * slope) if slope < 0 else float('nan')
 
-    # A RISING profile is noted, never flagged (owner ruling, 2026-08-28). No SLS Mw
-    # verdict in this module gates on the slope -- Debye, Zimm/Berry and the form-factor
-    # fits all ask about the INTERCEPT (finite, positive, well-conditioned design) -- so
-    # flagging here would make Guinier the only one answering a question about the trend.
-    # But a rise is not nothing: the q->0 intercept is then an extrapolation AGAINST the
-    # data's direction, which biases Mw low, and both causes are ordinary. So it travels
-    # on the passive `notes` channel the panel already renders for every method, the same
-    # allow-but-warn shape the single-point-level substitution note uses below.
-    if math.isfinite(slope) and slope > 0:
-        notes.append(
-            "the ln(dR)-vs-q^2 fit RISES with q^2 (slope = "
-            f"{slope:+.3g} nm^2), so the q->0 intercept extrapolates against the trend "
-            "and the Mw read from it is likely UNDERESTIMATED. Two ordinary causes: "
-            "interparticle interference, whose structure factor is suppressed as q -> 0 "
-            "(concentrated or charged systems), and an over-corrected solvent blank. No "
-            "size is reported either way -- Rg needs a negative slope.")
+    # A RISING profile flags no Mw (owner ruling, 2026-08-28): no SLS Mw verdict in this
+    # module gates on the slope -- Debye, Zimm/Berry and the form-factor fits all ask
+    # about the INTERCEPT -- so flagging here would make Guinier the only one answering a
+    # question about the trend. Its one note is the no-Rg precondition below, which
+    # carries the slope's signed value (a rise and a flat profile read the same predicate).
 
     # Apparent Mw from the intercept: dR(0) = exp(intercept) = K c Mw. Use np.exp, which
     # SATURATES to +inf for a large intercept (>~709.78), where math.exp would raise a
@@ -1400,26 +1674,23 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
     # for the whole line (slope AND intercept), so it names itself here and gates BOTH
     # flags below -- one wording, read by the SLS tab, the export and the Cross-Sample
     # candidate label alike. Joined with the conditioning note when both fire.
-    reasons = []
+    reasons = list(scale_notes(rayleigh_result, mw=('mw_apparent_g_per_mol',),
+                               scale_free=('rg_nm',)))
     if not fit.well_conditioned:
-        reasons.append(_ill_conditioned_note(fit.cond))
+        reasons.append(_ill_conditioned_note(fit.cond, cond_limit,
+                                             ('mw_apparent_g_per_mol', 'rg_nm')))
     if math.isfinite(qrg_max) and not valid:
-        reasons.append(
-            f"outside the Guinier regime: qRg(max) = {qrg_max:.3g} > {qrg_max_valid:g} "
-            f"(the validity limit), so the small-qRg approximation is strained at the "
-            f"high angles -- treat Rg and the intercept Mw with caution (Berry/Zimm "
-            f"linearize the high-qRg regime better)")
+        # Its own code, the Guinier limit: past it this fit's intercept Mw fails too, as
+        # the Debye and Zimm intercepts fail past theirs (`qrg_above_limit`).
+        reasons.append(Note('qrg_above_guinier_limit', ('rg_nm', 'mw_apparent_g_per_mol'),
+                            {'qrg': float(qrg_max), 'limit': float(qrg_max_valid)}))
     elif not math.isfinite(qrg_max):
         # `valid` is also False when no Rg could be extracted, and that cause names
-        # itself. The sentence states what the predicate READ -- a non-negative slope --
-        # never why it was exempted: the same predicate matches a measurably RISING
-        # profile too. No dated handle here: this string ships into the Guinier panel,
-        # the Origin Comments cell and the candidate label (R5.9's audience test).
-        reasons.append(
-            "no extractable Rg: the ln(dR)-vs-q^2 slope is not negative (the angular "
-            "dependence is inside the noise, the blank is over-corrected, or the profile "
-            "rises with q), so no size is reported. The intercept Mw is not flagged for "
-            "this: qRg could not be measured, so the regime limit was never exceeded")
+        # itself: the note states what the predicate READ -- a slope that is not
+        # negative -- never why, since the same predicate matches a measurably RISING
+        # profile too. The intercept Mw is not flagged for it: qRg could not be
+        # measured, so the regime limit was never exceeded.
+        reasons.append(_no_rg_note(('rg_nm',), 'slope', slope, 'nm²', 'negative'))
     # `valid` is False for two OPPOSITE reasons and only one is a failed precondition of
     # the INTERCEPT: a MEASURED qRg past the limit strains the parabola and biases it; a
     # NaN qRg means the angular dependence is unmeasurably small, the regime the form
@@ -1429,7 +1700,12 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
     # constructible here, since an infinite qRg needs a non-finite slope whose design
     # fails `well_conditioned` first).
     regime_ok_for_mw = math.isnan(qrg_max) or bool(valid)
-    note = '; '.join(reasons)
+    # exp(intercept) saturates to inf past ~709.78, which withholds the apparent Mw.
+    if not math.isfinite(mw_app):
+        reasons.append(Note('mw_not_finite', ('mw_apparent_g_per_mol',)))
+    partition = mode_point_notes(rayleigh_result, about=('mw_apparent_g_per_mol', 'rg_nm'))
+    reasons += partition
+    notes += reasons
     blank_ok = bool(getattr(rayleigh_result, 'blank_measured', True))
 
     return GuinierResult(
@@ -1442,6 +1718,7 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
         derived_provenance=str(getattr(rayleigh_result, 'derived_provenance', '') or ''),
         blank_provenance=str(getattr(rayleigh_result, 'blank_provenance', '') or ''),
         blank_measured=blank_ok,
+        standard_index_known=bool(getattr(rayleigh_result, 'standard_index_known', True)),
         # Rg here comes from the SLOPE of ln(dR) vs q^2 and never touches K at all, so it
         # is bit-identical whether or not dn/dc was supplied. Only the intercept-derived
         # Mw = exp(intercept)/(K c) rides on the optical scale -- hence the scale gates
@@ -1453,14 +1730,15 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
         mw_reliable=(rayleigh_result.calibrated and rayleigh_result.dn_dc_supplied
                      and blank_ok
                      and math.isfinite(mw_app) and fit.well_conditioned
-                     and regime_ok_for_mw),
+                     and regime_ok_for_mw and not partition),
         rg_reliable=bool(math.isfinite(rg) and rg > 0 and fit.well_conditioned
-                         and valid and blank_ok),
+                         and valid and blank_ok and not partition),
         qrg_max_valid=float(qrg_max_valid),
         rg_se=rg_se, mw_apparent_se=mw_se,
         se_estimator=estimator,
-        well_conditioned=fit.well_conditioned, cond=fit.cond, reliability_note=note,
+        well_conditioned=fit.well_conditioned, cond=fit.cond,
         notes=tuple(notes),
+        mode_resolved=bool(getattr(rayleigh_result, 'mode_resolved', False)),
     )
 
 
@@ -1468,9 +1746,10 @@ def guinier_analysis(rayleigh_result: RayleighRatioResult,
 # Pass 3: full Zimm / Berry double extrapolation + calibration-free A2
 # ===========================================================================
 #
-# Both models are linear in their parameters, so one multilinear regression on (1, q^2, c)
-# resolves Mw, Rg and A2 together -- the robust "global" fit. Model forms and inversions
-# are on `zimm_analysis`; the derivations are in the Theory-and-Equations-Guide.
+# Both models are linear in their parameters, so one multilinear regression -- on (1, q^2, c)
+# for Zimm, on (1, q^2, c, q^2 c) for Berry -- resolves Mw, Rg and A2 together, the "global"
+# fit. Model forms and inversions are on `zimm_analysis`; the derivations are in the
+# Theory-and-Equations-Guide.
 
 
 @dataclass
@@ -1480,7 +1759,8 @@ class ZimmBerryResult:
     mw_g_per_mol: float
     rg_nm: float                      # nan if the angular term is non-physical
     a2_mol_mL_per_g2: float
-    # global multilinear fit  ord = a + b q^2 + d c  (ord = Kc/dR or its sqrt)
+    # global multilinear fit  ord = a + b q^2 + d c  (ord = Kc/dR), or for Berry
+    # sqrt(Kc/dR) = a' + b' q^2 + d' c + e' q^2 c -- the cross term is `coef_q2c` below
     coef_intercept: float             # a (or a')
     coef_q2: float                    # b (or b')
     coef_c: float                     # d (or d')
@@ -1498,6 +1778,14 @@ class ZimmBerryResult:
     # per-angle c->0 intercepts
     q2_nm2: np.ndarray
     intercept_per_angle: np.ndarray           # ordinate at c -> 0, each angle
+    # Berry's fitted q^2 c cross term e', free (see `zimm_analysis`). It vanishes on both
+    # limit lines, so no reported quantity reads it. NaN for Zimm, and for a Berry fit whose
+    # grid could not resolve it (the three-column fallback, disclosed on `notes`).
+    coef_q2c: float = float('nan')
+    # `coef_q2c` as a multiple of the -b'd'/a' Berry's own equation predicts to first order:
+    # 1 on that form, -1 on a product of the two lines. Both carry the ordinate's scale, so
+    # the ratio survives an unknown one. NaN wherever `coef_q2c` is, or the prediction is 0.
+    coef_q2c_ratio: float = float('nan')
     # statistical (regression) standard errors -- exclude calibration/dn-dc
     # systematics. None when too few points to estimate them.
     mw_se: Optional[float] = None
@@ -1510,21 +1798,32 @@ class ZimmBerryResult:
     mw_from_q0_g_per_mol: Optional[float] = None
     extrapolation_agreement_rel: Optional[float] = None
     se_estimator: str = 'hc3'                 # covariance estimator behind the SEs
-    # numerical-health of the global design X = [1, q^2, c]. well_conditioned=False ->
-    # near-degenerate (clustered angles / near-equal concentrations / extreme scale) ->
+    # numerical-health of the global design X = [1, q^2, c] (Berry: [1, q^2, c, q^2 c], or
+    # the three columns after a fallback -- the design actually fitted). well_conditioned=
+    # False -> near-degenerate (clustered angles / near-equal concentrations) ->
     # mw_reliable and a2_reliable are suppressed even when calibrated (value still shown).
     well_conditioned: bool = True
     cond: float = float('nan')                # condition number of the design
-    reliability_note: str = ''                # ill-conditioned reason, if any
     # The SIZE's own flag (rule 10; see DebyeResult.rg_reliable): Rg^2 = 3b/a (6b'/a')
     # is a ratio of two coefficients of the same near-singular solve, so it shares the
-    # conditioning verdict and none of the scale gates. Value still reports.
+    # conditioning verdict and none of the scale gates. For Zimm it also carries the qRg
+    # regime below; for Berry the regime is a qualifier. Value still reports.
     rg_reliable: bool = True
-    # Passive, glyph-less notices for the GUI ⓘ tier: the drop of non-positive Kc/dR
-    # points (both methods), and a concentration or q^2 level whose grid intercept is a
-    # single ordinate rather than a fit -- the same text the module also emits via
-    # warnings.warn where it warns (kept for the headless/stderr path).
-    notes: tuple = ()
+    # The qRg regime (`zimm_analysis`): the largest fitted q times the reported Rg, the
+    # limit it was judged against (echoed, as `GuinierResult.qrg_max_valid` is), and
+    # whether it held -- False also when no Rg was extracted, as `guinier_valid` is. A Zimm
+    # fit past the limit names it in a precondition note and drops its Mw with its Rg; a
+    # Berry fit holds no limit of its own, so its verdict is True wherever qRg(max) is finite
+    # and a Berry Rg and Mw read past the Zimm limit are stated as a qualifier
+    # (`core.notes.qualifiers`, `berry_past_zimm_limit`).
+    qrg_max: float = float('nan')
+    qrg_max_valid: float = QRG_MAX_VALID_DEFAULT
+    qrg_regime_valid: bool = True
+    # Every note of the fit, as Notes: its preconditions, the drop of non-positive Kc/dR
+    # points (both methods; also emitted via warnings.warn, its message the note's export
+    # clause), and a concentration or q^2 level whose grid intercept is a single ordinate
+    # rather than a fit.
+    notes: Tuple[Note, ...] = ()
     # `calibrated`'s sibling for the OPTICAL scale (see RayleighRatioResult): False ->
     # no dn/dc was supplied, so K was 1 and Mw/A2 here are on an arbitrary optical
     # scale. The angular sizes are untouched -- K multiplies the whole Kc/dR ordinate
@@ -1543,6 +1842,13 @@ class ZimmBerryResult:
     # reliability verdict on this result, because an additive blank does not cancel the
     # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
     blank_measured: bool = True
+    # Carried from the Rayleigh result(s) this fit consumed: False -> k_c was applied with
+    # the standard's refractive index blank, so `calibrated` is False for that cause alone
+    # (the scale gates name it). See RayleighRatioResult.standard_index_known.
+    standard_index_known: bool = True
+    # Carried from the Rayleigh results: True when they are one mode's share of the excess
+    # intensity (see DebyeResult.mode_resolved).
+    mode_resolved: bool = False
 
 
 @dataclass
@@ -1550,7 +1856,8 @@ class CalibrationFreeA2Result:
     """A2 (times Mw) from intensity ratios alone -- no absolute calibration.
 
     Uses Y(c) = [I_excess(c_ref)/c_ref] / [I_excess(c)/c] at a fixed angle, which
-    is linear in c with slope/intercept = 2 A2 Mw. Because only intensity RATIOS
+    is linear in c with slope/intercept = 2 A2 Mw P(q), the product 2 A2 Mw at q -> 0
+    (`calibration_free_a2`'s rearrangement). Because only intensity RATIOS
     enter, the optical constant and Rayleigh-ratio calibration cancel -- valuable
     when absolute calibration is uncertain (e.g. low-dn/dc systems). If Mw is
     supplied, A2 itself is returned.
@@ -1560,7 +1867,7 @@ class CalibrationFreeA2Result:
     Y: np.ndarray
     slope: float
     intercept: float
-    two_a2_mw: float                  # slope / intercept = 2 A2 Mw  (mol*mL/g ... * g/mol)
+    two_a2_mw: float                  # slope / intercept = 2 A2 Mw P(q), 2 A2 Mw at q -> 0  (mol*mL/g ... * g/mol)
     a2_mol_mL_per_g2: Optional[float] # if mw provided
     r_squared: float
     # These SEs are free of calibration/dn-dc systematics *by construction*:
@@ -1574,11 +1881,10 @@ class CalibrationFreeA2Result:
     # still shown). There is no `calibrated` gate -- this estimator is calibration-free.
     well_conditioned: bool = True
     cond: float = float('nan')             # condition number of the design
-    reliability_note: str = ''             # ill-conditioned reason, if any
     two_a2_mw_reliable: bool = True        # False if the design is ill-conditioned
-    # Passive, glyph-less notices for the GUI ⓘ tier (e.g. dropped non-positive
-    # excess-Rayleigh points) -- the same text also emitted via warnings.warn.
-    notes: tuple = ()
+    # Every note of the fit, as Notes (e.g. dropped non-positive excess-Rayleigh points,
+    # also emitted via warnings.warn, its message the note's export clause).
+    notes: Tuple[Note, ...] = ()
     # APPARENT, always (invariant 7): Y(c) is formed at ONE finite angle, and there
     # slope/intercept = 2 A2 Mw P(q) -- the angle-contingent product, not its q -> 0
     # limit. Structural, like DebyeResult's; carried so the export and the
@@ -1601,6 +1907,10 @@ class CalibrationFreeA2Result:
     # wrong by an amount nothing here can bound. Normative home:
     # RayleighRatioResult.blank_measured.
     blank_measured: bool = True
+    # Carried from the Rayleigh result(s) this fit consumed: False -> k_c was applied with
+    # the standard's refractive index blank, so `calibrated` is False for that cause alone
+    # (the scale gates name it). See RayleighRatioResult.standard_index_known.
+    standard_index_known: bool = True
     # Where the intensities came from, and which solvent blank each concentration was
     # referenced against, when not an instrument reading against the sample reference.
     # These do NOT cancel in Y(c): a different blank moves every excess ratio, hence the
@@ -1619,9 +1929,8 @@ class SingleAngleLadderResult:
     intercept equation): Mw from the
     intercept, A2 from the slope. APPARENT, always (invariant 7): at one angle the
     q -> 0 extrapolation was never done, so the intercept is 1/(Mw P(q)) -- the
-    apparent Mw is Mw P(q) <= Mw -- and the slope carries the same angle
-    contingency (it is 2 A2 only where P(q) ~ 1). A Zimm or Berry set over several
-    angles is the route to the thermodynamic values.
+    apparent Mw is Mw P(q) <= Mw. A Zimm or Berry set over several angles is the
+    route to the thermodynamic values.
 
     The calibration-free product 2 A2 Mw = slope/intercept is carried as well: it
     is what survives an uncalibrated run (CLAUDE.md, physics), exactly as in the
@@ -1661,9 +1970,8 @@ class SingleAngleLadderResult:
     # 1/intercept -> mw_reliable / a2_reliable suppressed (value still shown).
     well_conditioned: bool = True
     cond: float = float('nan')                # condition number of the design
-    reliability_note: str = ''                # ill-conditioned reason, if any
-    # Passive, glyph-less notices for the GUI info tier (the non-positive Kc/dR drop).
-    notes: tuple = ()
+    # Every note of the fit, as Notes (its preconditions, the non-positive Kc/dR drop).
+    notes: Tuple[Note, ...] = ()
     # `calibrated`'s sibling for the OPTICAL scale (see RayleighRatioResult).
     dn_dc_supplied: bool = True
     # The provenance pair every fit built from RayleighRatioResults carries.
@@ -1674,6 +1982,10 @@ class SingleAngleLadderResult:
     # reliability verdict on this result, because an additive blank does not cancel the
     # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
     blank_measured: bool = True
+    # Carried from the Rayleigh result(s) this fit consumed: False -> k_c was applied with
+    # the standard's refractive index blank, so `calibrated` is False for that cause alone
+    # (the scale gates name it). See RayleighRatioResult.standard_index_known.
+    standard_index_known: bool = True
 
 
 def _collect_zimm_points(rayleigh_results: Sequence[RayleighRatioResult]):
@@ -1700,26 +2012,109 @@ def _collect_zimm_points(rayleigh_results: Sequence[RayleighRatioResult]):
     return (np.concatenate(q2_all), np.concatenate(c_all), np.concatenate(y_all))
 
 
+def _q2_levels(q2):
+    """The distinct angles of a flattened design: q^2 (nm^-2) rounded to 12 decimal places,
+    so one angle measured at several concentrations is one level."""
+    return np.unique(np.round(q2, 12))
+
+
+def _aggregate_scale_flags(rayleigh_results) -> Tuple[bool, bool, bool]:
+    """(all_calibrated, all_dn_dc_supplied, all_blank_measured) over a fit's Rayleigh
+    results: each True only when every non-zero-concentration result carries it."""
+    # One set for every flag, the non-zero concentrations: the solvent blank carries no
+    # dn/dc of its own and none is ever read from it, and a series with no measured c = 0
+    # point contributes no r.concentration_g_per_mL == 0 entry at all, so the skip is what
+    # makes the blank flag an honest `all` rather than a vacuous one. The blank flag is not
+    # a scale: it gates every verdict (the RayleighRatioResult docstring says why).
+    all_calibrated = all(r.calibrated for r in rayleigh_results
+                         if r.concentration_g_per_mL != 0)
+    all_dn_dc_supplied = all(r.dn_dc_supplied for r in rayleigh_results
+                             if r.concentration_g_per_mL != 0)
+    all_blank_measured = all(bool(getattr(r, 'blank_measured', True))
+                             for r in rayleigh_results
+                             if r.concentration_g_per_mL != 0)
+    return all_calibrated, all_dn_dc_supplied, all_blank_measured
+
+
+def _form_factor_inputs(rayleigh_results):
+    """The form-factor fits' flattened design, (q2, c, y, q, n_conc, n_ang, thermodynamic,
+    drop_notes): the points `_collect_zimm_points` keeps, less the non-positive Kc/dR ones
+    (recorded on `drop_notes`; `_drop_nonpositive_ordinate` hands an all-zero ordinate on
+    whole), with q the root of q^2 for the form factor's q*Rg argument.
+    Two or more concentrations make the fit thermodynamic. No angle floor is applied here:
+    the floor is the model's, set by how many shape parameters it fits."""
+    q2, c, y = _collect_zimm_points(rayleigh_results)
+    drop_notes: list = []
+    q2, c, y = _drop_nonpositive_ordinate('Form-factor', q2, c, y, drop_notes)
+    q = np.sqrt(q2)
+    n_conc = int(np.unique(c).size)
+    n_ang = int(_q2_levels(q2).size)
+    thermodynamic = n_conc >= 2
+    return q2, c, y, q, n_conc, n_ang, thermodynamic, drop_notes
+
+
 def zimm_analysis(
     rayleigh_results: Sequence[RayleighRatioResult],
     method: str = 'zimm',
     estimator: str = 'hc3',
     cond_limit: float = unc.COND_LIMIT,
+    qrg_max_valid: float = QRG_MAX_VALID_DEFAULT,
 ) -> ZimmBerryResult:
     """Full Zimm or Berry double extrapolation for Mw, Rg, and A2.
 
     Performs the global first-order fit (multilinear regression of the ordinate
-    on 1, q^2, and c) over all angles and concentrations, and also returns the
-    per-concentration and per-angle intercepts used to draw the classic Zimm grid
-    (for visualization and as a cross-check on the global fit).
+    on 1, q^2, and c, and for Berry q^2 c) over all angles and concentrations, and also
+    returns the per-concentration and per-angle intercepts used to draw the classic Zimm
+    grid (for visualization and as a cross-check on the global fit).
 
-    The first-order Zimm equation ``Kc/dR = (1/Mw)(1 + q^2 Rg^2/3) + 2 A2 c`` is LINEAR in
-    the parameters (a, b, d) of the model ``a + b q^2 + d c``, with ``a = 1/Mw``,
-    ``b = (1/Mw)(Rg^2/3)``, ``d = 2 A2`` -- so one multilinear regression of Kc/dR on
-    (1, q^2, c) over all points gives ``Mw = 1/a``, ``Rg = sqrt(3 b / a)``, ``A2 = d / 2``.
-    Berry uses ``sqrt(Kc/dR) = a' + b' q^2 + d' c`` with ``a' = 1/sqrt(Mw)``,
-    ``b' = a' Rg^2/6``, ``d' = A2 sqrt(Mw)``, so ``Mw = 1/a'^2``, ``Rg = sqrt(6 b'/a')``,
-    ``A2 = d' a'``. Berry linearizes the high-qRg regime (Mw above ~1 MDa) better.
+    The first-order Zimm equation ``Kc/dR = (1/Mw)(1 + q^2 Rg^2/3) + 2 A2 c`` (Russo et al.
+    2021, Eq. 13.3, p. 501) is LINEAR in the parameters (a, b, d) of the model
+    ``a + b q^2 + d c``, with ``a = 1/Mw``, ``b = (1/Mw)(Rg^2/3)``, ``d = 2 A2`` -- so one
+    multilinear regression of Kc/dR on (1, q^2, c) over all points gives ``Mw = 1/a``,
+    ``Rg = sqrt(3 b / a)``, ``A2 = d / 2``; Russo et al. fit the two lines one by one or
+    the whole equation at once (pp. 500, 504), and this is the second.
+
+    Berry takes the square root of Berry's own equation (Berry 1966, p. 4552:
+    ``Kc/R = [M P(u,0)]^-1 (1 + 2 Gamma2 P(u,0) c)``, the virial term inside P -- the page's
+    brace of Q and dP/dc taken as unity, as Berry finds it, and the c^2 terms dropped; Gamma2
+    = A2 M is not printed and follows by matching the Zimm equation's 2 A2 c at P = 1) and fits
+    ``sqrt(Kc/dR) = a' + b' q^2 + d' c + e' q^2 c``. Berry prints the two limit lines of
+    that surface, his square-root plots of ``sqrt(Kc/dR)`` against c at q -> 0 and against
+    q^2 at c -> 0 (pp. 4552-4553); the four-column surface through both is this program's
+    construction, not a printed form. The cross term vanishes on both lines,
+    so ``a' = 1/sqrt(Mw)``, ``b' = a' Rg^2/6``, ``d' = A2 sqrt(Mw)`` and ``Mw = 1/a'^2``,
+    ``Rg = sqrt(6 b'/a')``, ``A2 = d' a'`` -- rearrangements of that equation at its limits,
+    as Podzimek 2011 prints them (Eq. 2.28, p. 54; Eqs. 4.11 and 4.13, p. 221). On a
+    complete angle x concentration grid this least squares IS Berry's line-by-line
+    procedure in one solve: the bilinear basis separates over a product grid. The cross
+    term e' is FREE, a named choice: Berry's equation predicts e' = -b'd'/a' to first order
+    (its root carries sqrt(P) on the virial term), a product of the two lines gives
+    +b'd'/a', and the free column recovers either; it is recorded as ``coef_q2c``. Without
+    the column the global surface would be additive, a form no source prints, and biased on
+    any product-form data. Where the four-column design is rank-deficient or above
+    ``cond_limit`` (a ragged grid), the fit falls back to the three columns and says so on
+    ``notes``, never on a flag.
+
+    Neither construction is exact at finite qRg on Berry's own equation with a real form
+    factor (on a Debye coil at qRg_max 1.37: four-column Berry Rg -1.9 %, Zimm +7.8 %, the
+    direction Podzimek 2011 p. 230 reports for the first-order Zimm Rg). The sources place
+    Zimm at Rgq << 1 and Berry at Rgq ~ 1 (Takahashi et al. 2019, p. 1046), the
+    initial-slope Rg at qRg < 1 (Russo et al. 2021, pp. 517-518) and the molecular weight
+    in the Rayleigh region, Rgq < 1 (Takahashi et al. 2019, p. 1045), the figure
+    `QRG_MAX_VALID_DEFAULT` takes.
+
+    Inputs not prescribed by the source: the conditioning ceiling ``cond_limit`` (default
+    ``COND_LIMIT``, a numerical-health bound), the angle identity (q^2 rounded to 12
+    decimal places), the two-angle and two-concentration minimums (the design's mathematical
+    minimums), the drop of a non-positive Kc/dR (stated on ``notes``), the agreement check
+    between the two single-route Mw values, the weighting (equal weights on every retained
+    point), the Berry four-column surface with its cross term free and its three-column
+    fallback on a ragged grid (this program's construction, above); prescribed: the
+    first-order Zimm equation (Russo et al. 2021 Eq. 13.3, p. 501; Chu 1991 Eq. 2.1.8,
+    p. 18), fitted whole rather than line by line (Russo et al. 2021, pp. 500 and 504), the
+    Berry square-root ordinate (Berry 1966, p. 4552) and its inversions by rearrangement
+    (Podzimek 2011 Eqs. 2.28, 4.11 and 4.13), and the qRg regime ``qrg_max_valid`` reads
+    (Russo et al. 2021, p. 517; Takahashi et al. 2019, pp. 1045-1046).
 
     The ladder deliberately carries NO identity machinery (product decision,
     owner-ruled 2026-08-13). The one hazard identity fields could not catch is an
@@ -1738,12 +2133,26 @@ def zimm_analysis(
         One per concentration (the solvent reference, c = 0, is ignored). Need at
         least two concentrations and two angles to resolve all three quantities.
     method : str
-        'zimm' (ordinate = Kc/dR; default) or 'berry' (ordinate = sqrt(Kc/dR),
-        preferred for Mw above ~1 MDa or qRg approaching 1).
+        'zimm' (ordinate = Kc/dR; default) or 'berry' (ordinate = sqrt(Kc/dR), the
+        construction the sources place at qRg ~ 1).
     cond_limit : float
         Numerical-health ceiling for the design's (column-normalized) condition
         number; above it the fit is flagged near-degenerate and mw_reliable/a2_reliable
         are suppressed (see uncertainty.COND_LIMIT). Overridable; default COND_LIMIT.
+    qrg_max_valid : float
+        Upper q*Rg for the first-order angular term (default `QRG_MAX_VALID_DEFAULT`, shared
+        with every qRg verdict; the controller seeds it from the one Setting). Both methods
+        report ``qrg_max`` -- the largest fitted q times the reported Rg -- and echo the
+        limit. Past it a Zimm fit drops ``rg_reliable`` and ``mw_reliable`` and names the
+        failed precondition in one note about both (``qrg_above_limit``): the sources put
+        the Zimm plot's M, not only its Rg, at Rgq << 1 (Takahashi et al. 2019, p. 1046),
+        and give the number where they choose samples for M, the Rayleigh region Rgq < 1
+        (p. 1045). A fit
+        with no extractable Rg has no qRg to judge and keeps its Mw verdict. A Berry fit
+        drops nothing, the sources placing Berry at Rgq ~ 1 and printing no limit for it,
+        and its Rg and Mw read past the Zimm limit are a qualifier read off ``qrg_max`` and
+        ``qrg_max_valid`` (``berry_past_zimm_limit``). Neither drops A2: the regime is stated
+        on the c -> 0 equations (Takahashi's Eqs. 4 and 5 are limits at C -> 0).
 
     Returns
     -------
@@ -1758,20 +2167,10 @@ def zimm_analysis(
         raise ValueError(f"method must be 'zimm' or 'berry', got {method!r}.")
 
     q2, c, kc_over_dR = _collect_zimm_points(rayleigh_results)
-    all_calibrated = all(r.calibrated for r in rayleigh_results
-                         if r.concentration_g_per_mL != 0)
-    # The dn/dc sibling of all_calibrated, aggregated identically (same c != 0 skip:
-    # the solvent blank carries no dn/dc of its own and none is ever read from it).
-    all_dn_dc_supplied = all(r.dn_dc_supplied for r in rayleigh_results
-                             if r.concentration_g_per_mL != 0)
-    # The blank sibling, aggregated over the SAME set: a series with no measured c = 0
-    # point contributes no r.concentration_g_per_mL == 0 entry at all, so the skip is
-    # what makes this an honest `all` rather than a vacuous one.
-    all_blank_measured = all(bool(getattr(r, 'blank_measured', True))
-                             for r in rayleigh_results
-                             if r.concentration_g_per_mL != 0)
+    all_calibrated, all_dn_dc_supplied, all_blank_measured = _aggregate_scale_flags(
+        rayleigh_results)
     n_conc = np.unique(c).size
-    n_ang = np.unique(np.round(q2, 12)).size
+    n_ang = _q2_levels(q2).size
     if n_conc < 2:
         raise ValueError(
             f"Zimm/Berry analysis needs at least two concentrations, got {n_conc}."
@@ -1781,7 +2180,7 @@ def zimm_analysis(
             f"Zimm/Berry analysis needs at least two angles, got {n_ang}."
         )
 
-    notes: list = []       # passive ⓘ notices surfaced on the result (keep-both)
+    notes: list = []       # every note of the result, as Notes
     label = method.capitalize()
     # A non-positive Kc/dR (noise or an over-subtracted solvent reference, especially
     # at high angle) has no place in EITHER model: Berry cannot take its square root,
@@ -1795,12 +2194,12 @@ def zimm_analysis(
     if np.any(nonpos):
         n_drop = int(nonpos.sum())
         # Single source of the message -> both the note and the warning.
-        msg = _nonpositive_ordinate_note(label, n_drop, 'Kc/dR')
-        notes.append(msg)
-        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        drop = _nonpositive_ordinate_note(n_drop, 'Kc/ΔR')
+        notes.append(drop)
+        _warn_note(drop, stacklevel=2)
         q2, c, kc_over_dR = q2[~nonpos], c[~nonpos], kc_over_dR[~nonpos]
         n_conc = np.unique(c).size
-        n_ang = np.unique(np.round(q2, 12)).size
+        n_ang = _q2_levels(q2).size
         if n_conc < 2 or n_ang < 2:
             raise ValueError(
                 f"{label} analysis: after dropping non-positive Kc/dR points, "
@@ -1809,11 +2208,28 @@ def zimm_analysis(
             )
     ordinate = np.sqrt(kc_over_dR) if method == 'berry' else kc_over_dR
 
-    # Global multilinear fit: ordinate = a + b q^2 + d c, with its 3x3 covariance.
-    A = np.column_stack([np.ones_like(q2), q2, c])
-    mf = unc.multilinear_fit(A, ordinate, estimator, cond_limit)
+    # Global multilinear fit: ordinate = a + b q^2 + d c, with its 3x3 covariance -- and for
+    # Berry the free cross column e q^2 c as well (see the docstring), 4x4. The cross term
+    # vanishes on both limit lines, so a, b, d keep their meaning and their inversions.
+    A3 = np.column_stack([np.ones_like(q2), q2, c])
+    mf = (unc.multilinear_fit(np.column_stack([A3, q2 * c]), ordinate, estimator, cond_limit)
+          if method == 'berry' else unc.multilinear_fit(A3, ordinate, estimator, cond_limit))
+    if method == 'berry' and (mf.rank_deficient or not mf.well_conditioned):
+        # A ragged grid can leave the cross column unresolvable. The three-column fit is
+        # Berry's limit lines without the cross term, so falling back to it is a record
+        # on `notes`, never a flag; its own conditioning then decides the flags below.
+        notes.append(Note('berry_cross_term_dropped', (), {
+            'reason': 'rank-deficient' if mf.rank_deficient else 'ill-conditioned'}))
+        mf = unc.multilinear_fit(A3, ordinate, estimator, cond_limit)
     a, b, d = float(mf.coeffs[0]), float(mf.coeffs[1]), float(mf.coeffs[2])
-    cov = mf.cov                          # order (a, b, d)
+    e = float(mf.coeffs[3]) if len(mf.coeffs) == 4 else float('nan')
+    # Berry's first-order prediction -b'd'/a' (see the docstring). Each divisor is checked
+    # finite as well as nonzero, so an inf never becomes a plausible 0.0 ratio; `*` on
+    # floats saturates rather than raises (rule 12).
+    e_pred = -b * d / a if (math.isfinite(a) and a != 0) else float('nan')
+    e_ratio = (e / e_pred if (math.isfinite(e_pred) and e_pred != 0) else float('nan'))
+    cov = mf.cov                          # order (a, b, d[, e])
+    pad = [0.0] * (len(mf.coeffs) - 3)    # Mw, Rg, A2 never read e: a zero Jacobian entry
     r2 = mf.r_squared
 
     # The ordinate intercept a (Kc/dR extrapolated to q->0, c->0) is physically
@@ -1844,26 +2260,27 @@ def zimm_analysis(
                   and math.isfinite(b / a) and b / a > 0) else float('nan'))
         a2 = d * a if (math.isfinite(a) and a > 0) else float('nan')   # A2 = d'/sqrt(Mw) = d'*a'
 
-    # Statistical SEs by first-order propagation through Cov(a,b,d). Rg uses the
-    # same Jacobian form for Zimm (Rg^2=3b/a) and Berry (Rg^2=6b/a): dRg/da=-Rg/2a,
-    # dRg/db=+Rg/2b. Mw and A2 differ between the two constructions. Gated on a>0 (so
-    # no SE travels with a non-physical Mw) AND on the Mw Jacobian's denominator being a
-    # usable one: at an extreme intensity scale a^2 / a^3 can UNDERFLOW to 0.0 even though
-    # a != 0, which would make -1/a^2 raise a bare ZeroDivisionError. The denominator comes
-    # from the shared `power_or_nan`, whose NaN reaches the withhold through `propagate`.
+    # Statistical SEs by first-order propagation through Cov(a,b,d[,e]). Rg uses the same
+    # Jacobian form for Zimm (Rg^2=3b/a) and Berry (Rg^2=6b/a): dRg/da=-Rg/2a, dRg/db=+Rg/2b.
+    # Mw and A2 differ between the constructions; none reads Berry's e (`pad`'s zero entry).
+    # Gated on a>0 (so no SE travels with a non-physical Mw) AND on the Mw Jacobian's
+    # denominator being a usable one: at an extreme intensity scale a^2 / a^3 can UNDERFLOW
+    # to 0.0 even though a != 0, which would make -1/a^2 raise a bare ZeroDivisionError. The
+    # denominator comes from the shared `power_or_nan`, whose NaN reaches the withhold
+    # through `propagate`.
     mw_se = rg_se = a2_se = None
     if np.all(np.isfinite(cov)) and a > 0:
         if method == 'zimm':
             mw_se = unc.se_or_none(unc.propagate(
-                [-1.0 / unc.power_or_nan(a, 2), 0.0, 0.0], cov))
-            a2_se = unc.se_or_none(unc.propagate([0.0, 0.0, 0.5], cov))
+                [-1.0 / unc.power_or_nan(a, 2), 0.0, 0.0] + pad, cov))
+            a2_se = unc.se_or_none(unc.propagate([0.0, 0.0, 0.5] + pad, cov))
         else:  # berry: Mw=1/a^2, A2=d*a
             mw_se = unc.se_or_none(unc.propagate(
-                [-2.0 / unc.power_or_nan(a, 3), 0.0, 0.0], cov))
-            a2_se = unc.se_or_none(unc.propagate([d, 0.0, a], cov))
+                [-2.0 / unc.power_or_nan(a, 3), 0.0, 0.0] + pad, cov))
+            a2_se = unc.se_or_none(unc.propagate([d, 0.0, a] + pad, cov))
         if math.isfinite(rg) and rg > 0 and b != 0:
             rg_se = unc.se_or_none(
-                unc.propagate([-rg / (2.0 * a), rg / (2.0 * b), 0.0], cov))
+                unc.propagate([-rg / (2.0 * a), rg / (2.0 * b), 0.0] + pad, cov))
 
     # Per-concentration q->0 intercepts and per-angle c->0 intercepts (for the grid).
     # A level with a single usable point gets no per-level line: its lone ordinate IS
@@ -1876,7 +2293,7 @@ def zimm_analysis(
     single_point_conc = []
     for cl in conc_levels:
         m = c == cl
-        if np.unique(np.round(q2[m], 12)).size >= 2:
+        if _q2_levels(q2[m]).size >= 2:
             s_i, i_i = unc.polyfit_or_nan(q2[m], ordinate[m], 1)
         else:
             # One usable ANGLE at this level (one point, or several at one q^2 -- a
@@ -1885,7 +2302,7 @@ def zimm_analysis(
             i_i = float(np.mean(ordinate[m]))
             single_point_conc.append(float(cl))
         inter_per_c.append(i_i)
-    q2_levels = np.unique(np.round(q2, 12))
+    q2_levels = _q2_levels(q2)
     inter_per_q = []
     single_point_q2 = []
     for ql in q2_levels:
@@ -1897,17 +2314,11 @@ def zimm_analysis(
             single_point_q2.append(float(ql))
         inter_per_q.append(i_i)
     if single_point_conc:
-        levels = ', '.join(f'{v:g}' for v in single_point_conc)
-        notes.append(
-            f"Concentration level(s) {levels} g/mL carry a single usable angle each, so "
-            f"that angle's ordinate is taken as the level's q->0 grid intercept (no "
-            f"angular extrapolation at that level; the global fit is unaffected).")
+        notes.append(Note('grid_level_single_angle', ('intercept_per_concentration',),
+                          {'levels': tuple(single_point_conc)}))
     if single_point_q2:
-        levels = ', '.join(f'{v:.4g}' for v in single_point_q2)
-        notes.append(
-            f"q^2 level(s) {levels} nm^-2 carry a single usable concentration each, so "
-            f"that ordinate is taken as the angle's c->0 grid intercept (no concentration "
-            f"extrapolation at that angle; the global fit is unaffected).")
+        notes.append(Note('grid_level_single_concentration', ('intercept_per_angle',),
+                          {'levels': tuple(single_point_q2)}))
 
     # Consistency cross-check: the two single-route extrapolations of the ordinate
     # intercept to (q->0, c->0) should agree. Route 1: q->0 intercepts (per c)
@@ -1941,30 +2352,71 @@ def zimm_analysis(
     if mw_q0 and mw_c0 and (mw_q0 + mw_c0) != 0:
         agree = abs(mw_q0 - mw_c0) / (0.5 * abs(mw_q0 + mw_c0))
 
-    # Numerical health of the global design X = [1, q^2, c]: clustered angles or two
+    # Numerical health of the global design actually fitted (X = [1, q^2, c], or Berry's
+    # four columns): clustered angles or two
     # near-equal concentrations (or an extreme intensity scale) make it near-singular,
     # so 1/a (Mw) and d*a/d/2 (A2) are fragile even when calibrated and a>0. Suppress
     # both reliability flags and carry the reason (values still shown; Rg from the
     # slope-ratio stays reported). cond(X) is scale-invariant (invariant 4).
-    reasons = []
+    scaled = ('mw_g_per_mol', 'a2_mol_mL_per_g2')
+    reasons = list(scale_notes(
+        [r for r in rayleigh_results if r.concentration_g_per_mL != 0],
+        mw=scaled[:1], a2=scaled[1:], scale_free=('rg_nm',)))
     if not mf.well_conditioned:
-        reasons.append(_ill_conditioned_note(mf.cond))
+        reasons.append(_ill_conditioned_note(mf.cond, cond_limit, scaled + ('rg_nm',)))
+    # Mw and A2 are withheld for their cause, the intercept, and otherwise for their own
+    # non-finite values; a Zimm A2 = d/2 reads no intercept, so its own may stand alone.
+    a_ok = bool(math.isfinite(a) and a > 0)
+    if not a_ok:
+        reasons.append(_non_positive_intercept_note(a, scaled))
+    elif not math.isfinite(mw):
+        reasons.append(Note('mw_not_finite', scaled[:1]))
+    if not math.isfinite(a2) and (a_ok or method == 'zimm'):
+        reasons.append(Note('a2_not_finite', scaled[1:]))
+    partition = mode_point_notes(
+        [r for r in rayleigh_results if r.concentration_g_per_mL != 0],
+        about=('mw_g_per_mol', 'rg_nm', 'a2_mol_mL_per_g2'))
+    reasons += partition
     if not (math.isfinite(rg) and rg > 0):
-        reasons.append("no extractable Rg: the q^2-to-intercept coefficient ratio is not "
-                       "positive (the angular dependence is inside the noise, or the "
-                       "blank is over-corrected), so no size is reported; Mw and A2 are "
-                       "untouched by it")
-    note = '; '.join(reasons)
+        # No size, and Mw and A2 untouched by it: the q^2-to-intercept coefficient ratio
+        # is not positive, or the intercept it divides by is not.
+        if math.isfinite(a) and a > 0:
+            reasons.append(_no_rg_note(('rg_nm',), 'slope/intercept', b / a, 'nm²',
+                                       'positive'))
+        else:
+            reasons.append(_no_rg_note(('rg_nm',), 'intercept', a,
+                                       'mol/g' if method == 'zimm' else '(mol/g)^½',
+                                       'positive'))
+    # The qRg regime over the points actually fitted (post-drop). `regime_failed` keys on
+    # `isnan`, not `not isfinite`, as `guinier_analysis` does: a NaN qRg (no Rg) is said
+    # above, and +inf is a qRg past every limit (rule 12, both tails). `zimm_past_limit` is
+    # the one predicate behind the note and the Zimm Mw's verdict, so a NaN qRg flags no Mw.
+    # Berry is judged by no limit until the program holds one of its own; past the Zimm
+    # limit its Rg is described, never flagged (`core.notes.qualifiers`), and its Mw kept.
+    qrg_max = (float(math.sqrt(float(np.max(q2))) * rg) if math.isfinite(rg)
+               else float('nan'))
+    regime_valid = bool(math.isfinite(qrg_max)
+                        and (method == 'berry' or qrg_max <= qrg_max_valid))
+    regime_failed = (not math.isnan(qrg_max)) and not (qrg_max <= qrg_max_valid)
+    zimm_past_limit = regime_failed and method == 'zimm'
+    if zimm_past_limit:
+        reasons.append(_qrg_regime_note(('rg_nm', 'mw_g_per_mol'), qrg_max, qrg_max_valid,
+                                        'Zimm'))
+    notes += reasons
 
     return ZimmBerryResult(
         method=method, mw_g_per_mol=float(mw), rg_nm=float(rg),
         a2_mol_mL_per_g2=float(a2),
-        coef_intercept=a, coef_q2=b, coef_c=d, r_squared=float(r2),
+        coef_intercept=a, coef_q2=b, coef_c=d, coef_q2c=e, coef_q2c_ratio=e_ratio,
+        r_squared=float(r2),
         n_points=int(q2.size), n_concentrations=int(n_conc), n_angles=int(n_ang),
         is_apparent=False,
         calibrated=all_calibrated,
         dn_dc_supplied=all_dn_dc_supplied,
         blank_measured=all_blank_measured,
+        standard_index_known=all(bool(getattr(r, 'standard_index_known', True))
+                                 for r in rayleigh_results
+                                 if r.concentration_g_per_mL != 0),
         derived_provenance=_shared_derived_provenance(rayleigh_results),
         blank_provenance=_shared_blank_provenance(rayleigh_results),
         # Two SCALE gates (all_calibrated; all_dn_dc_supplied -- K = 1 puts the intercept
@@ -1973,19 +2425,21 @@ def zimm_analysis(
         # (negative/infinite Mw; for Berry a sign-flipped A2 = d'*a'), so neither Mw nor A2
         # may read reliable -- both are NaN'd above. well_conditioned adds the thin-design
         # gate; math.isfinite closes the float-overflow edge (a underflowing to 0 NaNs Mw).
-        # None is a magnitude threshold on Mw itself (invariant 4): a finite-but-huge Mw
-        # from inconsistent input is a GIGO concern elsewhere, not a conditioning defect.
+        # None is a magnitude threshold on Mw (invariant 4; a huge Mw from bad input is GIGO).
+        # A Zimm fit past the qRg limit fails its Mw; A2 (c -> 0) never reads the limit.
         mw_reliable=(all_calibrated and all_dn_dc_supplied and all_blank_measured
-                     and math.isfinite(a) and a > 0
-                     and mf.well_conditioned and math.isfinite(mw)),
+                     and a_ok and mf.well_conditioned and math.isfinite(mw)
+                     and not partition and not zimm_past_limit),
         a2_reliable=(all_calibrated and all_dn_dc_supplied and all_blank_measured
-                     and math.isfinite(a) and a > 0
-                     and mf.well_conditioned and math.isfinite(a2)),
+                     and a_ok and mf.well_conditioned and math.isfinite(a2)
+                     and not partition),
         # The size: ungated by SCALE, gated by the design it shares with Mw/A2 and by
         # all_blank_measured -- which gates all three, Rg included, because an unmeasured
         # blank is ADDITIVE and survives the q^2-to-intercept ratio the scales cancel in.
         rg_reliable=bool(math.isfinite(rg) and rg > 0 and mf.well_conditioned
-                         and all_blank_measured),
+                         and all_blank_measured and regime_valid and not partition),
+        qrg_max=qrg_max, qrg_max_valid=float(qrg_max_valid),
+        qrg_regime_valid=regime_valid,
         concentrations_g_per_mL=conc_levels,
         intercept_per_concentration=np.array(inter_per_c),
         q2_nm2=q2_levels, intercept_per_angle=np.array(inter_per_q),
@@ -1993,8 +2447,10 @@ def zimm_analysis(
         mw_from_c0_g_per_mol=mw_c0, mw_from_q0_g_per_mol=mw_q0,
         extrapolation_agreement_rel=agree,
         se_estimator=estimator,
-        well_conditioned=mf.well_conditioned, cond=mf.cond, reliability_note=note,
+        well_conditioned=mf.well_conditioned, cond=mf.cond,
         notes=tuple(notes),
+        mode_resolved=any(bool(getattr(r, 'mode_resolved', False))
+                          for r in rayleigh_results if r.concentration_g_per_mL != 0),
     )
 
 
@@ -2023,7 +2479,7 @@ SPHERE_FIRST_MINIMUM_QRG = 4.49340945790906 * math.sqrt(3.0 / 5.0)   # ~= 3.4806
 # `well_conditioned` and R^2. Reliable when the fitted min P over the angles stays >= this
 # floor: P ~ 0.22 at qRg ~ 2 recovers to a few %, P ~ 2e-3 past the first minimum is 30%+
 # wrong. 0.05 reads as "scattering < 5% of forward at some angle". A documented default
-# (invariant 4). Rg is still reported; only Mw/A2 reliability is suppressed.
+# (invariant 4), of `mie_p_min`. Rg is still reported; only Mw/A2 reliability is suppressed.
 MIE_FIT_P_MIN = 0.05
 
 # Smallest physically meaningful linear size (nm) for a form-factor fit -- the LOWER tail of
@@ -2031,12 +2487,14 @@ MIE_FIT_P_MIN = 0.05
 # not measured a particle. Stated as an Rg, and set so it means the SAME PHYSICAL SIZE as the
 # DLS floor: CUMULANT_MIN_RH_NM = 0.2 nm is a RADIUS, and a sphere of radius 0.2 nm has
 # Rg = 0.2*sqrt(3/5) = 0.155 nm. A documented physics criterion (invariant 4), not tuned to
-# any system; see _size_above_floor for what it binds on each result and why.
+# any system, and the default of each form-factor fit's `form_factor_min_size_nm`; see
+# _size_above_floor for what it binds on each result and why.
 FORM_FACTOR_MIN_SIZE_NM = 0.155
 
 
-def _size_above_floor(size_nm: float) -> bool:
-    """True when a fitted form-factor size clears ``FORM_FACTOR_MIN_SIZE_NM``.
+def _size_above_floor(size_nm: float, floor_nm: float = FORM_FACTOR_MIN_SIZE_NM) -> bool:
+    """True when a fitted form-factor size clears the size floor ``floor_nm``
+    (``FORM_FACTOR_MIN_SIZE_NM`` by default).
 
     **Why a fit is flagged here: NON-PHYSICALITY, not information loss.** The load-bearing
     claim is only that the fitted body is smaller than any particle a light-scattering
@@ -2064,20 +2522,44 @@ def _size_above_floor(size_nm: float) -> bool:
     (rule 10). A non-finite size returns True -- there is no size to judge, and the caller's
     own ``converged`` / ``rg_undefined`` flags already say so.
     """
-    return not (math.isfinite(size_nm) and size_nm < FORM_FACTOR_MIN_SIZE_NM)
+    return not (math.isfinite(size_nm) and size_nm < floor_nm)
 
 
-def _sub_molecular_note(label: str, size_nm: float) -> str:
-    """The reliability_note text for a fit that collapsed below the size floor.
+def _sub_molecular_note(label: str, size_nm: float, about: Tuple[str, ...],
+                        floor_nm: float = FORM_FACTOR_MIN_SIZE_NM) -> Note:
+    """The precondition note of a fit that collapsed below the size floor: smaller than a
+    solvent molecule, so not a particle this measurement could have seen.
 
-    One wording for all three builders (rule 10); `label` names the quantity that tripped it,
+    One code for all three builders (rule 10); `label` names the quantity that tripped it,
     which differs by result -- see FORM_FACTOR_MIN_SIZE_NM.
     """
-    return (f"fit returned a sub-molecular size ({label} = {size_nm:.3g} nm < "
-            f"{FORM_FACTOR_MIN_SIZE_NM:g} nm) -- smaller than a solvent molecule, so it is "
-            "not a particle this measurement could have seen and the fit has not found one; "
-            "Mw/A2 and the size alike are unusable (check the angular range and the excess "
-            "intensities)")
+    return Note('sub_molecular_size', about,
+                {'quantity': label, 'size': float(size_nm), 'floor': float(floor_nm)})
+
+
+def _nonphysical_notes(inv_mw: float, mw: float, sizes, about: Tuple[str, ...]) -> List[Note]:
+    """The precondition notes of a form-factor fit whose solver succeeded on a non-physical
+    parameter, one per quantity: 1/Mw not a positive finite number, else Mw not finite (a
+    reciprocal that overflowed), and each `(name, value)` of `sizes` not positive and
+    finite. One helper for the three builders (rule 10)."""
+    out = []
+    if not (math.isfinite(inv_mw) and inv_mw > 0):
+        out.append(Note('solution_nonphysical', about, {'quantity': '1/Mw'}))
+    elif not math.isfinite(mw):
+        out.append(Note('solution_nonphysical', about, {'quantity': 'Mw'}))
+    for name, value in sizes:
+        if not (math.isfinite(value) and value > 0):
+            out.append(Note('solution_nonphysical', about, {'quantity': name}))
+    return out
+
+
+def _ff_ill_conditioned_note(cond: float, limit: float, about: Tuple[str, ...]) -> Note:
+    """The precondition note of a form-factor fit whose Jacobian is near-singular at the
+    optimum (too few or clustered angles): its 1/Mw and A2 are numerically fragile. The
+    size is not gated on it (each builder's `rg_reliable`), so the code is not the linear
+    designs' `ill_conditioned`, whose ratio sizes share the design."""
+    return Note('jacobian_ill_conditioned', about,
+                {'cond': float(cond), 'limit': float(limit)})
 
 
 @dataclass
@@ -2139,9 +2621,9 @@ class FormFactorResult:
     # =False -> near-degenerate (too few/clustered angles) -> mw_reliable suppressed.
     well_conditioned: bool = True
     cond: float = float('nan')
-    reliability_note: str = ''
-    # Passive, glyph-less ⓘ notices for the GUI (e.g. non-convergence).
-    notes: tuple = ()
+    # Every note of the fit, as Notes (its preconditions -- non-convergence among them --
+    # and the non-positive Kc/dR drop).
+    notes: Tuple[Note, ...] = ()
     # `calibrated`'s sibling for the OPTICAL scale (see RayleighRatioResult): False ->
     # no dn/dc was supplied, so K was 1 and Mw/A2 here are on an arbitrary optical
     # scale. The angular sizes are untouched -- K multiplies the whole Kc/dR ordinate
@@ -2160,6 +2642,10 @@ class FormFactorResult:
     # reliability verdict on this result, because an additive blank does not cancel the
     # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
     blank_measured: bool = True
+    # Carried from the Rayleigh result(s) this fit consumed: False -> k_c was applied with
+    # the standard's refractive index blank, so `calibrated` is False for that cause alone
+    # (the scale gates name it). See RayleighRatioResult.standard_index_known.
+    standard_index_known: bool = True
     # Mie-model provenance (None for the analytic sphere/coil models). The relative index
     # m = n_solute/n_medium is a FIXED user-supplied input to the Mie fit (never fitted --
     # invariant 3), echoed here so it travels into display + export like the DLS reweighting.
@@ -2169,6 +2655,10 @@ class FormFactorResult:
     n_solute: Optional[float] = None
     n_medium: Optional[float] = None
     wavelength_nm: Optional[float] = None
+    # The thresholds the verdicts above read, echoed as `qrg_max_valid` is: the Mie
+    # deep-minimum floor on the fitted P(q) and the size floor.
+    mie_p_min: float = MIE_FIT_P_MIN
+    form_factor_min_size_nm: float = FORM_FACTOR_MIN_SIZE_NM
 
 
 # Shared least_squares STOPPING tolerances (ftol/xtol/gtol) for every form-factor fit. A
@@ -2262,6 +2752,9 @@ def form_factor_analysis(
     estimator: str = 'hc3',
     cond_limit: float = unc.COND_LIMIT,
     m: Optional[float] = None,
+    *,
+    mie_p_min: float = MIE_FIT_P_MIN,
+    form_factor_min_size_nm: float = FORM_FACTOR_MIN_SIZE_NM,
 ) -> FormFactorResult:
     """Fit the full form factor P(q) to Kc/dR across angles (and concentrations).
 
@@ -2273,6 +2766,19 @@ def form_factor_analysis(
     model is fit and the result is THERMODYNAMIC. Rg (and the sphere radius R) are
     scale-independent and survive an uncalibrated run; Mw / A2 inherit the usual
     calibration gate.
+
+    Inputs not prescribed by the source: the deep-minimum reliability floor
+    ``MIE_FIT_P_MIN`` (0.05; no source prints a floor on P(q)), the size floor
+    ``FORM_FACTOR_MIN_SIZE_NM`` (0.155 nm, the owner-decided DLS floor
+    ``CUMULANT_MIN_RH_NM`` converted to an Rg), the sphere model's limit
+    ``SPHERE_FIRST_MINIMUM_QRG`` (the form factor's first minimum, a mathematical value;
+    suppressing Mw/A2 reliability past it is the program's choice), and the unweighted least
+    squares on the normalised ordinate, where Pedersen 1997 Eq. 1 (p. 174) minimises a
+    chi-square weighted by each point's standard deviation (the floor is this program's
+    stand-in for that weighting near a minimum); prescribed: the model
+    Kc/dR = 1/(Mw P) + 2 A2 c (Chu 1991 Eq. 2.1.8, p. 18). Not yet read against a source:
+    the seed from the linear Zimm/Debye estimate, the Rg-grid multistart, the bounds and
+    the solver tolerances.
 
     Parameters
     ----------
@@ -2293,6 +2799,9 @@ def form_factor_analysis(
         Relative refractive index ``n_solute/n_medium`` -- REQUIRED for model='mie' (it enters
         the Mie scattering arithmetic), unused otherwise. A FIXED user-supplied input, never
         fitted (invariant 3).
+    mie_p_min, form_factor_min_size_nm : float
+        The Mie deep-minimum floor on the fitted P(q) and the size floor (defaults
+        ``MIE_FIT_P_MIN`` and ``FORM_FACTOR_MIN_SIZE_NM``), echoed on the result.
 
     Returns
     -------
@@ -2324,15 +2833,8 @@ def form_factor_analysis(
     if isinstance(rayleigh_results, RayleighRatioResult):
         rayleigh_results = [rayleigh_results]
 
-    # Flatten to (q, c, y) over all non-zero-concentration points. _collect_zimm_points
-    # returns q^2; take the root for the form factor's q*Rg argument.
-    q2, c, y = _collect_zimm_points(rayleigh_results)
-    drop_notes: list = []
-    q2, c, y = _drop_nonpositive_ordinate('Form-factor', q2, c, y, drop_notes)
-    q = np.sqrt(q2)
-    n_conc = int(np.unique(c).size)
-    n_ang = int(np.unique(np.round(q2, 12)).size)
-    thermodynamic = n_conc >= 2
+    q2, c, y, q, n_conc, n_ang, thermodynamic, drop_notes = _form_factor_inputs(
+        rayleigh_results)
     # Parameters: p = 2 (apparent 1/Mw, Rg) or 3 (thermodynamic +A2). Need >= 2 distinct
     # angles to constrain the shape Rg (two q-points, as Debye/Zimm need for their slope),
     # and >= p total points for identifiability. With >= 2 angles the apparent case has
@@ -2345,16 +2847,8 @@ def form_factor_analysis(
             "Form-factor P(q) fit needs at least two angles to resolve the shape; "
             f"got {n_ang}."
         )
-    all_calibrated = all(r.calibrated for r in rayleigh_results
-                         if r.concentration_g_per_mL != 0)
-    # The dn/dc sibling of all_calibrated, aggregated identically (same c != 0 skip:
-    # the solvent blank carries no dn/dc of its own and none is ever read from it).
-    all_dn_dc_supplied = all(r.dn_dc_supplied for r in rayleigh_results
-                             if r.concentration_g_per_mL != 0)
-    # The blank sibling, over the same set. Not a scale: it gates every verdict below.
-    all_blank_measured = all(bool(getattr(r, 'blank_measured', True))
-                             for r in rayleigh_results
-                             if r.concentration_g_per_mL != 0)
+    all_calibrated, all_dn_dc_supplied, all_blank_measured = _aggregate_scale_flags(
+        rayleigh_results)
     # Optical context: the Mie P(q) needs it in the arithmetic (size parameter + angle),
     # and it is echoed on EVERY result so the plot layer can cap its model grid at
     # back-scatter q = 2k (spec-05 review response: previously Mie-only, which left the
@@ -2495,43 +2989,43 @@ def form_factor_analysis(
     # tail of the same predicate and applies to EVERY model, the monotonic Debye coil
     # included: a sub-molecular Rg is not a shape result whatever P(q) does. Rg still reported.
     past_first_min = math.isfinite(qrg_max) and qrg_max > SPHERE_FIRST_MINIMUM_QRG
-    above_floor = _size_above_floor(rg)
+    above_floor = _size_above_floor(rg, form_factor_min_size_nm)
     if model == ff.SPHERE:
         form_factor_valid = above_floor and not past_first_min
     elif model == ff.MIE:
         mie_min_p = (float(np.min(_P(rg)))
                      if (math.isfinite(rg) and rg > 0 and converged) else float('nan'))
         form_factor_valid = above_floor and not (math.isfinite(mie_min_p)
-                                                 and mie_min_p < MIE_FIT_P_MIN)
+                                                 and mie_min_p < mie_p_min)
     else:
         form_factor_valid = above_floor   # Debye coil (monotonic P) — no minimum above it
 
+    scaled = ('mw_g_per_mol', 'a2_mol_mL_per_g2')
     notes: list = list(drop_notes)
+    notes += scale_notes([r for r in rayleigh_results if r.concentration_g_per_mL != 0],
+                         mw=scaled[:1], a2=scaled[1:], scale_free=('rg_nm',))
     if not res.success:
-        msg = ("Form-factor fit did not converge; values are the last least-squares "
-               "iterate — inspect the data or try the other model.")
-        notes.append(msg)
-        warnings.warn(msg, RuntimeWarning, stacklevel=2)
-    # reliability_note precedence: ill-conditioned design first (its own numeric criterion),
-    # then the size floor, then the beyond-first-minimum sphere-validity reason. The floor
-    # outranks the minimum reasons because a collapsed fit trips NEITHER of them -- describing
-    # it as "past the first minimum" would state the opposite of what happened (qRg_max -> 0).
+        not_converged = Note('ff_not_converged', scaled + ('rg_nm',))
+        notes.append(not_converged)
+        _warn_note(not_converged, stacklevel=2)
+    elif not converged:
+        notes += _nonphysical_notes(inv_mw, mw, (('Rg', rg),), scaled + ('rg_nm',))
+    if thermodynamic and a2 is not None and not math.isfinite(a2):
+        notes.append(Note('a2_not_finite', scaled[1:]))
+    # The design's conditioning is its own criterion and is named beside the shape-fit
+    # reasons, never instead. Between those two the size floor outranks the minimum: a
+    # collapsed fit trips NEITHER minimum, so describing it as "past the first minimum"
+    # would state the opposite of what happened (qRg_max -> 0).
     if not well_cond:
-        note = _ill_conditioned_note(cond)
-    elif not above_floor:
-        note = _sub_molecular_note('Rg', rg)
+        notes.append(_ff_ill_conditioned_note(cond, cond_limit, scaled))
+    if not above_floor:
+        notes.append(_sub_molecular_note('Rg', rg, scaled + ('rg_nm',),
+                                         form_factor_min_size_nm))
     elif not form_factor_valid and model == ff.MIE:
-        note = ("Mie fit spans a deep form-factor minimum (min P(q) over the angles "
-                f"< {MIE_FIT_P_MIN:g}); the ordinate there is a noisy small difference of "
-                "large intensities, so Mw/A2 are ill-conditioned (drop the highest angles; "
-                "Rg is still reported)")
+        notes.append(Note('deep_minimum', scaled, {'limit': float(mie_p_min)}))
     elif not form_factor_valid:
-        note = (f"sphere fit extends past the first form-factor minimum "
-                f"(qRg_max = {qrg_max:.2f} > {SPHERE_FIRST_MINIMUM_QRG:.2f}); Mw/A2 "
-                "unreliable there (drop the highest angles or, for high-contrast spheres, "
-                "use a full Mie treatment)")
-    else:
-        note = ''
+        notes.append(Note('past_first_minimum', scaled,
+                          {'qrg': float(qrg_max), 'limit': float(SPHERE_FIRST_MINIMUM_QRG)}))
 
     return FormFactorResult(
         model=model, is_apparent=not thermodynamic, converged=converged,
@@ -2542,8 +3036,11 @@ def form_factor_analysis(
         qrg_max=qrg_max, r_squared=float(r2), form_factor_valid=form_factor_valid,
         calibrated=all_calibrated,
         dn_dc_supplied=all_dn_dc_supplied, blank_measured=all_blank_measured,
+        standard_index_known=all(bool(getattr(r, 'standard_index_known', True))
+                                 for r in rayleigh_results
+                                 if r.concentration_g_per_mL != 0),
         derived_provenance=_shared_derived_provenance(rayleigh_results),
-            blank_provenance=_shared_blank_provenance(rayleigh_results),
+        blank_provenance=_shared_blank_provenance(rayleigh_results),
         # Rg/R survive uncalibrated AND dn/dc-absent runs alike (the ordinate scale cancels
         # -- the same normalization the y_scale rescaling below already encodes); Mw needs
         # BOTH scales known, a physical (converged, inv_mw>0) fit, a well-conditioned
@@ -2565,7 +3062,7 @@ def form_factor_analysis(
         # form_factor_valid -- gates the Rg offer (finding 1, round 9c44).
         rg_reliable=(converged and above_floor and all_blank_measured),
         mw_se=mw_se, rg_se=rg_se, r_se=r_se, a2_se=a2_se, se_estimator=estimator,
-        well_conditioned=well_cond, cond=cond, reliability_note=note,
+        well_conditioned=well_cond, cond=cond,
         notes=tuple(notes),
         # m/n_solute are Mie-only provenance (None for the analytic models; m is a fixed
         # user input, not fitted). The wavelength/medium pair is echoed for EVERY model so
@@ -2574,6 +3071,7 @@ def form_factor_analysis(
         m=(m if model == ff.MIE else None),
         n_solute=n_sol, n_medium=float(n_med),
         wavelength_nm=float(wl_nm),
+        mie_p_min=float(mie_p_min), form_factor_min_size_nm=float(form_factor_min_size_nm),
     )
 
 
@@ -2607,7 +3105,7 @@ _ELLIPSOID_DEGENERACY_TOL = 0.02
 # qRg regime (P depends on q, Rg only through q*Rg), NOT on absolute size. Default 0.1: the
 # axial ratio is "resolved" once eps moves the fit at least ~10% as strongly (fractionally)
 # as Rg does -- a boundary near qRg ~ 1.5, general and noise-independent. A relative-SE
-# ceiling backs it up for the noisy borderline.
+# ceiling backs it up for the noisy borderline. The defaults of the fit's parameters.
 _ELLIPSOID_AXIAL_SENS_TOL = 0.1
 _ELLIPSOID_AXIAL_MAX_REL_SE = 0.5
 
@@ -2627,9 +3125,13 @@ class EllipsoidFormFactorResult:
     calibration.
 
     At low qRg the axial ratio is unidentifiable (all shapes share the Guinier limit):
-    `axial_ratio_reliable` is then False, the axial-ratio SE is withheld, and Rg/Mw are
-    still reported and gated only on the CORE (inv_Mw, Rg[, A2]) conditioning -- so a
-    well-determined Rg is not held hostage to an unresolvable shape.
+    `axial_ratio_resolved` and `axial_ratio_reliable` are then False, the axial-ratio SE is
+    withheld, and Rg/Mw are still reported and gated only on the CORE (inv_Mw, Rg[, A2])
+    conditioning -- so a well-determined Rg is not held hostage to an unresolvable shape. An
+    identified axial ratio whose relative SE is past the precision limit is resolved and
+    not reliable: its SE is kept, and its precondition names the relative SE. An
+    unmeasured blank fails `axial_ratio_reliable` as it fails every reliability verdict
+    here, and leaves `axial_ratio_resolved` and the SE as they are.
     """
     model: str                        # always 'ellipsoid' (uniform with FormFactorResult)
     is_apparent: bool
@@ -2655,8 +3157,17 @@ class EllipsoidFormFactorResult:
     calibrated: bool
     mw_reliable: bool                 # False if uncalibrated / non-physical / ill-conditioned
     a2_reliable: bool = False
-    # False when the axial ratio is unresolved (qRg too small to distinguish shape).
+    # The axial ratio's trust verdict, resolved AND precise AND the blank measured: False
+    # when the ratio is unresolved (qRg too small to distinguish shape), resolved and
+    # imprecise (its relative SE past `axial_max_rel_se`), or the blank was not measured
+    # (`blank_measured`, as on every reliability verdict here); each cause names itself.
     axial_ratio_reliable: bool = True
+    # The identifiability half of the verdict above: True when the fit's sensitivity to
+    # the axial ratio clears `axial_sens_tol` on a well-conditioned full design, so the ±
+    # is computed and shown. A resolved ratio fails the verdict only when imprecise
+    # (`axial_ratio_imprecise`) or blankless, its ± shown; an unresolved one fails it with
+    # the ± withheld. The blank never moves this field.
+    axial_ratio_resolved: bool = True
     # Conservative proxy: past the sphere first-minimum qRg the single-particle fit is
     # ill-conditioned (Mw/zero-location trade off); the orientation-averaged ellipsoid P
     # smears the minimum, so this is a conservative (early) flag -- Mw/A2 reliability
@@ -2676,9 +3187,10 @@ class EllipsoidFormFactorResult:
     # direction so Mw/Rg reliability is independent of axial-ratio identifiability.
     well_conditioned: bool = True
     cond: float = float('nan')
-    reliability_note: str = ''
     n_solutions: int = 1              # size of the degenerate set this solution belongs to
-    notes: tuple = ()
+    # Every note of the solution, as Notes; its degeneracy is a qualifier read off
+    # `degenerate` / `n_solutions` / `is_prolate` (core.notes.qualifiers), never a note.
+    notes: Tuple[Note, ...] = ()
     # `calibrated`'s sibling for the OPTICAL scale (see RayleighRatioResult): False ->
     # no dn/dc was supplied, so K was 1 and Mw/A2 here are on an arbitrary optical
     # scale. The angular sizes are untouched -- K multiplies the whole Kc/dR ordinate
@@ -2697,18 +3209,32 @@ class EllipsoidFormFactorResult:
     # reliability verdict on this result, because an additive blank does not cancel the
     # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
     blank_measured: bool = True
+    # Carried from the Rayleigh result(s) this fit consumed: False -> k_c was applied with
+    # the standard's refractive index blank, so `calibrated` is False for that cause alone
+    # (the scale gates name it). See RayleighRatioResult.standard_index_known.
+    standard_index_known: bool = True
     # Optical context (fixed user inputs), echoed like the Mie/core-shell siblings so the
     # plot layer can form k = 2*pi*n/lambda and cap the model grid at back-scatter q = 2k
     # (spec engineering-05). Always populated by the fit (the ellipsoid has one model, so
     # no Mie-style conditional); Optional only for hand-built stand-ins.
     n_medium: Optional[float] = None
     wavelength_nm: Optional[float] = None
+    # The thresholds the verdicts above read, echoed as `qrg_max_valid` is: the axial-ratio
+    # sensitivity and precision limits and the size floor.
+    axial_sens_tol: float = _ELLIPSOID_AXIAL_SENS_TOL
+    axial_max_rel_se: float = _ELLIPSOID_AXIAL_MAX_REL_SE
+    form_factor_min_size_nm: float = FORM_FACTOR_MIN_SIZE_NM
+
+
+#: The no-fit precondition of the ellipsoid fit: on its sentinel, and its warning's message.
+_ELLIPSOID_NO_FIT_NOTE = Note('no_ff_solution', (), {'model': 'ellipsoid of revolution'})
 
 
 def _ellipsoid_no_fit(q, y, c, n_conc, n_ang, thermodynamic, calibrated, estimator,
                       n_med, wl_nm, *, dn_dc_supplied, blank_measured=True, derived_provenance='',
-        blank_provenance=''):
-    """The single converged=False sentinel returned when no ellipsoid fits (never [])."""
+        blank_provenance='', notes=(), standard_index_known=True, thresholds=None):
+    """The single converged=False sentinel returned when no ellipsoid fits (never []).
+    `notes` is the drop and scale notes of the input; the no-fit note joins them."""
     return EllipsoidFormFactorResult(
         model=ff.ELLIPSOID, is_apparent=not thermodynamic, converged=False,
         degenerate=False, is_prolate=False,
@@ -2726,11 +3252,10 @@ def _ellipsoid_no_fit(q, y, c, n_conc, n_ang, thermodynamic, calibrated, estimat
         derived_provenance=derived_provenance,
         blank_provenance=blank_provenance,
         mw_reliable=False, a2_reliable=False, axial_ratio_reliable=False,
+        axial_ratio_resolved=False, standard_index_known=standard_index_known,
         se_estimator=estimator, well_conditioned=False,
-        reliability_note='No ellipsoid of revolution reproduces the angular P(q) -- the '
-                         'ellipsoid model does not fit (try the sphere or Gaussian-coil '
-                         'model).',
-        n_solutions=0, notes=(), n_medium=float(n_med), wavelength_nm=float(wl_nm))
+        n_solutions=0, notes=tuple(notes) + (_ELLIPSOID_NO_FIT_NOTE,),
+        n_medium=float(n_med), wavelength_nm=float(wl_nm), **(thresholds or {}))
 
 
 def ellipsoid_form_factor_analysis(
@@ -2738,6 +3263,10 @@ def ellipsoid_form_factor_analysis(
     estimator: str = 'hc3',
     cond_limit: float = unc.COND_LIMIT,
     degeneracy_tol: float = _ELLIPSOID_DEGENERACY_TOL,
+    *,
+    axial_sens_tol: float = _ELLIPSOID_AXIAL_SENS_TOL,
+    axial_max_rel_se: float = _ELLIPSOID_AXIAL_MAX_REL_SE,
+    form_factor_min_size_nm: float = FORM_FACTOR_MIN_SIZE_NM,
 ) -> List[EllipsoidFormFactorResult]:
     """Fit the ellipsoid-of-revolution form factor P(q) to Kc/dR across angles (and c).
 
@@ -2768,6 +3297,11 @@ def ellipsoid_form_factor_analysis(
     degeneracy_tol : float
         A solution joins the reported set when its RMS residual exceeds the best solution's
         by less than this fraction of the data RMS (default 2 %). Documented, overridable.
+    axial_sens_tol, axial_max_rel_se, form_factor_min_size_nm : float
+        The axial ratio's identifiability threshold (its fractional sensitivity against
+        Rg's) and precision limit (its relative SE), and the size floor; defaults
+        ``_ELLIPSOID_AXIAL_SENS_TOL``, ``_ELLIPSOID_AXIAL_MAX_REL_SE`` and
+        ``FORM_FACTOR_MIN_SIZE_NM``, echoed on every result.
 
     Raises
     ------
@@ -2778,13 +3312,8 @@ def ellipsoid_form_factor_analysis(
     if isinstance(rayleigh_results, RayleighRatioResult):
         rayleigh_results = [rayleigh_results]
 
-    q2, c, y = _collect_zimm_points(rayleigh_results)
-    drop_notes: list = []
-    q2, c, y = _drop_nonpositive_ordinate('Form-factor', q2, c, y, drop_notes)
-    q = np.sqrt(q2)
-    n_conc = int(np.unique(c).size)
-    n_ang = int(np.unique(np.round(q2, 12)).size)
-    thermodynamic = n_conc >= 2
+    q2, c, y, q, n_conc, n_ang, thermodynamic, drop_notes = _form_factor_inputs(
+        rayleigh_results)
     # The ellipsoid adds an axial-ratio parameter over the sphere/coil fit, so it needs
     # angular CURVATURE to constrain the shape: at least three distinct angles (two only fix
     # a slope -> Rg, blind to eps). This is stricter than the >= 2 angles the Rg-only sphere/
@@ -2794,16 +3323,8 @@ def ellipsoid_form_factor_analysis(
             "Ellipsoid form-factor P(q) fit needs at least three angles to resolve the "
             f"axial ratio; got {n_ang}."
         )
-    all_calibrated = all(r.calibrated for r in rayleigh_results
-                         if r.concentration_g_per_mL != 0)
-    # The dn/dc sibling of all_calibrated, aggregated identically (same c != 0 skip:
-    # the solvent blank carries no dn/dc of its own and none is ever read from it).
-    all_dn_dc_supplied = all(r.dn_dc_supplied for r in rayleigh_results
-                             if r.concentration_g_per_mL != 0)
-    # The blank sibling, over the same set. Not a scale: it gates every verdict below.
-    all_blank_measured = all(bool(getattr(r, 'blank_measured', True))
-                             for r in rayleigh_results
-                             if r.concentration_g_per_mL != 0)
+    all_calibrated, all_dn_dc_supplied, all_blank_measured = _aggregate_scale_flags(
+        rayleigh_results)
     # Optical context for the result (display/plot provenance; the Pedersen P(q) itself
     # never needs it) — the cap-safe extraction shared with the Mie and core-shell paths.
     wl_nm, n_med = _echoed_optics(rayleigh_results)
@@ -2867,19 +3388,26 @@ def ellipsoid_form_factor_analysis(
                     and ELLIPSOID_EPS_MIN < eps < ELLIPSOID_EPS_MAX):
                 solutions.append((float(res.cost), res))
 
+    scaled = ('mw_g_per_mol', 'a2_mol_mL_per_g2')
+    input_notes = tuple(drop_notes) + scale_notes(
+        [r for r in rayleigh_results if r.concentration_g_per_mL != 0],
+        mw=scaled[:1], a2=scaled[1:], scale_free=('rg_nm', 'axial_ratio'))
+    all_index_known = all(bool(getattr(r, 'standard_index_known', True))
+                          for r in rayleigh_results if r.concentration_g_per_mL != 0)
+    thresholds = dict(axial_sens_tol=float(axial_sens_tol),
+                      axial_max_rel_se=float(axial_max_rel_se),
+                      form_factor_min_size_nm=float(form_factor_min_size_nm))
     if not solutions:
         # Emit the same RuntimeWarning the sphere/coil form_factor_analysis raises on a
         # non-converged fit, so a warning-based QC gate sees the ellipsoid no-fit too
         # (fix-the-family: the sentinel must not be a silent stderr gap for this sibling).
-        warnings.warn(
-            "No ellipsoid of revolution reproduces the angular P(q); the ellipsoid model "
-            "does not fit (try the sphere or Gaussian-coil model).",
-            RuntimeWarning, stacklevel=2)
+        _warn_note(_ELLIPSOID_NO_FIT_NOTE, stacklevel=2)
         return [_ellipsoid_no_fit(q, y, c, n_conc, n_ang, thermodynamic,
                                   all_calibrated, estimator, n_med, wl_nm,
                                   dn_dc_supplied=all_dn_dc_supplied, blank_measured=all_blank_measured,
             derived_provenance=_shared_derived_provenance(rayleigh_results),
-            blank_provenance=_shared_blank_provenance(rayleigh_results))]
+            blank_provenance=_shared_blank_provenance(rayleigh_results), notes=input_notes,
+            standard_index_known=all_index_known, thresholds=thresholds)]
 
     # ---- cluster distinct minima (lowest cost per basin), then keep the comparable set ----
     solutions.sort(key=lambda t: t[0])
@@ -2919,15 +3447,18 @@ def ellipsoid_form_factor_analysis(
             all_calibrated, estimator, cond_limit, eps_idx, degenerate, len(accepted),
             n_med, wl_nm, dn_dc_supplied=all_dn_dc_supplied, blank_measured=all_blank_measured,
             derived_provenance=_shared_derived_provenance(rayleigh_results),
-            blank_provenance=_shared_blank_provenance(rayleigh_results), drop_notes=drop_notes))
+            blank_provenance=_shared_blank_provenance(rayleigh_results), drop_notes=input_notes,
+            standard_index_known=all_index_known, thresholds=thresholds))
     return results
 
 
 def _build_ellipsoid_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_ang,
                             n_pts, calibrated, estimator, cond_limit, eps_idx,
                             degenerate, n_solutions, n_med, wl_nm, *, dn_dc_supplied, blank_measured=True, derived_provenance='',
-        blank_provenance='', drop_notes=()):
+        blank_provenance='', drop_notes=(), standard_index_known=True, thresholds=None):
     """Assemble one EllipsoidFormFactorResult (params, SEs, flags) from a converged fit.
+    `thresholds` holds the axial-ratio and size-floor thresholds the verdicts read (the
+    defaults where None), echoed on the result.
 
     Covariance when the axial ratio is UNRESOLVED. eps is profiled out by slicing the
     Jacobian to the core columns, so every dof guard inside the covariance sees p_core --
@@ -2948,6 +3479,9 @@ def _build_ellipsoid_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_
     in the one regime tried, so a defensibility gap rather than a measured under-report --
     recorded as a carried residual against this method rather than fixed here.
     """
+    thresholds = {'axial_sens_tol': _ELLIPSOID_AXIAL_SENS_TOL,
+                  'axial_max_rel_se': _ELLIPSOID_AXIAL_MAX_REL_SE,
+                  'form_factor_min_size_nm': FORM_FACTOR_MIN_SIZE_NM, **(thresholds or {})}
     inv_mw = float(res.x[0]) * y_scale
     rg = float(res.x[1])
     eps = float(res.x[2])
@@ -2979,8 +3513,8 @@ def _build_ellipsoid_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_
     core_cols = [0, 1] + ([3] if thermodynamic else [])
     cov_full, cond_full, wc_full = unc.covariance_from_jacobian(
         J, res.fun, estimator, cond_limit)
-    eps_resolved = (eps_sens >= _ELLIPSOID_AXIAL_SENS_TOL and wc_full
-                    and np.all(np.isfinite(cov_full)))
+    eps_resolved = bool(eps_sens >= thresholds['axial_sens_tol'] and wc_full
+                        and np.all(np.isfinite(cov_full)))
 
     mw_se = rg_se = axial_ratio_se = a2_se = None
     if eps_resolved:
@@ -2999,10 +3533,12 @@ def _build_ellipsoid_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_
             if thermodynamic:
                 j = np.zeros(p); j[3] = 1.0
                 a2_se = unc.se_or_none(unc.propagate(j, cov))
-        # A resolved-but-imprecise axial ratio (large relative SE) is still flagged.
-        axial_ratio_reliable = (axial_ratio_se is not None
-                                and math.isfinite(eps) and eps > 0
-                                and axial_ratio_se / eps <= _ELLIPSOID_AXIAL_MAX_REL_SE)
+        # A resolved-but-imprecise axial ratio (large relative SE) is still flagged, its ±
+        # shown; its own precondition below names the relative SE against the limit.
+        rel_se = (axial_ratio_se / eps
+                  if (axial_ratio_se is not None and math.isfinite(eps) and eps > 0)
+                  else float('nan'))
+        axial_ratio_reliable = bool(rel_se <= thresholds['axial_max_rel_se'])
     else:
         # eps unresolved -> profile it out: SEs for (inv_Mw, Rg[, A2]) only, eps SE withheld.
         cov_c, cond, well_cond = unc.covariance_from_jacobian(
@@ -3027,6 +3563,7 @@ def _build_ellipsoid_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_
             if thermodynamic:
                 j = np.zeros(p); j[2] = 1.0
                 a2_se = unc.se_or_none(unc.propagate(j, cov))
+        rel_se = float('nan')
         axial_ratio_reliable = False
 
     # ---- flags + regime indicator ----
@@ -3038,39 +3575,39 @@ def _build_ellipsoid_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_
     # is ill-conditioned. The orientation average smears the ellipsoid minimum, so flagging
     # at the sphere threshold is conservative (early). Suppresses Mw/A2 reliability past it.
     # The size floor is the same predicate's lower tail -- see FORM_FACTOR_MIN_SIZE_NM.
-    above_floor = _size_above_floor(rg)
+    above_floor = _size_above_floor(rg, thresholds['form_factor_min_size_nm'])
     form_factor_valid = above_floor and (not math.isfinite(qrg_max)
                                          or qrg_max <= SPHERE_FIRST_MINIMUM_QRG)
 
-    # Shape/degeneracy context is INFORMATIONAL, not an Mw/A2-reliability reason, so it rides
-    # in `notes` -- keeping `reliability_note` '' when Mw is reliable (matching FormFactorResult)
-    # so the export Mw/A2 Comments cell shows the apparent/thermodynamic regime label instead of
-    # being hijacked by shape text (code-review finding, 2026-07-20). (Only res.success solutions
-    # are ever assembled here -- non-converged fits are filtered before clustering -- so there is
-    # no last-iterate note like form_factor_analysis keeps.)
+    # The axial ratio fails its own verdict, never Mw's, for one of two causes: it is not
+    # identified at all (the ± withheld), or it is identified and imprecise (the ± shown).
+    # The degeneracy is a qualifier read off `degenerate` / `n_solutions` / `is_prolate`,
+    # never a note. (Only res.success solutions are ever assembled here -- non-converged
+    # fits are filtered before clustering -- so a solution that is not `converged` reached
+    # a non-physical parameter, named below.)
+    scaled = ('mw_g_per_mol', 'a2_mol_mL_per_g2')
     notes: list = list(drop_notes)
-    if not axial_ratio_reliable:
-        notes.append("axial ratio unresolved (qRg too small to distinguish shape -- all "
-                     "shapes share the Guinier limit); Rg is still reported")
-    if degenerate:
-        kind = 'prolate' if is_prolate else 'oblate'
-        notes.append(f"this data is also consistent with {n_solutions - 1} other "
-                     f"ellipsoid{'s' if n_solutions > 2 else ''} "
-                     f"({kind} solution shown) -- the shape fit is degenerate")
+    if not eps_resolved:
+        notes.append(Note('axial_ratio_unresolved', ('axial_ratio',), {'qrg': float(qrg_max)}))
+    elif not axial_ratio_reliable:
+        notes.append(Note('axial_ratio_imprecise', ('axial_ratio',),
+                          {'rel_se': float(rel_se),
+                           'limit': float(thresholds['axial_max_rel_se'])}))
+    if not converged:
+        notes += _nonphysical_notes(inv_mw, mw, (('Rg', rg),), scaled + ('rg_nm',))
+    if thermodynamic and a2 is not None and not math.isfinite(a2):
+        notes.append(Note('a2_not_finite', scaled[1:]))
 
-    # reliability_note: Mw/A2-reliability reasons ONLY (ill-conditioned / sub-molecular / past
-    # first-minimum), in that precedence -- see the sphere/Mie chain for why the floor outranks.
-    reasons = []
+    # The design's conditioning beside the shape-fit reasons, never instead; between
+    # those, the floor outranks the first minimum -- see the sphere/Mie chain for why.
     if not well_cond:
-        reasons.append(_ill_conditioned_note(cond))
-    elif not above_floor:
-        reasons.append(_sub_molecular_note('Rg', rg))
+        notes.append(_ff_ill_conditioned_note(cond, cond_limit, scaled))
+    if not above_floor:
+        notes.append(_sub_molecular_note('Rg', rg, scaled + ('rg_nm',),
+                                         thresholds['form_factor_min_size_nm']))
     elif not form_factor_valid:
-        reasons.append(
-            f"fit extends past the sphere first form-factor minimum "
-            f"(qRg_max = {qrg_max:.2f} > {SPHERE_FIRST_MINIMUM_QRG:.2f}); Mw/A2 "
-            "unreliable there")
-    note = '; '.join(reasons)
+        notes.append(Note('past_first_minimum', scaled,
+                          {'qrg': float(qrg_max), 'limit': float(SPHERE_FIRST_MINIMUM_QRG)}))
 
     return EllipsoidFormFactorResult(
         model=ff.ELLIPSOID, is_apparent=not thermodynamic, converged=converged,
@@ -3083,6 +3620,7 @@ def _build_ellipsoid_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_
         qrg_max=qrg_max, r_squared=float(r2), calibrated=calibrated,
         dn_dc_supplied=dn_dc_supplied,
         blank_measured=blank_measured,
+        standard_index_known=standard_index_known,
         derived_provenance=derived_provenance,
         blank_provenance=blank_provenance,
         # Rg/eps survive an uncalibrated OR dn/dc-absent run alike (the ordinate scale
@@ -3097,20 +3635,20 @@ def _build_ellipsoid_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_
         a2_reliable=(thermodynamic and calibrated and dn_dc_supplied and blank_measured
                      and converged and well_cond
                      and form_factor_valid and a2 is not None and math.isfinite(a2)),
-        # NOT gated on the blank (owner-ruled 2026-09-17), unlike every other verdict on
-        # this result. This field is not a trust verdict: it answers "could the data tell
-        # the shapes apart", and three consumers read it as that literal claim -- one of
-        # them the only flag in the tree that withholds a +-. ANDing an input absence into
-        # it made a resolved axial ratio print "(unresolved)" with a real SE suppressed
-        # (invariant 4's proxy ban, and invariant 8's withhold rule). Rg and Mw on this
-        # same result DO take the gate, because they are trust verdicts.
-        axial_ratio_reliable=axial_ratio_reliable,
+        # The trust verdict takes the blank like every reliability verdict here (the rule's
+        # home is RayleighRatioResult's docstring); identifiability, which the +- withhold
+        # and every "unresolved" word read, is `axial_ratio_resolved`: the blank leaves it.
+        axial_ratio_reliable=(axial_ratio_reliable and blank_measured),
+        axial_ratio_resolved=eps_resolved,
         form_factor_valid=form_factor_valid,
         rg_reliable=(converged and above_floor and blank_measured),  # finding 1 -- see the field's comment
         mw_se=mw_se, rg_se=rg_se, axial_ratio_se=axial_ratio_se, a2_se=a2_se,
         se_estimator=estimator, well_conditioned=well_cond, cond=cond,
-        reliability_note=note, n_solutions=n_solutions, notes=tuple(notes),
+        n_solutions=n_solutions, notes=tuple(notes),
         n_medium=float(n_med), wavelength_nm=float(wl_nm),
+        axial_sens_tol=float(thresholds['axial_sens_tol']),
+        axial_max_rel_se=float(thresholds['axial_max_rel_se']),
+        form_factor_min_size_nm=float(thresholds['form_factor_min_size_nm']),
     )
 
 
@@ -3127,8 +3665,8 @@ def _build_ellipsoid_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_
 # same physical criterion (and value) as the homogeneous-Mie MIE_FIT_P_MIN: at an angle where
 # P(q) dips below this, the ordinate 1/(Mw P) is a noise-dominated small difference of large
 # intensities and the Mw/A2 fit is ill-conditioned there (Rg is still reported -- the shape is
-# constrained by the whole curve). A documented module constant (invariant 4), not
-# a function parameter -- the same shape as MIE_FIT_P_MIN.
+# constrained by the whole curve). A documented default (invariant 4) of
+# `core_shell_form_factor_analysis`'s `core_shell_p_min` -- the same shape as MIE_FIT_P_MIN.
 CORE_SHELL_FIT_P_MIN = 0.05
 # Two solutions are the SAME basin (dedup) when both radii agree to this relative tolerance.
 _CORE_SHELL_CLUSTER_TOL = 0.05
@@ -3225,9 +3763,10 @@ class CoreShellFormFactorResult:
     se_estimator: str = 'hc3'
     well_conditioned: bool = True
     cond: float = float('nan')
-    reliability_note: str = ''
     n_solutions: int = 1              # size of the degenerate set this solution belongs to
-    notes: tuple = ()
+    # Every note of the solution, as Notes; its degeneracy is a qualifier read off
+    # `degenerate` / `n_solutions` (core.notes.qualifiers), never a note.
+    notes: Tuple[Note, ...] = ()
     # `calibrated`'s sibling for the OPTICAL scale (see RayleighRatioResult): False ->
     # no dn/dc was supplied, so K was 1 and Mw/A2 here are on an arbitrary optical
     # scale. The angular sizes are untouched -- K multiplies the whole Kc/dR ordinate
@@ -3246,6 +3785,10 @@ class CoreShellFormFactorResult:
     # reliability verdict on this result, because an additive blank does not cancel the
     # way an unknown SCALE does. See RayleighRatioResult.blank_measured.
     blank_measured: bool = True
+    # Carried from the Rayleigh result(s) this fit consumed: False -> k_c was applied with
+    # the standard's refractive index blank, so `calibrated` is False for that cause alone
+    # (the scale gates name it). See RayleighRatioResult.standard_index_known.
+    standard_index_known: bool = True
     # Contrast provenance (fixed user inputs), echoed for display + export like the Mie fields.
     m1: Optional[float] = None        # core relative index n_core/n_medium
     m2: Optional[float] = None        # shell relative index n_shell/n_medium
@@ -3253,12 +3796,22 @@ class CoreShellFormFactorResult:
     n_shell: Optional[float] = None
     n_medium: Optional[float] = None
     wavelength_nm: Optional[float] = None
+    # The thresholds the verdicts above read, echoed as `qrg_max_valid` is: the deep-minimum
+    # floor on the fitted P(q), the size floor and the contrast-match tolerance of the Rg.
+    core_shell_p_min: float = CORE_SHELL_FIT_P_MIN
+    form_factor_min_size_nm: float = FORM_FACTOR_MIN_SIZE_NM
+    core_shell_contrast_match_rel: float = ff._CORE_SHELL_CONTRAST_MATCH_REL
+
+
+#: The no-fit precondition of the core-shell fit: on its sentinel, and its warning's message.
+_CORE_SHELL_NO_FIT_NOTE = Note('no_ff_solution', (), {'model': 'core-shell sphere'})
 
 
 def _core_shell_no_fit(q, y, c, n_conc, n_ang, thermodynamic, calibrated, estimator,
                        m1, m2, n_core, n_shell, n_med, wl_nm, *, dn_dc_supplied, blank_measured=True, derived_provenance='',
-        blank_provenance=''):
-    """The single converged=False sentinel returned when no coated sphere fits (never [])."""
+        blank_provenance='', notes=(), standard_index_known=True, thresholds=None):
+    """The single converged=False sentinel returned when no coated sphere fits (never []).
+    `notes` is the drop and scale notes of the input; the no-fit note joins them."""
     return CoreShellFormFactorResult(
         model=ff.CORE_SHELL, is_apparent=not thermodynamic, converged=False,
         degenerate=False, rg_undefined=False,
@@ -3274,11 +3827,11 @@ def _core_shell_no_fit(q, y, c, n_conc, n_ang, thermodynamic, calibrated, estima
         # form_factor_valid stays True: nothing was fitted, so there is no size for the
         # FORM_FACTOR_MIN_SIZE_NM floor to judge, and every *_reliable flag is already False.
         mw_reliable=False, a2_reliable=False, rg_reliable=False, form_factor_valid=True,
+        standard_index_known=standard_index_known,
         se_estimator=estimator, well_conditioned=False,
-        reliability_note='No core-shell sphere reproduces the angular P(q) -- the core-shell '
-                         'model does not fit (try the sphere, Mie, or Gaussian-coil model).',
-        n_solutions=0, notes=(),
-        m1=m1, m2=m2, n_core=n_core, n_shell=n_shell, n_medium=n_med, wavelength_nm=wl_nm)
+        n_solutions=0, notes=tuple(notes) + (_CORE_SHELL_NO_FIT_NOTE,),
+        m1=m1, m2=m2, n_core=n_core, n_shell=n_shell, n_medium=n_med, wavelength_nm=wl_nm,
+        **(thresholds or {}))
 
 
 def _profile_core_shell_starts(P_of, q, yn, c, thermodynamic, n_keep=6, *,
@@ -3350,6 +3903,10 @@ def core_shell_form_factor_analysis(
     estimator: str = 'hc3',
     cond_limit: float = unc.COND_LIMIT,
     degeneracy_tol: float = _CORE_SHELL_DEGENERACY_TOL,
+    *,
+    core_shell_p_min: float = CORE_SHELL_FIT_P_MIN,
+    form_factor_min_size_nm: float = FORM_FACTOR_MIN_SIZE_NM,
+    core_shell_contrast_match_rel: float = ff._CORE_SHELL_CONTRAST_MATCH_REL,
 ) -> List[CoreShellFormFactorResult]:
     """Fit the coated-sphere (core-shell) form factor P(q) to Kc/dR across angles (and c).
 
@@ -3383,6 +3940,11 @@ def core_shell_form_factor_analysis(
     degeneracy_tol : float
         A solution joins the reported set when its RMS residual exceeds the best solution's by
         less than this fraction of the data RMS (default 2 %). Documented, overridable.
+    core_shell_p_min, form_factor_min_size_nm, core_shell_contrast_match_rel : float
+        The deep-minimum floor on the fitted P(q), the size floor on the outer radius and
+        the net-contrast tolerance below which the contrast-weighted Rg is undefined;
+        defaults ``CORE_SHELL_FIT_P_MIN``, ``FORM_FACTOR_MIN_SIZE_NM`` and
+        ``form_factor._CORE_SHELL_CONTRAST_MATCH_REL``, echoed on every result.
 
     Raises
     ------
@@ -3400,13 +3962,8 @@ def core_shell_form_factor_analysis(
     if isinstance(rayleigh_results, RayleighRatioResult):
         rayleigh_results = [rayleigh_results]
 
-    q2, c, y = _collect_zimm_points(rayleigh_results)
-    drop_notes: list = []
-    q2, c, y = _drop_nonpositive_ordinate('Form-factor', q2, c, y, drop_notes)
-    q = np.sqrt(q2)
-    n_conc = int(np.unique(c).size)
-    n_ang = int(np.unique(np.round(q2, 12)).size)
-    thermodynamic = n_conc >= 2
+    q2, c, y, q, n_conc, n_ang, thermodynamic, drop_notes = _form_factor_inputs(
+        rayleigh_results)
     # Two radii + 1/Mw is a three-parameter shape fit; it needs angular CURVATURE, so at least
     # three distinct angles (two only fix a slope -> one size). Stricter than the >= 2 the
     # Rg-only sphere/coil fit accepts, matching the ellipsoid's three-angle floor.
@@ -3415,16 +3972,8 @@ def core_shell_form_factor_analysis(
             "Core-shell form-factor P(q) fit needs at least three angles to resolve the two "
             f"radii; got {n_ang}."
         )
-    all_calibrated = all(r.calibrated for r in rayleigh_results
-                         if r.concentration_g_per_mL != 0)
-    # The dn/dc sibling of all_calibrated, aggregated identically (same c != 0 skip:
-    # the solvent blank carries no dn/dc of its own and none is ever read from it).
-    all_dn_dc_supplied = all(r.dn_dc_supplied for r in rayleigh_results
-                             if r.concentration_g_per_mL != 0)
-    # The blank sibling, over the same set. Not a scale: it gates every verdict below.
-    all_blank_measured = all(bool(getattr(r, 'blank_measured', True))
-                             for r in rayleigh_results
-                             if r.concentration_g_per_mL != 0)
+    all_calibrated, all_dn_dc_supplied, all_blank_measured = _aggregate_scale_flags(
+        rayleigh_results)
     wl_nm, n_med = _echoed_optics(rayleigh_results)
     n_core = m1 * n_med
     n_shell = m2 * n_med
@@ -3486,16 +4035,26 @@ def core_shell_form_factor_analysis(
                 and math.isfinite(rc) and rc > 0 and t >= 0 and math.isfinite(res.cost)):
             solutions.append((float(res.cost), res))
 
+    scaled = ('mw_g_per_mol', 'a2_mol_mL_per_g2')
+    # The blank is about every size the angular shape gives -- the radii and the shell
+    # they bound beside the Rg -- as it is about the ellipsoid's axial ratio.
+    input_notes = tuple(drop_notes) + scale_notes(
+        [r for r in rayleigh_results if r.concentration_g_per_mL != 0],
+        mw=scaled[:1], a2=scaled[1:],
+        scale_free=('rg_nm', 'r_core_nm', 'r_outer_nm', 'shell_thickness_nm'))
+    all_index_known = all(bool(getattr(r, 'standard_index_known', True))
+                          for r in rayleigh_results if r.concentration_g_per_mL != 0)
+    thresholds = dict(core_shell_p_min=float(core_shell_p_min),
+                      form_factor_min_size_nm=float(form_factor_min_size_nm),
+                      core_shell_contrast_match_rel=float(core_shell_contrast_match_rel))
     if not solutions:
-        warnings.warn(
-            "No core-shell sphere reproduces the angular P(q); the core-shell model does not "
-            "fit (try the sphere, Mie, or Gaussian-coil model).",
-            RuntimeWarning, stacklevel=2)
+        _warn_note(_CORE_SHELL_NO_FIT_NOTE, stacklevel=2)
         return [_core_shell_no_fit(q, y, c, n_conc, n_ang, thermodynamic, all_calibrated,
                                    estimator, m1, m2, n_core, n_shell, n_med, wl_nm,
                                    dn_dc_supplied=all_dn_dc_supplied, blank_measured=all_blank_measured,
             derived_provenance=_shared_derived_provenance(rayleigh_results),
-            blank_provenance=_shared_blank_provenance(rayleigh_results))]
+            blank_provenance=_shared_blank_provenance(rayleigh_results), notes=input_notes,
+            standard_index_known=all_index_known, thresholds=thresholds)]
 
     # ---- cluster distinct minima (lowest cost per basin), keep the comparable set ----
     solutions.sort(key=lambda t: t[0])
@@ -3531,7 +4090,8 @@ def core_shell_form_factor_analysis(
             estimator, cond_limit, degenerate, len(accepted), _P, m1, m2, n_core, n_shell,
             n_med, wl_nm, dn_dc_supplied=all_dn_dc_supplied, blank_measured=all_blank_measured,
             derived_provenance=_shared_derived_provenance(rayleigh_results),
-            blank_provenance=_shared_blank_provenance(rayleigh_results), drop_notes=drop_notes)
+            blank_provenance=_shared_blank_provenance(rayleigh_results), drop_notes=input_notes,
+            standard_index_known=all_index_known, thresholds=thresholds)
         for _cost, res, _rc, _ro in accepted
     ]
 
@@ -3539,15 +4099,22 @@ def core_shell_form_factor_analysis(
 def _build_core_shell_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n_ang, n_pts,
                              calibrated, estimator, cond_limit, degenerate, n_solutions, P_of,
                              m1, m2, n_core, n_shell, n_med, wl_nm, *, dn_dc_supplied, blank_measured=True, derived_provenance='',
-        blank_provenance='', drop_notes=()):
-    """Assemble one CoreShellFormFactorResult (params, SEs, flags) from a converged fit."""
+        blank_provenance='', drop_notes=(), standard_index_known=True, thresholds=None):
+    """Assemble one CoreShellFormFactorResult (params, SEs, flags) from a converged fit.
+    `thresholds` holds the deep-minimum, size-floor and contrast-match thresholds the
+    verdicts read (the defaults where None), echoed on the result."""
+    thresholds = {'core_shell_p_min': CORE_SHELL_FIT_P_MIN,
+                  'form_factor_min_size_nm': FORM_FACTOR_MIN_SIZE_NM,
+                  'core_shell_contrast_match_rel': ff._CORE_SHELL_CONTRAST_MATCH_REL,
+                  **(thresholds or {})}
     inv_mw = float(res.x[0]) * y_scale
     r_core = float(res.x[1])
     t = float(res.x[2])
     r_outer = r_core + t
     a2 = float(res.x[3]) * y_scale if thermodynamic else None
     mw = 1.0 / inv_mw if (math.isfinite(inv_mw) and inv_mw > 0) else float('nan')
-    rg = ff.core_shell_contrast_weighted_rg(r_core, r_outer, m1, m2)
+    rg = ff.core_shell_contrast_weighted_rg(
+        r_core, r_outer, m1, m2, contrast_match_rel=thresholds['core_shell_contrast_match_rel'])
     # rg is nan for EITHER a near-zero net contrast (contrast-matched) OR an opposite-sign
     # core/shell radial moment (Rg^2 <= 0, a hollow-like profile with a large net contrast) --
     # in both the scattering Rg is not physically defined, so the wording below stays true of
@@ -3591,34 +4158,34 @@ def _build_core_shell_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n
     # The size floor binds the OUTER RADIUS here, not Rg: this result's Rg is a contrast-weighted
     # moment that is undefined by design when the contrasts cancel (rg_undefined), so it is not a
     # size to judge. r_outer is the particle's outer radius and is finite on any converged fit.
-    above_floor = _size_above_floor(r_outer)
+    above_floor = _size_above_floor(r_outer, thresholds['form_factor_min_size_nm'])
     form_factor_valid = above_floor and not (math.isfinite(min_p)
-                                             and min_p < CORE_SHELL_FIT_P_MIN)
+                                             and min_p < thresholds['core_shell_p_min'])
 
+    # The undefined Rg fails the size's verdict alone; the degeneracy is a qualifier read
+    # off `degenerate` / `n_solutions`, never a note.
+    scaled = ('mw_g_per_mol', 'a2_mol_mL_per_g2')
     notes: list = list(drop_notes)
     if rg_undefined:
-        notes.append("the core/shell contrast profile has no defined scattering Rg (the "
-                     "contrasts nearly cancel, or their radial moments oppose) -- Rg is not "
-                     "reported; the two radii still are")
-    if degenerate:
-        notes.append(f"this data is also consistent with {n_solutions - 1} other core-shell "
-                     f"solution{'s' if n_solutions > 2 else ''} (different radius pairs) -- "
-                     "the two-radius fit is degenerate")
+        notes.append(Note('rg_undefined', ('rg_nm',)))
+    # Only res.success solutions are assembled, so one that is not `converged` reached a
+    # non-physical parameter.
+    if not converged:
+        notes += _nonphysical_notes(inv_mw, mw, (('R_core', r_core),), scaled + ('rg_nm',))
+    if thermodynamic and a2 is not None and not math.isfinite(a2):
+        notes.append(Note('a2_not_finite', scaled[1:]))
 
-    # reliability_note: Mw/A2-reliability reasons ONLY (ill-conditioned / past a deep minimum),
-    # so the export Mw comment shows the regime label when Mw is reliable (matching the sibling
-    # results), not shape/degeneracy text (which rides in `notes`).
+    # The design's conditioning beside the shape-fit reasons, never instead; between
+    # those, the floor outranks the deep minimum -- see the sphere/Mie chain for why.
     if not well_cond:
-        note = _ill_conditioned_note(cond)
-    elif not above_floor:
-        note = _sub_molecular_note('outer radius', r_outer)
+        notes.append(_ff_ill_conditioned_note(cond, cond_limit, scaled))
+    if not above_floor:
+        notes.append(_sub_molecular_note('outer radius', r_outer,
+                                         scaled + ('rg_nm', 'r_outer_nm'),
+                                         thresholds['form_factor_min_size_nm']))
     elif not form_factor_valid:
-        note = (f"core-shell fit spans a deep form-factor minimum (min P(q) over the angles "
-                f"< {CORE_SHELL_FIT_P_MIN:g}); the ordinate there is a noisy small difference "
-                "of large intensities, so Mw/A2 are ill-conditioned (drop the highest angles; "
-                "the radii are still reported)")
-    else:
-        note = ''
+        notes.append(Note('deep_minimum', scaled,
+                          {'limit': float(thresholds['core_shell_p_min'])}))
 
     return CoreShellFormFactorResult(
         model=ff.CORE_SHELL, is_apparent=not thermodynamic, converged=converged,
@@ -3630,6 +4197,7 @@ def _build_core_shell_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n
         qrg_max=qrg_max, r_squared=float(r2), calibrated=calibrated,
         dn_dc_supplied=dn_dc_supplied,
         blank_measured=blank_measured,
+        standard_index_known=standard_index_known,
         derived_provenance=derived_provenance,
         blank_provenance=blank_provenance,
         # Radii/Rg survive an uncalibrated OR dn/dc-absent run alike (the ordinate scale
@@ -3649,10 +4217,49 @@ def _build_core_shell_result(res, q, y, c, yn, y_scale, thermodynamic, n_conc, n
         form_factor_valid=form_factor_valid,
         mw_se=mw_se, r_core_se=r_core_se, r_outer_se=r_outer_se, a2_se=a2_se, rg_se=None,
         se_estimator=estimator, well_conditioned=well_cond, cond=cond,
-        reliability_note=note, n_solutions=n_solutions, notes=tuple(notes),
+        n_solutions=n_solutions, notes=tuple(notes),
         m1=float(m1), m2=float(m2), n_core=float(n_core), n_shell=float(n_shell),
         n_medium=float(n_med), wavelength_nm=float(wl_nm),
+        core_shell_p_min=float(thresholds['core_shell_p_min']),
+        form_factor_min_size_nm=float(thresholds['form_factor_min_size_nm']),
+        core_shell_contrast_match_rel=float(thresholds['core_shell_contrast_match_rel']),
     )
+
+
+# Agree-on-Rg tolerance for the "size determined, shape ambiguous" consensus of a degenerate
+# form-factor fit: its per-solution Rg values agree when their relative spread is within
+# _FF_CONSENSUS_RG_REL OR their absolute spread is within _FF_CONSENSUS_RG_ABS_NM (the floor keeps
+# the relative test from being needlessly harsh at small sizes). Owner-set defaults (2026-07-21):
+# core-shell 36.8/37.3/37.3/37.3 -> agree; ellipsoid 101/129/175 -> do not. The consensus reports
+# the MEAN of the solution Rg values. Documented in the Advanced Guide.
+_FF_CONSENSUS_RG_REL = 0.10
+_FF_CONSENSUS_RG_ABS_NM = 1.0
+
+
+def rg_values_agree(rgs, *, rel_tol: float = _FF_CONSENSUS_RG_REL,
+                    abs_tol_nm: float = _FF_CONSENSUS_RG_ABS_NM) -> bool:
+    """Whether a degenerate fit's per-solution Rg values agree closely enough to call the SIZE
+    determined even though the shape/radii are not. True when the peak spread is within
+    `rel_tol` of the mean OR within `abs_tol_nm` absolute (defaults _FF_CONSENSUS_RG_REL,
+    _FF_CONSENSUS_RG_ABS_NM). Needs >= 2 finite positive values; a single value is trivially
+    'determined' (True)."""
+    vals = [float(r) for r in rgs if r is not None and np.isfinite(r) and r > 0]
+    if len(vals) < 2:
+        return len(vals) == 1
+    spread = max(vals) - min(vals)
+    mean = sum(vals) / len(vals)
+    return spread <= abs_tol_nm or (mean > 0 and spread / mean <= rel_tol)
+
+
+def form_factor_consensus_rg(rgs, *, rel_tol: float = _FF_CONSENSUS_RG_REL,
+                             abs_tol_nm: float = _FF_CONSENSUS_RG_ABS_NM) -> Optional[float]:
+    """The consensus Rg (nm) of a degenerate form-factor fit: the mean of the per-solution Rg
+    values `rgs` when there is more than one and they agree (`rg_values_agree` at `rel_tol`,
+    `abs_tol_nm`), else None. The caller passes the Rg of the degenerate solutions it offers."""
+    rgs = list(rgs)
+    if len(rgs) > 1 and rg_values_agree(rgs, rel_tol=rel_tol, abs_tol_nm=abs_tol_nm):
+        return float(sum(rgs) / len(rgs))
+    return None
 
 
 def calibration_free_a2(
@@ -3665,14 +4272,24 @@ def calibration_free_a2(
 ) -> CalibrationFreeA2Result:
     """A2 from intensity ratios at a fixed angle, without absolute calibration.
 
-    For a fixed angle, Kc/dR = 1/Mw + 2 A2 c (in the low-q limit) implies the
-    excess intensity I_excess proportional to c Mw /(1 + 2 A2 Mw c). Forming
+    A rearrangement of the Zimm equation's general form, Kc/dR = 1/(Mw P(q)) + 2 A2 c
+    (Chu 1991, Eq. 2.1.8, printed p. 18). At a fixed angle it makes the excess intensity
+    I_excess proportional to c Mw P /(1 + 2 A2 Mw P c), so forming
 
-        Y(c) = [I_excess(c_ref)/c_ref] / [I_excess(c)/c]
+        Y(c) = [I_excess(c_ref)/c_ref] / [I_excess(c)/c] = (1 + 2 A2 Mw P c) / (1 + 2 A2 Mw P c_ref)
 
-    gives a line in c whose slope/intercept = 2 A2 Mw, independent of the optical
-    constant and Rayleigh-ratio calibration (they cancel in the ratio). This is
-    useful when absolute calibration is uncertain, e.g. low-dn/dc systems.
+    gives a line in c whose slope/intercept = 2 A2 Mw P(q): the product 2 A2 Mw in the
+    q -> 0 limit, apparent at a finite angle. The optical constant and the Rayleigh-ratio
+    calibration cancel in the ratio, and so does c_ref: the reference only scales every
+    Y(c) by one constant, so any concentration serves as it. This is useful when absolute
+    calibration is uncertain, e.g. low-dn/dc systems.
+
+    Inputs not prescribed by the source: the angle (the caller's; the source's product is
+    its q -> 0 limit), the reference concentration (any; it cancels), the two-concentration
+    minimum (the line's mathematical minimum), the drop of a point the mask hid (silent, the
+    user's own choice) and of a non-positive excess (stated on ``notes``), the conditioning
+    ceiling ``cond_limit`` (default ``COND_LIMIT``, a numerical-health bound) and the
+    weighting (equal weights on every retained point).
 
     Parameters
     ----------
@@ -3685,8 +4302,10 @@ def calibration_free_a2(
         Angle at which to form the ratios (ideally the lowest available, closest
         to q -> 0).
     reference_index : int
-        Which concentration (after sorting ascending, excluding c = 0) is the
-        reference c_ref. Default 0 (lowest non-zero concentration).
+        Which concentration (after sorting ascending, excluding c = 0, any whose point
+        at the angle the mask hid and any whose excess there is non-positive) is the
+        reference c_ref. Default 0 (the lowest shown non-zero concentration with a
+        positive excess). Every choice gives the same slope/intercept.
     mw_g_per_mol : float, optional
         If provided, A2 is returned (= (slope/intercept) / (2 Mw)).
 
@@ -3697,15 +4316,16 @@ def calibration_free_a2(
     Raises
     ------
     ValueError
-        If fewer than two non-zero concentrations have the requested angle; if
-        the chosen reference concentration has a non-positive excess Rayleigh
-        ratio; or if dropping non-positive excess points leaves fewer than two.
+        If fewer than two non-zero concentrations have the requested angle, or fewer
+        than two once the points the mask hid are dropped, or once the non-positive
+        excess points are dropped; or if ``reference_index`` is out of range for the
+        concentrations left.
 
     Warns
     -----
     RuntimeWarning
-        If any non-reference point with a non-positive excess Rayleigh ratio is
-        dropped before forming Y(c).
+        If any point with a non-positive excess Rayleigh ratio is dropped before the
+        reference is chosen and Y(c) is formed.
     """
     # Build (c, excess) at the requested angle from each result, keeping the result
     # itself beside each point so the provenance of what actually entered Y(c) can be
@@ -3726,6 +4346,44 @@ def calibration_free_a2(
             f"{angle_deg} deg; found {len(pts)}."
         )
     pts.sort(key=lambda t: t[0])
+    # A non-finite excess carries no measurement; a point the mask hid is its ordinary
+    # source (`masked_rayleigh` writes NaN). It leaves silently before the reference is
+    # chosen, as `single_angle_ladder` drops it, so a hidden point never refuses the fit as
+    # its reference and is never named as a non-positive excess below. Which remaining
+    # concentration becomes the reference does not matter: it scales every Y(c) by one
+    # constant (the docstring's rearrangement).
+    pts = [p for p in pts if math.isfinite(p[1])]
+    if len(pts) < 2:
+        raise ValueError(
+            f"calibration-free A2: after dropping the non-finite points (such as those the "
+            f"mask hid), only {len(pts)} concentration(s) remain at {angle_deg} deg (need "
+            "at least two). Check the mask and the dark count rate."
+        )
+
+    # Drop the non-positive excess points, also before the reference is chosen, so a
+    # measured one gets one treatment wherever it sits, the reference included. A
+    # negative or zero excess (noise floor or an over-subtracted solvent reference --
+    # common in exactly the low-contrast systems this calibration-free estimator
+    # targets) would give a negative or infinite Y and silently corrupt the
+    # slope/intercept. Mirror the Berry non-positive-Kc/dR drop above. Unlike a hidden
+    # point it is a measured value, so the note and its warning say it left.
+    notes: list = []       # every note of the result, as Notes
+    # Every point here is finite (the hidden ones left above), so the note counts only the
+    # measured non-positive excesses; `isfinite` stays in the predicate as a structural
+    # guard, so a +inf could never pass as positive if that drop changes.
+    n_drop = sum(1 for p in pts if not (math.isfinite(p[1]) and p[1] > 0))
+    if n_drop:
+        # Single source of the message -> both the note and the warning.
+        drop = _nonpositive_ordinate_note(n_drop, 'excess Rayleigh ratio', ('two_a2_mw',))
+        notes.append(drop)
+        _warn_note(drop, stacklevel=2)
+        pts = [p for p in pts if math.isfinite(p[1]) and p[1] > 0]
+        if len(pts) < 2:
+            raise ValueError(
+                "calibration-free A2: after dropping non-positive excess points, "
+                f"only {len(pts)} concentration(s) remain (need at least two). "
+                "Check the solvent blank."
+            )
     conc = np.array([p[0] for p in pts])
     excess = np.array([p[1] for p in pts])
     sources = [p[2] for p in pts]
@@ -3737,50 +4395,14 @@ def calibration_free_a2(
         )
     c_ref = conc[reference_index]
     e_ref = excess[reference_index]
-    # The reference sets the numerator of every ratio; a non-positive (or NaN)
-    # reference excess makes Y meaningless. Reject it explicitly rather than silently
-    # producing a corrupt line (and never silently reindex to another point). The
-    # negated `math.isfinite(...) and ... > 0` form catches NaN AND +inf -- e_ref <= 0
-    # would let a NaN fall through (all NaN comparisons are False), and a bare
-    # `e_ref > 0` would let +inf through (every Y would collapse to a plausible 0.0).
+    # The reference sets the numerator of every ratio, so it must be finite and positive.
+    # Both drops above guarantee it; the negated form is what fires if either changes.
     if not (math.isfinite(e_ref) and e_ref > 0):
         raise ValueError(
             f"calibration-free A2: the reference concentration "
             f"(index {reference_index}, c = {c_ref:g} g/mL) has a non-positive or "
-            f"non-finite excess Rayleigh ratio ({e_ref:g}); its ratio is undefined. "
-            f"Choose a reference concentration with positive excess scattering."
+            f"non-finite excess Rayleigh ratio ({e_ref:g}); its ratio is undefined."
         )
-
-    # Drop any remaining non-positive excess points before forming Y(c). A negative
-    # or zero excess (noise floor or an over-subtracted solvent reference -- common
-    # in exactly the low-contrast systems this calibration-free estimator targets)
-    # would give a negative or infinite Y and silently corrupt the slope/intercept.
-    # Mirror the Berry non-positive-Kc/dR drop above.
-    notes: list = []       # passive ⓘ notices surfaced on the result (keep-both)
-    # Finite as well as positive: an infinite excess passes `> 0` and then collapses
-    # Y = (e_ref/c_ref)/(inf/c) to a plausible 0.0 inside the ladder -- the wrong-number
-    # shape this filter's own comment is reasoning about, one value class over.
-    pos = np.isfinite(excess) & (excess > 0)
-    if not np.all(pos):
-        n_drop = int((~pos).sum())
-        # Single source of the message -> both the note and the warning. Keep the
-        # "non-positive excess" phrasing (a regression test matches on it).
-        msg = (
-            f"calibration-free A2 dropped {n_drop} point(s) with a non-positive "
-            "excess Rayleigh ratio (noise or over-subtracted solvent reference) "
-            "before forming Y(c). If this removes too many points, the "
-            "calibration-free A2 is unreliable for this dataset."
-        )
-        notes.append(msg)
-        warnings.warn(msg, RuntimeWarning, stacklevel=2)
-        conc, excess = conc[pos], excess[pos]
-        sources = [s for s, keep in zip(sources, pos, strict=True) if keep]
-        if conc.size < 2:
-            raise ValueError(
-                "calibration-free A2: after dropping non-positive excess points, "
-                f"only {conc.size} concentration(s) remain (need at least two). "
-                "Check the solvent blank."
-            )
 
     # Y(c) = (e_ref / c_ref) / (excess / c)
     Y = (e_ref / c_ref) / (excess / conc)
@@ -3792,7 +4414,7 @@ def calibration_free_a2(
                  if (math.isfinite(intercept) and intercept != 0) else float('nan'))
     a2 = (two_a2_mw / (2.0 * mw_g_per_mol)) if mw_g_per_mol else None
 
-    # SE of 2A2Mw = slope/intercept: slope & intercept are correlated (same fit),
+    # SE of slope/intercept (2A2Mw P(q), 2A2Mw at q -> 0): slope & intercept are correlated (same fit),
     # so propagate through the 2x2 covariance, not as an independent ratio. On a short
     # concentration ladder this HC3 SE is CONSERVATIVE (meets-or-exceeds the sampling
     # spread, ~1.3x at n=5; never under-reports) because HC3 up-weights the high-leverage
@@ -3815,12 +4437,17 @@ def calibration_free_a2(
     # describe, and the product built on it is undefined.
     intercept_ok = bool(math.isfinite(intercept) and intercept > 0)
     all_blank = all(bool(getattr(s, 'blank_measured', True)) for s in sources)
-    reasons = []
+    # Both scales cancel in Y(c), so only the blank is a precondition here: the two scale
+    # flags below are records of the inputs, not gates (see the dataclass).
+    product = ('two_a2_mw', 'a2_mol_mL_per_g2')
+    reasons = list(scale_notes(sources, scale_free=product))
     if not fit.well_conditioned:
-        reasons.append(_ill_conditioned_note(fit.cond))
+        reasons.append(_ill_conditioned_note(fit.cond, cond_limit, product))
     if not intercept_ok:
-        reasons.append(_non_positive_intercept_note('2 A2 Mw'))
-    note = '; '.join(reasons)
+        reasons.append(_non_positive_intercept_note(intercept, product))
+    elif not math.isfinite(two_a2_mw):
+        reasons.append(Note('two_a2_mw_not_finite', ('two_a2_mw',)))
+    notes += reasons
 
     return CalibrationFreeA2Result(
         angle_deg=float(angle_deg), concentrations_g_per_mL=conc, Y=Y,
@@ -3828,7 +4455,7 @@ def calibration_free_a2(
         a2_mol_mL_per_g2=a2, r_squared=float(r2),
         two_a2_mw_se=two_a2_mw_se, a2_se=a2_se,
         se_estimator=estimator,
-        well_conditioned=fit.well_conditioned, cond=fit.cond, reliability_note=note,
+        well_conditioned=fit.well_conditioned, cond=fit.cond,
         # `and math.isfinite(two_a2_mw)`: the sibling reliability flags (Debye, Zimm/Berry,
         # Guinier) all carry it, and this one did not -- cond(X) is computed from the
         # concentration design alone, so a non-finite value would ride out flagged
@@ -3846,6 +4473,8 @@ def calibration_free_a2(
         calibrated=all(bool(getattr(s, 'calibrated', True)) for s in sources),
         dn_dc_supplied=all(bool(getattr(s, 'dn_dc_supplied', True)) for s in sources),
         blank_measured=all_blank,
+        standard_index_known=all(bool(getattr(s, 'standard_index_known', True))
+                                 for s in sources),
         derived_provenance=_shared_derived_provenance(sources),
         blank_provenance=_shared_blank_provenance(sources),
     )

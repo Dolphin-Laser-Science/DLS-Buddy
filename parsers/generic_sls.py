@@ -55,10 +55,14 @@ from typing import List
 
 import numpy as np
 
+from core.notes import Note, render
 from parsers.base_parser import (
+    MAX_BAD_ROW_FRACTION,
     BaseSLSParser,
     ParseError,
     SLSFilePreview,
+    detect_delimiter,
+    read_text_lines,
 )
 
 # Minimum number of angle/intensity data rows to accept: ONE. A single-angle intensity
@@ -71,24 +75,10 @@ from parsers.base_parser import (
 # instrument produces, so that guard is unreachable and is left alone.
 _MIN_ROWS = 1
 
-# Maximum fraction of rows allowed to be malformed before raising.
-_MAX_BAD_ROW_FRACTION = 0.05
-
-
-def _detect_delimiter(first_line: str) -> str:
-    """Return ',' or '\t' from the first data line, or raise ParseError."""
-    if '\t' in first_line and ',' not in first_line:
-        return '\t'
-    if ',' in first_line and '\t' not in first_line:
-        return ','
-    if ',' in first_line and '\t' in first_line:
-        if first_line.count(',') >= first_line.count('\t'):
-            return ','
-        return '\t'
-    raise ParseError(
-        f"Cannot detect delimiter in first data line: {first_line!r}. "
-        f"The file must be comma- or tab-delimited."
-    )
+# The generic parsers' shared malformed-row threshold and delimiter detection
+# (base_parser.py), under the names this module and its tests use.
+_MAX_BAD_ROW_FRACTION = MAX_BAD_ROW_FRACTION
+_detect_delimiter = detect_delimiter
 
 
 class GenericSLSParser(BaseSLSParser):
@@ -156,21 +146,9 @@ class GenericSLSParser(BaseSLSParser):
             more than 5% of rows are malformed, if any angle is outside
             (0, 180), or if any intensity is negative.
         """
-        if not os.path.isfile(file_path):
-            raise FileNotFoundError(f"File not found: {file_path!r}")
-
         # Try UTF-8 first; fall back to latin-1 for instruments that write
         # non-ASCII degree symbols or other characters in their output.
-        try:
-            try:
-                with open(file_path, encoding='utf-8', newline='') as fh:
-                    raw_lines = [line.rstrip('\r\n') for line in fh]
-            except UnicodeDecodeError:
-                with open(file_path, encoding='latin-1', newline='') as fh:
-                    raw_lines = [line.rstrip('\r\n') for line in fh]
-        except OSError as exc:
-            # A file the OS refuses to read is a plain ParseError (see generic_dls.py).
-            raise ParseError(f"Could not read {file_path!r}: {exc}") from exc
+        raw_lines = read_text_lines(file_path, ('utf-8', 'latin-1'))
 
         lines = [l for l in raw_lines if l.strip()]
 
@@ -234,23 +212,19 @@ class GenericSLSParser(BaseSLSParser):
         # First, rows skipped under the bad-row ceiling -- tolerated, not hidden.
         found_notes = []
         if n_bad:
-            found_notes.append(
-                f"{n_bad} of {total} row(s) could not be read as two numbers and were "
-                f"skipped; {len(angles)} loaded. If a skipped row was meant to carry data, fix it "
-                f"in the file and re-load."
-            )
+            found_notes.append(Note('parser.rows_skipped', ('angles_deg', 'intensities'),
+                                    {'n_skipped': n_bad, 'n': total,
+                                     'n_loaded': len(angles)}))
         # Then negative intensities: warn rather than raise, because some instruments
         # report small negative values after background subtraction.
         negative_intensities = [v for v in intensities if v < 0]
         if negative_intensities:
-            found_notes.append(
-                f"{len(negative_intensities)} negative intensity value(s) found "
-                "(can occur after background subtraction). Stored as-is; verify the "
-                "data is physically reasonable before proceeding with analysis."
-            )
+            found_notes.append(Note('parser.negative_intensity', ('intensities',),
+                                    {'n': len(negative_intensities)}))
         notes = tuple(found_notes)
         for note in notes:
-            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+            warnings.warn(f"{file_path!r}: {render(note, surface='export')}", UserWarning,
+                          stacklevel=2)
 
         preview = SLSFilePreview(
             source_file=os.path.abspath(file_path),

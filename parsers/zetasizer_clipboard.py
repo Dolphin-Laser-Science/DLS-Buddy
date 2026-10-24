@@ -50,12 +50,15 @@ from typing import List
 
 import numpy as np
 
+from core.notes import Note, render
 from parsers.base_parser import (
+    MAX_BAD_ROW_FRACTION,
     BaseDLSParser,
     DLSFilePreview,
     MalformedDataError,
     ParseError,
     convert_delay_times,
+    read_text_lines,
 )
 
 
@@ -81,9 +84,9 @@ _FIRST_RECORD_COL = 1    # every column from here on is one record's correlogram
 # 'X Lag Time'.
 _LAG_HEADER_TOKEN = 'lag time'
 # Reject the file if more than this fraction of its data rows have a non-numeric
-# lag cell — mirrors the generic parsers' guard, so a mostly-non-numeric file that
+# lag cell — the generic parsers' threshold, so a mostly-non-numeric file that
 # slips past the header sniff fails loudly instead of loading as all-NaN.
-_MAX_BAD_ROW_FRACTION = 0.05
+_MAX_BAD_ROW_FRACTION = MAX_BAD_ROW_FRACTION
 # 'Record N: <label>' -> capture <label>.
 _RECORD_LABEL_RE = re.compile(r'^\s*Record\s+\d+\s*:\s*(.*)$')
 
@@ -102,21 +105,7 @@ def _read_lines(file_path: str) -> List[str]:
     ParseError
         If the file cannot be read at all.
     """
-    if not os.path.isfile(file_path):
-        raise FileNotFoundError(f"File not found: {file_path!r}")
-    last_exc = None
-    for encoding in _ENCODINGS:
-        try:
-            with open(file_path, encoding=encoding, newline='') as fh:
-                return [line.rstrip('\r\n') for line in fh]
-        except UnicodeDecodeError as exc:
-            last_exc = exc
-            continue
-        except OSError as exc:
-            raise ParseError(f"Could not read {file_path!r}: {exc}") from exc
-    raise ParseError(
-        f"Could not decode {file_path!r} with any of {_ENCODINGS}: {last_exc}"
-    ) from last_exc
+    return read_text_lines(file_path, _ENCODINGS)
 
 
 def _extract_label(raw_cell: str) -> str:
@@ -291,7 +280,8 @@ class ZetasizerClipboardParser(BaseDLSParser):
             while n > 0 and vals[n - 1] is None:
                 n -= 1                              # strip the trailing padding run
             holes = [r for r in range(n) if vals[r] is None]
-            label = labels[i] or f'column {i + 1}'
+            # A 'Record N:' header with no sample name is named as the file numbers it.
+            label = labels[i] or header_parts[i].strip().rstrip(':')
             if n == 0:
                 # A header with no numeric value ANYWHERE carries no data, so dropping it
                 # loses nothing, where raising would cost the paste's other good records.
@@ -322,25 +312,20 @@ class ZetasizerClipboardParser(BaseDLSParser):
         # 5 % ceiling above tolerates a few); that is a lag channel the user never
         # sees, so it is disclosed like the empty-column drop below.
         if n_bad:
-            found_notes.append(
-                f"{n_bad} of {total} data row(s) have a non-numeric lag-time cell and "
-                f"were skipped for every record; {len(lag_us)} lag channel(s) loaded. If "
-                f"a skipped row was meant to carry data, fix it and re-paste."
-            )
+            found_notes.append(Note('parser.rows_skipped', ('delay_times_s', 'correlogram'),
+                                    {'n_skipped': n_bad, 'n': total,
+                                     'n_loaded': len(lag_us)}))
         if dropped:
-            shown = ', '.join(repr(d) for d in dropped[:3])
-            if len(dropped) > 3:
-                shown += f', ... ({len(dropped)} in total)'
-            found_notes.append(
-                f"{len(dropped)} of {len(record_cols)} record column(s) have a header but "
-                f"no numeric value in any row, so they were not loaded: {shown}. The other "
-                f"{len(corr)} record(s) loaded normally. An empty record column usually "
-                f"means the paste was cut short -- re-copy the correlation data if those "
-                f"records were meant to be included."
-            )
+            # Every dropped column, by name: a note's values hold names and numbers, never
+            # display text (ui_style_guide §5, the `values` rule).
+            names = tuple(dropped)
+            found_notes.append(Note('parser.empty_columns', ('correlogram',),
+                                    {'n_empty': len(dropped), 'n': len(record_cols),
+                                     'columns': names}))
         notes = tuple(found_notes)
         for note in notes:
-            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+            warnings.warn(f"{file_path!r}: {render(note, surface='export')}", UserWarning,
+                          stacklevel=2)
 
         # µs -> s through the shared table: the lag axis feeds Gamma, D and Rh, so
         # its factor lives in one place rather than in a copy per format.

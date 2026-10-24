@@ -74,8 +74,12 @@ already calls intentional, stated here because this is where a site author
 reasons about combination.
 
 So the refusing surfaces are wider than the two tags: check_replicate_identity
-compares eight fields, and every one of them is a field whose disagreement makes
-the AVERAGE describe no real condition.
+refuses on seven fields (polymer, solvent, angle, wavelength, concentration,
+mw_fraction, analyzer geometry), and every one of them is a field whose
+disagreement makes the AVERAGE describe no real condition. Temperature is not
+among them: repeats of one condition drift about 0.01 K between runs, so their
+temperatures differ by construction and the average still has its referent. It
+sits under rule 2 below.
 
 A replicate average is not a repeat, so it never enters another average
 (owner-ruled 2026-09-13). The replicate +/- is honest only because its inputs are
@@ -89,15 +93,25 @@ Reopen trigger, recorded: one real selection wrongly refused in ordinary use.
 Rule 2 (disclosure). Everything else combines, and anything surprising about
 the combination is stated where it travels: on the result itself when there is
 one (notes -> export Comments), on the row or label when it is eligibility
-(grayed + reason), as a passive hint when the program cannot verify the hazard
-(an untagged multi-Mw series: Mw is an output, not an identity field). Silence
-is never a mode where a user is present or a durable value is written -- and a
-passive path (candidates, auto-select) never writes a durable value rule 1
-would refuse. Identity fields (polymer, solvent, temperature -- compared only
+(grayed + reason). A hazard the program cannot verify (an untagged multi-Mw
+series: Mw is an output, not an identity field) follows ui_style_guide.md §5,
+"Hazards the program cannot verify": made checkable, settled earlier, or
+documented, and shown only as an approved exception. Silence is never a mode
+where a user is present or a durable value is written about a hazard the program
+has established -- and a passive path (candidates, auto-select) never writes a
+durable value rule 1 would refuse. Identity fields (polymer, solvent, temperature -- compared only
 through the shared comparison forms in this file) sit under THIS rule, not
 rule 1: a within-sample identity mix is constructible only by the user's own
 manual override, the hybrid grouping model makes that the user's call, and the
-note travels to exports.
+note travels to exports. Across a replicate set temperature is RECORDED, never
+refused: check_replicate_identity returns every run's temperature and their
+span, unrounded, the average inherits the first run's temperature, and the span
+travels as provenance (the correlogram average's provenance keys, the derived
+static point's note, the written replicate Rh's label) -- on every correlogram
+average, a zero span included, and on the note and the label when it is nonzero;
+the span is unrounded, so no bucket edge decides what is disclosed. The
+replicate ± path's single-sample guard still reads the grouping, so a run the
+0.1 C bucket split off is moved into its sample first.
 
 Dialogs guard the destruction of stored values; they never license
 computations. A confirm can legitimate deleting the user's own stored result
@@ -108,9 +122,10 @@ Standing surfaces (a classification aid for the next site author, not policy):
 refuse (the replicate-identity check, the controller's mixed-polarization
 refusal, the DDLS cross-bucket check, an average offered to an average) is rule 1's
 backstop; warn-and-continue
-(the Gamma-vs-q2 identity note), filter-and-disclose (the DLS tab's grayed
-other-fraction rows) and the passive hint (the SLS pooling hint) are rule 2 at
-three surfaces; silent grouping is not a mode -- the sidebar IS the workspace
+(the Gamma-vs-q2 identity note, the replicate temperature span) and filter-and-disclose (the DLS tab's grayed
+other-fraction rows) are rule 2 at two surfaces; a hazard the program cannot verify
+gets no note but by an approved exception (ui_style_guide.md §5);
+silent grouping is not a mode -- the sidebar IS the workspace
 proposal's disclosure surface, and levels self-derived from one array are not
 identity decisions at all; silent filtering survives only where no user is
 addressable (the Rh candidate tiers), and the offered label still discloses.
@@ -187,6 +202,10 @@ Change history
 2026-09-13  Rule 1 gains the replicate average. (doctrine text only)
             A replicate average never enters another average: it is not a repeat,
             and counting it as one under-reports the replicate +/-. No field change.
+2026-10-15  Rule 2's passive hint retired. (doctrine text only)
+            A hazard the program cannot verify follows ui_style_guide.md §5 (the
+            owner's decision): no fourth kind of note, an approved exception the one
+            way such a hazard is shown. No field change.
 """
 
 from __future__ import annotations
@@ -297,13 +316,13 @@ def casefold_identity_name(raw_name: str) -> str:
 # The bucket is placed in CELSIUS, not Kelvin, and that is load-bearing. Set points are
 # chosen in Celsius and the conversion adds exactly 0.15, so 20, 25, 30, 35 and 50 C land
 # EXACTLY on 0.1 K bin edges -- bucketing in Kelvin would split a sample at 25.00 C over a
-# microkelvin of noise, the modal case rather than a rare one. Rounding the Celsius value
-# puts each at a bin CENTRE, 0.05 C clear of either edge. Not tuning to a lab or instrument
-# (invariant 4): it is the unit the number was chosen in. Known limitation, accepted: any
-# rounding bucket splits at ITS edges, so 25.04 and 25.06 C land either side of one. The
-# remedy is the manual regrouping that already ships, NOT a clustering algorithm.
+# microkelvin of noise. Rounding the Celsius value puts each at a bin CENTRE, 0.05 C clear of
+# either edge: the unit the number was chosen in, not tuning to an instrument (invariant 4).
+# Known limitation: any bucket splits at ITS edges (a readback 0.05 C off set point sits on one).
+# Only the DDLS pairing check refuses on it; Gamma-vs-q2 warns, the replicate averager records
+# temperature (doctrine rule 2), and a stranded run is regrouped by hand, NOT clustered.
 TEMPERATURE_GROUP_DECIMALS = 1
-_KELVIN_AT_ZERO_CELSIUS = 273.15
+KELVIN_AT_ZERO_CELSIUS = 273.15
 
 
 def round_temperature_for_identity(temperature_K: float) -> float:
@@ -317,8 +336,8 @@ def round_temperature_for_identity(temperature_K: float) -> float:
     Two temperatures in the same bucket return the same float, which is all a key
     needs -- the value is a bucket label, never a temperature to compute with.
     """
-    celsius = float(temperature_K) - _KELVIN_AT_ZERO_CELSIUS
-    return round(celsius, TEMPERATURE_GROUP_DECIMALS) + _KELVIN_AT_ZERO_CELSIUS
+    celsius = float(temperature_K) - KELVIN_AT_ZERO_CELSIUS
+    return round(celsius, TEMPERATURE_GROUP_DECIMALS) + KELVIN_AT_ZERO_CELSIUS
 
 
 def _round_to_sig_figs(value: float, sig_figs: int) -> float:
@@ -431,7 +450,7 @@ def make_sample_key(
 
 
 # ---------------------------------------------------------------------------
-# Small validation helpers (private to this module)
+# Small validation helpers (the underscored ones private to this module)
 # ---------------------------------------------------------------------------
 #
 # Centralizing these means each dataclass validates itself the same way, with
@@ -465,17 +484,17 @@ def _require_same_length(a, b, name_a: str, name_b: str) -> None:
 # reaches the engine and crashes it far from the cause -- an infinite refractive index
 # gives q = inf, and np.polyfit answers that with a bare "SVD did not converge". Tokens
 # like `inf`, `nan` and `1e400` all parse straight through the GUI's float(text), so this
-# is a typo away (2026-07-31 spec-01; mirrors the _require_finite_array guard on the
+# is a typo away (this mirrors the _require_finite_array guard on the
 # measured arrays and the explicit dn/dc check on SLSMeasurement).
 
-def _require_positive(value, field_name: str) -> None:
+def require_positive(value, field_name: str) -> None:
     if value is None or not (math.isfinite(value) and value > 0):
         raise ValueError(
             f"{field_name} must be a positive finite number, got {value!r}."
         )
 
 
-def _require_non_negative(value, field_name: str) -> None:
+def require_non_negative(value, field_name: str) -> None:
     if value is None or not (math.isfinite(value) and value >= 0):
         raise ValueError(
             f"{field_name} must be a finite number, zero or positive, got {value!r}."
@@ -494,7 +513,7 @@ def _require_finite_or_none(value, field_name: str) -> None:
         )
 
 
-def _require_scattering_angle(value, field_name: str) -> None:
+def require_scattering_angle(value, field_name: str) -> None:
     if value is None or not (0 < value < 180):
         raise ValueError(
             f"{field_name} must be strictly between 0 and 180 degrees, "
@@ -502,7 +521,7 @@ def _require_scattering_angle(value, field_name: str) -> None:
         )
 
 
-def _require_non_empty_string(value, field_name: str) -> None:
+def require_non_empty_string(value, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(
             f"{field_name} must be a non-empty string, got {value!r}."
@@ -667,7 +686,7 @@ def _normalize_analyzer_geometry(value, field_name: str):
 CHAIN_TYPES = ('linear', 'branched')
 
 
-def _normalize_chain_type(value, field_name: str = 'chain_type'):
+def normalize_chain_type(value, field_name: str = 'chain_type'):
     """Return the canonical lower-case chain-type code, or None. Raise if invalid."""
     if value is None:
         return None
@@ -895,19 +914,19 @@ class DLSMeasurement:
         _require_finite_array(self.delay_times_s, "delay_times_s")
         _require_finite_array(self.correlogram, "correlogram")
         _require_increasing_lag_axis(self.delay_times_s, "delay_times_s")
-        _require_non_empty_string(self.polymer_name, "polymer_name")
-        _require_non_empty_string(self.solvent_name, "solvent_name")
-        _require_positive(self.temperature_K, "temperature_K")
-        _require_positive(self.wavelength_nm, "wavelength_nm")
-        _require_positive(self.solvent_refractive_index, "solvent_refractive_index")
-        _require_scattering_angle(self.angle_deg, "angle_deg")
+        require_non_empty_string(self.polymer_name, "polymer_name")
+        require_non_empty_string(self.solvent_name, "solvent_name")
+        require_positive(self.temperature_K, "temperature_K")
+        require_positive(self.wavelength_nm, "wavelength_nm")
+        require_positive(self.solvent_refractive_index, "solvent_refractive_index")
+        require_scattering_angle(self.angle_deg, "angle_deg")
         if self.concentration_g_per_mL is not None:
-            _require_non_negative(
+            require_non_negative(
                 self.concentration_g_per_mL, "concentration_g_per_mL")
         if self.viscosity_Pa_s is not None:
-            _require_positive(self.viscosity_Pa_s, "viscosity_Pa_s")
+            require_positive(self.viscosity_Pa_s, "viscosity_Pa_s")
         if self.solute_refractive_index is not None:
-            _require_positive(self.solute_refractive_index, "solute_refractive_index")
+            require_positive(self.solute_refractive_index, "solute_refractive_index")
         self.analyzer_geometry = _normalize_analyzer_geometry(
             self.analyzer_geometry, "analyzer_geometry")
         if self.sample_times_s is not None:
@@ -1094,13 +1113,13 @@ class SLSMeasurement:
         # below; intensities has no such check, so guard it explicitly -- rule-10.)
         _require_finite_array(self.intensities, "intensities")
         for angle in self.angles_deg:
-            _require_scattering_angle(angle, "each value in angles_deg")
-        _require_non_empty_string(self.polymer_name, "polymer_name")
-        _require_non_empty_string(self.solvent_name, "solvent_name")
-        _require_positive(self.temperature_K, "temperature_K")
-        _require_positive(self.wavelength_nm, "wavelength_nm")
-        _require_positive(self.solvent_refractive_index, "solvent_refractive_index")
-        _require_non_negative(self.concentration_g_per_mL, "concentration_g_per_mL")
+            require_scattering_angle(angle, "each value in angles_deg")
+        require_non_empty_string(self.polymer_name, "polymer_name")
+        require_non_empty_string(self.solvent_name, "solvent_name")
+        require_positive(self.temperature_K, "temperature_K")
+        require_positive(self.wavelength_nm, "wavelength_nm")
+        require_positive(self.solvent_refractive_index, "solvent_refractive_index")
+        require_non_negative(self.concentration_g_per_mL, "concentration_g_per_mL")
         # dn/dc: ABSENT (None) is legal and disclosed -- see the class docstring's
         # "Optional optics" for why, and what the analyses then report. What is refused
         # is a SUPPLIED value that cannot be a real increment: non-finite, or exactly
@@ -1125,9 +1144,9 @@ class SLSMeasurement:
                     "reported on a disclosed arbitrary scale."
                 )
         if self.solute_refractive_index is not None:
-            _require_positive(self.solute_refractive_index, "solute_refractive_index")
+            require_positive(self.solute_refractive_index, "solute_refractive_index")
         if self.shell_refractive_index is not None:
-            _require_positive(self.shell_refractive_index, "shell_refractive_index")
+            require_positive(self.shell_refractive_index, "shell_refractive_index")
         # The vendor calibration record, as read from the instrument file. These are
         # DISPLAY-ONLY: the program computes its own k_c from a calibrant point, and the
         # value the SLS engine uses arrives as a function argument from the calibration

@@ -69,44 +69,30 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 from core.data_models import DLSMeasurement
+from core.notes import Note, render
 from parsers.base_parser import (
+    MAX_BAD_ROW_FRACTION,
     BaseDLSParser,
     DLSFilePreview,
     ParseError,
     apply_data_form,
     convert_delay_times,
+    detect_delimiter,
+    read_text_lines,
 )
 
 # Minimum number of data rows to accept
 _MIN_ROWS = 2
 
-# Maximum fraction of rows allowed to be malformed before the parser raises
-# rather than silently discarding. If more than this fraction fails to parse,
-# the file almost certainly has headers or is the wrong format.
-_MAX_BAD_ROW_FRACTION = 0.05
-
-
-def _detect_delimiter(first_line: str) -> str:
-    """Return ',' or '\t' based on the first data line, or raise ParseError."""
-    if '\t' in first_line and ',' not in first_line:
-        return '\t'
-    if ',' in first_line and '\t' not in first_line:
-        return ','
-    if ',' in first_line and '\t' in first_line:
-        # Both present — comma-separated files sometimes contain tabs in
-        # labels. Count occurrences and pick the majority.
-        if first_line.count(',') >= first_line.count('\t'):
-            return ','
-        return '\t'
-    raise ParseError(
-        f"Cannot detect delimiter in first data line: {first_line!r}. "
-        f"The file must be comma- or tab-delimited."
-    )
+# The generic parsers' shared malformed-row threshold and delimiter detection
+# (base_parser.py), under the names this module and its tests use.
+_MAX_BAD_ROW_FRACTION = MAX_BAD_ROW_FRACTION
+_detect_delimiter = detect_delimiter
 
 
 # The conversion itself now lives in base_parser.py, because the Brookhaven
@@ -313,21 +299,8 @@ class GenericDLSParser(BaseDLSParser):
             If the file violates the two-column no-header contract, or
             more than 5% of rows are malformed.
         """
-        if not os.path.isfile(file_path):
-            raise FileNotFoundError(f"File not found: {file_path!r}")
-
-        try:
-            try:
-                with open(file_path, encoding='utf-8', newline='') as fh:
-                    raw_lines = [line.rstrip('\r\n') for line in fh]
-            except UnicodeDecodeError:
-                # Fall back to latin-1 for files with non-UTF-8 characters
-                with open(file_path, encoding='latin-1', newline='') as fh:
-                    raw_lines = [line.rstrip('\r\n') for line in fh]
-        except OSError as exc:
-            # A file the OS refuses to read (locked, permission denied) is a plain
-            # ParseError, like the instrument parsers' read sites -- not an escape.
-            raise ParseError(f"Could not read {file_path!r}: {exc}") from exc
+        # UTF-8 first; fall back to latin-1 for files with non-UTF-8 characters.
+        raw_lines = read_text_lines(file_path, ('utf-8', 'latin-1'))
 
         # Remove blank lines
         lines = [l for l in raw_lines if l.strip()]
@@ -381,15 +354,13 @@ class GenericDLSParser(BaseDLSParser):
 
         # Under the ceiling a bad row is tolerated, not hidden: it is disclosed on the
         # preview (the GUI's passive box) and as a UserWarning (headless), keep-both.
-        notes: tuple = ()
+        notes: Tuple[Note, ...] = ()
         if n_bad:
-            note = (
-                f"{n_bad} of {total} row(s) could not be read as two numbers and were "
-                f"skipped; {len(col1)} loaded. If a skipped row was meant to carry data, fix it "
-                f"in the file and re-load."
-            )
+            note = Note('parser.rows_skipped', ('delay_times_s', 'correlogram'),
+                        {'n_skipped': n_bad, 'n': total, 'n_loaded': len(col1)})
             notes = (note,)
-            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+            warnings.warn(f"{file_path!r}: {render(note, surface='export')}", UserWarning,
+                          stacklevel=2)
 
         preview = GenericDLSFilePreview(
             source_file=os.path.abspath(file_path),

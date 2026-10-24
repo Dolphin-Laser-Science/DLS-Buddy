@@ -7,7 +7,8 @@ Mode-resolved dynamics. Three pure steps:
   1. `extract_modes`      -- every relaxation mode of ONE measurement, as
                              pickable `ModePoint`s (the rows of the "mode map",
                              the (q^2, Gamma) scatter of Sedlak & Amis 1992
-                             Fig. 3).
+                             Fig. 3); `extract_mode_runs` runs it over a
+                             map's runs, tagging each point with its run.
   2. `fit_mode_family`    -- Gamma vs q^2 for ONE user-picked mode family:
                              through-origin D (+ apparent Rh, always computed,
                              always labeled) and the slow-mode deviation form
@@ -40,37 +41,53 @@ from __future__ import annotations
 
 import math
 import warnings
-from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from dataclasses import dataclass, replace
+from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from core.data_models import DLSMeasurement, round_angle_for_identity
+from core.note_registry import REGISTRY
+from core.notes import WHERE, WHERE_UNIT, Note, RefusedInputs, find_notes, has_note, render
 from analysis import uncertainty as unc
 from physics.constants import stokes_einstein_rh
 from analysis.dls._common import (
-    _d_from_gamma,
+    _all_notes,
+    d_from_gamma,
     _decay_completeness,
     _decay_completeness_check,
+    _fitted_tau_span,
+    _grid_end_check,
     _measurement_q_m,
+    _no_viscosity_note,
+    _not_diffusive_note,
+    _require_viscosity,
+    _result_flags,
     DIFFUSIVE_INTERCEPT_REL_MAX,
     DIFFUSIVE_R2_MIN,
+    MAX_RETAINED_ACF_RATIO,
     MIN_DECAY_COMPLETENESS,
 )
+from analysis.dls.cumulants import CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM, size_range_check
 from analysis.dls.exponentials import fit_double_exponential
 from analysis.dls.distributions import (
-    find_distribution_peaks, fit_contin, fit_nnls, integrate_between)
+    _fit_decay_check, find_distribution_peaks, fit_contin, fit_nnls, integrate_between,
+    lobe_geometric_mean)
 
 
-# The mode-amplitude resolvability floor: below ~2 % of the total scattered
-# intensity a mode's parameters are imprecise (Sedlak 2001, Physical Chemistry
-# of Polyelectrolytes ch. 1, pp. 7-8; the dashed-line caveat of Sedlak & Amis
-# 1992a p. 820). A documented default, not a magic number (invariant 4); it
-# gates a NOTE on the point, never its existence -- a sub-floor mode still
-# appears on the map and is still pickable.
+# The mode-amplitude resolvability floor: below ~2 % of the total scattered intensity a
+# mode's contribution should not be evaluated (Sedlak 2001, Physical Chemistry of
+# Polyelectrolytes ch. 1, pp. 7-8, one of his two requirements for evaluating a mode; the
+# dashed-line caveat of Sedlak & Amis 1992a p. 820). A documented default (invariant 4).
+# It gates a NOTE on a point, never its existence: a sub-floor 'double' mode, or a manual
+# integration interval ('contin' / 'nnls', not floored), still appears and is pickable. On
+# the automatic lobes the same value is `extract_modes`' default `min_weight_fraction`, so
+# a sub-floor lobe is dropped before it becomes a point unless the caller lowers that.
 DEFAULT_AMPLITUDE_FLOOR = 0.02
 
 MODE_SOURCES = ('double', 'contin', 'nnls')
+# The fit each source runs, as the `fit_refused_inputs` note names it.
+_SOURCE_FIT_NAMES = {'double': 'double-exponential', 'contin': 'CONTIN', 'nnls': 'NNLS'}
 
 
 @dataclass(frozen=True)
@@ -89,9 +106,9 @@ class ModePoint:
     mode-resolved Stokes-Einstein size (NaN when viscosity is missing) --
     computed by the source fitters through the one Gamma->Rh home.
 
-    `item_id` and `polarization_state` are provenance attached by the
-    controller (`dataclasses.replace`); the analysis layer leaves the defaults.
-    `item_id` is NEVER a pick key.
+    `item_id` and `polarization_state` are provenance its caller reads and
+    `extract_mode_runs` attaches (`dataclasses.replace`); `extract_modes` leaves
+    the defaults. `item_id` is NEVER a pick key.
 
     `alpha`/`alpha_selection_method` record the CONTIN regularization the
     amplitudes came from (None/'' for double/NNLS), and `gcv_gamma` the
@@ -117,13 +134,27 @@ class ModePoint:
     parametric double-exponential): 'auto' = the scan's own local-minimum
     lobes, 'manual' = user-set bounds. All additive with defaults — picks are
     (angle, Gamma) value-keyed, so nothing re-keys.
+
+    `mean_gamma_s_inv` / `mean_rh_nm` are the mode's POSITION: for a CONTIN or NNLS
+    source its lobe's geometric mean (`lobe_geometric_mean`, the automatic lobes and the
+    manual intervals alike), for the double-exponential source the mode's own Gamma and
+    Rh, which have no lobe. ONE Gamma per point drives every derived quantity: `d_m2_s`
+    and the decay-completeness verdict derive from the mean, the map plots it, and
+    `fit_mode_family` regresses on it (`plotted_gamma_s_inv`). `gamma_s_inv` / `rh_nm`
+    stay the node with the most weight, and `gamma_s_inv` stays the PICK KEY: the node is
+    the grid index of the extracted point, the better identity, and the mean a property
+    derived from it, so a saved pick still matches and no migration exists. The one cost,
+    disclosed: a pick is keyed to a Gamma the user does not see plotted (the plotted point
+    sits at the mean, about half a grid step from the node for a narrow lobe and a step or
+    more for a broad, overlapping or grid-end one). NaN when the producing path predates
+    them; `plotted_gamma_s_inv` then reads the node.
     """
     angle_deg: float
     q_m_inv: float
     q2_m2: float
     gamma_s_inv: float
     amplitude_fraction: float
-    d_m2_s: float                     # Gamma/q^2 via _d_from_gamma (NaN-capable)
+    d_m2_s: float                     # Gamma/q^2 via d_from_gamma (NaN-capable)
     rh_nm: float                      # apparent, mode-resolved (NaN-capable)
     source_method: str                # 'double' | 'contin' | 'nnls'
     mode_index: int                   # rank within its run, fast->slow (0 = fastest)
@@ -135,10 +166,19 @@ class ModePoint:
     # above: the condition, the measured quantity it came from, and the documented
     # threshold it was judged against. Set for EVERY source -- a mode that never finished
     # decaying is the same defect whether it came from the parametric fit or from a
-    # distribution peak, and one predicate covers all three (rule 12).
-    decay_incomplete: bool = False    # decay_completeness < min_decay_completeness
+    # distribution peak, and one rate predicate covers all three (rule 12). True when
+    # decay_completeness < min_decay_completeness, or, for a distribution source, when
+    # the correlogram itself never decayed (`distributions._fit_decay_check`), so a
+    # point can carry the flag with its own completeness above the threshold.
+    decay_incomplete: bool = False
     decay_completeness: float = float('nan')      # Gamma * (fitted lag span)
     min_decay_completeness: float = MIN_DECAY_COMPLETENESS
+    # The grid-end verdict beside it, the same note-gate shape: the condition here, the
+    # measured quantity the node `rh_nm`, the threshold the grid's ends `rh_min_nm` /
+    # `rh_max_nm` below. True when the point's lobe (or manual interval) has its maximum
+    # on the grid's first or last node (`_common._grid_end_check`); False for the
+    # parametric source, which has no grid, and on a point built before the field existed.
+    grid_end: bool = False
     polarization_state: Optional[str] = None   # 'VV' | 'VH' | None (unpolarized class)
     alpha: Optional[float] = None     # CONTIN regularization (None for double/NNLS)
     alpha_selection_method: str = ''  # 'gcv' | 'lcurve' | 'ftest' | 'user' | '' (non-CONTIN)
@@ -153,6 +193,30 @@ class ModePoint:
     bounds_lo_rh_nm: float = float('nan')   # integration-lobe bounds (distribution sources)
     bounds_hi_rh_nm: float = float('nan')
     bounds_source: str = ''           # 'auto' | 'manual' | '' (parametric)
+    mean_gamma_s_inv: float = float('nan')  # the mode's position: the lobe's geometric
+    mean_rh_nm: float = float('nan')        # mean (distribution), its own (double)
+
+
+def plotted_gamma_s_inv(point) -> float:
+    """The Gamma every derived quantity of a mode point reads: its position, the lobe's
+    geometric mean (`ModePoint.mean_gamma_s_inv`), or the node `gamma_s_inv` for a point
+    that carries no mean -- a mode recorded, or a double built, before the field existed.
+    Takes a `ModePoint` or a recorded snapshot of one (the controller's
+    `RecordedModePoint`), read by attribute."""
+    mean = getattr(point, 'mean_gamma_s_inv', None)
+    if mean is not None and math.isfinite(mean) and mean > 0:
+        return float(mean)
+    return float(point.gamma_s_inv)
+
+
+def _point_rh_nm(point) -> float:
+    """The size at a mode point's position, `plotted_gamma_s_inv`'s companion: the lobe's
+    geometric mean `mean_rh_nm`, or the node `rh_nm` for a point that carries no mean. NaN
+    when the point has no size (no viscosity), which the size range reads as unanswerable."""
+    mean = getattr(point, 'mean_rh_nm', None)
+    if mean is not None and math.isfinite(mean) and mean > 0:
+        return float(mean)
+    return float(point.rh_nm)
 
 
 @dataclass
@@ -161,21 +225,27 @@ class ModeExtraction:
     modes: tuple                      # ModePoint, Gamma descending
     source_method: str
     success: bool
-    notes: tuple = ()
+    # Every note of the extraction: why it failed (`success` False), the inversion's own
+    # notes relayed, and the records of what was skipped or set by hand.
+    notes: Tuple[Note, ...] = ()
+    # The residual weighting the inversion recorded (`DistributionResult.weighting`), the
+    # one its points carry; '' for the parametric source, which runs no inversion.
+    weighting: str = ''
 
 
 @dataclass
 class ModeMapRun:
     """One sample's mode map: every extracted mode of every eligible run.
 
-    Assembled by the controller (which walks the sample and attaches item_id /
-    polarization_state); cached as the substrate the user picks families from.
+    Assembled by the controller (which walks the sample, reads each run's item_id /
+    polarization_state and pools `extract_mode_runs`' points); cached as the
+    substrate the user picks families from.
     `source_method` is recorded on the result, not the cache key (the
     gamma_source precedent).
     """
     points: tuple                     # ModePoint, all runs pooled
     source_method: str
-    notes: tuple = ()
+    notes: Tuple[Note, ...] = ()
 
 
 @dataclass
@@ -228,8 +298,18 @@ class ModeFamilyFitResult:
     se_estimator: str = 'hc3'
     n_low_amplitude: int = 0          # picked points under their amplitude floor
     n_decay_incomplete: int = 0       # picked points that never finished decaying
-    # passive, glyph-less notices for the GUI's info tier (keep-both where noted)
-    notes: tuple = ()
+    # Every note of the fit: the q^2+q^4 form's preconditions, then the records of the
+    # pick set (keep-both with a warning where noted)
+    notes: Tuple[Note, ...] = ()
+    # Always True: one mode's Rh at one concentration (invariant 7). `core.notes.qualifiers`
+    # reads it, and names the value mode-resolved by the class (MODE_FAMILY_CLASSES).
+    is_apparent: bool = True
+    # "Did the preconditions hold?" for the family's D and Rh, the flag every DLS Rh
+    # carries, rolled up over the picked points the way `GammaQ2Result` rolls up its
+    # angles (`_result_flags`, the any-one rule): an undecayed point, a point at the Rh
+    # grid's end, the family Rh past the technique's size range, no viscosity. The
+    # amplitude floor is a record, never this verdict (guide sec. 3.5.4).
+    rh_reliable: bool = True
 
 
 @dataclass
@@ -251,27 +331,42 @@ class AmplitudeRatioResult:
     fast_fraction: np.ndarray
     slow_fraction: np.ndarray
     ratio_f_over_s: np.ndarray        # NaN where unanswerable (A_s = 0)
-    fast_flat: bool                   # verdict; False when unanswerable (note says why)
+    fast_flat: bool                   # label; False when unanswerable (a note says why)
     fast_rel_span: float              # (max - min)/mean of A_f; NaN when < 2 angles
     flatness_rel_threshold: float
     n_shared_angles: int
-    notes: tuple = ()
-
-
-def _fitted_tau_span(fit_tau_s) -> float:
-    """The lag span of a fit's own windowed tau array, or NaN when there is none.
-
-    Mirrors `exponentials._tau_span_s`; kept here rather than imported because this module
-    reads the array off a RESULT (which may be empty on a degenerate fit) while that one
-    holds the array it just windowed. Both feed the one `_decay_completeness`.
-    """
-    tau = np.asarray(fit_tau_s, dtype=float)
-    return float(tau[-1] - tau[0]) if tau.size >= 2 else float('nan')
+    notes: Tuple[Note, ...] = ()      # the flatness preconditions, then the records
 
 
 # ---------------------------------------------------------------------------
 # 1. Per-measurement mode extraction
 # ---------------------------------------------------------------------------
+
+def _refusal_notes(exc: ValueError, source: str, measurement) -> Tuple[Note, ...]:
+    """The notes an extraction carries when its fitter refused the correlogram.
+
+    A `RefusedInputs` names its cause as notes, relayed here about the whole extraction
+    (they were about the refusing fit's own attributes). The proxy `fit_refused_inputs`
+    stays where no cause names the refusal: a plain `ValueError`, or relayed causes none
+    of which fails `success` itself (a missing viscosity fails only `rh_reliable`, on
+    fits that ran), each read off its registry row. A missing viscosity is also named by
+    the inversion's own test of it (`_require_viscosity`), whether or not the fitter
+    raised it as a cause; the double-exponential source degrades without one rather than
+    refusing."""
+    causes = exc.notes if isinstance(exc, RefusedInputs) else ()
+    relayed = tuple(replace(n, about=()) for n in causes)
+    named = any('success' in REGISTRY[n.code].fails
+                for n in relayed if n.code in REGISTRY)
+    proxy = (None if named
+             else Note('fit_refused_inputs', (), {'fit': _SOURCE_FIT_NAMES[source]}))
+    viscosity = None
+    if source in ('contin', 'nnls'):
+        try:
+            _require_viscosity(measurement)
+        except ValueError:
+            viscosity = _no_viscosity_note(())
+    return _all_notes(proxy, relayed, viscosity)
+
 
 def extract_modes(
     measurement: DLSMeasurement,
@@ -285,6 +380,7 @@ def extract_modes(
     manual_bounds_rh_nm: Optional[Sequence[Sequence[float]]] = None,
     min_decay_completeness: float = MIN_DECAY_COMPLETENESS,
     baseline: Optional[float] = None,
+    max_retained_acf_ratio: float = MAX_RETAINED_ACF_RATIO,
     **dist_kw,
 ) -> ModeExtraction:
     """Extract every usable relaxation mode of one measurement.
@@ -299,11 +395,22 @@ def extract_modes(
     `min_weight_fraction` is the distribution-peak noise threshold; its
     default here is the amplitude floor (0.02) rather than the distribution
     tab's 0.05, because the mode map exists to SHOW weak modes down to the
-    resolvability limit -- below that limit a lobe is indistinguishable from
-    inversion noise (Sedlak 2001 pp. 7-8), so dropping it is extraction
+    resolvability limit -- the ~2 % of the total intensity Sedlak (2001, pp. 7-8)
+    requires of a mode before its contribution is evaluated; treating a lobe
+    below it as inversion noise is this program's reading, not his -- so
+    dropping it is extraction
     granularity, not a gate on a result. Modes above the floor appear
     unflagged; a double-exponential mode below it appears WITH the
     `low_amplitude` note-flag (that path has no noise threshold).
+
+    Inputs not prescribed by the source: dropping a distribution lobe below
+    `min_weight_fraction` (default 0.02) as inversion noise, this program's reading of
+    Sedlak's requirement (above), and the inputs the underlying fitters' own lines name
+    (`fit_double_exponential`, `find_distribution_peaks`); prescribed: `amplitude_floor`
+    (default 0.02), Sedlak 2001's requirement that a mode's amplitude not fall below
+    approximately 2 % of the total scattered intensity before its contribution is
+    evaluated (pp. 7-8), and the decay-completeness criterion as
+    `fit_double_exponential` states it.
 
     `manual_bounds_rh_nm` -- user-set integration intervals `[(lo, hi), ...]`
     in Rh (nm), replacing the automatic lobe split when overlapping peaks
@@ -328,13 +435,17 @@ def extract_modes(
     Applied to EVERY source from one predicate, because the defect is a property
     of a rate against a lag window and not of how the rate was obtained; the
     'double' points therefore agree with `fit_double_exponential`'s own per-mode
-    verdict by construction. It gates a note, never a refusal.
+    verdict by construction. A distribution source's points also take the
+    correlogram's own decay (`distributions._fit_decay_check` at
+    `max_retained_acf_ratio`), as its peaks do: an inversion's lobe passes its rate
+    test on a correlogram that never decayed, and that fact fails every lobe of the
+    fit. It gates a note, never a refusal.
 
-    A distribution source's own PASSIVE notes are relayed verbatim onto the
-    extraction -- that its residual weight ran without a committed count rate,
-    or that the weight could not be formed and which input refused -- because
-    the inversion result is dropped here and a note left on it would reach no
-    surface. They are the notes that say why a point records the form it does.
+    A distribution source's own notes are relayed onto the extraction -- that the
+    weight could not be formed, dead channels, CONTIN's alpha preconditions --
+    because the inversion result is dropped here and a note left on it would reach
+    no surface. Whether the weight ran without a committed count rate is the
+    recorded form each point carries (`ModePoint.weighting`).
 
     Failure-tolerant by contract: a fit failure OR an unfittable correlogram
     (the fitters' own ValueError) returns `success=False` with empty modes and
@@ -366,7 +477,7 @@ def extract_modes(
             "measures a floating baseline over a lag span, so `baseline_window` is "
             "refused.")
 
-    notes: List[str] = []
+    notes: List[Note] = []
     q = _measurement_q_m(measurement)
     q2 = q * q                    # `*` saturates to inf; `**` would raise (rule 12)
     if not (math.isfinite(q2) and q2 > 0):
@@ -376,18 +487,16 @@ def extract_modes(
         # every OTHER run), so this withholds with a note instead of raising.
         return ModeExtraction(
             modes=(), source_method=source, success=False,
-            notes=("The scattering vector q is not usable for this measurement "
-                   "(q = 4*pi*n/lambda*sin(theta/2)) -- check the solvent "
-                   "refractive index and the wavelength.",))
+            notes=(Note('q_unusable', (), {'q2': float(q2)}),))
 
-    # (gamma, amplitude, rh, (bounds_lo, bounds_hi), bounds_source) tuples from
-    # the chosen source, unordered. The fitter call is wrapped: an unfittable
-    # CORRELOGRAM raises ValueError out of the underlying fits (e.g. the
-    # cumulant seed's "0 points survive the cutoff" on a flat trace), and for a
-    # per-measurement map extraction that is a data failure to disclose, not an
-    # error to propagate -- one weird run must not kill a multi-angle map. The
-    # message travels as the note. Manual-bounds integration runs OUTSIDE the
-    # wrap: its ValueError is an input-contract violation, not a data failure.
+    # (gamma, amplitude, rh, bounds, bounds_source, mean_gamma, mean_rh, grid_end) per mode,
+    # unordered: the node, then the position (the lobe's geometric mean; a double mode's
+    # own), then whether the lobe's maximum is a grid-end node (never, for a double). The
+    # fitter call is wrapped: an unfittable CORRELOGRAM raises ValueError out of the fits
+    # (e.g. the cumulant seed's "0 points survive the cutoff" on a flat trace), a data
+    # failure to disclose per run, not an error to propagate -- one weird run must not kill
+    # a multi-angle map; the message travels as the note. Manual-bounds integration runs
+    # OUTSIDE the wrap: its ValueError is an input-contract violation, not a data failure.
     _no_bounds = (float('nan'), float('nan'))
     raw: List[tuple] = []
     dist = None
@@ -409,8 +518,7 @@ def extract_modes(
             if not res.success:
                 return ModeExtraction(
                     modes=(), source_method=source, success=False,
-                    notes=("Double-exponential fit failed; no modes extracted "
-                           "from this measurement.",))
+                    notes=(Note('fit_not_converged', ()),))
             # NO all-modes-undecayed withhold here, owner-ruled 2026-09-06. One returned
             # no modes at all when both were flagged `decay_incomplete`, contradicting
             # flag-not-refuse -- and "both modes undecayed" is equally true of a genuinely
@@ -421,7 +529,7 @@ def extract_modes(
             tau_span = _fitted_tau_span(res.fit_tau_s)
             for m in (res.mode1, res.mode2):
                 raw.append((m.gamma_s_inv, m.amplitude_fraction, m.rh_nm,
-                            _no_bounds, ''))
+                            _no_bounds, '', m.gamma_s_inv, m.rh_nm, False))
         else:
             fitter = fit_contin if source == 'contin' else fit_nnls
             res = fitter(measurement, tau_min_s=tau_min_s, tau_max_s=tau_max_s,
@@ -448,24 +556,19 @@ def extract_modes(
             weighting = dist.weighting
             sample_time_provenance = dist.sample_time_provenance
             run_duration_form = dist.run_duration_form
-            # And its PASSIVE NOTES, relayed verbatim. The inversion result is dropped
-            # here, so a note left on it would never reach the map: the no-count-rate
-            # note and the note a weight that could not be formed carries are the two
-            # that say why a point records the form it does.
+            # And its NOTES, relayed. The inversion result is dropped here, so a note
+            # left on it would never reach the map: the note a weight that could not be
+            # formed carries says why a point records the form it does, and CONTIN's
+            # alpha preconditions are caveats the mode amplitudes inherit.
             notes.extend(dist.notes)
             if source == 'contin':
                 alpha_method = ('user' if res.alpha_was_user_supplied
                                 else res.alpha_selection_method)
                 gcv_gamma = res.gcv_gamma       # None unless the selector was GCV
-                if res.reliability_note:
-                    # The one sentence every surface shows (ContinResult carries it).
-                    notes.append(res.reliability_note
-                                 + '; the mode amplitudes inherit that caveat.')
+                notes.extend(find_notes(res, kind='precondition'))
     except ValueError as exc:
-        return ModeExtraction(
-            modes=(), source_method=source, success=False,
-            notes=(f"No modes could be extracted from this measurement: "
-                   f"{exc}",))
+        return ModeExtraction(modes=(), source_method=source, success=False,
+                              notes=_refusal_notes(exc, source, measurement))
 
     if dist is not None:
         if manual_bounds_rh_nm:
@@ -474,8 +577,7 @@ def extract_modes(
             if gamma_grid.size != rh_grid.size:
                 return ModeExtraction(     # the find_distribution_peaks guard
                     modes=(), source_method=source, success=False,
-                    notes=("The distribution's decay-rate grid is malformed; "
-                           "no modes extracted.",))
+                    notes=(Note('grid_malformed', ()),), weighting=weighting)
             intervals, rh_s, w_s = integrate_between(
                 rh_grid, dist.weights, manual_bounds_rh_nm)
             gamma_s = gamma_grid[np.argsort(rh_grid)]
@@ -485,44 +587,48 @@ def extract_modes(
                     n_empty += 1
                     continue
                 peak_i = lo + int(np.argmax(w_s[lo:hi]))
+                # The interval's position, and its grid-end verdict, by the one computation
+                # each the automatic lobes use.
+                mean = lobe_geometric_mean(rh_s, w_s, lo, hi, gamma_s)
+                at_end = not _grid_end_check(peak_i, rh_s.size, float(rh_s[peak_i]))[0]
                 raw.append((float(gamma_s[peak_i]), frac, float(rh_max),
-                            (float(rh_s[lo]), float(rh_s[hi - 1])), 'manual'))
+                            (float(rh_s[lo]), float(rh_s[hi - 1])), 'manual',
+                            mean.gamma_s_inv, mean.rh_nm, at_end))
             if n_empty:
-                notes.append(
-                    f"{n_empty} manual integration interval(s) captured no "
-                    f"weight and produced no mode."
-                )
+                notes.append(Note('empty_manual_interval', (), {'n': n_empty}))
             # The standing rail (owner, 2026-08-14): a manual split exists
             # because peaks overlap, and overlap violates the wide-separation
             # validity condition -- the caveat travels unconditionally.
-            notes.append(
-                "Manual integration bounds were used for this run's mode "
-                "amplitudes. Overlapping peaks violate the wide-separation "
-                "validity condition of the mode decomposition; for genuinely "
-                "overlapping modes the parametric (double-exponential) route "
-                "is the better separator."
-            )
+            notes.append(Note('manual_bounds', ()))
         else:
-            peaks = find_distribution_peaks(dist, min_weight_fraction)
+            peaks = find_distribution_peaks(
+                dist, min_weight_fraction, min_decay_completeness=min_decay_completeness,
+                max_retained_acf_ratio=max_retained_acf_ratio)
             for pk in peaks:
                 raw.append((pk.gamma_s_inv, pk.weight_fraction, pk.rh_nm,
-                            (pk.rh_lo_nm, pk.rh_hi_nm), 'auto'))
+                            (pk.rh_lo_nm, pk.rh_hi_nm), 'auto',
+                            pk.mean_gamma_s_inv, pk.mean_rh_nm, has_note(pk, 'grid_end')))
 
     # A mode whose Gamma is not a positive finite number cannot be placed on
     # the map or picked by value; skip it with a note (disclosed, not silent).
-    usable = [t for t in raw if math.isfinite(t[0]) and t[0] > 0]
+    usable = [t for t in raw if math.isfinite(t[0]) and t[0] > 0
+              and math.isfinite(t[5]) and t[5] > 0]
     if len(usable) < len(raw):
-        notes.append(
-            f"Skipped {len(raw) - len(usable)} mode(s) with no usable decay "
-            f"rate (non-positive or non-finite Gamma)."
-        )
+        notes.append(Note('unusable_rate_dropped', ('modes',), {
+            'n_dropped': len(raw) - len(usable), 'n': len(raw), 'points': 'modes',
+            'quantity': 'Γ'}))
     if not usable:
-        notes.append("No usable modes were extracted from this measurement.")
         return ModeExtraction(modes=(), source_method=source, success=False,
-                              notes=tuple(notes))
+                              notes=_all_notes(Note('no_modes', ()), notes),
+                              weighting=weighting)
 
-    usable.sort(key=lambda t: -t[0])          # fast -> slow (Gamma descending)
+    usable.sort(key=lambda t: -t[5])          # fast -> slow (Gamma descending)
     n = len(usable)
+    # A distribution source's correlogram decay, asked once of the fit, fails every one of
+    # its points (a recommendation the owner accepted, 2026-10-17); the parametric source's
+    # verdict is its own rate test, `fit_double_exponential`'s.
+    data_ok = (_fit_decay_check(dist, max_retained_acf_ratio)[0] if dist is not None
+               else True)
 
     def _decay_fields(gamma: float) -> dict:
         # The completeness is computed ONCE and both the flag and the recorded value come
@@ -531,7 +637,7 @@ def extract_modes(
         completeness = _decay_completeness(gamma, tau_span)
         reliable, _note = _decay_completeness_check(completeness,
                                                     min_decay_completeness)
-        return dict(decay_incomplete=not reliable,
+        return dict(decay_incomplete=not (reliable and data_ok),
                     decay_completeness=completeness,
                     min_decay_completeness=float(min_decay_completeness))
 
@@ -541,12 +647,12 @@ def extract_modes(
             q_m_inv=float(q), q2_m2=float(q2),
             gamma_s_inv=float(g),
             amplitude_fraction=float(a),
-            d_m2_s=_d_from_gamma(g, q),
+            d_m2_s=d_from_gamma(mg, q),       # from the position, as everything derived
             rh_nm=float(r),
             source_method=source, mode_index=i, n_modes_in_run=n,
             low_amplitude=bool(a < amplitude_floor),
             amplitude_floor=float(amplitude_floor),
-            **_decay_fields(g),
+            **_decay_fields(mg),
             alpha=alpha, alpha_selection_method=alpha_method, gcv_gamma=gcv_gamma,
             rh_min_nm=rh_lo, rh_max_nm=rh_hi, n_grid=n_grid_used,
             weighting=weighting,
@@ -554,11 +660,60 @@ def extract_modes(
             run_duration_form=run_duration_form,
             bounds_lo_rh_nm=float(blo), bounds_hi_rh_nm=float(bhi),
             bounds_source=bsrc,
+            mean_gamma_s_inv=float(mg), mean_rh_nm=float(mr),
+            grid_end=bool(at_end),
         )
-        for i, (g, a, r, (blo, bhi), bsrc) in enumerate(usable)
+        for i, (g, a, r, (blo, bhi), bsrc, mg, mr, at_end) in enumerate(usable)
     )
     return ModeExtraction(modes=modes, source_method=source, success=True,
-                          notes=tuple(notes))
+                          notes=_all_notes(notes), weighting=weighting)
+
+
+@dataclass(frozen=True)
+class ModeRunOutcome:
+    """One run's mode extraction, as `extract_mode_runs` returns it: the `ModeExtraction`
+    with its points tagged with the run's provenance, or None when the extraction
+    refused its inputs (a `ValueError`)."""
+    extraction: Optional[ModeExtraction]
+    # The refusal's own notes (`core.notes.RefusedInputs.notes`); () for a refusal that
+    # names no cause, and for a run that was extracted.
+    refusal: Tuple[Note, ...] = ()
+
+
+def extract_mode_runs(
+    runs: Sequence[Tuple[DLSMeasurement, Mapping[str, Any],
+                         Optional[Sequence[Sequence[float]]], Any, Any]],
+    source: str,
+    **kw,
+) -> Tuple[ModeRunOutcome, ...]:
+    """Every mode of every run of a mode map, one `extract_modes` call per run.
+
+    Each run is (measurement, its own keyword arguments, its manual integration bounds,
+    item_id, polarization state). A run's keyword arguments are laid over the shared
+    `**kw`, and the two provenance values are opaque here: each point the run yields
+    carries them as `ModePoint.item_id` and `ModePoint.polarization_state`.
+
+    Returns one outcome per run, in the order given. An extraction that refuses its
+    inputs (a `ValueError`) leaves its run with no points and its refusal's notes, so
+    one weird run never kills the map; any other exception propagates.
+    """
+    out: List[ModeRunOutcome] = []
+    for m, run_kw, bounds, item_id, polarization_state in runs:
+        # Manual integration bounds apply to distribution sources only: the parametric
+        # 'double' would refuse them, so they stay with the caller, dormant, until a
+        # distribution run.
+        mb = bounds if source != 'double' else None
+        try:
+            ext = extract_modes(m, source, manual_bounds_rh_nm=mb, **{**kw, **run_kw})
+        except ValueError as exc:
+            out.append(ModeRunOutcome(
+                extraction=None,
+                refusal=tuple(exc.notes) if isinstance(exc, RefusedInputs) else ()))
+            continue
+        tagged = tuple(replace(pt, item_id=item_id, polarization_state=polarization_state)
+                       for pt in ext.modes)
+        out.append(ModeRunOutcome(extraction=replace(ext, modes=tagged)))
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +764,7 @@ def fit_mode_family(
             f"angles, got {len(points)}."
         )
 
-    notes: List[str] = []
+    notes: List[Note] = []            # the records of the pick set
 
     angles = np.array([p.angle_deg for p in points], dtype=float)
     if np.unique(angles).size < 2:
@@ -627,7 +782,9 @@ def fit_mode_family(
             "sin(theta/2) -- check the solvent refractive index and the "
             "wavelength on the source measurements."
         )
-    gamma = np.array([p.gamma_s_inv for p in points], dtype=float)
+    # Each point's POSITION (the lobe's geometric mean for a distribution source), the
+    # Gamma its `d_m2_s` was derived from -- one Gamma per point (`plotted_gamma_s_inv`).
+    gamma = np.array([plotted_gamma_s_inv(p) for p in points], dtype=float)
     amps = np.array([p.amplitude_fraction for p in points], dtype=float)
     d_app = np.array([p.d_m2_s for p in points], dtype=float)
 
@@ -636,40 +793,57 @@ def fit_mode_family(
     if len(methods) > 1:
         # Single source of the message -> both the note and the warning
         # (keep-both), the analyze_gamma_q2 identity-mix shape.
-        msg = ("The picked modes come from different extraction methods "
-               f"({', '.join(sorted(methods))}). A mode family should be "
-               "picked from one method's map.")
-        notes.append(msg)
-        warnings.warn(msg, UserWarning, stacklevel=2)
+        mixed = Note('mixed_extraction_methods', (),
+                     {'methods': tuple(sorted(_SOURCE_FIT_NAMES[m] for m in methods))})
+        notes.append(mixed)
+        warnings.warn(render(mixed, surface='export'), UserWarning, stacklevel=2)
     ids = [p.item_id for p in points if p.item_id]
     same_run = len(ids) != len(set(ids))
     if same_run:
-        notes.append(
-            "Two or more picked modes belong to the same measurement -- a "
-            "mode family normally takes at most one mode per run. The "
-            "regression SEs are withheld: part of the residual spread is "
-            "then WITHIN one correlogram, whose lag channels are correlated, "
-            "so an independent-points SE would under-report."
-        )
+        # Part of the residual spread is then WITHIN one correlogram, whose lag channels
+        # are correlated, so an independent-points SE would under-report (below).
+        notes.append(Note('se_withheld_same_run', ('d_se', 'rh_se', 'a_se', 'b_se')))
     n_low = int(sum(1 for p in points if p.low_amplitude))
     if n_low:
         floor = max(p.amplitude_floor for p in points)
-        notes.append(
-            f"{n_low} of {len(points)} picked mode(s) fall below the "
-            f"{floor:.0%} amplitude floor; their decay rates and amplitudes "
-            f"are imprecise."
-        )
+        notes.append(Note('low_amplitude_points', ('amplitude_fractions',), {
+            'n': n_low, 'total': len(points), 'floor': float(floor)}))
+    # The point verdicts the family's Rh rests on, each its own count note (a mode can be
+    # strong and undecayed, or weak and fully decayed): about the decay rates they judge
+    # and every value fitted from them, so the precondition reaches each export cell.
+    point_about = ('gamma_s_inv', 'd_m2_s', 'rh_nm', 'a_m2_s', 'b_m4_s',
+                   'd_se', 'rh_se', 'a_se', 'b_se')
     n_undecayed = int(sum(1 for p in points if p.decay_incomplete))
+    undecayed_note = None
     if n_undecayed:
-        # A separate judgement from the amplitude floor, so it gets its own line rather
-        # than sharing one: a mode can be strong and undecayed, or weak and fully decayed.
-        floor = max(p.min_decay_completeness for p in points)
-        notes.append(
-            f"{n_undecayed} of {len(points)} picked mode(s) did not finish "
-            f"decaying inside their delay window (Gamma * lag span below "
-            f"{floor:.3g}); their decay rates are extrapolations past the end "
-            f"of the measurement, so the fitted D and Rh inherit that."
-        )
+        undecayed_note = Note('undecayed_points', point_about, {
+            'n': n_undecayed, 'total': len(points)})
+        notes.append(undecayed_note)
+    n_grid_end = int(sum(1 for p in points if getattr(p, 'grid_end', False)))
+    grid_end_note = None
+    if n_grid_end:
+        grid_end_note = Note('grid_end_points', point_about,
+                             {'n': n_grid_end, 'total': len(points)})
+        notes.append(grid_end_note)
+    # A point outside the technique's size range fails the family's Rh as an angle's does
+    # Gamma vs q^2's (`angular._pooled_point_notes`, the shape: the count, then the first
+    # point's own reason where it was found), the size asked only of a decay the point
+    # observed (the one precedence of `cumulants._cumulant_flags`), on the point's
+    # position (a recommendation the owner accepted, 2026-10-17). Every such cause bears
+    # on the decay rate (`DECAY_BEARING_CODES`), so the count is the decay-bearing one.
+    out_of_range = [(float(a), n) for a, p in zip(angles, points, strict=True)
+                    if not p.decay_incomplete
+                    for n in (size_range_check(_point_rh_nm(p), CUMULANT_MAX_RH_NM,
+                                                CUMULANT_MIN_RH_NM)[1],) if n is not None]
+    range_notes: Tuple[Note, ...] = ()
+    if out_of_range:
+        first_at, first = out_of_range[0]
+        range_notes = (
+            Note('inputs_flagged_decay', ('rh_nm',), {
+                'k': len(out_of_range), 'n': len(points), 'inputs': 'mode points',
+                WHERE: tuple(a for a, _n in out_of_range), WHERE_UNIT: 'deg'}),
+            replace(first, values={**first.values, WHERE: (first_at,), WHERE_UNIT: 'deg'}))
+    notes.extend(range_notes)
 
     order = np.argsort(q2)
     angles, q, q2, gamma = angles[order], q[order], q2[order], gamma[order]
@@ -702,6 +876,7 @@ def fit_mode_family(
     a = b = q4_r2 = q4_cond = float('nan')
     a_se = b_se = None
     q4_ok = False
+    q4_note = None
     # `q2.max() > 0` beside the count: q2 is already finite (raised on above),
     # but an all-zero abscissa would make the normalization below divide by
     # zero -- the same degenerate design linear_fit_through_origin withholds on.
@@ -730,15 +905,11 @@ def fit_mode_family(
         a_se = alpha_se / s if alpha_se is not None else None
         b_se = beta_se / (s * s) if beta_se is not None else None
         if not q4_ok:
-            notes.append(
-                f"The q^2+q^4 design is ill-conditioned (cond={q4_cond:.1e}); "
-                f"a and b are numerically unreliable -- widen the angle range."
-            )
+            q4_note = Note('ill_conditioned', ('a_m2_s', 'b_m4_s'),
+                           {'cond': q4_cond, 'limit': mf.cond_limit})
     else:
-        notes.append(
-            "The q^2+q^4 deviation form needs at least three distinct "
-            "angles; it was not fitted."
-        )
+        q4_note = Note('q4_not_fitted', ('a_m2_s', 'b_m4_s'),
+                       {'n': int(np.unique(q2).size), 'need': 3})
 
     # Apparent, mode-resolved Rh -- ALWAYS computed when D is usable (the
     # verdict above never gates it; owner-ruled 2026-08-14). isfinite as well
@@ -749,6 +920,16 @@ def fit_mode_family(
     else:
         rh = float('nan')
     rh_se = unc.power_law_se(rh, d, d_se, -1) if math.isfinite(rh) else None
+
+    # The family's Rh verdict, `analyze_gamma_q2`'s roll-up: the point verdicts above, the
+    # technique's size range on the family Rh itself and the viscosity a blank Rh lacks.
+    size_note = size_range_check(rh, CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM)[1]
+    visc_note = _no_viscosity_note() if viscosity_Pa_s is None else None
+    rh_reliable, _rh_notes = _result_flags(undecayed_note, grid_end_note, *range_notes,
+                                           size_note, visc_note)
+    notes.extend(n for n in (size_note, visc_note) if n is not None)
+    if not is_diffusive:
+        notes.append(_not_diffusive_note(r2, intercept_rel))
 
     # Invariant 8: the SEs above are
     # licensed by the points being INDEPENDENT angles. Two modes of one
@@ -776,7 +957,8 @@ def fit_mode_family(
         se_estimator=estimator,
         n_low_amplitude=n_low,
         n_decay_incomplete=n_undecayed,
-        notes=tuple(notes),
+        notes=_all_notes(q4_note, notes),
+        rh_reliable=rh_reliable,
     )
 
 
@@ -806,7 +988,7 @@ def amplitude_vs_q(
     than two shared angles make flatness unanswerable (the is_diffusive
     convention for an unanswerable verdict).
     """
-    notes: List[str] = []
+    notes: List[Note] = []            # the records of the pairing
 
     def _by_angle(pts: Sequence[ModePoint], label: str):
         buckets: dict = {}
@@ -815,11 +997,9 @@ def amplitude_vs_q(
                                []).append(p)
         multi = sorted(a for a, lst in buckets.items() if len(lst) > 1)
         if multi:
-            angles_txt = ', '.join(f'{a:g}' for a in multi)
-            notes.append(
-                f"Skipped angle(s) {angles_txt} deg: the {label} family holds "
-                f"more than one picked mode there (no averaging is invented)."
-            )
+            # Skipped there: no averaging is invented.
+            notes.append(Note('multiple_points_at_angle', (), {
+                'family': label, 'angles': tuple(float(a) for a in multi)}))
         return {a: lst[0] for a, lst in buckets.items() if len(lst) == 1}
 
     fast = _by_angle(fast_points, 'fast')
@@ -828,9 +1008,7 @@ def amplitude_vs_q(
     candidates = sorted(set(fast) & set(slow))
     n_only = len(set(fast) ^ set(slow))
     if n_only:
-        notes.append(
-            f"{n_only} angle(s) present in only one family were skipped."
-        )
+        notes.append(Note('angles_in_one_family', (), {'n': n_only}))
     # A_f/A_s is defined WITHIN one decomposition: the modes of one run sum
     # to ~1, so a pair drawn from two different runs (or two polarization
     # states -- different scattering channels) is a ratio of two unrelated
@@ -845,24 +1023,19 @@ def amplitude_vs_q(
         else:
             shared.append(a)
     if mismatched:
-        angles_txt = ', '.join(f'{a:g}' for a in mismatched)
-        notes.append(
-            f"Skipped angle(s) {angles_txt} deg: the fast and slow modes "
-            f"there do not come from the same run and polarization state, "
-            f"and A_f/A_s is only defined within one decomposition."
-        )
+        # A_f/A_s is only defined within one decomposition (one run, one polarization).
+        notes.append(Note('mixed_runs_at_angle', ('ratio_f_over_s',), {
+            'angles': tuple(float(a) for a in mismatched)}))
     if not shared:
-        notes.append(
-            "The fast and slow families share no same-run angles; the "
-            "amplitude report is empty."
-        )
         return AmplitudeRatioResult(
             angles_deg=np.array([]), sin2_half_theta=np.array([]),
             fast_fraction=np.array([]), slow_fraction=np.array([]),
             ratio_f_over_s=np.array([]),
             fast_flat=False, fast_rel_span=float('nan'),
             flatness_rel_threshold=flatness_rel_threshold,
-            n_shared_angles=0, notes=tuple(notes),
+            n_shared_angles=0,
+            notes=_all_notes(Note('too_few_shared_angles', ('fast_flat',),
+                                  {'n': 0, 'need': 2}), notes),
         )
 
     angles = np.array(shared, dtype=float)
@@ -876,10 +1049,9 @@ def amplitude_vs_q(
     ratio = np.full(angles.shape, float('nan'))
     ratio[answerable] = a_f[answerable] / a_s[answerable]
     if not answerable.all():
-        notes.append(
-            f"A_f/A_s withheld at {int((~answerable).sum())} angle(s): the "
-            f"slow-mode amplitude there is zero or not finite."
-        )
+        # The slow-mode amplitude there is zero or not finite.
+        notes.append(Note('ratio_withheld', ('ratio_f_over_s',),
+                          {'n': int((~answerable).sum())}))
 
     # Fast-amplitude angle-flatness: (max-min)/mean against the documented
     # threshold. Unanswerable (< 2 shared angles, or a degenerate mean) ->
@@ -889,20 +1061,15 @@ def amplitude_vs_q(
     if finite_f.size >= 2 and math.isfinite(mean_f) and mean_f > 0:
         rel_span = float((finite_f.max() - finite_f.min()) / mean_f)
         flat = bool(rel_span <= flatness_rel_threshold)
-        if not flat:
-            notes.append(
-                f"The fast-mode amplitude varies by "
-                f"{rel_span:.0%} of its mean across angles (threshold "
-                f"{flatness_rel_threshold:.0%}); in the two-mode "
-                f"phenomenology A_f is expected q-flat -- see the guide."
-            )
+        flat_note = (None if flat else Note('fast_amplitude_not_flat', ('fast_flat',), {
+            'span': rel_span, 'limit': float(flatness_rel_threshold)}))
     else:
         rel_span = float('nan')
         flat = False
-        notes.append(
-            "Fast-amplitude angle-flatness could not be assessed (fewer than "
-            "two shared angles with a usable fast amplitude)."
-        )
+        # The usable shared angles: finite fast amplitudes with a positive mean.
+        n_usable = int(finite_f.size) if (math.isfinite(mean_f) and mean_f > 0) else 0
+        flat_note = Note('too_few_shared_angles', ('fast_flat',),
+                         {'n': n_usable, 'need': 2})
 
     return AmplitudeRatioResult(
         angles_deg=angles, sin2_half_theta=sin2,
@@ -910,5 +1077,5 @@ def amplitude_vs_q(
         fast_flat=flat, fast_rel_span=rel_span,
         flatness_rel_threshold=flatness_rel_threshold,
         n_shared_angles=int(angles.size),
-        notes=tuple(notes),
+        notes=_all_notes(flat_note, notes),
     )

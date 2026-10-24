@@ -45,15 +45,15 @@ from typing import Optional
 import shiboken6
 from PySide6 import QtCore, QtWidgets
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from analysis.uncertainty import format_pm
-from app import units as U
+from core.formatting import format_pm
+from core import units as U
 from physics import solvents as solvents_lib
 from gui.help import section_header
 from gui.plot_controls import (
-    AxisControlBar, make_canvas_expanding, set_plot_export_name, themed_navtoolbar)
+    AxisControlBar, LazyCanvas, make_canvas_expanding, set_plot_export_name,
+    themed_navtoolbar)
 from gui.solvent_picker import index_of_solvent, populate_solvent_combo
 from gui.theme import ThemedLabel, token as theme_token
 from gui.widgets import value_unit_row as _value_unit_row
@@ -88,12 +88,9 @@ class SolventExplorerModule(QtWidgets.QWidget):
                 'lower-confidence data, which the Data tab offers but never auto-fills.',
                 'Values never enter an analysis — this view only shows them '
                 '(use the Data tab to auto-fill a measurement).',
-                'Each curve is drawn only across the range the library covers; '
-                'the shaded band is a conservative bound at each condition, '
-                'including an allowance for disagreement between published '
-                'sources (narrowest where the sources are strongest).',
-                'The band is <b>shown, never propagated</b> into any reported ± '
-                '(see Theory-and-Equations-Guide §1.1.2).',
+                'Each curve is drawn only across the range the library covers; its '
+                'shaded band is <b>shown, never propagated</b> into any reported ± '
+                '(Theory-and-Equations-Guide §1.1.2).',
             ]))
 
         # ---- top: form (left) + numeric readout (right) ----
@@ -149,7 +146,7 @@ class SolventExplorerModule(QtWidgets.QWidget):
         pv = QtWidgets.QVBoxLayout(plots)
         pv.setContentsMargins(0, 0, 0, 0)
         self.figure = Figure(figsize=(9.6, 3.4), constrained_layout=True)
-        self.canvas = make_canvas_expanding(FigureCanvas(self.figure))
+        self.canvas = make_canvas_expanding(LazyCanvas(self.figure))
         pv.addWidget(themed_navtoolbar(self.canvas, plots, self.controller))
         set_plot_export_name(self.canvas, 'solvent_properties')
         pv.addWidget(self.canvas, 1)

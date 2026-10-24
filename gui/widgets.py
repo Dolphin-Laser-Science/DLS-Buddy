@@ -6,6 +6,7 @@ Small cross-module Qt widget helpers that don't belong to any one tab:
 
 * the tab-bar room fix (`RoomyTabBar` / `roomy_tabs`) — a usability fix;
 * the visible-grip splitter (`GripSplitter`);
+* the embedded plot's scaffold (`make_plot_pane`): figure, canvas, toolbar, axis bar;
 * the **shared selection layer** (`SelectionModel` + `MeasurementPicker`) — the one
   measurement-picker idiom every analysis tab uses (real checkboxes, include-semantics,
   select-all/none, grouped by sample). Promoted from the DLS-only checklist so all tabs
@@ -28,13 +29,15 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from core.data_models import IDENTITY_FORM_BY_FIELD
 from core.naming import UNCONFIRMED_SAMPLE
+from core.notes import Note, render
 from gui.help import section_header
+from gui.note_text import REMEDIES
 
 
 def confirm_regroup_losses(parent, controller, losses) -> bool:
@@ -88,18 +91,46 @@ def value_unit_row(value_widget: QtWidgets.QWidget,
 PARSE_NOTES_TITLE = 'Loaded with notes'
 
 
-def show_parse_notes(parent: QtWidgets.QWidget, notes: Sequence[str]) -> None:
-    """Render passive parser notices as one ⓘ box. No-op when there are none.
+def show_parse_notes(parent: QtWidgets.QWidget,
+                     notes: Sequence[Tuple[str, object]]) -> None:
+    """Render the parsers' load-time notes as one ⓘ box: each `(file name, note)` pair
+    (`parsers.base_parser.collect_parse_notes`) as its file and registry clause, with the
+    code's remedy from `gui.note_text.REMEDIES` on the line below where it has one. No-op
+    when there are none.
 
     Lives here rather than in `main_window` because the trace loader (Utilities) does not
     go through `_finish_load` and would otherwise need its own copy -- the two-of-three
     wiring that leaves the third loader silently opted out (rule 10)."""
     if not notes:
         return
+    lines = []
+    for name, note in notes:
+        if isinstance(note, Note):
+            # Uncounted, unlike the GUI's other notes: these notes are kept on no
+            # measurement, so this box is the one place a dropped column is named.
+            lines.append(f'{name}: {render(note)}')
+            remedy = REMEDIES.get(note.code)
+            if remedy:
+                lines.append(f'    {remedy}')
+        else:                          # a sentence a preview still carries as text
+            lines.append(f'{name}: {note}')
     QtWidgets.QMessageBox.information(
         parent, PARSE_NOTES_TITLE,
         'The data was loaded and is used as-entered. Notes:\n\n  '
-        + '\n  '.join(notes))
+        + '\n  '.join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Stale-fit hints (the DLS and SLS analysis tabs)
+# ---------------------------------------------------------------------------
+# Shown when a fit on screen was computed from inputs that have since changed (each tab
+# stores its run signature with the fit and a redisplay compares the two). One wording
+# for every tab, so the same state reads the same whichever tab shows it.
+STALE_HINT = 'Inputs changed since this fit — press Run to refresh.'
+
+# The same mark for a fit kept on screen while Run is off, so it does not ask for Run
+# (ui_style_guide.md § 4, "Unavailable analysis").
+STALE_UNRUNNABLE = 'Inputs changed since this fit.'
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +227,23 @@ def roomy_tabs(tab_widget: QtWidgets.QTabWidget) -> QtWidgets.QTabWidget:
     convenience."""
     tab_widget.setTabBar(RoomyTabBar())
     return tab_widget
+
+
+def make_plot_pane(parent, controller, figsize, *, constrained_layout=None):
+    """An embedded plot's scaffold, built in this order: the `Figure`, its canvas (a
+    `LazyCanvas`, expanding with its container), the navigation toolbar (parented to
+    `parent`, saving white, the controller's export folder) and the `AxisControlBar`
+    for that canvas. Returns `(figure, canvas, toolbar, axis_bar)`; the caller adds the
+    axes and lays the widgets out."""
+    # Imported here: `gui.plot_controls` imports this module.
+    from matplotlib.figure import Figure
+    from gui.plot_controls import (AxisControlBar, LazyCanvas, make_canvas_expanding,
+                                   themed_navtoolbar)
+    figure = Figure(figsize=figsize, constrained_layout=constrained_layout)
+    canvas = make_canvas_expanding(LazyCanvas(figure))
+    toolbar = themed_navtoolbar(canvas, parent, controller)
+    axis_bar = AxisControlBar(canvas)
+    return figure, canvas, toolbar, axis_bar
 
 
 # ---------------------------------------------------------------------------
@@ -542,12 +590,6 @@ class SelectionModel(QtCore.QObject):
         new = [iid] if iid else []
         if new != self._ids:
             self._ids = new
-            self.changed.emit()
-
-    def ensure(self, iid: Optional[str]) -> None:
-        """Tick ``iid`` if absent (used to auto-include a focused pick)."""
-        if iid and iid not in self._ids:
-            self._ids.append(iid)
             self.changed.emit()
 
     def prune(self, live: Iterable[str]) -> None:

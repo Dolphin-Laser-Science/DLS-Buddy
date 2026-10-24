@@ -22,13 +22,8 @@ Design contract (consistent with the rest of the platform)
 ----------------------------------------------------------
 Every analysis function here is a PURE function: it takes data objects and
 parameters and returns a result object. No analysis function draws a plot,
-writes a file, or mutates its inputs.
-
-The one exception is export_synthetic_correlogram_csv(), whose explicit purpose
-is to write a file. It is clearly separated from the pure generator
-(generate_synthetic_correlogram, which only computes and returns a result), so
-the generation logic remains pure and testable while the file write is a thin,
-obvious helper.
+writes a file, or mutates its inputs. The CSV writer for a generated correlogram,
+export_synthetic_correlogram_csv(), lives in exporting/instrument_files.py.
 
 Units
 -----
@@ -66,6 +61,7 @@ import numpy as np
 from scipy.optimize import brentq
 
 from core.data_models import SLSMeasurement, SampleKey
+from core.notes import Note, render
 from analysis import uncertainty as unc
 from physics.constants import (
     scattering_vector_q_m,
@@ -109,9 +105,9 @@ class RhoResult:
     sample_key: Optional[SampleKey] = None
     keys_matched: Optional[bool] = None   # None if keys not supplied
     rho_se: Optional[float] = None        # propagated from Rg, Rh SEs (both required)
-    # passive, glyph-less notices for the GUI ⓘ tier (e.g. Rg/Rh keys disagree) --
-    # the same text the module also emits via warnings.warn (keep-both).
-    notes: tuple = ()
+    # record notes (the Rg and Rh sample keys disagree); the module also emits each as a
+    # UserWarning, its export clause the message (keep-both).
+    notes: Tuple[Note, ...] = ()
 
 
 # ===========================================================================
@@ -214,7 +210,8 @@ def i_sin_theta(
 #: beside the text, so there is no second ladder to fall out of step.
 _RHO_MEASURED_BIAS_NOTE = (
     " ⓘ These are TABULATED (Kirkwood-Riseman) reference values; measured ρ typically "
-    "runs ~10-14% below them (Burchard 1999), so a real sample can read one band low. "
+    "runs ~10-14% below them (Theory-and-Equations-Guide §5.1), so a real sample can "
+    "read one band low. "
     "A narrow θ-solvent coil, tabulated at 1.50, often measures 1.29-1.35 -- the "
     "branched/star range.")
 
@@ -261,17 +258,13 @@ def _rho_band(rho: float) -> Tuple[str, bool]:
     # tabulated reference to be biased away from
 
 
-def _rho_band_text(rho: float) -> str:
-    """The band verdict alone, without the measured-bias note."""
-    return _rho_band(rho)[0]
-
-
 def _interpret_rho(rho: float) -> str:
     """Return a short textual interpretation of a rho = Rg/Rh value.
 
     Reference values are architecture-resolved from Burchard (1999, Table 4;
-    theta-solvent unless noted), with the classical coil/sphere limits (Chu
-    1991). rho is a *qualitative* architecture fingerprint, not a hard
+    theta-solvent unless noted); the hard sphere's geometric half, Rg^2 = (3/5) R^2
+    for a uniform solid sphere, is Chu (1991) Eq. 2.A.7, p. 51, and Chu prints no
+    Rg/Rh ratio. rho is a *qualitative* architecture fingerprint, not a hard
     classifier: branched and star objects sit below the linear-coil value, but
     their ranges overlap the sphere-to-coil span, so rho narrows the
     possibilities rather than naming one. It also shifts with solvent quality
@@ -381,7 +374,7 @@ def compute_rho(
 
     keys_matched: Optional[bool] = None
     matched_key: Optional[SampleKey] = None
-    notes: list = []       # passive ⓘ notices surfaced on the result (keep-both)
+    notes: List[Note] = []
     if rg_sample_key is not None and rh_sample_key is not None:
         keys_matched = (
             rg_sample_key.polymer_name == rh_sample_key.polymer_name
@@ -396,15 +389,19 @@ def compute_rho(
         if keys_matched:
             matched_key = rg_sample_key
         else:
-            msg = (
-                f"Rg and Rh sample keys disagree on polymer/solvent/"
-                f"temperature: Rg from {rg_sample_key}, Rh from {rh_sample_key}. "
-                f"rho is only meaningful for the same sample."
-            )
             if require_match:
-                raise ValueError(msg)
-            notes.append(msg)   # single source -> both the note and the warning
-            warnings.warn(msg, UserWarning, stacklevel=2)
+                raise ValueError(
+                    f"Rg and Rh sample keys disagree on polymer/solvent/"
+                    f"temperature: Rg from {rg_sample_key}, Rh from {rh_sample_key}. "
+                    f"rho is only meaningful for the same sample.")
+            # The three fields the check compares; concentration is extrapolated away.
+            note = Note('rho_sample_mismatch', (), {
+                'rg_key': (rg_sample_key.polymer_name, rg_sample_key.solvent_name,
+                           float(rg_sample_key.temperature_K)),
+                'rh_key': (rh_sample_key.polymer_name, rh_sample_key.solvent_name,
+                           float(rh_sample_key.temperature_K))})
+            notes.append(note)   # one source -> both the note and the warning
+            warnings.warn(render(note, surface='export'), UserWarning, stacklevel=2)
 
     rho = rg_nm / rh_nm
     # Rg (SLS) and Rh (DLS) are independent measurements, so rho's SE is the
@@ -605,7 +602,8 @@ class HydrodynamicResult:
     mw_branched: Optional[float] = None
     mw_linear_range: Optional[tuple] = None    # (min, max) Mw of the linear reference series
     mw_in_range: Optional[bool] = None    # branched Mw within the linear span? None if unknown
-    linear_ref_note: str = ''             # provenance of the linear reference (shown verbatim)
+    # record notes: the linear reference law h was read against (`linear_reference_law`)
+    notes: Tuple[Note, ...] = ()
 
 
 def _star_arms_from_h(h: float) -> float:
@@ -660,7 +658,8 @@ class ArchitectureResult:
     mw_branched: Optional[float] = None
     mw_linear_range: Optional[tuple] = None    # (min, max) Mw of the linear reference series
     mw_in_range: Optional[bool] = None    # branched Mw within the linear span? None if unknown
-    linear_ref_note: str = ''             # provenance of the linear reference (shown verbatim)
+    # record notes: the linear reference law g was read against (`linear_reference_law`)
+    notes: Tuple[Note, ...] = ()
     branching_model: str = 'regular_star'      # 'regular_star' | 'random_tri' | 'random_tetra'
     branching_index: Optional[float] = None    # n (branch units/molecule) for a random model; None for the regular star OR g out of (0,1]
     branching_index_se: Optional[float] = None  # ALWAYS None: n is a deterministic transform of the reported g (its ± is shown on g)
@@ -795,13 +794,41 @@ def _interpret_g(g: float, f_eff: float, mw_in_range: Optional[bool],
             + range_note)
 
 
+def _linear_reference_notes(quantity: str, about: str, n_linear_points: Optional[int],
+                            mw_range: Optional[tuple]) -> Tuple[Note, ...]:
+    """The record of the linear reference law a contraction factor was read against: its
+    radius, how many linear samples fitted it and their Mw span; none when the caller
+    did not say both."""
+    if n_linear_points is None or mw_range is None:
+        return ()
+    return (Note('linear_reference_law', (about,),
+                 {'quantity': quantity, 'n': int(n_linear_points),
+                  'lo': float(mw_range[0]), 'hi': float(mw_range[1])}),)
+
+
+def _mw_range_verdict(mw_linear_range: Optional[Sequence[float]],
+                      mw_branched: Optional[float]
+                      ) -> Tuple[Optional[bool], Optional[tuple]]:
+    """`(mw_in_range, mw_range_out)` for a contraction factor: whether the branched Mw lies
+    inside the linear reference series' Mw span, and that span as `(lo, hi)`. The first is
+    None without a span or a finite branched Mw, the second None without a span."""
+    mw_in_range: Optional[bool] = None
+    mw_range_out: Optional[tuple] = None
+    if mw_linear_range is not None:
+        lo, hi = float(min(mw_linear_range)), float(max(mw_linear_range))
+        mw_range_out = (lo, hi)
+        if mw_branched is not None and math.isfinite(mw_branched):
+            mw_in_range = bool(lo <= mw_branched <= hi)
+    return mw_in_range, mw_range_out
+
+
 def branching_contraction_factor(
     rg_branched,
     rg_linear: float,
     *,
     mw_branched: Optional[float] = None,
     mw_linear_range: Optional[Sequence[float]] = None,
-    linear_ref_note: str = '',
+    n_linear_points: Optional[int] = None,
     model: str = 'regular_star',
 ) -> ArchitectureResult:
     """Scattering branching contraction factor g = Rg_br^2 / Rg_lin^2 at matched Mw.
@@ -826,8 +853,9 @@ def branching_contraction_factor(
     mw_linear_range : (min, max), optional
         The Mw span of the linear reference series. With `mw_branched`, sets
         `mw_in_range` (False -> g relies on extrapolating the law).
-    linear_ref_note : str
-        Human-readable provenance of the linear reference (shown verbatim).
+    n_linear_points : int, optional
+        How many linear samples the reference law was fitted to. With
+        `mw_linear_range`, recorded as the `linear_reference_law` note.
     model : {'regular_star', 'random_tri', 'random_tetra'}
         Which architecture the reading assumes. The regular-star `effective_arms`
         is computed for EVERY model (always available); a random model ADDITIONALLY
@@ -876,13 +904,7 @@ def branching_contraction_factor(
         branching_index = random_branching_index(
             g, functionality=_RANDOM_BRANCHING_FUNCTIONALITY[model])
 
-    mw_in_range: Optional[bool] = None
-    mw_range_out: Optional[tuple] = None
-    if mw_linear_range is not None:
-        lo, hi = float(min(mw_linear_range)), float(max(mw_linear_range))
-        mw_range_out = (lo, hi)
-        if mw_branched is not None and math.isfinite(mw_branched):
-            mw_in_range = bool(lo <= mw_branched <= hi)
+    mw_in_range, mw_range_out = _mw_range_verdict(mw_linear_range, mw_branched)
 
     return ArchitectureResult(
         g=float(g),
@@ -896,7 +918,7 @@ def branching_contraction_factor(
         mw_branched=mw_branched,
         mw_linear_range=mw_range_out,
         mw_in_range=mw_in_range,
-        linear_ref_note=linear_ref_note,
+        notes=_linear_reference_notes('Rg', 'g', n_linear_points, mw_range_out),
         branching_model=model,
         # None when no random model was selected OR the inversion is undefined (g out of
         # (0,1]): a non-finite n must NOT leak as a stored value (consumers guard `is None`).
@@ -952,7 +974,7 @@ def hydrodynamic_contraction_factor(
     *,
     mw_branched: Optional[float] = None,
     mw_linear_range: Optional[Sequence[float]] = None,
-    linear_ref_note: str = '',
+    n_linear_points: Optional[int] = None,
 ) -> HydrodynamicResult:
     """Hydrodynamic branching contraction factor h = Rh_br / Rh_lin at matched Mw.
 
@@ -993,13 +1015,7 @@ def hydrodynamic_contraction_factor(
     # reported on h). NaN when h is outside the star domain (h > 1).
     f_eff = _star_arms_from_h(h)
 
-    mw_in_range: Optional[bool] = None
-    mw_range_out: Optional[tuple] = None
-    if mw_linear_range is not None:
-        lo, hi = float(min(mw_linear_range)), float(max(mw_linear_range))
-        mw_range_out = (lo, hi)
-        if mw_branched is not None and math.isfinite(mw_branched):
-            mw_in_range = bool(lo <= mw_branched <= hi)
+    mw_in_range, mw_range_out = _mw_range_verdict(mw_linear_range, mw_branched)
 
     return HydrodynamicResult(
         h=float(h),
@@ -1012,7 +1028,7 @@ def hydrodynamic_contraction_factor(
         mw_branched=mw_branched,
         mw_linear_range=mw_range_out,
         mw_in_range=mw_in_range,
-        linear_ref_note=linear_ref_note,
+        notes=_linear_reference_notes('Rh', 'h', n_linear_points, mw_range_out),
     )
 
 
@@ -1037,7 +1053,8 @@ def compare_g_h(g: Optional[float], h: Optional[float]) -> str:
         return ("Both g and h exceed 1 -- not necessarily an input problem: this is "
                 "the expected signature of a polydisperse or randomly-branched "
                 "architecture (an A_f polycondensate has g ≈ 2 and h ≈ 1.2-1.4; "
-                "Burchard 1980, Table II). If a contracted single architecture was "
+                "Theory-and-Equations-Guide §5.4.1). If a contracted single "
+                "architecture was "
                 "expected, check the linear reference / Mw.")
     if h_r > _CONTRACTION_RADIUS_TOL or g_r > _CONTRACTION_RADIUS_TOL:
         return ("g and h disagree on whether the chain is contracted -- treat with "
@@ -1096,6 +1113,9 @@ class ResultCandidate:
     #                                  SE or no SE. Named value_se_estimator (not se_estimator) so it pairs
     #                                  with value_se and stays a passthrough, not a primary-fit tag.
     calibrated: Optional[bool] = None  # None = calibration N/A (Rg/Rh); real flag for scale-dependent SLS Mw/A2
+    standard_index_known: Optional[bool] = None  # the source fit's own: False = it applied k_c with the
+    #                                  standard's refractive index blank, the cause of calibrated=False;
+    #                                  None = N/A (Rg/Rh). A store copies it beside `calibrated`.
     # The second, INDEPENDENT scale flag, carried for the same reason `calibrated` is: a
     # picked value must arrive with its own scale verdict, never one re-derived later from
     # a label string. None = N/A (Rg/Rh) or unknown; False = the source run had no dn/dc,
@@ -1116,6 +1136,10 @@ class ResultCandidate:
     #                                  guided manual entry among physically-admissible solutions. Rendered
     #                                  neutral ⓘ (ui_style_guide §5), and propagated like model_dependent
     #                                  (rule 10). See select_default_candidate + auto_selectable (G1/G3).
+    notes: Tuple[Note, ...] = ()     # the failed preconditions behind the label's clause, each
+    #                                  about `value`: what a store copies onto the sample, re-aimed
+    #                                  at its value field, so the Cross-Sample row marks the value
+    #                                  (core.workspace.set_value_notes). () when it failed none.
     auto_selectable: bool = True     # False = never chosen by the passive default (select_default_candidate
     #                                  filters it out) -- it is offered in the picker but is only ever an
     #                                  EXPLICIT user pick. Each degenerate per-solution candidate sets this
@@ -1443,7 +1467,8 @@ def _schatzel_sd(tau: np.ndarray, sample_times: np.ndarray, gamma_bar: float,
                 and np.all(np.isfinite(var))):
             raise ValueError(
                 f"mean_count_rate_cps = {mean_count_rate_cps!r} gives mean counts per "
-                f"sample time that Eq. (49)'s shot-noise terms cannot use: the smallest "
+                f"sample time that the Schätzel variance's shot-noise terms cannot use "
+                f"(Theory-and-Equations-Guide §2.3): the smallest "
                 f"n_bar over the channels is {float(np.min(nbar))!r}, and the terms in "
                 f"1/n_bar and 1/n_bar^2 must stay finite on every channel. Use a "
                 f"realistic photon count rate (a real file's is tens to hundreds of kHz)."
@@ -1469,10 +1494,13 @@ def _schatzel_classical_sd(tau: np.ndarray, sample_times: np.ndarray,
         k             = tau_k / Delta_t_k, the channel index within its block,
         M_k           = T / Delta_t_k, the number of products averaged,
 
-    all of which the generator already knows. Peters (1993, p. 152) measured that this
-    classical intensity noise dominates in almost every channel except roughly the
-    first 32, so the limit is a good description of most of a real axis; it degrades at
-    short lag and at low count rate.
+    all of which the generator already knows. Peters (1993, p. 152) reports, for one
+    latex sample (0.25 ms decay time, 300 kHz mean count rate, ALV-5000), that this
+    classical intensity noise "dominates in almost every correlation channel except the
+    first 32 channels, where photon noise still contributes significantly". On that run
+    the limit describes most of the axis; the channel count belongs to that sample and
+    count rate, not to axes in general. That the limit degrades at low count rate is this
+    program's own reading of the two dropped groups (see (4) below), not Peters'.
 
     THE RUN DURATION T CANCELS, so this function does not take one. M_k enters only as
     1/M_k = Delta_t_k / T, in which T is the same for every channel; the caller uses
@@ -1554,6 +1582,17 @@ _BIGANZOLI_CHI0_SERIES = tuple(2.0 * (-2.0) ** n / math.factorial(n + 2)
 #: Eq. (9)'s S5 group grows as (k - 1) e^Gamma, so k = 1 + ulp moves the SD by -15 % at
 #: Gamma = 48 and k = 1 - ulp inflates it x153 at Gamma = 60.
 _BIGANZOLI_LAG_INDEX_RTOL = 1e-6
+
+
+class _Eq9Refused(ValueError):
+    """`_biganzoli_sd` refused its inputs, and on which: `cause` is the refusal's key
+    (`decay_per_sample_time`, `lag_index`, `run_duration`, `count_rate`, `channel_sd`),
+    the one a weight that falls back names (`cumulants._WEIGHT_CAUSES`), and the message
+    names the input to change. A `ValueError`, so a caller that catches one still does."""
+
+    def __init__(self, cause: str, message: str) -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 def _biganzoli_sd(tau: np.ndarray, sample_times: np.ndarray, gamma_bar: float,
@@ -1645,10 +1684,11 @@ def _biganzoli_sd(tau: np.ndarray, sample_times: np.ndarray, gamma_bar: float,
     formed as 2 / expm1(2 x), and k - 2 + coth(Gamma) as (k - 1) + (coth(Gamma) - 1), so
     the k = 1 channel does not cancel.
 
-    Raises ValueError, naming the input to change, unless Gamma_k, n_bar_k (when a rate
-    is given) and T - tau_k (when a duration is given) are finite and positive on every
-    channel, every channel with tau_k > 0 has a whole lag index of at least 1, and the SD
-    returned is finite and positive on every channel.
+    Raises `_Eq9Refused`, a ValueError carrying the refusal's cause key, naming the input
+    to change, unless Gamma_k, n_bar_k (when a rate is given) and T - tau_k (when a
+    duration is given) are finite and positive on every channel, every channel with
+    tau_k > 0 has a whole lag index of at least 1, and the SD returned is finite and
+    positive on every channel.
     """
     tau, dt = np.broadcast_arrays(np.asarray(tau, dtype=float),
                                   np.asarray(sample_times, dtype=float))
@@ -1656,7 +1696,8 @@ def _biganzoli_sd(tau: np.ndarray, sample_times: np.ndarray, gamma_bar: float,
     # Guarded on the COMPUTED product, as in `_schatzel_sd`: an underflowed Gamma divides
     # by zero in every coth, and no single input is to blame for the product.
     if not (np.all(np.isfinite(gamma_dt)) and np.min(gamma_dt) > 0):
-        raise ValueError(
+        raise _Eq9Refused(
+            'decay_per_sample_time',
             f"the Biganzoli-Ferri variance needs a positive finite decay-per-sample-time "
             f"gamma_bar * Delta_t on every channel; the smallest is "
             f"{float(np.min(gamma_dt))!r} for gamma_bar = {gamma_bar!r} s^-1."
@@ -1677,8 +1718,10 @@ def _biganzoli_sd(tau: np.ndarray, sample_times: np.ndarray, gamma_bar: float,
     off_index = (tau > 0) & ~whole
     if np.any(off_index):
         bad = int(np.argmax(off_index))
-        raise ValueError(
-            f"Eq. (9) is written on a whole lag index k = tau / Delta_t of at least 1, and "
+        raise _Eq9Refused(
+            'lag_index',
+            f"The Biganzoli–Ferri variance is written on a whole lag index k = tau / "
+            f"Delta_t of at least 1 (Theory-and-Equations-Guide §3.2.9), and "
             f"the channel at lag tau = {float(tau[bad])!r} s has sample time Delta_t = "
             f"{float(dt[bad])!r} s, so k = {float(k[bad])!r}: the sample time contradicts "
             f"its lag. Give each channel the sample time its correlator accumulated it over, "
@@ -1696,10 +1739,12 @@ def _biganzoli_sd(tau: np.ndarray, sample_times: np.ndarray, gamma_bar: float,
                   & np.isfinite(inv_products))
         if not (math.isfinite(duration_s) and duration_s > 0 and np.all(usable)):
             bad = int(np.argmin(usable))
-            raise ValueError(
+            raise _Eq9Refused(
+                'run_duration',
                 f"duration_s = {duration_s!r} s leaves no products at lag tau = "
-                f"{float(tau[bad])!r} s: Eq. (9)'s 1/(M - k) = Delta_t / (T - tau) needs a "
-                f"finite run duration longer than every lag. Give the measurement's run "
+                f"{float(tau[bad])!r} s: the Biganzoli–Ferri variance's 1/(M - k) = "
+                f"Delta_t / (T - tau) needs a finite run duration longer than every lag "
+                f"(Theory-and-Equations-Guide §3.2.9). Give the measurement's run "
                 f"duration, or None for the T -> infinity form."
             )
     nbar = None if mean_count_rate_cps is None else mean_count_rate_cps * dt
@@ -1728,17 +1773,21 @@ def _biganzoli_sd(tau: np.ndarray, sample_times: np.ndarray, gamma_bar: float,
             inv_nbar2 = 1.0 / (nbar * nbar)
         if not (np.all(np.isfinite(nbar)) and np.min(nbar) > 0
                 and np.all(np.isfinite(inv_nbar2))):
-            raise ValueError(
+            raise _Eq9Refused(
+                'count_rate',
                 f"mean_count_rate_cps = {mean_count_rate_cps!r} gives mean counts per "
-                f"sample time that Eq. (9)'s shot-noise terms cannot use: the smallest "
+                f"sample time that the Biganzoli–Ferri variance's shot-noise terms cannot "
+                f"use (Theory-and-Equations-Guide §3.2.9): the smallest "
                 f"n_bar over the channels is {float(np.min(nbar))!r}, and the terms in "
                 f"1/n_bar and 1/n_bar^2 must stay finite on every channel. Use a "
                 f"realistic photon count rate (a real file's is tens to hundreds of kHz)."
             )
     if not (np.all(np.isfinite(sd)) and np.min(sd) > 0):
         bad = int(np.argmin(np.isfinite(sd) & (sd > 0)))
-        raise ValueError(
-            f"Eq. (9) gives no finite positive SD at lag tau = {float(tau[bad])!r} s "
+        raise _Eq9Refused(
+            'channel_sd',
+            f"The Biganzoli–Ferri variance (Theory-and-Equations-Guide §3.2.8) gives no "
+            f"finite positive SD at lag tau = {float(tau[bad])!r} s "
             f"(Gamma_k = {float(gamma_dt[bad])!r}, k = {float(k[bad])!r}) for "
             f"gamma_bar = {gamma_bar!r} s^-1 and beta = {beta!r}. Check beta, the fitted "
             f"intercept (0 < beta <= 1); that gamma_bar * Delta_t is not so small that "
@@ -2098,10 +2147,15 @@ def generate_synthetic_correlogram(
         different nuisance corrections and neither is a point estimate -- the
         lower end removes per-run amplitude AND per-run decay-rate drift, which
         also removes some real noise, and at n = 3 it over-corrects; the clean
-        ALV-only figure is +0.304. Correlated noise is what breaks regularized
-        fits' smoothing-parameter selection -- Peters (1993, ch. 3) measured
-        exactly this and reported that synthetic photon noise reproduced NONE of
-        the pathology he saw on real data (his Fig. 3.20). At the default
+        ALV-only figure is +0.304. Correlated noise is the kind a regularized
+        fit absorbs: Peters (1993, ch. 3) measured distorted CONTIN
+        distributions on single real measurements against their mean (Figs.
+        3.14-3.19, printed pp. 165-168) and found that added synthetic photon
+        noise left "almost no visible difference" (p. 166; his Fig. 3.20,
+        p. 168). The effect on the smoothing-parameter selection itself is his
+        stated expectation, not a measurement: such algorithms "assume
+        independent normally distributed noise to ensure correct determination
+        of the optimum regularizer strength" (p. 174). At the default
         `noise_correlation=0.0` this generator cannot exercise that failure mode
         at all, and a validation run there runs under the one condition that
         makes the pathology vanish.
@@ -2163,9 +2217,14 @@ def generate_synthetic_correlogram(
         classical limit, refuses it. Both consume `duration_s`.
 
         Why the shape matters: it is not monotonic. The per-channel noise falls
-        through the correlogram's decay, then TURNS UP in the coarsest blocks where
-        M_k = T / Delta_t_k leaves few products to average -- the upturn Biganzoli and
-        Ferri (2018, p. 29381) report in the last stage. Over a 22-octave ALV-like axis
+        through the correlogram's decay, then TURNS UP, by a different mechanism in
+        each family. Under the two Schaetzel models it rises through the coarse
+        blocks, where 1/M_k = Delta_t_k / T grows with the block's sample time and
+        few products are left to average. Under the two exact models it keeps
+        falling and rises only in the last stage, where the lag times become
+        comparable with the measuring time and Eq. (9)'s 1/(M - k) factor grows
+        (printed p. 29378): the upturn Biganzoli and Ferri (2018, printed p. 29382)
+        report, and absent when the run is long against the longest lag. Over a 22-octave ALV-like axis
         it spans a factor of ~20. That span is RELATIVE -- the absolute scale is the
         caller's noise_level -- so Peters' measured per-channel range is not a check
         on it; what the sources corroborate is the shape, not the magnitude.
@@ -2352,8 +2411,8 @@ def generate_synthetic_correlogram(
         raise ValueError(
             f"duration_s={duration_s!r} is consumed only by the exact-in-Gamma models "
             f"('biganzoli_classical', 'biganzoli_full'), so passing it with noise_model="
-            f"{noise_model!r} would leave it unused: Eq. (49)'s relative shape cancels "
-            f"the run duration. Refused rather than silently ignored, exactly as "
+            f"{noise_model!r} would leave it unused: the Schätzel variance's relative "
+            f"shape cancels the run duration (Theory-and-Equations-Guide §2.3). Refused rather than silently ignored, exactly as "
             f"mean_count_rate_cps is refused with a model that does not consume it."
         )
 
@@ -2366,7 +2425,7 @@ def generate_synthetic_correlogram(
     # nothing downstream of an unusable q is worth generating.
     _q2 = q * q          # `*` saturates to inf; `**` RAISES OverflowError on a Python
     #                      float, i.e. inside the guard, before it can refuse. See
-    #                      analysis/dls/_common.py::_d_from_gamma for the full note.
+    #                      analysis/dls/_common.py::d_from_gamma for the full note.
     if not (math.isfinite(_q2) and _q2 > 0):
         raise ValueError(
             f"the scattering vector is unusable for these optics (q = {q!r} m^-1, so "
@@ -2515,8 +2574,8 @@ def generate_synthetic_correlogram(
     # extreme-but-finite decay rate underflows the denominator to 0.0 while
     # `gamma_bar != 0` still passes. Same mis-sizing as the q^2 guard above.
     # (Written as `gamma_bar * gamma_bar`, never `** 2` -- a Python-float `**` RAISES
-    # OverflowError on the other tail, inside the guard; see _d_from_gamma's note.)
-    _gb2 = gamma_bar * gamma_bar        # `*` not `**`: see _d_from_gamma's note
+    # OverflowError on the other tail, inside the guard; see d_from_gamma's note.)
+    _gb2 = gamma_bar * gamma_bar        # `*` not `**`: see d_from_gamma's note
     pdi = mu2 / _gb2 if (math.isfinite(_gb2) and _gb2 > 0) else float('nan')
     d_eff = gamma_bar / _q2
     rh_eff_nm = stokes_einstein_rh(d_eff, temperature_K, viscosity_Pa_s) * 1e9
@@ -2555,60 +2614,3 @@ def generate_synthetic_correlogram(
         duplicate_lag_indices=(axis.duplicate_indices if axis is not None
                                else np.array([], dtype=int)),
     )
-
-
-# Conversion factors: seconds -> output unit (multiply by these)
-_DELAY_OUTPUT_FACTORS = {'s': 1.0, 'ms': 1.0e3, 'us': 1.0e6, 'ns': 1.0e9}
-
-
-def export_synthetic_correlogram_csv(
-    result: SyntheticCorrelogramResult,
-    file_path: str,
-    delay_unit: str = 's',
-    delimiter: str = ',',
-) -> str:
-    """Write a synthetic correlogram as a two-column CSV for the generic parser.
-
-    The output has no header rows and two columns -- delay time and the
-    correlation value -- exactly matching the generic DLS parser's contract.
-    Load it back with GenericDLSParser, setting delay_time_unit to match
-    `delay_unit` and data_form to match the result's output_form (and beta or
-    baseline_B if the form is 'g1' or 'g2').
-
-    This is the one function in utilities.py that performs file I/O.
-
-    Parameters
-    ----------
-    result : SyntheticCorrelogramResult
-        The output of generate_synthetic_correlogram().
-    file_path : str
-        Destination path for the CSV.
-    delay_unit : str
-        Unit to write the delay times in: 's' (default), 'ms', 'us', or 'ns'.
-        When loading, set the generic parser's delay_time_unit to the same value.
-    delimiter : str
-        Column delimiter, ',' (default) or '\\t'.
-
-    Returns
-    -------
-    str
-        The file path written.
-
-    Raises
-    ------
-    ValueError
-        If delay_unit is unrecognized.
-    """
-    if delay_unit not in _DELAY_OUTPUT_FACTORS:
-        raise ValueError(
-            f"delay_unit must be one of {sorted(_DELAY_OUTPUT_FACTORS)}, "
-            f"got {delay_unit!r}."
-        )
-    factor = _DELAY_OUTPUT_FACTORS[delay_unit]
-    delays_out = result.delay_times_s * factor
-
-    with open(file_path, 'w', newline='') as fh:
-        for t, v in zip(delays_out, result.signal, strict=True):
-            fh.write(f"{t:.10e}{delimiter}{v:.10e}\n")
-
-    return file_path

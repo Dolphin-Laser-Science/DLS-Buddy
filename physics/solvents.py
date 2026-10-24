@@ -36,7 +36,7 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from core.data_models import casefold_identity_name
+from core.data_models import KELVIN_AT_ZERO_CELSIUS, casefold_identity_name
 
 
 # ===========================================================================
@@ -670,7 +670,7 @@ _SOLVENT_PROPS: Dict[str, SolventProps] = {
 # Helpers
 # ===========================================================================
 
-_C_TO_K = 273.15
+_C_TO_K = KELVIN_AT_ZERO_CELSIUS
 
 
 def _lookup(name: str) -> SolventProps:

@@ -69,10 +69,10 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 BOLTZMANN_K: float = 1.380649e-23
-"""Boltzmann constant in J/K (exact; 2019 SI redefinition, CODATA 2022 / NIST SP 961)."""
+"""Boltzmann constant in J/K (exact, CODATA 2022 / NIST SP 961)."""
 
 AVOGADRO_NA: float = 6.02214076e23
-"""Avogadro's number in mol^-1 (exact; 2019 SI redefinition, CODATA 2022 / NIST SP 961)."""
+"""Avogadro's number in mol^-1 (exact, CODATA 2022 / NIST SP 961)."""
 
 
 # ---------------------------------------------------------------------------
@@ -333,10 +333,12 @@ def stokes_einstein_diffusion_coefficient(
 # Base values are the POLARIZED ratio R_VV at 25 °C:
 #   532 nm: 2.34e-5 cm^-1  -- Takahashi, Takano, Kinugasa & Sakurai,
 #           Anal. Sci. 2019, 35, 1045 (metrology redetermination via certified
-#           reference polymers; the authoritative 532 nm value).
+#           reference polymers; by its own account the first accurate
+#           determination at 532 nm, p. 1050).
 #   660 nm: 8.456e-6 cm^-1 -- Sivokhin & Kazantsev, ChemistrySelect 2021, 6,
-#           9499 (Table 2). Also the source of the depolarization and temperature
-#           data below.
+#           9499 (Table 2; its absolute scale is Wu 2010's correlation, not a
+#           measurement of theirs -- see the exponent note below). Also the
+#           source of the depolarization and temperature data below.
 # Other wavelengths can be added with a properly sourced R_VV; do not interpolate
 # (the wavelength dependence is steep, ~lambda^-4.17 for toluene; Wu, Chem. Phys.
 # 2010, Eq. 4 -- benzene's raw power is 4.38 there, ~4.2 after its refractive-index
@@ -356,10 +358,12 @@ _TOLUENE_RVV_25C: dict = {
 _TOLUENE_RVV_TEMP_COEFFICIENT: float = 0.00421   # per °C  (relative, positive; S&K Eq. 9)
 
 # Vertical depolarization ratio of toluene, rho_v = I_VH / I_VV.
-# Sivokhin & Kazantsev 2021, Table 1: 0.346 at 25 °C (measured at 660 nm),
-# decreasing ~linearly with temperature (0.364 at 10 °C to 0.310 at 50 °C).
-# rho_v is only weakly wavelength-dependent; this 660 nm value is used at other
-# wavelengths unless the user supplies one. It is the key uncertain parameter for
+# Sivokhin & Kazantsev 2021, Table 1: 0.346 at 25 °C (at 660 nm by their Conclusions,
+# p. 9502; the table names no wavelength), decreasing ~linearly with temperature (0.364
+# at 10 °C to 0.310 at 50 °C). S&K measure one wavelength only. The wavelength
+# independence rests on Wu 2010, p. 45: toluene's rho_u "does not vary significantly"
+# with wavelength (within 7.3 % of its 0.492 average), and rho_v is assumed to share
+# that. So this 660 nm value is used at other wavelengths unless the user supplies one. It is the key uncertain parameter for
 # converting between geometries.
 _TOLUENE_DEPOL_V_25C: float = 0.346
 _TOLUENE_DEPOL_V_TEMP_COEFFICIENT: float = -0.00135   # per °C  (absolute)
@@ -387,8 +391,10 @@ _WAVELENGTH_MATCH_TOLERANCE_NM: float = 2.0
 # up to 6 % at 532 nm, so a scaled value would not be a sourced one).
 #
 # S&K 2021 Eqs. (10)-(11) [p. 9501] fold this same Wu exponent (their Eq. 2, cited
-# to Wu 2010 as ref [2]) into a direct R(lambda, T) formula anchored only at their
-# own 660 nm data. At 532 nm it evaluates to 2.068e-5 cm^-1 -- an 11.6% deviation
+# to Wu 2010 as ref [2]) into a direct R(lambda, T) formula. Its absolute scale is
+# Wu's as well: S&K take the 659 nm value "calculated from equation (2)" as their
+# starting point (p. 9500) and measure only its temperature dependence and rho_v.
+# At 532 nm it evaluates to 2.068e-5 cm^-1 -- an 11.6% deviation
 # from the Takahashi 2019 metrology value this module uses -- which exceeds Wu's
 # own ~6% correlation scatter and is why Eqs. (10)-(11) are not used here either.
 _TOLUENE_RVV_WAVELENGTH_EXPONENT: float = -4.17
@@ -502,7 +508,7 @@ def rayleigh_ratio_toluene(
         value from Sivokhin & Kazantsev 2021 is used (0.346 at 25 C). Supply your
         own if you have measured it, especially at wavelengths far from 660 nm.
         Must be in [0, 0.75], the physical range for vertically polarized
-        incident light (see _RHO_V_DEPOLARIZATION_LIMIT).
+        incident light (see RHO_V_DEPOLARIZATION_LIMIT).
 
     Returns
     -------
@@ -604,9 +610,9 @@ def rayleigh_ratio_toluene(
     # optical_anisotropy_squared), on BOTH arms: a negative Rayleigh ratio is not an
     # extrapolation the warn-not-raise rule for the table covers. The
     # `not (0.0 <= x <= limit)` form also rejects NaN and inf.
-    if not (0.0 <= rho_v <= _RHO_V_DEPOLARIZATION_LIMIT):
+    if not (0.0 <= rho_v <= RHO_V_DEPOLARIZATION_LIMIT):
         raise ValueError(
-            f"rho_v must be in [0, {_RHO_V_DEPOLARIZATION_LIMIT}] for the toluene "
+            f"rho_v must be in [0, {RHO_V_DEPOLARIZATION_LIMIT}] for the toluene "
             f"calibrant's depolarization ratio, got {rho_v!r} ({origin})."
         )
 
@@ -803,7 +809,7 @@ def optical_constant_K(
 
 # Largest physically meaningful rho_v for vertically polarized incident light.
 # At this value the isotropic scattering vanishes (see module notes above).
-_RHO_V_DEPOLARIZATION_LIMIT: float = 0.75
+RHO_V_DEPOLARIZATION_LIMIT: float = 0.75
 
 
 def depolarization_ratio_unpolarized(rho_v: float) -> float:
@@ -839,9 +845,9 @@ def depolarization_ratio_unpolarized(rho_v: float) -> float:
     Verified against Sivokhin & Kazantsev (2021) Table 1 (toluene, 660 nm):
     rho_v = 0.364/0.346/0.310 at 10/25/50 C give rho_u = 0.534/0.514/0.473.
     """
-    if not (0.0 <= rho_v <= _RHO_V_DEPOLARIZATION_LIMIT):
+    if not (0.0 <= rho_v <= RHO_V_DEPOLARIZATION_LIMIT):
         raise ValueError(
-            f"rho_v must be in [0, {_RHO_V_DEPOLARIZATION_LIMIT}] for vertically "
+            f"rho_v must be in [0, {RHO_V_DEPOLARIZATION_LIMIT}] for vertically "
             f"polarized incident light, got {rho_v!r}."
         )
     return 2.0 * rho_v / (1.0 + rho_v)
@@ -872,7 +878,7 @@ def depolarization_ratio_vertical(rho_u: float) -> float:
     ValueError
         If rho_u is outside [0, 6/7].
     """
-    rho_u_limit = 2.0 * _RHO_V_DEPOLARIZATION_LIMIT / (1.0 + _RHO_V_DEPOLARIZATION_LIMIT)  # 6/7
+    rho_u_limit = 2.0 * RHO_V_DEPOLARIZATION_LIMIT / (1.0 + RHO_V_DEPOLARIZATION_LIMIT)  # 6/7
     if not (0.0 <= rho_u <= rho_u_limit + 1e-12):
         raise ValueError(
             f"rho_u must be in [0, {rho_u_limit:.6g}] (= 6/7), got {rho_u!r}."
@@ -929,9 +935,9 @@ def cabannes_isotropic_factor(rho_v: float) -> float:
     1991 Sec. 8.4.1.A the vertical-incident relations above. The anisotropic
     FRACTION removed is 1 - f = (4/3) rho_v.
     """
-    if not (0.0 <= rho_v <= _RHO_V_DEPOLARIZATION_LIMIT):
+    if not (0.0 <= rho_v <= RHO_V_DEPOLARIZATION_LIMIT):
         raise ValueError(
-            f"rho_v must be in [0, {_RHO_V_DEPOLARIZATION_LIMIT}], got {rho_v!r}."
+            f"rho_v must be in [0, {RHO_V_DEPOLARIZATION_LIMIT}], got {rho_v!r}."
         )
     return 1.0 - (4.0 / 3.0) * rho_v
 
@@ -1010,9 +1016,9 @@ def optical_anisotropy_squared(rho_v: float) -> float:
     Convert via the depolarization ratio, which is convention-independent, not by
     equating delta^2 and gamma^2 directly.
     """
-    if not (0.0 <= rho_v < _RHO_V_DEPOLARIZATION_LIMIT):
+    if not (0.0 <= rho_v < RHO_V_DEPOLARIZATION_LIMIT):
         raise ValueError(
-            f"rho_v must be in [0, {_RHO_V_DEPOLARIZATION_LIMIT}) for a finite "
+            f"rho_v must be in [0, {RHO_V_DEPOLARIZATION_LIMIT}) for a finite "
             f"delta^2, got {rho_v!r}."
         )
     return 5.0 * rho_v / (3.0 - 4.0 * rho_v)
@@ -1030,8 +1036,9 @@ def optical_anisotropy_squared(rho_v: float) -> float:
 #
 # Rigid circular cylinder (length L, diameter d, axial ratio p = L/d):
 #   Tirado, Lopez Martinez & Garcia de la Torre, J. Chem. Phys. 81, 2047 (1984),
-#   Eqs. (3),(5),(9),(10). The end-effect correction polynomials are fitted for
-#   2 < p < 30; outside that range the formulas are unsupported extrapolations.
+#   Eqs. (3),(5),(9),(10). The authors state the end-effect correction polynomials
+#   as correct for approximately 2 < p < 30 (p. 2048); outside that range the
+#   formulas are unsupported extrapolations.
 #
 # Sphere (radius R):
 #   translational D_t = kT/(6 pi eta R)         (Stokes-Einstein; stokes_einstein_rh)
@@ -1119,7 +1126,7 @@ def rod_length_from_translational_diffusion(diffusion_coefficient_m2_per_s: floa
 
 
 def rod_aspect_ratio_valid(aspect_ratio_p: float) -> bool:
-    """True if p = L/d is in the Tirado (1984) fitted range 2 < p < 30."""
+    """True if p = L/d is in the range Tirado (1984) state as valid, 2 < p < 30."""
     return ROD_ASPECT_RATIO_MIN < aspect_ratio_p < ROD_ASPECT_RATIO_MAX
 
 
@@ -1198,7 +1205,8 @@ def _require_positive_lengths(length_m, diameter_m, temperature_K, viscosity_Pa_
 #   (Biopolymers 14, 2421, correcting Perrin 1934), friction about the equatorial
 #   axis (his Eq. 9):
 #     C2 = 4 C0 (1-rho^4) / {3 rho^2 [aS (2-rho^2) - 2]},  C0 = 8 pi eta a b^2
-#     D_perp = kT/C2.
+#     D_perp = kT/C2   (the Einstein relation applied to it; Koenig prints the
+#                       friction coefficients only, no diffusion coefficient).
 #   Koenig's sign correction is to the *equatorial-axis relaxation* tau_2, NOT to
 #   C2/tau_1 (the tumbling), which Perrin already had right; C2 is used here as
 #   Koenig restates it. Reduces to kT/(8 pi eta R^3) (Stokes-Einstein-Debye) at a=b.
@@ -1279,7 +1287,8 @@ def ellipsoid_rotational_diffusion(polar_semi_axis_m: float,
 
         D_perp = kT / C2,   C0 = 8 pi eta a b^2,   rho = b/a
         C2 = 4 C0 (1 - rho^4) / {3 rho^2 [aS (2 - rho^2) - 2]}
-        (Koenig 1975 Eq. 9, correcting Perrin 1934)
+        (C2: Koenig 1975 Eq. 9, correcting Perrin 1934; D_perp = kT/C2 is the
+        Einstein relation applied to it, which Koenig does not print)
 
     This is the tumbling of the symmetry axis -- the rotation DDLS observes (the
     spin about the symmetry axis is not seen). Reduces to the sphere value

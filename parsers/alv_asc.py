@@ -60,10 +60,12 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from core.notes import Note, render
 from parsers.base_parser import (
     BaseDLSParser,
     BaseTraceParser,
     DLSFilePreview,
+    KCPS_TO_CPS,
     TraceFilePreview,
     MalformedDataError,
     ParseError,
@@ -73,7 +75,6 @@ from parsers.base_parser import (
 )
 
 _ENCODING = 'latin-1'
-_KHZ_TO_CPS = 1000.0                 # 1 kHz of photon counts = 1000 counts/s
 _SECTION_CORRELATION = '"Correlation"'
 _SECTION_COUNT_RATE = '"Count Rate"'
 _ANGLE_KEY_RE = re.compile(r'^Angle\((\d+)\)')
@@ -119,9 +120,9 @@ class _ALVData:
     # one run's length or the total the averaged correlogram was built over, so nothing
     # is carried and the weight takes its T -> infinity form, which the fit records.
     run_duration_s: Optional[float] = None
-    # Passive load-time notices (a data block cut short by a bad row), carried onto
-    # every preview built from this file.
-    notes: tuple = ()
+    # Load-time record notes (a data block cut short by a bad row), carried onto every
+    # preview built from this file.
+    notes: Tuple[Note, ...] = ()
 
 
 def _read_lines(file_path: str) -> List[str]:
@@ -194,7 +195,7 @@ def _mean_count_rates_cps(header: Dict[str, str]) -> List[Optional[float]]:
         if khz is None or not np.isfinite(khz) or khz <= 0.0:
             out.append(None)
         else:
-            out.append(khz * _KHZ_TO_CPS)
+            out.append(khz * KCPS_TO_CPS)
     return out
 
 
@@ -296,19 +297,19 @@ def _parse_alv_file(file_path: str) -> _ALVData:
     # after the stop that were never read: a truncated correlogram or trace, which
     # every fit would take at face value. Disclosed keep-both -- on `notes` for the
     # GUI's passive box and as a UserWarning for a headless caller.
+    # About the whole file (`about` ()): the note is copied onto the correlogram and the
+    # trace previews alike, which share no attribute it could name.
     found_notes = []
     for name, cut, block, stop in (('Correlation', corr_cut, corr, after_corr),
                                    ('Count Rate', cr_cut, cr, after_cr)):
         if cut:
-            found_notes.append(
-                f"the {name} block ended at line {stop + 1} on a row that is not "
-                f"numeric or has a different number of columns; {block.shape[0]} row(s) "
-                f"were read before it and the rest of the block was not loaded. If the "
-                f"file was not edited by hand, re-export it."
-            )
+            found_notes.append(Note('parser.block_truncated', (),
+                                    {'block': name, 'line': stop + 1,
+                                     'n_read': int(block.shape[0])}))
     notes = tuple(found_notes)
     for note in notes:
-        warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+        warnings.warn(f"{file_path!r}: {render(note, surface='export')}", UserWarning,
+                      stacklevel=2)
 
     need_cols = max(active) + 1          # column 0 is lag/time, channel i is column i
     for name, block in (('Correlation', corr), ('Count Rate', cr)):
@@ -328,7 +329,7 @@ def _parse_alv_file(file_path: str) -> _ALVData:
         _ALVChannel(
             index=i, angle_deg=angles[i],
             correlogram=corr[:, i].astype(float),
-            count_rates_cps=cr[:, i].astype(float) * _KHZ_TO_CPS,
+            count_rates_cps=cr[:, i].astype(float) * KCPS_TO_CPS,
             mean_count_rate_cps=(mean_crs[i - 1] if i <= len(mean_crs) else None),
         )
         for i in active
@@ -416,14 +417,14 @@ class ALVCorrelatorParser(BaseDLSParser):
         # own correlogram, and the measurement is the unit the weight runs on. The rule is
         # `base_parser.carried_run_duration`, the same one the Brookhaven reader applies --
         # spelled here on `g2 - 1 > -1`, which is what this format ships.
+        # The header's `Duration` is the run duration T only for a one-run acquisition.
         durations, duration_notes = [], []
         for ch in data.channels:
             carried, note = carried_run_duration(
                 data.run_duration_s, data.delay_times_s,
-                np.asarray(ch.correlogram, dtype=float) > -1.0,
-                "the header's Duration for a one-run acquisition")
+                np.asarray(ch.correlogram, dtype=float) > -1.0)
             durations.append(carried)
-            duration_notes.append(note)          # '' where the duration was carried
+            duration_notes.append(note)          # None where the duration was carried
         # The note rides ONLY the previews that actually withheld a duration. The angles
         # of one file share a `Duration` and an axis but not their liveness, so a
         # file-wide note lands on angles whose duration WAS carried and tells them the
@@ -445,7 +446,7 @@ class ALVCorrelatorParser(BaseDLSParser):
                 vendor_duration_s=data.duration_s,
                 duration_s=carried,
                 trace_preview=_trace_preview_for(data, ch),
-                notes=base_notes + ((note,) if note else ()),
+                notes=base_notes + ((note,) if note is not None else ()),
             )
             for ch, carried, note in zip(data.channels, durations, duration_notes,
                                          strict=True)

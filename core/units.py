@@ -1,6 +1,6 @@
 """
-app/units.py
-============
+core/units.py
+=============
 
 Unit conversions for the GUI input/display boundary.
 
@@ -23,6 +23,8 @@ Usage::
 from __future__ import annotations
 
 from typing import Dict, List
+
+from core.data_models import KELVIN_AT_ZERO_CELSIUS
 
 # Linear quantities: unit label -> multiplicative factor to the canonical unit.
 # The FIRST entry of each dict is the human-scale default the GUI starts on.
@@ -90,9 +92,9 @@ def to_canonical(quantity: str, value: float, unit: str) -> float:
         if unit == 'K':
             return value
         if unit == '°C':
-            return value + 273.15
+            return value + KELVIN_AT_ZERO_CELSIUS
         if unit == '°F':
-            return (value - 32.0) * 5.0 / 9.0 + 273.15
+            return (value - 32.0) * 5.0 / 9.0 + KELVIN_AT_ZERO_CELSIUS
         raise ValueError(f"Unknown temperature unit {unit!r}.")
     try:
         return value * _LINEAR[quantity][unit]
@@ -135,9 +137,9 @@ def from_canonical(quantity: str, value: float, unit: str) -> float:
         if unit == 'K':
             return value
         if unit == '°C':
-            return value - 273.15
+            return value - KELVIN_AT_ZERO_CELSIUS
         if unit == '°F':
-            return (value - 273.15) * 9.0 / 5.0 + 32.0
+            return (value - KELVIN_AT_ZERO_CELSIUS) * 9.0 / 5.0 + 32.0
         raise ValueError(f"Unknown temperature unit {unit!r}.")
     try:
         return value / _LINEAR[quantity][unit]

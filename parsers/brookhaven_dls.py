@@ -67,18 +67,21 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 
+from core.notes import Note, render
 from parsers.base_parser import (
     BaseDLSParser,
     BaseTraceParser,
     DLSFilePreview,
+    KCPS_TO_CPS,
     MalformedDataError,
     ParseError,
     TraceFilePreview,
     convert_delay_times,
+    read_text_lines,
 )
 
 # ---------------------------------------------------------------------------
@@ -108,11 +111,6 @@ _PADDING_G2M1 = -1.0
 _TRACE_LABEL_ROW = 0
 _TRACE_HEADER_ROW = 1
 _TRACE_DATA_START_ROW = 2
-
-# Conversion factors applied by these parsers before storing. The delay axis goes
-# through the shared table in base_parser instead: it feeds Gamma, D and Rh, so its
-# factor lives in one place.
-_KCPS_TO_CPS = 1000.0               # count rates: kcps -> cps
 
 
 # ---------------------------------------------------------------------------
@@ -159,22 +157,9 @@ def _parse_elapsed_seconds(timestamp_str: str) -> float:
 def _read_lines(file_path: str, encoding: str) -> List[str]:
     """Read all lines from a file, stripping line endings.
 
-    Raises
-    ------
-    FileNotFoundError
-        If the file does not exist.
-    ParseError
-        If the file cannot be decoded with the specified encoding.
+    Raises FileNotFoundError or ParseError as ``read_text_lines`` does.
     """
-    if not os.path.isfile(file_path):
-        raise FileNotFoundError(f"File not found: {file_path!r}")
-    try:
-        with open(file_path, encoding=encoding, newline='') as fh:
-            return [line.rstrip('\r\n') for line in fh]
-    except (UnicodeDecodeError, OSError) as exc:
-        raise ParseError(
-            f"Could not read {file_path!r} with encoding {encoding!r}: {exc}"
-        ) from exc
+    return read_text_lines(file_path, (encoding,))
 
 
 def _extract_label(raw_line: str) -> str:
@@ -331,16 +316,14 @@ class BrookhavenDLSParser(BaseDLSParser):
         # correlogram every fit reads -- so it is disclosed on BOTH channels (the
         # keep-both convention: `notes` for the GUI's passive box, a UserWarning for a
         # headless caller). Padding rows are the format's own and are not reported.
-        notes: tuple = ()
+        notes: Tuple[Note, ...] = ()
         if n_bad:
-            note = (
-                f"{n_bad} data row(s) could not be read as a delay-time / C(t) pair and "
-                f"were skipped; {len(delay_times_us)} channel(s) loaded. A skipped row "
-                f"shortens the correlogram -- if the file was not edited by hand, "
-                f"re-export it."
-            )
+            note = Note('parser.rows_skipped', ('delay_times_s', 'correlogram'),
+                        {'n_skipped': n_bad, 'n': n_bad + len(delay_times_us),
+                         'n_loaded': len(delay_times_us)})
             notes = (note,)
-            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+            warnings.warn(f"{file_path!r}: {render(note, surface='export')}", UserWarning,
+                          stacklevel=2)
 
         # Build the preview. Physical parameters are left as None.
         preview = DLSFilePreview(
@@ -472,7 +455,7 @@ class BrookhavenTraceParser(BaseTraceParser):
                 continue
 
             times_s.append(t_s)
-            count_rates_cps.append(rate_kcps * _KCPS_TO_CPS)   # kcps -> cps
+            count_rates_cps.append(rate_kcps * KCPS_TO_CPS)   # kcps -> cps
 
         if len(times_s) == 0:
             raise MalformedDataError(
@@ -482,15 +465,14 @@ class BrookhavenTraceParser(BaseTraceParser):
 
         # Same disclosure as the correlogram route above: a skipped row is a gap in
         # the trace the diagnostics will read as a real interval.
-        notes: tuple = ()
+        notes: Tuple[Note, ...] = ()
         if n_bad:
-            note = (
-                f"{n_bad} data row(s) could not be read as a time / count-rate pair and "
-                f"were skipped; {len(times_s)} point(s) loaded. If the file was not "
-                f"edited by hand, re-export it."
-            )
+            note = Note('parser.rows_skipped', ('times_s', 'count_rates_cps'),
+                        {'n_skipped': n_bad, 'n': n_bad + len(times_s),
+                         'n_loaded': len(times_s)})
             notes = (note,)
-            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+            warnings.warn(f"{file_path!r}: {render(note, surface='export')}", UserWarning,
+                          stacklevel=2)
 
         preview = TraceFilePreview(
             source_file=os.path.abspath(file_path),

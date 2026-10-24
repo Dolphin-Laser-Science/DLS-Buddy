@@ -96,6 +96,7 @@ import numpy as np
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
+from core.notes import Note, render
 from parsers.base_parser import (
     BaseDLSParser,
     DLSFilePreview,
@@ -144,25 +145,6 @@ _WORKBOOK_OPEN_ERRORS = (
     SyntaxError,
     TypeError,
     OSError,
-)
-
-_NOTE_OVERLAP = (
-    "{n_dropped} of {n_raw} channels in the '" + _SHEET_NAME + "' sheet repeat a delay "
-    "time already present and were discarded, leaving {n_kept}. A multi-tau correlator "
-    "reports the lag at each of its block boundaries twice, once from each neighbouring "
-    "block; the value kept at each repeat is the first -- the finer block's estimate -- "
-    "as the multi-tau scheme prescribes (Magatti and Ferri 2001, Eq. 11). Keeping the "
-    "other one instead was measured to move the cumulant size by 0.02 % and the "
-    "recovered size distribution's peak not at all, against 0.5-17 % for ordinary "
-    "analysis choices on the same file."
-)
-
-_NOTE_NO_METADATA = (
-    "The Prometheus Panta .xlsx export carries no measurement parameters at all: no "
-    "scattering angle, laser wavelength, refractive index, temperature, viscosity, "
-    "concentration, sample name, duration or count rate. Nothing has been pre-filled or "
-    "assumed -- every parameter must be entered before analysis. The scattering angle in "
-    "particular is load-bearing: it enters the recovered size through q squared."
 )
 
 
@@ -455,8 +437,12 @@ class PantaXlsxParser(BaseDLSParser):
 
         notes = []
         if dropped.size:
-            overlap_note = _NOTE_OVERLAP.format(
-                n_dropped=dropped.size, n_raw=tau_raw.size, n_kept=tau_kept.size)
+            # The record names the count and that the first copy of each repeated lag
+            # was kept (the module docstring, point 2, gives why).
+            overlap_note = Note('parser.repeated_lags_dropped',
+                                ('delay_times_s', 'correlogram'),
+                                {'n_dropped': int(dropped.size), 'n': int(tau_raw.size),
+                                 'n_kept': int(tau_kept.size)})
             notes.append(overlap_note)
             # Only the overlap gets a warnings.warn: it is the one event where
             # this parser DISCARDS measured data, which a headless caller with no
@@ -464,8 +450,9 @@ class PantaXlsxParser(BaseDLSParser):
             # standing property of the format rather than something that happened
             # to this file, so warning on every healthy load would be noise -- it
             # travels on `notes`, which is the channel the GUI actually surfaces.
-            warnings.warn(f"{file_path!r}: {overlap_note}", UserWarning, stacklevel=2)
-        notes.append(_NOTE_NO_METADATA)
+            warnings.warn(f"{file_path!r}: {render(overlap_note, surface='export')}",
+                          UserWarning, stacklevel=2)
+        notes.append(Note('parser.no_metadata'))
 
         preview = DLSFilePreview(
             source_file=os.path.abspath(file_path),

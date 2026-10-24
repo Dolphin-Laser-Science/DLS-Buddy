@@ -43,6 +43,19 @@ unmatched angles are all NOTES that travel with the result (rule 2). N modes
 are partitioned by the same closure as two (Sedlak 2001 Eq. 11's n-mode
 form); nothing here is two-mode-specific.
 
+The per-mode preconditions are counted per mode and per angle. The amplitude
+floor (cited at `analysis.dls.modes.extract_modes`) and the lag window's (a mode
+that never finished decaying) are each judged on the points one mode's share was
+built on. A fraction is a mode's share of ONE decomposition at its angle, so a
+mode that did not decay there sits, extrapolated, in every fraction's
+denominator: every mode's point at that angle fails, the undecayed mode's as
+undecayed and its decayed neighbours' as sharing the decomposition. A mode whose
+lobe sits on the Rh grid's end fails its angle by the same rule
+(`analysis.sls.ModePointCounts` is its home). Each per-mode
+clone carries its counts (`ModePointCounts`) for the fits that read them; which fits
+fold them is pinned by
+`tests/test_mode_partition.py::test_the_planted_truncation_fails_every_mode_at_its_angles`.
+
 Uncertainty (invariant 8): per-mode intensities carry NO +- -- each is one
 ill-posed inversion's amplitude times one intensity (the NNLS/CONTIN stance).
 The amplitude-Guinier Rg carries the regression SE across independent angles
@@ -67,8 +80,10 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 
 from core.data_models import round_angle_for_identity
+from core.notes import Note
 from analysis import uncertainty as unc
-from analysis.sls import RayleighRatioResult
+from analysis.sls import (QRG_MAX_VALID_DEFAULT, ModePointCounts, RayleighRatioResult,
+                          mode_point_notes)
 
 __all__ = ['PartitionModeInput', 'PartitionedMode', 'ModePartitionResult',
            'AmplitudeGuinierResult', 'partition_rayleigh', 'amplitude_guinier',
@@ -111,6 +126,9 @@ class PartitionModeInput:
     # does: an amplitude read off a decay the measurement never saw is imprecise for the
     # same reason a sub-floor one is, and the partitioned intensity inherits it.
     decay_incomplete: Tuple[bool, ...] = ()
+    # Per point: is this mode's lobe maximum on the Rh grid's first or last node? The same
+    # optional shape; the rule it feeds is `analysis.sls.ModePointCounts`'.
+    grid_end: Tuple[bool, ...] = ()
 
 
 @dataclass
@@ -129,7 +147,8 @@ class ModePartitionResult:
     (NaN where no mode matched, or where the matched modes come from
     different runs -- a closure is only meaningful within ONE decomposition).
     `well_separated` is a LABEL against the documented house threshold; it
-    gates a note, never a refusal (doctrine rule 2).
+    gates a note, never a refusal (doctrine rule 2). `notes` holds every note of
+    the partition as `core.notes.Note`.
     """
     angles_deg: np.ndarray                 # the SLS series' angles, ascending
     excess_total_cm_inv: np.ndarray        # the unpartitioned dR (what sums back)
@@ -141,7 +160,7 @@ class ModePartitionResult:
     separation_ratio_min: float
     min_separation_ratio: float            # min adjacent-Gamma ratio over shared angles
     well_separated: bool                   # LABEL -- gates a note, never a refusal
-    notes: tuple = ()
+    notes: Tuple[Note, ...] = ()
 
 
 @dataclass
@@ -166,8 +185,12 @@ class AmplitudeGuinierResult:
     relative change of 1/A across the window is under `min_relative_change`
     -- the order of the per-point scatter ill-posed amplitudes carry -- so
     only relative changes are meaningful. A documented, overridable
-    parameter (invariant 4); `below_resolution_floor` gates a note, the
-    value still reports.
+    parameter (invariant 4); `below_resolution_floor` is read as a qualifier
+    (`core.notes.qualifiers`), the value still reports.
+
+    `notes` holds every note of the fit as `core.notes.Note`, its preconditions the
+    unmeasured blank's included -- this result has no `blank_provenance` for an exporter
+    to name the blank from.
     """
     q2_nm2: np.ndarray                     # the fitted abscissa (kept points)
     inv_amplitude: np.ndarray              # the fitted ordinate 1/A
@@ -191,7 +214,7 @@ class AmplitudeGuinierResult:
     cond: float = float('nan')
     # The 1/coefficient family flag (rule 10): Rg^2 = 3*slope/intercept divides
     # by a fitted coefficient, so a degenerate design (or no extractable size)
-    # drops this flag with the reason in reliability_note -- the value still
+    # drops this flag with the reason in a precondition note -- the value still
     # reports (flag, don't NaN).
     rg_reliable: bool = True
     # Was the parent series' solvent blank MEASURED at every angle? This fit takes bare
@@ -200,17 +223,8 @@ class AmplitudeGuinierResult:
     # shrug off (the docstring says why), so it gates `rg_reliable`. Normative home:
     # sls.RayleighRatioResult.blank_measured.
     blank_measured: bool = True
-    reliability_note: str = ''
     derived_provenance: str = ''           # partition record (export family)
-    notes: tuple = ()
-
-
-#: The precondition sentence for a mode-resolved size fitted from a series whose solvent
-#: blank was never measured. A literal here rather than a copied record: this result carries
-#: no `blank_provenance` field to copy one into (see `amplitude_guinier`).
-_NO_BLANK_NOTE = ("solvent blank not measured for the parent series: the partitioned "
-                  "amplitudes inherit whatever the assumed blank left in dR, so this "
-                  "apparent size is not reliable")
+    notes: Tuple[Note, ...] = ()
 
 
 def _join_provenance(partition: str, existing: str) -> str:
@@ -247,6 +261,20 @@ def partition_rayleigh(
     an honest disclosed one). When the picked set is exhaustive the closure
     holds exactly: sum_i dR_i = dR at every matched angle.
 
+    The per-mode preconditions are counted per mode over the points its share was
+    built on, under the per-angle rule (the module docstring): each mode's undecayed,
+    grid-end and sub-floor points are notes here, and each clone carries the counts
+    (`RayleighRatioResult.mode_counts`), the angles where an undecayed or grid-end
+    neighbour shared its decomposition among them, for the fits that read them.
+
+    Inputs not prescribed by the source: `separation_ratio_min` (default 5.0),
+    which gates the `well_separated` verdict and its note, and `closure_tol`
+    (default 0.05), which gates a record.
+    Sedlak states the separation requirement only qualitatively (2001, pp. 7-8:
+    peaks "should not overlap completely"), and the held resolution theory of
+    the inversion gives a limit that depends on the signal-to-noise ratio, not
+    a partition threshold.
+
     Raises ValueError only on empty inputs or mismatched tuple lengths
     (caller bugs); every data condition is a note.
     """
@@ -257,18 +285,19 @@ def partition_rayleigh(
         if (len(m.amplitude_fractions) != n or len(m.gamma_s_inv) != n
                 or len(m.item_ids) != n or len(m.low_amplitude) != n
                 or (m.bounds_sources and len(m.bounds_sources) != n)
-                or (m.decay_incomplete and len(m.decay_incomplete) != n)):
+                or (m.decay_incomplete and len(m.decay_incomplete) != n)
+                or (m.grid_end and len(m.grid_end) != n)):
             raise ValueError(
                 f"Mode family {m.label!r}: parallel tuples disagree in length."
             )
 
-    notes: List[str] = []
+    notes: List[Note] = []
     angles = np.asarray(rayleigh.angles_deg, dtype=float)
     dR = np.asarray(rayleigh.excess_rayleigh_cm_inv, dtype=float)
     n_angles = angles.size
 
-    # Per mode: rounded angle -> (amplitude, gamma, item_id, low, undecayed),
-    # single-point buckets only (multiplicity skipped with a note, never averaged).
+    # Per mode: rounded angle -> (amplitude, gamma, item_id, low, undecayed, at the grid
+    # end), single-point buckets only (multiplicity skipped with a note, never averaged).
     per_mode_maps = []
     for m in modes:
         buckets: dict = {}
@@ -276,72 +305,77 @@ def partition_rayleigh(
             buckets.setdefault(round_angle_for_identity(a), []).append(j)
         multi = sorted(a for a, js in buckets.items() if len(js) > 1)
         if multi:
-            angles_txt = ', '.join(f'{a:g}' for a in multi)
-            notes.append(
-                f"Skipped angle(s) {angles_txt} deg for mode {m.label!r}: more "
-                f"than one recorded point there (no averaging is invented)."
-            )
+            # More than one recorded point at an angle: skipped, no averaging invented.
+            notes.append(Note('multiple_points_at_angle', (),
+                              {'family': m.label, 'angles': tuple(float(a) for a in multi)}))
         per_mode_maps.append({
             a: (float(m.amplitude_fractions[js[0]]),
                 float(m.gamma_s_inv[js[0]]), m.item_ids[js[0]],
                 bool(m.low_amplitude[js[0]]),
-                bool(m.decay_incomplete[js[0]]) if m.decay_incomplete else False)
+                bool(m.decay_incomplete[js[0]]) if m.decay_incomplete else False,
+                bool(m.grid_end[js[0]]) if m.grid_end else False)
             for a, js in buckets.items() if len(js) == 1})
 
     closure = np.full(n_angles, float('nan'))
     per_mode_dR = [np.full(n_angles, float('nan')) for _ in modes]
     sep_ratios: List[float] = []
-    n_mixed_run = 0
-    n_low = 0
-    n_undecayed = 0
+    mixed_run_angles: List[float] = []
+    # Per mode, over the points its share was built on: [built, undecayed, low, spoiled,
+    # at the grid end, sharing a decomposition with a mode at the grid end].
+    counts = [[0, 0, 0, 0, 0, 0] for _ in modes]
     for k in range(n_angles):
         key = round_angle_for_identity(angles[k])
         found = [(i, per_mode_maps[i][key]) for i in range(len(modes))
                  if key in per_mode_maps[i]]
-        for i, (amp, _g, _iid, low, undecayed) in found:
+        ids = {iid for _i, (_a, _g, iid, _low, _u, _e) in found if iid}
+        # One decomposition per run at this angle (the closure's own condition): an
+        # undecayed mode reaches every fraction's denominator in ITS run, a decayed
+        # neighbour's included, and no other run's. With one run at the angle, every mode
+        # shares it; with several, a mode shares only the modes of its own named run. A
+        # mode at the grid's end spoils its neighbours by the same rule.
+        undecayed_runs = [iid for _i, (_a, _g, iid, _low, u, _e) in found if u]
+        grid_end_runs = [iid for _i, (_a, _g, iid, _low, _u, e) in found if e]
+        for i, (amp, _g, iid_i, low, undecayed, at_end) in found:
             per_mode_dR[i][k] = amp * dR[k]
-            if low:
-                n_low += 1          # counts points a partition was BUILT on
-            if undecayed:
-                n_undecayed += 1    # same counting rule, separate judgement
+            if not math.isfinite(per_mode_dR[i][k]):
+                continue            # no intensity built here (a masked angle)
+            shared_undecayed = any(len(ids) <= 1 or (iid_u and iid_u == iid_i)
+                                   for iid_u in undecayed_runs)
+            shared_grid_end = any(len(ids) <= 1 or (iid_e and iid_e == iid_i)
+                                  for iid_e in grid_end_runs)
+            counts[i][0] += 1
+            counts[i][1] += bool(undecayed)
+            counts[i][2] += bool(low)
+            counts[i][3] += bool(shared_undecayed and not undecayed)
+            counts[i][4] += bool(at_end)
+            counts[i][5] += bool(shared_grid_end and not at_end)
         if not found:
             continue
-        ids = {iid for _i, (_a, _g, iid, _low, _u) in found if iid}
         if len(ids) > 1:
-            n_mixed_run += 1        # amplitudes valid per se; the SUM is not
+            mixed_run_angles.append(float(angles[k]))   # amplitudes valid; the SUM is not
         else:
-            closure[k] = float(sum(amp for _i, (amp, _g, _iid, _low, _u)
+            closure[k] = float(sum(amp for _i, (amp, _g, _iid, _low, _u, _e)
                                    in found))
             # The separation ratio, like the closure, is only defined WITHIN
             # one decomposition -- decay rates from different runs never
             # coexisted in one spectrum, so they feed no verdict.
-            gammas = sorted(g for _i, (_a, g, _iid, _low, _u) in found
+            gammas = sorted(g for _i, (_a, g, _iid, _low, _u, _e) in found
                             if math.isfinite(g) and g > 0)
             for g_lo, g_hi in zip(gammas, gammas[1:], strict=False):
                 if g_lo > 0:
                     sep_ratios.append(g_hi / g_lo)
-    if n_mixed_run:
-        notes.append(
-            f"Closure withheld at {n_mixed_run} angle(s): the matched modes "
-            f"there come from different runs, and a closure is only defined "
-            f"within one decomposition."
-        )
-    # Low-amplitude disclosure -- counted over the points the partition was
-    # actually built on (matched, single-bucket), never over every recorded
-    # point (the note claimed
-    # imprecision for intensities that were never built).
-    if n_low:
-        notes.append(
-            f"{n_low} of the mode point(s) used sit below their amplitude "
-            f"floor; the partitioned intensities built on them are imprecise."
-        )
-    if n_undecayed:
-        notes.append(
-            f"{n_undecayed} of the mode point(s) used never finished decaying "
-            f"inside their delay window; their amplitudes come from a decay the "
-            f"measurement did not observe, so the partitioned intensities "
-            f"built on them are unreliable."
-        )
+    if mixed_run_angles:
+        # Closure withheld there: a closure is only defined within one decomposition.
+        notes.append(Note('mixed_runs_at_angle', ('closure_fraction',),
+                          {'angles': tuple(mixed_run_angles)}))
+    # Each mode's counts, over the points its share was actually built on (matched,
+    # single-bucket, a finite intensity), never over every recorded point: its own
+    # undecayed, grid-end and sub-floor points named here; the neighbours such a mode
+    # spoiled are named by the fits that read the clone's counts (`sls.mode_point_notes`).
+    mode_counts = [ModePointCounts(m.label, *c) for m, c in zip(modes, counts, strict=True)]
+    for mc in mode_counts:
+        notes.extend(n for n in mode_point_notes(mc, about=('per_mode',))
+                     if n.code not in ('partition_angle_spoiled', 'partition_angle_grid_end'))
 
     matched = [k for k in range(n_angles)
                if any(math.isfinite(per_mode_dR[i][k]) for i in range(len(modes)))]
@@ -350,10 +384,8 @@ def partition_rayleigh(
     for i, m in enumerate(modes):
         n_missing = int(np.sum(~np.isfinite(per_mode_dR[i])))
         if n_missing:
-            notes.append(
-                f"Mode {m.label!r}: {n_missing} of {n_angles} angle(s) have no "
-                f"recorded amplitude and were excluded from its series."
-            )
+            notes.append(Note('mode_amplitude_missing', ('per_mode',),
+                              {'label': m.label, 'n': n_missing, 'total': n_angles}))
 
     # Closure disclosure -- deficit (modes not in the set) and excess
     # (double-picked weight) are different stories, so two wordings.
@@ -363,18 +395,13 @@ def partition_rayleigh(
             closure[fin] < 1.0 - closure_tol) else 0.0
         excess = float(np.nanmax(closure[fin] - 1.0)) if np.any(
             closure[fin] > 1.0 + closure_tol) else 0.0
+        # Two facts, not one: modes missing from the set, and weight picked twice. The
+        # fractions are used as measured, never renormalized.
         if deficit > 0.0:
-            notes.append(
-                f"Up to {deficit:.0%} of the excess intensity at some angles "
-                f"is carried by modes not in this recorded set (the fractions "
-                f"are used as measured, never renormalized)."
-            )
+            notes.append(Note('closure_deficit', ('closure_fraction',), {'deficit': deficit}))
         if excess > 0.0:
-            notes.append(
-                f"The picked modes' fractions sum to more than 1 by up to "
-                f"{excess:.0%} at some angles -- the same intensity may be "
-                f"counted in two picked modes."
-            )
+            notes.append(Note('closure_excess', ('closure_fraction',),
+                              {'limit': 1.0, 'excess': excess}))
 
     # Separation label: min adjacent-Gamma ratio over shared angles, against
     # the documented house threshold. Vacuously well-separated with a single
@@ -384,18 +411,10 @@ def partition_rayleigh(
     min_sep = float(min(sep_ratios)) if sep_ratios else float('nan')
     well_sep = bool(math.isnan(min_sep) or min_sep >= separation_ratio_min)
     if not well_sep:
-        notes.append(
-            f"The picked modes' decay rates come within a factor "
-            f"{min_sep:.1f} of each other at some angle (threshold "
-            f"{separation_ratio_min:g}); the mode decomposition -- and this "
-            f"partition with it -- assumes well-separated modes."
-        )
+        notes.append(Note('modes_not_separated', (),
+                          {'ratio': min_sep, 'limit': float(separation_ratio_min)}))
     if any('manual' in (m.bounds_sources or ()) for m in modes):
-        notes.append(
-            "Manual integration bounds contributed to these amplitudes; "
-            "overlapping peaks violate the wide-separation validity condition "
-            "of the partition."
-        )
+        notes.append(Note('manual_bounds'))
 
     # The per-mode Rayleigh clones: same class every SLS fitter consumes.
     k_const = rayleigh.optical_constant_K
@@ -414,6 +433,8 @@ def partition_rayleigh(
                 excess_rayleigh_cm_inv=dR_i,
                 kc_over_dR_mol_per_g=kc_i,
                 derived_provenance=mode_prov,
+                mode_resolved=True,
+                mode_counts=mode_counts[i],
             )))
 
     return ModePartitionResult(
@@ -438,10 +459,11 @@ def amplitude_guinier(
     source_item_ids: Optional[Sequence[str]] = None,
     estimator: str = 'hc3',
     min_relative_change: float = 0.05,
-    qrg_max_valid: float = 1.3,
+    qrg_max_valid: float = QRG_MAX_VALID_DEFAULT,
     cond_limit: float = unc.COND_LIMIT,
     derived_provenance: str = '',
     blank_measured: bool = True,
+    mode_counts: Optional[ModePointCounts] = None,
 ) -> AmplitudeGuinierResult:
     """Sedlak Eq. 7 on one mode's amplitude series: apparent mode size.
 
@@ -450,6 +472,10 @@ def amplitude_guinier(
     non-finite amplitudes are excluded with a note (1/A needs A > 0; a
     negative partitioned point means the parent dR itself went negative
     there).
+
+    `mode_counts` is the per-mode clone's counts (`RayleighRatioResult.mode_counts`),
+    filled by the caller as `blank_measured` is, since this fit takes bare arrays: an
+    undecayed, grid-end, sub-floor or spoiled point names itself and fails `rg_reliable`.
 
     Raises ValueError with fewer than two kept points at distinct q^2 (the
     `debye_analysis` contract -- a fit that cannot be formed is a caller
@@ -464,14 +490,13 @@ def amplitude_guinier(
     if len(ids) != q2.size:
         raise ValueError('source_item_ids disagrees in length with the data.')
 
-    notes: List[str] = []
+    notes: List[Note] = []
     good = np.isfinite(q2) & np.isfinite(amp) & (amp > 0)
     n_dropped = int(np.sum(~good))
     if n_dropped:
-        notes.append(
-            f"{n_dropped} point(s) with a non-positive or non-finite "
-            f"amplitude were excluded (1/A needs A > 0)."
-        )
+        # 1/A needs A > 0.
+        notes.append(Note('nonpositive_points_dropped', ('rg_app_nm',),
+                          {'n': n_dropped, 'ordinate': 'or non-finite amplitude'}))
     q2k = q2[good]
     ampk = amp[good]
     ids_kept = [i for i, g in zip(ids, good, strict=True) if g]
@@ -495,13 +520,6 @@ def amplitude_guinier(
               and math.isfinite(intercept) and intercept > 0) else float('nan'))
     amp_q0 = (1.0 / intercept
               if (math.isfinite(intercept) and intercept > 0) else float('nan'))
-    no_size_note = ''
-    if not math.isfinite(rg):
-        no_size_note = (
-            "No apparent size could be extracted: the mode's amplitude does "
-            "not decrease with q (non-positive slope/intercept ratio)."
-        )
-        notes.append(no_size_note)
 
     # Regression SE (statistical only), delta-method through the same
     # slope/intercept jacobian as the Debye Rg -- but Rg = sqrt(3*slope/
@@ -520,17 +538,9 @@ def amplitude_guinier(
         rg_se = unc.se_or_none(unc.propagate(jac, fit.cov))
     if same_run:
         rg_se = None
-        notes.append(
-            "Two or more fitted points come from the same run; the "
-            "regression SE is withheld (part of the spread is within one "
-            "correlogram, whose lag channels are correlated)."
-        )
-    elif rg_se is not None:
-        notes.append(
-            "The Rg SE is the regression SE across independent angles -- "
-            "statistical only, excluding the inversion's own systematics "
-            "(regularization, integration bounds)."
-        )
+        notes.append(Note('se_withheld_same_run', ('rg_se',)))
+    # A reported Rg SE excludes the inversion's own systematics: a qualifier, read off
+    # `mode_resolved` and `rg_se` (core.notes.qualifiers), never a note.
 
     # Resolution floor from the FITTED q-window (invariant 4: documented,
     # overridable; never Sedlak's copied 25 nm). Below it the model's total
@@ -538,47 +548,45 @@ def amplitude_guinier(
     # (Rg^2 / 3) * (q2_max - q2_min), is under `min_relative_change`.
     span = float(q2k.max() - q2k.min())     # > 0: >= 2 distinct q^2 enforced
     floor = math.sqrt(3.0 * min_relative_change / span)
+    # Below the floor only relative changes are meaningful: a qualifier, read off
+    # `below_resolution_floor` (core.notes.qualifiers), never a note.
     below = bool(math.isfinite(rg) and rg < floor)
-    if below:
-        notes.append(
-            f"The apparent Rg is below the ~{floor:.0f} nm resolution floor "
-            f"of this q-range -- treat it as relative-changes-only."
-        )
 
     qrg_max = (math.sqrt(float(q2k.max())) * rg
                if math.isfinite(rg) else float('nan'))
     valid = bool(math.isfinite(qrg_max) and qrg_max <= qrg_max_valid)
-    if math.isfinite(qrg_max) and not valid:
-        notes.append(
-            f"q*Rg reaches {qrg_max:.2f} (validity limit {qrg_max_valid:g}); "
-            f"the small-qRg expansion behind Eq. 7 is strained at the high "
-            f"angles."
-        )
 
-    # This fit's own words, not the Zimm/Debye sibling's: it has one concentration
-    # and yields only an apparent Rg, so the note names that quantity and the one
-    # remedy the method has (a wider angular spread), never Mw/A2 or more
-    # concentrations.
-    note = ('' if fit.well_conditioned else
-            f"ill-conditioned fit design (cond={fit.cond:.1e}); the apparent Rg is "
-            f"numerically unreliable -- widen the angular spread")
-    # A size the amplitudes cannot yield is a failed precondition too, so the flag's
-    # own note names it rather than leaving `rg_reliable=False` unexplained.
-    if no_size_note:
-        note = ' '.join(x for x in (note, no_size_note) if x)
+    # The size's failed preconditions, each named (invariant 4 clause 1). The design's
+    # conditioning: this fit has one concentration and yields only an apparent Rg, so the
+    # note is about that quantity alone, never Mw/A2.
+    if not fit.well_conditioned:
+        notes.append(Note('ill_conditioned', ('rg_app_nm',),
+                          {'cond': float(fit.cond), 'limit': float(cond_limit)}))
+    # A size the amplitudes cannot yield: the amplitude does not decrease with q (the
+    # slope/intercept ratio is not positive), or the intercept 1/A(0) is not.
+    if not math.isfinite(rg):
+        if math.isfinite(intercept) and intercept > 0:
+            values = {'quantity': 'slope/intercept', 'value': float(ratio), 'unit': 'nm²'}
+        else:
+            values = {'quantity': '1/A(0)', 'value': float(intercept),
+                      'unit': '(1/amplitude)'}
+        notes.append(Note('no_rg', ('rg_app_nm',), {**values, 'required': 'positive'}))
     # The strained-regime verdict is a failed precondition of the METHOD, exactly as on
     # `sls.guinier_analysis` (which cites this class as its pattern source): it drops
-    # `rg_reliable` and names itself, rather than riding only in `notes`.
+    # `rg_reliable` and names itself.
     if math.isfinite(qrg_max) and not valid:
-        note = ' '.join(x for x in (note, notes[-1]) if x)
-    # The blank names itself HERE, not in a `blank_provenance` record, because this result
-    # has none: it takes bare arrays and no RayleighRatioResult, so there is no sentence to
-    # copy. Without this the flag went down with nothing to explain it, and the
-    # mode-partition exporter -- which composes its Comments from `reliability_note` --
-    # flagged a size and said why on no surface at all (round d0ce f1). Invariant 4
-    # clause 1: a False flag names its failed precondition.
+        notes.append(Note('qrg_above_limit', ('rg_app_nm',),
+                          {'qrg': float(qrg_max), 'limit': float(qrg_max_valid),
+                           'regime': 'amplitude-Guinier'}))
+    # The blank names itself HERE, not through a `blank_provenance` record, because this
+    # result has none: it takes bare arrays and no RayleighRatioResult. Without it the flag
+    # went down with nothing to explain it, and the mode-partition exporter -- which
+    # composes its Comments from the fit's notes -- flagged a size and said why on no
+    # surface at all (round d0ce f1). Invariant 4 clause 1.
     if not blank_measured:
-        note = ' '.join(x for x in (note, _NO_BLANK_NOTE) if x)
+        notes.append(Note('blank_unmeasured', ('rg_app_nm',)))
+    partition = mode_point_notes(mode_counts, about=('rg_app_nm',)) if mode_counts else ()
+    notes += partition
 
     return AmplitudeGuinierResult(
         q2_nm2=q2k, inv_amplitude=y,
@@ -594,9 +602,8 @@ def amplitude_guinier(
         rg_se=rg_se, se_estimator=estimator,
         well_conditioned=fit.well_conditioned, cond=fit.cond,
         rg_reliable=bool(math.isfinite(rg) and rg > 0 and fit.well_conditioned
-                         and valid and blank_measured),
+                         and valid and blank_measured and not partition),
         blank_measured=bool(blank_measured),
-        reliability_note=note,
         derived_provenance=derived_provenance,
         notes=tuple(notes),
     )

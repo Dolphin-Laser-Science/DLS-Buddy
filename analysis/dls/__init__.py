@@ -30,7 +30,8 @@ API and import surface are unchanged -- everything below is re-exported here, so
     cumulants.py      fit_cumulants (linear Koppel 1972 + nonlinear Frisken 2001)
     exponentials.py   single / double / KWW fits
     distributions.py  NNLS / CONTIN / lognormal + peaks + Rh<->Gamma axis helper
-    angular.py        Gamma-q^2, concentration extrapolation, Rh<->Gamma converters
+    angular.py        Gamma-q^2, concentration extrapolation, the per-point fit both
+                      run (fit_point -> PointFit), Rh<->Gamma converters
     replicate.py      true-replicate correlogram averaging
     modes.py          mode-resolved dynamics: per-run mode extraction (the mode
                       map), per-family Gamma-q^2 fits, fast/slow amplitude report
@@ -77,7 +78,8 @@ References (in project knowledge)
     solver and some implementation details are deliberately not followed (see the
     distribution methods). Where the GUI and the Provencher papers or
     first-principles formulation diverge, this package follows the latter.
-  Brookhaven Particle Explorer and TurboCorr DLSW manuals
+  Brookhaven Particle Explorer and TurboCorr DLSW manuals: instrument references for
+    the Brookhaven file formats and sampling structure, never a method's source.
   Koppel 1972; Frisken 2001 (cumulants)
 
 Design contract
@@ -91,8 +93,8 @@ without recomputation.
 from __future__ import annotations
 
 from analysis.dls._common import (
-    _apply_tau_window,
-    _d_from_gamma,
+    apply_tau_window,
+    d_from_gamma,
     baseline_over_window,
     DIFFUSIVE_INTERCEPT_REL_MAX,
     DIFFUSIVE_R2_MIN,
@@ -120,23 +122,31 @@ from analysis.dls.distributions import (
     DistributionResult,
     LCurveResult,
     distribution_axis,
+    LobeMean,
     find_distribution_peaks,
     fit_contin,
     fit_lognormal,
     fit_nnls,
     integrate_between,
+    lobe_geometric_mean,
+    log_grid_step,
+    one_node_resolution_log_step,
+    peak_lobe_geometric_mean_nm,
     validate_integration_bounds,
 )
 from analysis.dls.angular import (
     ConcentrationExtrapolationResult,
     GammaQ2Result,
+    PointFit,
     analyze_gamma_q2,
     extrapolate_diffusion_vs_concentration,
+    fit_point,
     gamma_to_rh_nm,
     rh_nm_to_gamma,
 )
 from analysis.dls.replicate import (
     AveragedCorrelogramResult,
+    ReplicateIdentityReport,
     average_replicate_correlograms,
     check_replicate_identity,
 )
@@ -148,9 +158,12 @@ from analysis.dls.modes import (
     ModeFamilyFitResult,
     ModeMapRun,
     ModePoint,
+    ModeRunOutcome,
     amplitude_vs_q,
+    extract_mode_runs,
     extract_modes,
     fit_mode_family,
+    plotted_gamma_s_inv,
 )
 
 __all__ = [
@@ -185,6 +198,11 @@ __all__ = [
     'distribution_axis',
     'find_distribution_peaks',
     'integrate_between',
+    'LobeMean',
+    'lobe_geometric_mean',
+    'log_grid_step',
+    'one_node_resolution_log_step',
+    'peak_lobe_geometric_mean_nm',
     'validate_integration_bounds',
     # angular / front-end
     'GammaQ2Result',
@@ -193,8 +211,11 @@ __all__ = [
     'rh_nm_to_gamma',
     'analyze_gamma_q2',
     'extrapolate_diffusion_vs_concentration',
+    'PointFit',
+    'fit_point',
     # replicate averaging
     'AveragedCorrelogramResult',
+    'ReplicateIdentityReport',
     'average_replicate_correlograms',
     'check_replicate_identity',
     # mode-resolved dynamics (the mode map)
@@ -202,16 +223,19 @@ __all__ = [
     'MODE_SOURCES',
     'ModePoint',
     'ModeExtraction',
+    'ModeRunOutcome',
     'ModeMapRun',
     'ModeFamilyFitResult',
     'AmplitudeRatioResult',
     'extract_modes',
+    'extract_mode_runs',
     'fit_mode_family',
+    'plotted_gamma_s_inv',
     'amplitude_vs_q',
-    # private helper used by the headless DLS validators
-    '_apply_tau_window',
+    # the delay-window helper used by the headless DLS validators
+    'apply_tau_window',
     # D = Gamma/q^2 with its guards -- re-exported so the CONTROLLER's per-point vetting
     # table computes it the same way the engines do, instead of keeping an inline copy
     # that disagreed with the fit about which points are usable.
-    '_d_from_gamma',
+    'd_from_gamma',
 ]

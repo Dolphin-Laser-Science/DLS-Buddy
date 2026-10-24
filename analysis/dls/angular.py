@@ -18,21 +18,24 @@ from __future__ import annotations
 
 import math
 import warnings
-from dataclasses import dataclass
-from typing import List, Mapping, NamedTuple, Optional, Sequence
+from dataclasses import dataclass, replace
+from typing import List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
 from core.data_models import (DLSMeasurement, casefold_identity_name,
                               round_temperature_for_identity)
+from core.note_registry import DECAY_BEARING_CODES
+from core.notes import WHERE, WHERE_UNIT, Note, RefusedInputs, find_notes, render
 from analysis import uncertainty as unc
-from physics.constants import stokes_einstein_rh
+from physics.constants import stokes_einstein_diffusion_coefficient, stokes_einstein_rh
 from analysis.dls._common import (
-    _d_from_gamma, _decay_rate_to_rh_nm, _measurement_q_m, _result_flags,
-    DIFFUSIVE_INTERCEPT_REL_MAX, DIFFUSIVE_R2_MIN, NO_VISCOSITY_NOTE)
+    _all_notes, d_from_gamma, _decay_rate_to_rh_nm, _lifted, _measurement_q_m,
+    _no_viscosity_note, _not_diffusive_note, _result_flags, DIFFUSIVE_INTERCEPT_REL_MAX,
+    DIFFUSIVE_R2_MIN)
 from analysis.dls.cumulants import (
     CUMULANT_FIT_CUTOFF_DEFAULT, CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM,
-    _resolve_weighting, _size_range_check, fit_cumulants)
+    _resolve_weighting, size_range_check, fit_cumulants)
 from analysis.dls.exponentials import fit_single_exponential
 
 
@@ -101,17 +104,20 @@ class GammaQ2Result:
     # every eligible measurement's per-point Γ/q²/D_app + quality tag, attached by the
     # controller run so the GUI table/graying come from the run.
     all_points: Optional[list] = None
-    # passive, glyph-less notices for the GUI ⓘ tier (e.g. a mixed sample identity)
-    # -- the same text the module also emits via warnings.warn (keep-both).
-    notes: tuple = ()
-    # "Did the preconditions hold?" for the pooled Rh, on the same pair every
-    # per-measurement DLS result carries, so the flag travels WITH the value to the
-    # Cross-Sample promotion instead of stopping at the per-angle fits: a per-angle
-    # verdict (undecayed window, size range, PDI, no viscosity) is rolled up here, and
-    # the pooled Rh is checked against the technique's size range itself. Without it a
-    # flagged tier-1 cumulant Rh was laundered into an unflagged q->0 Rh.
+    # Every note of the fit: the preconditions `rh_reliable` rests on, then the records
+    # (e.g. a mixed sample identity -- the clause the module also emits via warnings.warn,
+    # keep-both -- the dropped angles, the per-angle fits' own records).
+    notes: Tuple[Note, ...] = ()
+    # "Did the preconditions hold?" for the pooled Rh, the flag every per-measurement DLS
+    # result carries, so it travels WITH the value to the Cross-Sample promotion instead
+    # of stopping at the per-angle fits: a per-angle verdict (undecayed window, size
+    # range, PDI, no viscosity) is rolled up here, and the pooled Rh is checked against
+    # the technique's size range itself. Without it a flagged tier-1 cumulant Rh was
+    # laundered into an unflagged q->0 Rh.
     rh_reliable: bool = True
-    reliability_note: str = ''
+    # Always True: extrapolated over angle only, the Rh holds one concentration's
+    # interactions (invariant 7). `core.notes.qualifiers` reads it.
+    is_apparent: bool = True
 
 
 @dataclass
@@ -164,25 +170,27 @@ class ConcentrationExtrapolationResult:
     # Mw = 1/intercept family; rule 10). kD sign-flips when D0 <= 0 -- a WELL-conditioned
     # fit (a steep +slope extrapolating D0 below zero) can still produce a finite,
     # false-confident kD ±, which `well_conditioned` alone does NOT catch -- so kD is
-    # gated on BOTH a D0 > 0 sign guard and the numerical-health flag. The value is still
-    # returned (flag, don't NaN the whole result); `reliability_note` says why.
+    # gated on a D0 > 0 sign guard as well as the numerical-health flag, and on its
+    # inputs' decay rates and a finite value (`extrapolate_diffusion_vs_concentration`). The
+    # value is still returned (flag, don't NaN the whole result); a precondition note says
+    # why.
     kd_reliable: bool = True
     well_conditioned: bool = True         # numerical-health of the [1, c] design
     cond: float = float('nan')            # condition number of the D-vs-c design
-    # ONE note field for two flags. `reliability_note` carries the kD reason (sign flip /
-    # ill-conditioned) AND the Rh0 reason (a rolled-up per-point verdict, the size range
-    # of the extrapolated Rh0), joined -- the two flags below say which applies. The
-    # per-point verdicts bear on both, since D0 and kD come from the same line.
-    reliability_note: str = ''
     # The Rh0 precondition flag, on the same name every DLS Rh carries (GammaQ2Result,
     # CumulantResult, the exponential results) so the promotion path reads one shape.
     rh_reliable: bool = True
     # every eligible measurement's per-point D_app + quality tag, attached by the
     # controller run so the GUI table/graying come from the run.
     all_points: Optional[list] = None
-    # passive, glyph-less notices for the GUI ⓘ tier (e.g. a mixed system) -- the
-    # same text the module also emits via warnings.warn (keep-both).
-    notes: tuple = ()
+    # Every note of the fit: the kD causes (sign flip / ill-conditioned) and the Rh0 causes
+    # (a rolled-up per-point verdict, the size range of the extrapolated Rh0), each about
+    # the attributes it fails, then the records (e.g. a mixed system -- the clause the
+    # module also emits via warnings.warn, keep-both).
+    notes: Tuple[Note, ...] = ()
+    # Always False: D0 is extrapolated to infinite dilution, the thermodynamic Rh0
+    # (invariant 7). `core.notes.qualifiers` reads it.
+    is_apparent: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +207,6 @@ def rh_nm_to_gamma(rh_nm, q_m_inv, temperature_K, viscosity_Pa_s):
 
     Gamma = D q^2 with D = kB T / (6 pi eta Rh).
     """
-    from physics.constants import stokes_einstein_diffusion_coefficient
     # The withhold contract is this function's own: an unusable Rh yields NaN, it does not
     # raise. `rh_nm <= 0` rejected NaN but admitted +inf, which used to give D = 0.0 and so
     # Gamma = 0.0, and `stokes_einstein_diffusion_coefficient` refuses a non-finite Rh, so
@@ -207,7 +214,7 @@ def rh_nm_to_gamma(rh_nm, q_m_inv, temperature_K, viscosity_Pa_s):
     if not (math.isfinite(rh_nm) and rh_nm > 0):
         return float('nan')
     d = stokes_einstein_diffusion_coefficient(rh_nm * 1e-9, temperature_K, viscosity_Pa_s)
-    # The contract is enforced on the RESULT, exactly as in the inverse `_d_from_gamma`.
+    # The contract is enforced on the RESULT, exactly as in the inverse `d_from_gamma`.
     # The guard above is about `rh_nm`; the expression is `d * q ** 2`, and that mismatch
     # breaks the contract at BOTH ends -- a Python-float `**` raises OverflowError at
     # q ~ 1e155, and the square underflows to 0.0 at q ~ 1e-170, returning a decay rate of
@@ -275,27 +282,40 @@ def _per_measurement_fit_kwargs(measurements, fit_kwargs, gamma_source,
     return out
 
 
-class _PointFit(NamedTuple):
-    """One measurement's per-point fit, as the pooled engines read it: the rate, its
-    verdict, whether the default weight fell back, and the per-fit RECORD the pooled
-    result relays -- the fit's passive notes, the weighting that ran and the sample time
-    it was evaluated on ('' for each under a single-exponential source, which records no
-    weighting)."""
+class PointFit(NamedTuple):
+    """One measurement's per-point fit, as the pooled engines and the controller's
+    per-point table read it: the rate, its verdict and the precondition notes it rests on,
+    whether the default weight fell back, the per-fit RECORD the pooled result relays --
+    the fit's record notes, the weighting that ran and the sample time it was evaluated on
+    ('' for each under a single-exponential source, which records no weighting) -- and the
+    two values the table tags a point by: the fit's PDI (NaN under a single-exponential
+    source, which reports none) and whether it converged (the fit's `success`)."""
     gamma: float
     rh_reliable: bool
-    reliability_note: str
+    preconditions: Tuple[Note, ...]
     fell_back: bool
-    notes: tuple = ()
+    notes: Tuple[Note, ...] = ()
     weighting: str = ''
     sample_time_provenance: str = ''
+    pdi: float = float('nan')
+    success: bool = True
 
 
-def _gamma_for_measurement(measurement, gamma_source, tau_min_s, tau_max_s,
-                           skip_initial_channels=0, cumulant_method='linear',
-                           cumulant_fit_cutoff=CUMULANT_FIT_CUTOFF_DEFAULT,
-                           cumulant_weighting=None, cumulant_order=2, fit_kw=None):
-    """A `_PointFit` -- (Gamma, rh_reliable, reliability_note, fell_back) and the fit's
-    record -- from one measurement's per-point fit.
+def _records(notes) -> Tuple[Note, ...]:
+    """The notes of `notes` that are not preconditions: what a per-point fit records about
+    how it was obtained, which the pooled result relays."""
+    preconditions = find_notes(notes, kind='precondition')
+    return tuple(n for n in notes if n not in preconditions)
+
+
+def fit_point(measurement, *, gamma_source, tau_min_s, tau_max_s,
+              skip_initial_channels=0, cumulant_method='linear',
+              cumulant_fit_cutoff=CUMULANT_FIT_CUTOFF_DEFAULT,
+              cumulant_weighting=None, cumulant_order=2, fit_kw=None):
+    """A `PointFit` -- (Gamma, rh_reliable, its precondition notes, fell_back), the fit's
+    record, its PDI and its convergence -- from one measurement's per-point fit: the fit
+    `analyze_gamma_q2` and `extrapolate_diffusion_vs_concentration` run on each point, and
+    that a caller may run once and hand them (`point_fits`).
 
     `fit_kw` is this measurement's own inputs (`PER_MEASUREMENT_FIT_KEYS`), laid over the
     shared window: a window key in it wins for this measurement, and a baseline key is
@@ -339,86 +359,125 @@ def _gamma_for_measurement(measurement, gamma_source, tau_min_s, tau_max_s,
                             fit_cutoff=cumulant_fit_cutoff,
                             weighting=cumulant_weighting, **kw)
         fell_back = fit.weighting == 'uniform' and cumulant_weighting != 'uniform'
-        return _PointFit(fit.gamma_s_inv, fit.rh_reliable, fit.reliability_note, fell_back,
-                         tuple(fit.notes), fit.weighting, fit.sample_time_provenance)
+        return PointFit(fit.gamma_s_inv, fit.rh_reliable,
+                        find_notes(fit, kind='precondition'), fell_back,
+                        _records(fit.notes), fit.weighting, fit.sample_time_provenance,
+                        fit.pdi, fit.success)
     elif gamma_source == 'single':
         fit = fit_single_exponential(
             measurement, skip_initial_channels=skip_initial_channels, **kw)
-        return _PointFit(fit.mode.gamma_s_inv, fit.mode.rh_reliable,
-                         fit.mode.reliability_note, False, tuple(fit.notes))
+        return PointFit(fit.mode.gamma_s_inv, fit.mode.rh_reliable,
+                        find_notes(fit.mode, kind='precondition'), False,
+                        _records(fit.notes), success=fit.success)
     else:
         raise ValueError(
             f"gamma_source must be 'cumulant' or 'single', got {gamma_source!r}."
         )
 
 
-def _fit_every_point(measurements, per_kw, where, gamma_source, tau_min_s, tau_max_s,
-                     *args) -> List[_PointFit]:
-    """`_gamma_for_measurement` over the pooled set, naming the point when a fit REFUSES
+def _fit_every_point(measurements, per_kw, where, **fit_args) -> List[PointFit]:
+    """`fit_point` over the pooled set, naming the point when a fit REFUSES
     its inputs: a per-measurement input the fit cannot take (a baseline span holding too
     few of its live channels, a window that leaves too few points) would otherwise abort
     the whole pooled fit with a message that names no run. The refusal still aborts it --
     the inputs are the caller's, and a pool fitted around a silently dropped run is not
-    what was asked for -- but it says which run. `where(m)` names a point ("at 30 deg")."""
+    what was asked for -- but it says which run. `where(m)` names a point ("at 30 deg").
+    A refusal that names its cause (`RefusedInputs`) is re-raised as one, carrying its
+    notes, so a caller relaying it names the cause; any other stays a plain ValueError."""
     fits = []
     for m, kw in zip(measurements, per_kw, strict=True):
         try:
-            fits.append(_gamma_for_measurement(m, gamma_source, tau_min_s, tau_max_s,
-                                               *args, kw))
+            fits.append(fit_point(m, **fit_args, fit_kw=kw))
+        except RefusedInputs as exc:
+            raise RefusedInputs(
+                exc.notes, f'The fit {where(m)} refused its inputs: {exc}') from exc
         except ValueError as exc:
             raise ValueError(f'The fit {where(m)} refused its inputs: {exc}') from exc
     return fits
 
 
-def _relayed_point_notes(points: Sequence[float], fits: Sequence[_PointFit],
-                         unit: str) -> List[str]:
-    """Each per-point fit's PASSIVE notes, once per distinct note with the points that
-    carried it named in front -- the shape `run_mode_map` relays a run's notes in and
-    `extract_modes` an inversion's. A pooled result is the only surface that shows its
-    Rh, so a note about how a point was fitted (a floating baseline resting on its bound,
-    µ₂ at its bound, dead channels) must reach it; word-for-word repeats are named once.
-    `points` and `fits` are aligned (the caller's sorted order)."""
-    noted: dict = {}
+def _given_point_fits(measurements, point_fits, fit_kwargs) -> List[PointFit]:
+    """A caller's `point_fits`, one per measurement, in place of `_fit_every_point`:
+    refused together with `fit_kwargs`, which only a fit run here would read, and when
+    they do not align with `measurements`."""
+    if fit_kwargs is not None:
+        raise ValueError(
+            "point_fits and fit_kwargs were both given: the per-point fits are already "
+            "run, so no per-measurement fit inputs remain to apply; give one or the "
+            "other.")
+    return [f for _m, f in zip(measurements, point_fits, strict=True)]
+
+
+def _relayed_point_notes(points: Sequence[float], fits: Sequence[PointFit], attr: str,
+                         unit: str) -> Tuple[Note, ...]:
+    """Each per-point fit's RECORD notes, each distinct one once, as notes about `attr`,
+    the pooled result's per-point array they explain, with the points that carried it in
+    its `where` (their coordinates in `unit`; `core.notes.render` prints them in front) --
+    the relay `run_mode_map` makes of a run's notes. A pooled result is the only surface
+    that shows its Rh, so a note about how a point was fitted (a floating baseline resting
+    on its bound, µ₂ at its bound, dead channels) must reach it, and say where it was
+    found. `points` and `fits` are aligned (the caller's sorted order)."""
+    merged: dict = {}
     for x, fit in zip(points, fits, strict=True):
-        for note in fit.notes:
-            if note:
-                noted.setdefault(note, []).append(f'{x:.4g}')
-    return [f"{', '.join(dict.fromkeys(where))}{unit}: {note}"
-            for note, where in noted.items()]
+        for n in _lifted(fit.notes, attr):
+            entry = merged.setdefault((n.code, n.values), [n, []])
+            if float(x) not in entry[1]:
+                entry[1].append(float(x))
+    return tuple(replace(n, values={**n.values, WHERE: tuple(where), WHERE_UNIT: unit})
+                 for n, where in merged.values())
 
 
-def _pooled_point_note(angles_or_concs: np.ndarray, notes: List[str], axis: str,
-                       unit: str, stated_at_pool: str = '') -> str:
-    """One sentence rolling the flagged per-point verdicts of a pooled fit up to the
-    result: WHICH points were flagged (the fact the pooled surface can state), and the
-    first such note verbatim (the reason), since per-point notes differ in their
-    numbers and a full list would bury the reader. The per-point fits themselves carry
-    every note. Empty when no fitted point is flagged."""
-    # A sentence the caller states ONCE at the pooled level (`stated_at_pool`: the
-    # missing-viscosity note, when the pooled Rh is blank for that reason) is stripped
-    # from the per-point notes so it does not print twice inside the "at 30 deg: ..."
-    # prefix. Stripped only then: a point lacking viscosity in a set whose others have
-    # it keeps its note here, or the roll-up would launder exactly that flag.
+def _decay_bearing(preconditions: Tuple[Note, ...]) -> bool:
+    """Whether a flagged point's preconditions include one that bears on its decay rate
+    (`core.note_registry.DECAY_BEARING_CODES`, the one roster every reader of the rule
+    reads): such a point's Gamma, and so its D, is itself in doubt, where a point lacking
+    only a viscosity has an exact Gamma and D and no radius."""
+    return any(n.code in DECAY_BEARING_CODES for n in preconditions)
+
+
+def _pooled_point_notes(point_preconditions: Sequence[Tuple[Note, ...]], inputs: str,
+                        rh_attr: str, stated_at_pool: bool = False, *,
+                        points: Sequence[float] = (), unit: str = '',
+                        decay_about: Tuple[str, ...] = ()) -> Tuple[Note, ...]:
+    """The flagged per-point verdicts of a pooled fit rolled up to the result, about the
+    pooled Rh `rh_attr`: how many of the fitted points were flagged for a cause bearing on
+    their decay rate (`inputs_flagged_decay`, which fails a line's kD as well as its Rh)
+    and how many for any other cause (`inputs_flagged`), each with its points in its
+    `where` -- a point counts once, in the first when it carries both -- and the first
+    flagged point's own preconditions (the reason, with that point in their `where`, so a
+    per-point cause never reads as the pooled fit's), since per-point notes differ in
+    their values and a full list would bury the reader. `points` holds each fitted point's
+    coordinate in `unit`, aligned with `point_preconditions`, as `_relayed_point_notes`
+    takes them. `decay_about` names the other verdicts' attributes the decay count fails
+    (a line's kD), so the count is about every value it fails, as the result's notes
+    contract says. The per-point fits themselves carry every note. Empty when no fitted
+    point is flagged."""
+    # The missing viscosity the caller states ONCE at the pooled level (`stated_at_pool`,
+    # when the pooled Rh is blank for that reason) is left out of the per-point notes so
+    # it is not stated twice. Left out only then: a point lacking viscosity in a set whose
+    # others have it keeps its note here, or the roll-up would launder exactly that flag.
     if stated_at_pool:
-        notes = [n.replace(stated_at_pool, '').strip() for n in notes]
-    flagged = [(x, n) for x, n in zip(angles_or_concs, notes, strict=True) if n]
+        point_preconditions = [tuple(n for n in pre if n.code != 'no_viscosity')
+                               for pre in point_preconditions]
+    flagged = [(float(x), pre) for x, pre in zip(points, point_preconditions, strict=True)
+               if pre]
     if not flagged:
-        return ''
-    where = ', '.join(f'{x:.4g}{unit}' for x, _ in flagged)
-    return (f'{len(flagged)} of {len(notes)} fitted {axis} carry a flagged per-point fit '
-            f'({where}); at {flagged[0][0]:.4g}{unit}: {flagged[0][1]}')
-
-
-def _fallback_note(fallbacks: tuple, unit: str) -> str:
-    """The passive sentence naming the points whose default weight fell back to 'uniform'
-    (`_gamma_for_measurement`), or '' when none did. Each such point's own fit note names
-    the input Eq. (9) refused; this says only where, so the pooled result states it once."""
-    if not fallbacks:
-        return ''
-    where = ', '.join(f'{x:.4g}' for x in fallbacks)
-    return (f'The sourced residual weight could not be formed at {where}{unit}, so '
-            f'{"that point" if len(fallbacks) == 1 else "those points"} fell back to the '
-            f'unweighted (uniform) cumulant fit; each run\'s own fit note names the refusal.')
+        return ()
+    first_at, first = flagged[0]
+    decay = tuple(x for x, pre in flagged if _decay_bearing(pre))
+    other = tuple(x for x, pre in flagged if not _decay_bearing(pre))
+    counts = []
+    if decay:
+        counts.append(Note('inputs_flagged_decay', (rh_attr, *decay_about), {
+            'k': len(decay), 'n': len(point_preconditions), 'inputs': inputs,
+            WHERE: decay, WHERE_UNIT: unit}))
+    if other:
+        counts.append(Note('inputs_flagged', (rh_attr,), {
+            'k': len(other), 'n': len(point_preconditions), 'inputs': inputs,
+            WHERE: other, WHERE_UNIT: unit}))
+    return (*counts,
+            *(replace(n, values={**n.values, WHERE: (first_at,), WHERE_UNIT: unit})
+              for n in _lifted(first, rh_attr)))
 
 
 def analyze_gamma_q2(
@@ -435,6 +494,7 @@ def analyze_gamma_q2(
     cumulant_weighting: Optional[str] = None,
     cumulant_order: int = 2,
     fit_kwargs: Optional[Sequence[Optional[Mapping]]] = None,
+    point_fits: Optional[Sequence[PointFit]] = None,
 ) -> GammaQ2Result:
     """Analyze Gamma vs q^2 across angles for one sample.
 
@@ -464,7 +524,7 @@ def analyze_gamma_q2(
         The residual weighting of every per-angle cumulant, passed to `fit_cumulants` as
         `cumulant_method` and `cumulant_fit_cutoff` are; None is the arm's default. An angle
         whose default weight cannot be formed falls back to 'uniform' on its own, and the
-        result records which (`cumulant_weighting_fallbacks`, and a sentence on `notes`).
+        result records which (`cumulant_weighting_fallbacks`, and a record on `notes`).
     cumulant_order : int
         The order of every per-angle cumulant fit (default 2), echoed on the result as
         `cumulant_order`. Unused under a 'single' source.
@@ -475,6 +535,12 @@ def analyze_gamma_q2(
         value could stand for all of them. A window key in a dict overrides
         `tau_min_s`/`tau_max_s` for that measurement. None (the default) is every
         measurement's fit on the shared inputs alone, exactly as before this parameter.
+    point_fits : sequence of PointFit, optional
+        One per measurement, aligned with `measurements`: each point's fit already run by
+        `fit_point` on the inputs this call names, used in place of fitting it again.
+        The caller vouches for those inputs, since the result echoes this call's
+        cumulant inputs; refused together with `fit_kwargs`, which only a fit run here
+        would read.
 
     Returns
     -------
@@ -483,7 +549,9 @@ def analyze_gamma_q2(
     Raises
     ------
     ValueError
-        If fewer than two measurements, or they are not at distinct angles.
+        If fewer than two measurements, or they are not at distinct angles; or if
+        `point_fits` is given together with `fit_kwargs`, or does not align with
+        `measurements`.
     """
     if len(measurements) < 2:
         raise ValueError(
@@ -493,17 +561,14 @@ def analyze_gamma_q2(
     # Check they are the same sample (sample_key ignores angle, so all should match).
     # Combination doctrine rule 2 (disclosure), core/data_models.py: an identity
     # mix computes and notes; the note travels to the export Comments.
-    notes: list = []       # passive ⓘ notices surfaced on the result (keep-both)
+    notes: list = []       # the result's records (keep-both with the warning)
     keys = {m.sample_key for m in measurements}
     if len(keys) > 1:
         # Single source of the message -> both the note and the warning.
-        msg = (
-            "Measurements do not all share the same sample identity "
-            "(polymer/solvent/concentration/temperature). Γ vs q² assumes one "
-            "sample across angles."
-        )
-        notes.append(msg)
-        warnings.warn(msg, UserWarning, stacklevel=2)
+        mixed = Note('mixed_sample_identity', (), {
+            'fields': ('polymer', 'solvent', 'concentration', 'temperature')})
+        notes.append(mixed)
+        warnings.warn(render(mixed, surface='export'), UserWarning, stacklevel=2)
 
     angles = np.array([m.angle_deg for m in measurements], dtype=float)
     if np.unique(angles).size < 2:
@@ -530,14 +595,21 @@ def analyze_gamma_q2(
     weighting_echo = (_resolve_weighting(cumulant_method, cumulant_weighting)
                       if gamma_source == 'cumulant' else None)
     order_echo = int(cumulant_order) if gamma_source == 'cumulant' else None
-    per_kw = _per_measurement_fit_kwargs(measurements, fit_kwargs, gamma_source,
-                                         cumulant_method)
-    fits = _fit_every_point(measurements, per_kw, lambda m: f'at {m.angle_deg:g} deg',
-                            gamma_source, tau_min_s, tau_max_s, skip_initial_channels,
-                            cumulant_method, cumulant_fit_cutoff, cumulant_weighting,
-                            cumulant_order)
+    if point_fits is not None:
+        fits = _given_point_fits(measurements, point_fits, fit_kwargs)
+    else:
+        per_kw = _per_measurement_fit_kwargs(measurements, fit_kwargs, gamma_source,
+                                             cumulant_method)
+        fits = _fit_every_point(measurements, per_kw, lambda m: f'at {m.angle_deg:g} deg',
+                                gamma_source=gamma_source, tau_min_s=tau_min_s,
+                                tau_max_s=tau_max_s,
+                                skip_initial_channels=skip_initial_channels,
+                                cumulant_method=cumulant_method,
+                                cumulant_fit_cutoff=cumulant_fit_cutoff,
+                                cumulant_weighting=cumulant_weighting,
+                                cumulant_order=cumulant_order)
     gamma = np.array([f.gamma for f in fits], dtype=float)
-    point_notes = [f.reliability_note if not f.rh_reliable else '' for f in fits]
+    point_notes = [f.preconditions if not f.rh_reliable else () for f in fits]
 
     # sort by q^2 ascending for clean output
     order = np.argsort(q2)
@@ -545,9 +617,7 @@ def analyze_gamma_q2(
     point_notes = [point_notes[i] for i in order]
     sorted_fits = [fits[i] for i in order]
     fallbacks = tuple(float(angles[k]) for k, f in enumerate(sorted_fits) if f.fell_back)
-    if fallbacks:
-        notes.append(_fallback_note(fallbacks, ' deg'))
-    notes.extend(_relayed_point_notes(angles, sorted_fits, ' deg'))
+    notes.extend(_relayed_point_notes(angles, sorted_fits, 'gamma_s_inv', 'deg'))
     record = dict(point_weightings=tuple(f.weighting for f in sorted_fits),
                   point_sample_time_provenance=tuple(
                       f.sample_time_provenance for f in sorted_fits))
@@ -562,24 +632,20 @@ def analyze_gamma_q2(
     # usable subset only.
     usable = np.isfinite(gamma) & (gamma > 0)
     if not usable.all():
-        dropped = ', '.join(f'{a:.4g}' for a in angles[~usable])
-        notes.append(
-            f"Dropped {int((~usable).sum())} of {angles.size} measurement(s) from the "
-            f"Gamma-vs-q^2 fit (theta = {dropped} deg): no usable decay rate (a "
-            f"non-positive or non-finite Gamma). Check those correlograms."
-        )
+        notes.append(Note('unusable_rate_dropped', ('gamma_s_inv',), {
+            'n_dropped': int((~usable).sum()), 'n': int(angles.size), 'points': 'angles',
+            'quantity': 'Γ'}))
     gamma = np.where(usable, gamma, np.nan)
     fitted_notes = [n for n, u in zip(point_notes, usable, strict=True) if u]
     temperature_K = measurements[0].temperature_K
     eta = measurements[0].viscosity_Pa_s
 
-    if np.unique(angles[usable]).size < 2:
+    n_usable = int(np.unique(angles[usable]).size)
+    if n_usable < 2:
         # Fewer than two distinct angles survived, so there is no line to fit. Withheld
         # rather than raised, as in the sibling: the INPUT was valid and the data failed.
-        notes.append(
-            "Fewer than two angles yielded a usable decay rate, so no Gamma-vs-q^2 line "
-            "was fitted."
-        )
+        too_few = Note('too_few_points', ('d_m2_s', 'rh_nm'),
+                       {'n': n_usable, 'points': 'angles', 'need': 2})
         nan = float('nan')
         return GammaQ2Result(
             angles_deg=angles, q_m_inv=q, q2_m2=q2, gamma_s_inv=gamma,
@@ -588,17 +654,14 @@ def analyze_gamma_q2(
             intercept_relative=nan, d_app_trend_rel=nan, is_diffusive=False,
             gamma_source=gamma_source, temperature_K=temperature_K,
             r2_threshold=r2_threshold, intercept_rel_threshold=intercept_rel_threshold,
-            d_se=None, rh_se=None, se_estimator=estimator, notes=tuple(notes),
+            d_se=None, rh_se=None, se_estimator=estimator,
+            notes=_all_notes(too_few, notes),
             cumulant_method=(cumulant_method if gamma_source == 'cumulant' else None),
             cumulant_fit_cutoff=(cumulant_fit_cutoff if gamma_source == 'cumulant'
                                  else None),
             cumulant_weighting=weighting_echo, cumulant_weighting_fallbacks=fallbacks,
             cumulant_order=order_echo, **record,
             rh_reliable=False,
-            reliability_note=(
-                "D and Rh could not be computed: fewer than two measurements yielded a "
-                "usable decay rate, so there was no line to fit -- see the notes for "
-                "which angles were dropped."),
         )
     d_app = gamma / q2
     q2_fit, g_fit, d_app_fit = q2[usable], gamma[usable], d_app[usable]
@@ -643,16 +706,18 @@ def analyze_gamma_q2(
         math.isfinite(r2) and r2 >= r2_threshold
         and abs(intercept_rel) <= intercept_rel_threshold
     )
+    diffusive_note = None if is_diffusive else _not_diffusive_note(r2, intercept_rel)
 
     # The pooled verdict: the per-angle preconditions of the fits this line rests on
     # (rolled up -- a flagged Gamma makes the slope through it suspect whichever angle
     # it sits at), the technique's size range applied to the pooled Rh itself, and the
     # missing-viscosity cause of a blank Rh. `_result_flags`, the disjunction every arm
     # uses, so a flag at one angle is never cleared by seven clean neighbours.
-    _size_ok, size_note = _size_range_check(rh, CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM)
-    pool_visc = NO_VISCOSITY_NOTE if eta is None else ''
-    rh_reliable, reliability_note = _result_flags(
-        _pooled_point_note(angles[usable], fitted_notes, 'angles', ' deg', pool_visc),
+    _size_ok, size_note = size_range_check(rh, CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM)
+    pool_visc = _no_viscosity_note() if eta is None else None
+    rh_reliable, preconditions = _result_flags(
+        _pooled_point_notes(fitted_notes, 'angles', 'rh_nm', pool_visc is not None,
+                            points=angles[usable], unit='deg'),
         size_note, pool_visc)
 
     return GammaQ2Result(
@@ -670,8 +735,8 @@ def analyze_gamma_q2(
                              else None),
         cumulant_weighting=weighting_echo, cumulant_weighting_fallbacks=fallbacks,
         cumulant_order=order_echo, **record,
-        notes=tuple(notes),
-        rh_reliable=rh_reliable, reliability_note=reliability_note,
+        notes=_all_notes(preconditions, diffusive_note, notes),
+        rh_reliable=rh_reliable,
     )
 
 
@@ -692,6 +757,7 @@ def extrapolate_diffusion_vs_concentration(
     cumulant_weighting: Optional[str] = None,
     cumulant_order: int = 2,
     fit_kwargs: Optional[Sequence[Optional[Mapping]]] = None,
+    point_fits: Optional[Sequence[PointFit]] = None,
 ) -> ConcentrationExtrapolationResult:
     """Extrapolate the apparent diffusion coefficient to infinite dilution.
 
@@ -717,7 +783,7 @@ def extrapolate_diffusion_vs_concentration(
     invisible omission is what this policy must not look like -- and `n_concentrations`
     counts only what was fitted. If fewer than two distinct concentrations survive there
     is nothing to extrapolate, and the whole result is withheld (NaN) with a
-    `reliability_note` saying so.
+    `too_few_points` precondition note saying so.
 
     Parameters
     ----------
@@ -730,9 +796,9 @@ def extrapolate_diffusion_vs_concentration(
     cumulant_weighting : str, optional
         The residual weighting of every per-concentration cumulant; see
         `analyze_gamma_q2`, whose parameter this mirrors, fallback record included.
-    cumulant_order, fit_kwargs
-        The per-point cumulant order and each measurement's own fit inputs; see
-        `analyze_gamma_q2`, whose parameters these mirror.
+    cumulant_order, fit_kwargs, point_fits
+        The per-point cumulant order, each measurement's own fit inputs and its fit
+        already run; see `analyze_gamma_q2`, whose parameters these mirror.
 
     Returns
     -------
@@ -741,7 +807,8 @@ def extrapolate_diffusion_vs_concentration(
     Raises
     ------
     ValueError
-        If fewer than two distinct concentrations are supplied.
+        If fewer than two distinct concentrations are supplied; or if `point_fits` is
+        given together with `fit_kwargs`, or does not align with `measurements`.
     """
     if len(measurements) < 2:
         raise ValueError(
@@ -754,19 +821,17 @@ def extrapolate_diffusion_vs_concentration(
     # mix computes and notes; the note travels to the export Comments. Compared
     # through the SHARED identity forms, never raw values -- a raw compare flagged
     # a 'PVP' + 'pvp ' ladder the workspace itself grouped as one sample.
-    notes: list = []       # passive ⓘ notices surfaced on the result (keep-both)
+    notes: list = []       # the result's records (keep-both with the warning)
     ids = {(casefold_identity_name(m.polymer_name),
             casefold_identity_name(m.solvent_name),
             round_temperature_for_identity(m.temperature_K))
            for m in measurements}
     if len(ids) > 1:
         # Single source of the message -> both the note and the warning.
-        msg = (
-            "Measurements do not all share polymer/solvent/temperature. "
-            "Concentration extrapolation assumes one system."
-        )
-        notes.append(msg)
-        warnings.warn(msg, UserWarning, stacklevel=2)
+        mixed = Note('mixed_sample_identity', (),
+                     {'fields': ('polymer', 'solvent', 'temperature')})
+        notes.append(mixed)
+        warnings.warn(render(mixed, surface='export'), UserWarning, stacklevel=2)
 
     conc = np.array([m.concentration_g_per_mL for m in measurements], dtype=float)
     if np.unique(conc).size < 2:
@@ -775,7 +840,7 @@ def extrapolate_diffusion_vs_concentration(
             "concentrations; the values supplied are not all different."
         )
 
-    # `_d_from_gamma`, not an inline `gamma / q ** 2`: written inline this carries both
+    # `d_from_gamma`, not an inline `gamma / q ** 2`: written inline this carries both
     # float-boundary defects the helper exists to close -- a Python-float `**` RAISES
     # OverflowError at q ~ 1e155, and the square underflows to 0.0 at q ~ 1e-170 for a
     # ZeroDivisionError. (The helper is not yet the quotient's single home;
@@ -783,37 +848,41 @@ def extrapolate_diffusion_vs_concentration(
     weighting_echo = (_resolve_weighting(cumulant_method, cumulant_weighting)
                       if gamma_source == 'cumulant' else None)
     order_echo = int(cumulant_order) if gamma_source == 'cumulant' else None
-    per_kw = _per_measurement_fit_kwargs(measurements, fit_kwargs, gamma_source,
-                                         cumulant_method)
-    fits = _fit_every_point(
-        measurements, per_kw,
-        # A run with no concentration is named "n/a" (the measurement's own repr), so its
-        # refusal still surfaces as the named ValueError rather than a format TypeError.
-        lambda m: (f'at {m.concentration_g_per_mL:.4g} g/mL'
-                   if m.concentration_g_per_mL is not None else 'at c = n/a')
-                  + f', {m.angle_deg:g} deg',
-        gamma_source, tau_min_s, tau_max_s, skip_initial_channels, cumulant_method,
-        cumulant_fit_cutoff, cumulant_weighting, cumulant_order)
-    d_app = np.array([_d_from_gamma(f.gamma, _measurement_q_m(m))
+    if point_fits is not None:
+        fits = _given_point_fits(measurements, point_fits, fit_kwargs)
+    else:
+        per_kw = _per_measurement_fit_kwargs(measurements, fit_kwargs, gamma_source,
+                                             cumulant_method)
+        fits = _fit_every_point(
+            measurements, per_kw,
+            # A run with no concentration is named "n/a" (the measurement's own repr), so
+            # its refusal still surfaces as the named ValueError rather than a format
+            # TypeError.
+            lambda m: (f'at {m.concentration_g_per_mL:.4g} g/mL'
+                       if m.concentration_g_per_mL is not None else 'at c = n/a')
+                      + f', {m.angle_deg:g} deg',
+            gamma_source=gamma_source, tau_min_s=tau_min_s, tau_max_s=tau_max_s,
+            skip_initial_channels=skip_initial_channels, cumulant_method=cumulant_method,
+            cumulant_fit_cutoff=cumulant_fit_cutoff, cumulant_weighting=cumulant_weighting,
+            cumulant_order=cumulant_order)
+    d_app = np.array([d_from_gamma(f.gamma, _measurement_q_m(m))
                       for f, m in zip(fits, measurements, strict=True)])
-    # The per-point verdict rides beside its D (see `_gamma_for_measurement`); it is
+    # The per-point verdict rides beside its D (see `fit_point`); it is
     # rolled up over the FITTED points below, once the drop has decided which those are.
-    point_notes = [f.reliability_note if not f.rh_reliable else '' for f in fits]
+    point_notes = [f.preconditions if not f.rh_reliable else () for f in fits]
 
     order = np.argsort(conc)
     conc, d_app = conc[order], d_app[order]
     point_notes = [point_notes[i] for i in order]
     sorted_fits = [fits[i] for i in order]
     fallbacks = tuple(float(conc[k]) for k, f in enumerate(sorted_fits) if f.fell_back)
-    if fallbacks:
-        notes.append(_fallback_note(fallbacks, ' g/mL'))
-    notes.extend(_relayed_point_notes(conc, sorted_fits, ' g/mL'))
+    notes.extend(_relayed_point_notes(conc, sorted_fits, 'd_values_m2_s', 'g/mL'))
     record = dict(point_weightings=tuple(f.weighting for f in sorted_fits),
                   point_sample_time_provenance=tuple(
                       f.sample_time_provenance for f in sorted_fits))
 
     # A measurement whose D_app is unanswerable is DROPPED from the fit, not allowed to NaN
-    # the whole extrapolation. `_d_from_gamma` returns NaN for a non-positive or non-finite
+    # the whole extrapolation. `d_from_gamma` returns NaN for a non-positive or non-finite
     # Gamma -- a cumulant fit on a weak, noisy correlogram does that in ordinary conditions
     # -- and one such point would otherwise NaN d0/kD/Rh0/R2 together. The surviving
     # concentrations still answer the question, so they are fitted and the drop is disclosed
@@ -821,29 +890,24 @@ def extrapolate_diffusion_vs_concentration(
     # arrays are still returned so the plot shows the gap.
     usable = np.isfinite(d_app)
     if not usable.all():
-        dropped = ', '.join(f'{c:.4g}' for c in conc[~usable])
-        # The reason is a DISJUNCTION because `_d_from_gamma` withholds for several
-        # causes -- a non-positive/non-finite Gamma, a q outside the representable range,
-        # a quotient that over/underflows -- and naming one would assert a cause that may
-        # not have occurred.
-        notes.append(
-            f"Dropped {int((~usable).sum())} of {conc.size} measurement(s) from the "
-            f"D-vs-c fit (c = {dropped} g/mL): no usable D could be formed (a "
-            f"non-positive decay rate, or a q outside the representable range). "
-            f"Check those correlograms."
-        )
+        # The note names no cause because `d_from_gamma` withholds for several -- a
+        # non-positive/non-finite Gamma, a q outside the representable range, a quotient
+        # that over/underflows -- and naming one would assert a cause that may not have
+        # occurred.
+        notes.append(Note('unusable_rate_dropped', ('d_values_m2_s',), {
+            'n_dropped': int((~usable).sum()), 'n': int(conc.size),
+            'points': 'concentrations', 'quantity': 'D'}))
     conc_fit, d_fit = conc[usable], d_app[usable]
 
-    if np.unique(conc_fit).size < 2:
+    n_usable = int(np.unique(conc_fit).size)
+    if n_usable < 2:
         # Fewer than two distinct concentrations survived, so there is nothing to
         # extrapolate. Withheld rather than raised: the INPUT was valid (the guards above
         # passed) and it is the data that failed, which is a flag-don't-crash case. Note
         # `linear_fit` would not raise here either -- on one point it returns a slope and
         # `well_conditioned = True` -- so the fit is skipped, not fitted-and-discarded.
-        notes.append(
-            "Fewer than two concentrations yielded a usable D, so no extrapolation to "
-            "infinite dilution was attempted."
-        )
+        too_few = Note('too_few_points', ('d0_m2_s', 'rh0_nm', 'kd_mL_per_g'),
+                       {'n': n_usable, 'points': 'concentrations', 'need': 2})
         return ConcentrationExtrapolationResult(
             concentrations_g_per_mL=conc, d_values_m2_s=d_app,
             d0_m2_s=float('nan'), rh0_nm=float('nan'), kd_mL_per_g=float('nan'),
@@ -861,12 +925,8 @@ def extrapolate_diffusion_vs_concentration(
             cumulant_weighting=weighting_echo, cumulant_weighting_fallbacks=fallbacks,
             cumulant_order=order_echo, **record,
             kd_reliable=False, well_conditioned=False, cond=float('inf'),
-            reliability_note=(
-                "D0 could not be computed: fewer than two measurements yielded a usable "
-                "decay rate, so there was nothing to extrapolate -- see the notes for "
-                "which concentrations were dropped."),
             rh_reliable=False,
-            notes=tuple(notes),
+            notes=_all_notes(too_few, notes),
         )
     point_notes = [n for n, u in zip(point_notes, usable, strict=True) if u]
 
@@ -896,31 +956,32 @@ def extrapolate_diffusion_vs_concentration(
         kd_se = unc.se_or_none(unc.propagate(
             [-slope / unc.power_or_nan(d0, 2), 1.0 / d0], lf.cov))  # [intercept, slope]
 
-    # Reliability of kD: a finite value from a D0 > 0, well-conditioned fit. When False
-    # the value is still shown (flag, don't NaN) with the reason on `reliability_note`.
-    # The D0 <= 0 sign flip is NOT a conditioning failure (the design can be perfectly
-    # well-conditioned), so it needs its own guard -- distinct from `well_conditioned`.
-    kd_reliable = bool(d0_ok and lf.well_conditioned and math.isfinite(kd))
+    # Reliability of kD: a finite value from a D0 > 0, well-conditioned fit over inputs
+    # whose decay rates hold, each failed precondition on its own note (invariant 4
+    # clause 1) and the value still shown. The D0 <= 0 sign flip is NOT a conditioning
+    # failure (the design can be perfectly well-conditioned), so it has its own guard. An
+    # input flagged for a cause bearing on its decay rate (`DECAY_BEARING_CODES`) fails
+    # kD as it fails Rh0, named by `inputs_flagged_decay` in the Rh0 roll-up below; a
+    # cause that does not (a missing viscosity) leaves kD standing.
+    decay_flagged = any(_decay_bearing(pre) for pre in point_notes)
+    kd_reliable = bool(d0_ok and lf.well_conditioned and math.isfinite(kd)
+                       and not decay_flagged)
     # The note splits `d0_ok` back into its two halves because they are different
-    # failures: a fit that returned no D0 at all must not be reported as "D0 <= 0 ...
-    # extrapolated non-physical", a cause that did not occur. Only the message splits --
-    # one predicate still gates every USE of D0.
+    # failures: a fit that returned no D0 at all must not be reported as a non-positive
+    # D0, a cause that did not occur. Only the note splits -- one predicate still gates
+    # every USE of D0. A kD past the float range from a usable D0 is named on its own.
+    d0_about = ('d0_m2_s', 'kd_mL_per_g', 'rh0_nm')
     if not math.isfinite(d0):
-        reliability_note = (
-            "D0 could not be computed: the D-vs-c fit returned no finite intercept, so "
-            "no infinite-dilution value (and no kD) is reported -- this is a failed fit, "
-            "not a non-physical extrapolation.")
+        d0_note = Note('d0_not_finite', d0_about)
     elif not d0_ok:
-        reliability_note = (
-            "D0 <= 0: the infinite-dilution diffusion coefficient extrapolated "
-            "non-physical, so kD = slope/D0 sign-flips and its ± is not defensible -- "
-            "add lower concentrations closer to c -> 0.")
-    elif not lf.well_conditioned:
-        reliability_note = (
-            f"ill-conditioned D-vs-c design (cond={lf.cond:.1e}); kD numerically "
-            "unreliable -- add concentrations or widen their spread.")
+        d0_note = Note('d0_nonpositive', d0_about, {'d0': d0, 'limit': 0.0})
     else:
-        reliability_note = ''
+        d0_note = None
+    cond_note = (None if lf.well_conditioned else
+                 Note('ill_conditioned', ('kd_mL_per_g',),
+                      {'cond': lf.cond, 'limit': lf.cond_limit}))
+    overflow_note = (Note('kd_not_finite', ('kd_mL_per_g',))
+                     if d0_ok and not math.isfinite(kd) else None)
 
     temperature_K = measurements[0].temperature_K
     eta = measurements[0].viscosity_Pa_s
@@ -934,18 +995,19 @@ def extrapolate_diffusion_vs_concentration(
     # preconditions of the fits the line rests on, the technique's size range applied
     # to the extrapolated Rh0, and the missing-viscosity cause of a blank Rh0. Joined
     # onto the kD note above -- one note field, two flags (see the dataclass).
-    _size_ok, size_note = _size_range_check(rh0, CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM)
-    pool_visc = NO_VISCOSITY_NOTE if eta is None else ''
+    _size_ok, size_note = size_range_check(rh0, CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM,
+                                            about=('rh0_nm',))
+    pool_visc = _no_viscosity_note(('rh0_nm',)) if eta is None else None
     # The D0 cause belongs to Rh0 too: `rh0 = f(d0)` is withheld by the SAME `d0_ok`
     # predicate, so a verdict built without it reports True beside a NaN (invariant 4
-    # clause 1 -- the reported value must be one the method can produce). The string is
-    # the one the kD note already carries; `_result_flags` de-duplicates it on the join
-    # below, so the sentence still prints once.
-    d0_cause = reliability_note if not d0_ok else ''
-    rh_reliable, rh_note = _result_flags(
-        _pooled_point_note(conc_fit, point_notes, 'concentrations', ' g/mL', pool_visc),
-        size_note, pool_visc, d0_cause)
-    _joined_ok, reliability_note = _result_flags(reliability_note, rh_note)
+    # clause 1 -- the reported value must be one the method can produce). It is the note
+    # the kD cause already carries; `_result_flags` keeps it once on the join below.
+    rh_reliable, rh_notes = _result_flags(
+        _pooled_point_notes(point_notes, 'concentrations', 'rh0_nm', pool_visc is not None,
+                            points=conc[usable], unit='g/mL',
+                            decay_about=('kd_mL_per_g',)),
+        size_note, pool_visc, d0_note)
+    _joined_ok, preconditions = _result_flags(d0_note, cond_note, overflow_note, rh_notes)
 
     return ConcentrationExtrapolationResult(
         concentrations_g_per_mL=conc, d_values_m2_s=d_app,
@@ -961,7 +1023,7 @@ def extrapolate_diffusion_vs_concentration(
         cumulant_weighting=weighting_echo, cumulant_weighting_fallbacks=fallbacks,
         cumulant_order=order_echo, **record,
         kd_reliable=kd_reliable, well_conditioned=lf.well_conditioned,
-        cond=lf.cond, reliability_note=reliability_note,
+        cond=lf.cond,
         rh_reliable=rh_reliable,
-        notes=tuple(notes),
+        notes=_all_notes(preconditions, notes),
     )

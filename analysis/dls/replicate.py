@@ -6,27 +6,40 @@ Replicate averaging: combine several TRUE repeat correlograms (same sample,
 re-measured back-to-back at the same settings, so identical lag grids) into one
 denoised correlogram by a plain channel-by-channel arithmetic mean of g2(tau) - 1.
 
-The per-channel spread is reported for completeness, but note (ISO 22412;
-Schaetzel 1990) that a defensible size UNCERTAINTY does NOT come from one averaged
-curve's lag channels (they are correlated): it comes from the spread of the
-per-replicate FITTED results, handled separately by the controller's derived-results
-averaging (analysis/uncertainty.replicate_mean_se).
+The per-channel spread is reported for completeness. A correlogram's lag channels are
+correlated (Schaetzel 1990), so a defensible size UNCERTAINTY does NOT come from one
+averaged curve's lag channels: it comes from the spread of the per-replicate FITTED
+results, the repeat-measurement route of ISO 22412, handled separately by the
+controller's derived-results averaging (analysis/uncertainty.replicate_mean_se).
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 from core.data_models import (
     DLSMeasurement,
     casefold_identity_name,
-    round_temperature_for_identity,
 )
 from analysis.dls._common import _measurement_q_m
+
+
+@dataclass(frozen=True)
+class ReplicateIdentityReport:
+    """What `check_replicate_identity` records about a set it let through.
+
+    Temperature is recorded rather than refused (the predicate's docstring has
+    why): every replicate's committed value, in selection order, and their span,
+    max - min, unrounded. The span is 0.0 for an identical set and the report
+    carries it then too: a record of provenance, not a warning, and not a verdict
+    on sameness.
+    """
+    temperatures_K: Tuple[float, ...]
+    temperature_span_K: float
 
 
 @dataclass
@@ -38,11 +51,12 @@ class AveragedCorrelogramResult:
     lands on the IDENTICAL lag-time grid. Averaging then is a plain element-wise
     mean of g2(tau) - 1, which denoises the curve without distorting it.
 
-    The per-channel spread is reported for completeness, but note (ISO 22412;
-    Schaetzel 1990) that a defensible size UNCERTAINTY does NOT come from one
-    averaged curve's lag channels (they are correlated): it comes from the spread
-    of the per-replicate FITTED results, handled separately by the controller's
-    derived-results averaging (analysis/uncertainty.replicate_mean_se).
+    The per-channel spread is reported for completeness. A correlogram's lag
+    channels are correlated (Schaetzel 1990), so a defensible size UNCERTAINTY does
+    NOT come from one averaged curve's lag channels: it comes from the spread of the
+    per-replicate FITTED results, the repeat-measurement route of ISO 22412, handled
+    separately by the controller's derived-results averaging
+    (analysis/uncertainty.replicate_mean_se).
     """
     delay_times_s: np.ndarray          # the shared lag grid (identical across runs)
     mean_g2m1: np.ndarray              # channel-by-channel mean of g2 - 1
@@ -52,13 +66,22 @@ class AveragedCorrelogramResult:
     # carried identity (all replicates share these -- enforced by
     # check_replicate_identity, not merely assumed; taken from the first)
     q_m_inv: float
+    # what the identity check recorded rather than refused: every replicate's
+    # temperature and their span (`ReplicateIdentityReport`)
+    identity: ReplicateIdentityReport
+    # each run's least-squares scale against the mean curve, in input order, their mean
+    # 1 by construction: a provenance datum, not a verdict (why it is recorded, and its
+    # formula, at `average_replicate_correlograms`). NaN for every run when the mean
+    # curve has no scale (all zero, or non-finite).
+    run_amplitudes: Tuple[float, ...]
 
 
 def check_replicate_identity(
     measurements: List[DLSMeasurement],
     rtol: float = 1e-6,
-) -> None:
-    """Raise ValueError unless every measurement is a true replicate of the first.
+) -> ReplicateIdentityReport:
+    """Raise ValueError unless every measurement is a true replicate of the first;
+    return what was recorded about the set.
 
     THE one answer to "are these the same measurement, repeated?", shared by both
     averaging paths: correlogram averaging (below) and the controller's
@@ -73,17 +96,27 @@ def check_replicate_identity(
     over non-replicates describes no real condition, and the replicate +/- is the
     platform's only honest single-sample dynamic SE precisely BECAUSE the inputs
     are true repeats (invariant 8 / ISO 22412). The known false-refusal surface
-    was engineered away (the three uncompared fields below), and the "user knows
-    better" cases have data-side remedies -- correct the metadata, which the user
-    owns -- that beat an override. Flip trigger, recorded: ONE real selection
-    wrongly refused in ordinary use reopens this as a warn-and-mark design; if
-    friction appears, prefer auto-partitioning (average each condition separately
-    in one gesture) before any override.
+    was engineered away (temperature and the three uncompared fields below), and
+    the "user knows better" cases have data-side remedies -- correct the metadata,
+    which the user owns -- that beat an override.
 
-    EIGHT fields must agree: polymer, solvent, temperature, angle, wavelength,
-    concentration, mw_fraction, analyzer_geometry. Each is a name, a category, an
-    instrument setting, or a quantity the user enters once per sample -- none has a
-    per-run drift mechanism, so the check has no false-refusal surface to size.
+    SEVEN fields must agree: polymer, solvent, angle, wavelength, concentration,
+    mw_fraction, analyzer_geometry. Each is a name, a category, an instrument
+    setting, or a quantity the user enters once per sample -- none has a per-run
+    drift mechanism, so the check has no false-refusal surface to size.
+
+    TEMPERATURE is RECORDED, never refused. It is the one identity field with a
+    per-run drift mechanism: the bath readback drifts about 0.01 K between runs of
+    one sample, and any bucket edge splits such a set (a 0.1 C bucket refused a
+    real 135 deg triple 0.01 K apart while two triples of the same sample at the
+    same spread passed). The constraint and its home: combination doctrine rule 2
+    (core/data_models.py), under CLAUDE.md invariant 4's flag-not-refuse
+    principle. The returned report carries every run's committed temperature and
+    their span, unrounded, so no bucket edge survives into the disclosure. The
+    callers record it as provenance (the correlogram average on every set, a zero
+    span included; the derived static point's note and the written replicate Rh's
+    label when it is nonzero), and the average inherits the FIRST replicate's
+    temperature, as it does the three uncompared fields below.
 
     THREE physical fields are deliberately NOT compared: ``viscosity_Pa_s``,
     ``solvent_refractive_index`` and ``solute_refractive_index``. The reason is the
@@ -118,12 +151,6 @@ def check_replicate_identity(
       (strip + casefold; core.data_models.casefold_identity_name), the same one
       make_sample_key and sample_group_key use, so "are these the same sample?"
       has no private answer here.
-    * temperature -- through THE sample-identity bucket
-      (core.data_models.round_temperature_for_identity, 0.1 C), for the same
-      reason: one computation, so the averager cannot be stricter about "same
-      temperature" than the grouping that put these runs in one sample. An
-      earlier rtol=1e-6 compare here was ~300x tighter than that bucket and
-      refused real per-run thermometer drift (owner ruling, round 1).
     * angle and wavelength -- within rtol. Both are instrument settings written as
       fixed text, so they have no drift mechanism; q depends on both, so a mismatch
       means the correlograms describe different physics.
@@ -145,7 +172,7 @@ def check_replicate_identity(
     fits each replicate on its own grid and needs no shared one.
     """
     if not measurements:
-        return
+        return ReplicateIdentityReport(temperatures_K=(), temperature_span_K=0.0)
     first = measurements[0]
 
     def _norm(s: Optional[str]) -> str:
@@ -164,19 +191,8 @@ def check_replicate_identity(
                 f"Replicate {i} solvent ({m.solvent_name!r}) does not match the "
                 f"first ({first.solvent_name!r})."
             )
-        # Temperature through the SAME bucket the sample grouping uses, so the two
-        # identity questions are one computation and the averager can never be
-        # stricter than the grouping that put these runs in one sample.
-        ta, tb = (round_temperature_for_identity(m.temperature_K),
-                  round_temperature_for_identity(first.temperature_K))
-        if ta != tb:
-            raise ValueError(
-                f"Replicate {i} temperature ({m.temperature_K:g} K) does not match "
-                f"the first ({first.temperature_K:g} K). Replicate averaging is "
-                f"only valid across true replicates measured at the same "
-                f"conditions."
-            )
-
+        # Temperature is not compared here: it is recorded below (the docstring's
+        # TEMPERATURE paragraph).
         for attr, label in (('angle_deg', 'angle'),
                             ('wavelength_nm', 'wavelength')):
             a, b = getattr(m, attr), getattr(first, attr)
@@ -227,6 +243,10 @@ def check_replicate_identity(
                     f"({b!r}). {why}"
                 )
 
+    temps = tuple(float(m.temperature_K) for m in measurements)
+    return ReplicateIdentityReport(temperatures_K=temps,
+                                   temperature_span_K=max(temps) - min(temps))
+
 
 def average_replicate_correlograms(
     measurements: List[DLSMeasurement],
@@ -235,9 +255,10 @@ def average_replicate_correlograms(
     """Average a set of TRUE replicate correlograms onto their shared lag grid.
 
     All measurements must be genuine repeats of one sample: identical lag grids
-    plus the eight identity fields `check_replicate_identity` enforces (polymer,
-    solvent, temperature, angle, wavelength, concentration, Mw fraction, analyzer
-    geometry). The averaging is a plain channel-by-channel
+    plus the seven identity fields `check_replicate_identity` enforces (polymer,
+    solvent, angle, wavelength, concentration, Mw fraction, analyzer geometry);
+    their temperatures are recorded, not compared, on the result's `identity`
+    report. The averaging is a plain channel-by-channel
     arithmetic mean of g2(tau) - 1 -- valid because true replicates share the
     coherence factor beta, and any small residual amplitude difference is absorbed
     by the floating beta in the subsequent fit.
@@ -246,6 +267,21 @@ def average_replicate_correlograms(
     common grid would blend neighboring lag channels (which are already
     correlated, Schaetzel 1990) and would silently let non-replicates be averaged,
     defeating the "true replicates only" guard.
+
+    RUN AMPLITUDES. The result also records each run's amplitude, its least-squares
+    scale against the mean curve, a_i = sum_k g_ik gbar_k / sum_k gbar_k^2, so the a_i
+    average to exactly 1. It is recorded because, in FCS, an amplitude change between
+    repeats caused by a changing particle number is a systematic error inherent in the
+    sample, not measurement scatter (Wohland, Rigler & Vogel 2001, p. 2991, the
+    paragraph after Eq. 19); the program reads a DLS run's height difference the same
+    way, and it follows, from the arithmetic of a mean, that one bad run shifts the mean
+    curve rather than averaging out. The
+    source's own remedy normalizes each curve's amplitude before an SD (its Eqs. 20-21,
+    p. 2992), a different estimator. A pure height difference is harmless, since every
+    fit floats beta; one that moved with the shape (dust adds its own slow decay) is
+    not, and the two cannot be told apart here, so the datum is recorded for the user
+    rather than acted on. The estimator is the program's own, not Wohland's
+    (Theory-and-Equations-Guide §6.4).
 
     Parameters
     ----------
@@ -263,7 +299,7 @@ def average_replicate_correlograms(
     ValueError
         If fewer than two measurements are given, the lag grids are not
         identical (same length and values within rtol), or the identity/optics
-        fields do not match across the set.
+        fields do not match across the set (temperature is never a cause).
     """
     n = len(measurements)
     if n < 2:
@@ -299,16 +335,28 @@ def average_replicate_correlograms(
                 f"results' to average fits across runs with differing grids."
             )
 
-    # 2) Matching identity / optics / concentration / fraction.
-    check_replicate_identity(measurements, rtol=rtol)
+    # 2) Matching identity / optics / concentration / fraction; temperature recorded.
+    identity = check_replicate_identity(measurements, rtol=rtol)
 
     stack = np.vstack([m.correlogram for m in measurements])   # (n, n_channels)
     mean_g2m1 = stack.mean(axis=0)
     sd_g2m1 = stack.std(axis=0, ddof=1)
     sem_g2m1 = sd_g2m1 / math.sqrt(n)
 
+    # The per-run amplitude (the docstring's RUN AMPLITUDES paragraph). The curves are
+    # divided by the mean curve's largest magnitude first, which leaves every a_i
+    # unchanged and keeps both sums near 1, so neither overflows nor underflows at any
+    # input scale; a mean curve with no finite, nonzero scale has no amplitude.
+    scale = float(np.max(np.abs(mean_g2m1))) if mean_g2m1.size else 0.0
+    if math.isfinite(scale) and scale > 0.0:
+        unit = mean_g2m1 / scale
+        run_amplitudes = tuple(float(a) for a in (stack / scale) @ unit / float(unit @ unit))
+    else:
+        run_amplitudes = (float('nan'),) * n
+
     return AveragedCorrelogramResult(
         delay_times_s=np.array(grid, dtype=float),
         mean_g2m1=mean_g2m1, sd_g2m1=sd_g2m1, sem_g2m1=sem_g2m1,
-        n_replicates=n, q_m_inv=_measurement_q_m(first),
+        n_replicates=n, q_m_inv=_measurement_q_m(first), identity=identity,
+        run_amplitudes=run_amplitudes,
     )

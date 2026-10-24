@@ -49,43 +49,30 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 from core.data_models import IntensityTrace
+from core.notes import Note, render
 from parsers.base_parser import (
+    MAX_BAD_ROW_FRACTION,
     BaseTraceParser,
     TraceFilePreview,
     ParseError,
     convert_count_rate,
     convert_trace_times,
+    detect_delimiter,
+    read_text_lines,
 )
 
 # Minimum number of (time, count_rate) rows to accept.
 _MIN_ROWS = 2
 
-# Maximum fraction of malformed rows tolerated before raising rather than
-# silently discarding -- a higher rate means the file has headers or is the
-# wrong format. (Same threshold and intent as the generic DLS/SLS parsers.)
-_MAX_BAD_ROW_FRACTION = 0.05
-
-
-def _detect_delimiter(first_line: str) -> str:
-    """Return ',' or '\\t' based on the first data line, or raise ParseError.
-
-    Matches the generic DLS/SLS parsers' delimiter detection.
-    """
-    if '\t' in first_line and ',' not in first_line:
-        return '\t'
-    if ',' in first_line and '\t' not in first_line:
-        return ','
-    if ',' in first_line and '\t' in first_line:
-        return ',' if first_line.count(',') >= first_line.count('\t') else '\t'
-    raise ParseError(
-        f"Cannot detect delimiter in first data line: {first_line!r}. "
-        f"The file must be comma- or tab-delimited."
-    )
+# The generic parsers' shared malformed-row threshold and delimiter detection
+# (base_parser.py), under the names this module and its tests use.
+_MAX_BAD_ROW_FRACTION = MAX_BAD_ROW_FRACTION
+_detect_delimiter = detect_delimiter
 
 
 class GenericTraceFilePreview(TraceFilePreview):
@@ -165,19 +152,7 @@ class GenericTraceParser(BaseTraceParser):
     """
 
     def parse(self, file_path: str) -> List[GenericTraceFilePreview]:
-        if not os.path.isfile(file_path):
-            raise FileNotFoundError(f"File not found: {file_path!r}")
-
-        try:
-            try:
-                with open(file_path, encoding='utf-8', newline='') as fh:
-                    raw_lines = [line.rstrip('\r\n') for line in fh]
-            except UnicodeDecodeError:
-                with open(file_path, encoding='latin-1', newline='') as fh:
-                    raw_lines = [line.rstrip('\r\n') for line in fh]
-        except OSError as exc:
-            # A file the OS refuses to read is a plain ParseError (see generic_dls.py).
-            raise ParseError(f"Could not read {file_path!r}: {exc}") from exc
+        raw_lines = read_text_lines(file_path, ('utf-8', 'latin-1'))
 
         lines = [l for l in raw_lines if l.strip()]
         if len(lines) < _MIN_ROWS:
@@ -223,15 +198,13 @@ class GenericTraceParser(BaseTraceParser):
             )
 
         # Tolerated, not hidden -- see generic_dls.py (keep-both disclosure).
-        notes: tuple = ()
+        notes: Tuple[Note, ...] = ()
         if n_bad:
-            note = (
-                f"{n_bad} of {total} row(s) could not be read as two numbers and were "
-                f"skipped; {len(times)} loaded. If a skipped row was meant to carry data, fix it "
-                f"in the file and re-load."
-            )
+            note = Note('parser.rows_skipped', ('times_s', 'count_rates_cps'),
+                        {'n_skipped': n_bad, 'n': total, 'n_loaded': len(times)})
             notes = (note,)
-            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+            warnings.warn(f"{file_path!r}: {render(note, surface='export')}", UserWarning,
+                          stacklevel=2)
 
         preview = GenericTraceFilePreview(
             source_file=os.path.abspath(file_path),

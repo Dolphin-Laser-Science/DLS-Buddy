@@ -26,26 +26,25 @@ and displays what comes back.
 from __future__ import annotations
 
 import math
-import os
 from typing import List, Optional
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from analysis.synthetic_dataset import DDLS_SHAPES
 from analysis.trace_analysis import (FALSE_ALARM_PROBABILITY_DEFAULT,
                                      HAMPEL_WINDOW_MIN_PTS, OUTLIER_K_DEFAULT,
-                                     PSD_WINDOWS, preload_stationarity_backend,
-                                     resolve_running_average_window)
+                                     PSD_WINDOWS)
+from app import synthetic
 from app.controller import (TRACE_DIAGNOSTIC_PLOT_VIEWS,
                             TRACE_DIAGNOSTIC_VIEWS)
-from app import units as U
+from app.loading import detect_trace, load_trace_files
+from core import units as U
 from core.naming import sample_display_name
 from gui.plot_controls import (
-    make_split_panels, make_canvas_expanding, make_vertical_plot_stack,
+    LazyCanvas, make_split_panels, make_canvas_expanding, make_vertical_plot_stack,
     set_plot_export_name, themed_navtoolbar,
 )
 from gui.export_helper import (
@@ -58,7 +57,7 @@ from gui.widgets import (roomy_tabs, SampleSelector, show_parse_notes,
                          value_unit_row as _value_unit_row)
 
 
-from gui.worker import busy_notice, run_when_idle, runner
+from gui.worker import RunSlot, busy_notice, run_when_idle, runner
 
 from plotting.plots import (
     plot_i_sin_theta, plot_synthetic_correlogram, plot_intensity_trace,
@@ -68,11 +67,9 @@ from plotting.plots import (
     cycle as _plot_cycle,
     display_factor as _plot_factor, display_unit as _plot_unit,
 )
-from parsers.autodetect import autodetect
-from parsers.base_parser import (MalformedDataError, ParseError,
-                                 collect_parse_notes)
-from parsers.alv_asc import ALVTraceParser
-from parsers.brookhaven_dls import BrookhavenTraceParser
+# The generic trace fallback (`_load_generic_trace`) parses here, behind its units prompt;
+# the instrument parsers and the load itself are `app/loading.py`'s.
+from parsers.base_parser import ParseError
 from parsers.generic_trace import GenericTraceParser
 
 class _HampelWindowSpinBox(QtWidgets.QSpinBox):
@@ -107,13 +104,6 @@ _HAMPEL_COLOR = '#009E73'
 # (spec engineering-04): the old frozen Okabe-Ito literal here never followed
 # a Settings palette swap, which is exactly the staleness cycle() exists to
 # prevent.
-
-# Instrument trace parsers tried (in order) by the auto-detection on load. Each
-# sniffs its own format strictly (ALV .ASC structure; Brookhaven HH:MM:SS
-# timestamps) and raises ParseError otherwise, so the first that succeeds is the
-# right one. The lenient generic two-column parser is the explicit fallback (it
-# matches almost anything, so it must not be in this list) and prompts for units.
-_TRACE_PARSERS = [ALVTraceParser, BrookhavenTraceParser]
 
 # Default seeds for the intensity-trace controls. These used to live in Settings;
 # they are now plain in-tab fields seeded each launch
@@ -238,23 +228,6 @@ _SYNTH_ARTIFACTS = [
     ('form_factor', 'Form-factor series (SLS + DLS)', True, True),
     ('full_set', 'Full Mw-series test set', False, True),
 ]
-# Default save filenames per single-file artifact (written into the chosen folder).
-# 'depolarized' writes two ALV files (VV + VH), 'architecture'/'full_set' write subfolders,
-# so they are handled specially in _synth_save (no single-name entry here).
-_SYNTH_FILENAMES = {
-    'correlogram': 'Synthetic correlogram.csv',
-    'trace': 'Synthetic trace (kcps vs s).csv',
-    'multi_dls': 'Synthetic DLS multi-angle.ASC',
-    'two_mode': 'Synthetic DLS two-mode.ASC',
-    'sls_zimm': 'Synthetic SLS Zimm.csv',
-    'sls_ff_sphere': 'Synthetic SLS form-factor sphere.csv',
-    'sls_ff_debye': 'Synthetic SLS form-factor coil.csv',
-    'sls_ff_ellipsoid': 'Synthetic SLS form-factor ellipsoid.csv',
-    'sls_ff_mie': 'Synthetic SLS form-factor Mie sphere.csv',
-    'sls_ff_core_shell': 'Synthetic SLS form-factor core-shell.csv',
-    'sls_single_conc': 'Synthetic SLS single-concentration.csv',
-    'sls_single_angle': 'Synthetic SLS single-angle.csv',
-}
 # Depolarization/shape input rows: (key, label, default). Rod dims are (L, d);
 # ellipsoid dims are (a, b) — the two dim labels relabel when the shape changes.
 _SYNTH_DEPOL = [
@@ -279,11 +252,15 @@ class UtilitiesModule(QtWidgets.QWidget):
         super().__init__(parent)
         self.controller = controller
         self.sample_id: Optional[str] = None
-        # Staleness token for every backgrounded trace-view computation (the ADF
-        # stationarity test and, for long traces, the histogram/block-variance
-        # diagnostics); bumped whenever the trace view refreshes so a late result
-        # from a superseded view is dropped.
-        self._trace_epoch = 0
+        # The ADF test's run slot. Its epoch is the staleness token for every
+        # backgrounded trace-view computation (the ADF stationarity test and, for long
+        # traces, the histogram/block-variance diagnostics); bumped whenever the trace
+        # view refreshes so a late result from a superseded view is dropped. A busy
+        # ADF press is queued, retried at idle while its view is still the one shown.
+        self._adf_slot = RunSlot(
+            available=lambda target: target[0] == self._adf_slot.epoch,
+            rerun=lambda target: self._dispatch_adf(*target[1:]))
+        self._generate_slot = RunSlot()      # a busy Generate is refused
         # Per-trace diagnostics memo: (trace_id, 'hist'|'bv') -> result. The
         # histogram and block-variance are pure functions of the (immutable) trace
         # data, so each is computed ONCE and shared by the text line and the
@@ -296,10 +273,11 @@ class UtilitiesModule(QtWidgets.QWidget):
         # Warm the statsmodels import HERE, on the main thread, before any trace
         # view can dispatch the ADF stationarity test to the worker thread — a
         # first-time statsmodels/scipy.signal import on the worker under
-        # PySide6's shiboken import hook can corrupt the heap (see the helper's
-        # docstring). Costs ~1 s once at startup; a missing statsmodels is not
-        # an error here (the diagnostic reports it when actually used).
-        preload_stationarity_backend()
+        # PySide6's shiboken import hook can corrupt the heap (see the docstring
+        # of analysis.trace_analysis.preload_stationarity_backend). Costs ~1 s once
+        # at startup; a missing statsmodels is not an error here (the diagnostic
+        # reports it when actually used).
+        self.controller.preload_trace_backend()
         self._build_ui()
         self.set_measurement(None)
 
@@ -356,7 +334,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         v.addLayout(row)
 
         self.isin_fig = Figure(figsize=(4.7, 3.4))
-        self.isin_canvas = make_canvas_expanding(FigureCanvas(self.isin_fig))
+        self.isin_canvas = make_canvas_expanding(LazyCanvas(self.isin_fig))
         self.isin_ax = self.isin_fig.add_subplot(111)
         v.addWidget(themed_navtoolbar(self.isin_canvas, w, self.controller))
         set_plot_export_name(self.isin_canvas, 'i_sin_theta')
@@ -376,45 +354,19 @@ class UtilitiesModule(QtWidgets.QWidget):
 
         left.addWidget(section_header('Traces to Plot', 'Inspect count-rate traces '
                                       'for drift, dust and stationarity.', bullets=[
-            'This list chooses what is <b>plotted</b>. Load, attach and remove '
-            'traces in the <b>Workspace</b> panel on the left.',
-            'Tick one or more traces to overlay them. The <b>focused</b> trace — the '
-            'highlighted one when it is ticked, else the first ticked one — drives the '
-            'stats line, the diagnostic sub-plot and every <b>Export …</b> button.',
-            '<b>Absolute</b> vs <b>Relative (baseline-normalized)</b> scale.',
-            'Overlays: flagged outliers, a windowed-Hampel decomposition, and a '
-            'running average.',
-            '<b>Outliers</b> judges every point against the whole trace; '
-            '<b>Windowed Hampel</b> judges each point against a moving window '
-            'and draws the rolling baseline it used. Both share one <b>k</b>.',
-            'Sizing the Hampel window: an event lasting up to about <b>half the '
-            'window</b> can be flagged. Anything longer is tracked as baseline, '
-            'so a persistent offset shows up as a step in the <b>rolling curve</b>, '
-            'not as flags — widen the window to catch longer events, narrow it to '
+            'This list picks what is <b>plotted</b>; load, attach and remove traces '
+            'in the <b>Workspace</b> sidebar.',
+            'Tick traces to overlay them; the <b>focused</b> one (highlighted if '
+            'ticked, else the first ticked) drives the stats line, the diagnostic '
+            'sub-plot and every <b>Export …</b> button.',
+            '<b>Scale</b>: <b>Absolute</b> or <b>Relative (baseline-normalized)</b>.',
+            'Overlays: <b>Outliers</b> judges each point against the whole trace, '
+            '<b>Windowed Hampel</b> against a moving window, both with one <b>k</b>; '
+            '<b>Running average</b> draws a sliding mean.',
+            'Widen the <b>Hampel window</b> to catch longer events; narrow it to '
             'follow a faster-moving baseline.',
-            'A <b>gap in the band</b> means that stretch was not judged: either no '
-            'full window fits (the two ends of the trace) or over half the window '
-            'shares one value, leaving no scale to measure against. Nothing is '
-            'flagged there, and the summary line reports how much was skipped.',
-            'The <b>Diagnostic</b> combo picks the sub-plot: the <b>count-rate '
-            'histogram</b> (with a Fano check), <b>block variance</b>, the '
-            '<b>Allan deviation</b>, the <b>power spectral density</b>, or the '
-            '<b>periodogram</b>. Each exports its own numbers with '
-            '<b>Export diagnostic…</b>.',
-            'The <b>Allan deviation</b> answers “how long may I average?”. While '
-            'it falls with slope −1/2, averaging longer keeps paying; where it '
-            'flattens or turns up, drift has taken over and averaging past that '
-            'τ buys nothing.',
-            'The <b>spectrum</b> finds periodic contamination — pump or stirrer '
-            'vibration, temperature cycling, mains harmonics. The dashed line is '
-            'where an ideal photon-counting detector would sit; broad power above '
-            'it is excess noise, a narrow spike above it is something periodic.',
-            'The <b>periodogram</b> puts a number on that spike: its line is the '
-            'height noise alone would rarely reach. Read it only when the trace '
-            'is otherwise well behaved — the test assumes uncorrelated noise, so '
-            'on a drifting trace it is marked <b>unreliable</b> rather than '
-            'believed. A spectral line also makes the Allan curve jump about, so '
-            'check the spectrum before trusting an averaging time.',
+            '<b>Diagnostic</b> picks the sub-plot and <b>Export diagnostic…</b> '
+            'writes its numbers; reading each view: User-Manual §11.1.5.',
         ]))
         # A multi-select checklist (Select all/none), matching the DLS correlogram
         # tab's measurement selector: tick several traces to
@@ -461,23 +413,18 @@ class UtilitiesModule(QtWidgets.QWidget):
 
         # overlay toggles (GUI-owned flags, never baked into the figure data)
         # 'k' tooltip: k multiplies the trace's OWN robust sigma, not the Poisson one.
-        _k_help = ('k — the robust band multiplier, shared by both outlier overlays. '
-                   'A point is flagged when its count rate lies outside '
-                   'median ± k·σ, where σ is 1.4826·MAD — the scatter of the trace '
-                   'itself. Outliers measures both against the whole trace; Windowed '
-                   'Hampel measures both against a moving window. It finds samples '
-                   'that stand out from this trace; whether the trace as a whole is '
-                   'noisier than photon statistics allow is a separate question, '
-                   'answered by the Fano factor in the summary line. See the '
-                   'Theory-and-Equations-Guide.')
+        _k_help = ('k — the band multiplier shared by both outlier overlays: a point '
+                   'is flagged outside median ± k·σ, σ being the trace’s own robust '
+                   'scatter (1.4826·MAD). It finds single samples that stand out; '
+                   'whether the whole trace is noisier than photon statistics allow '
+                   'is the Fano factor’s question, in the summary line '
+                   '(Theory-and-Equations-Guide §2.1.1 and §2.1.3).')
         _window_help = (
-            'Width of the moving window, in points; auto sizes it from the trace '
-            'length. The window sets what counts as an impulse: an event lasting '
-            'up to about half the window can be flagged, and anything longer is '
-            'tracked as baseline instead — so a persistent offset appears in the '
-            'rolling curve rather than in the flags. Widening the window also '
-            'lowers the spurious-flag rate and widens the unjudged gap at each end '
-            'of the trace. See the Theory-and-Equations-Guide.')
+            'Width of the moving window in points (auto: sized from the trace '
+            'length); events up to about half the window can be flagged, longer ones '
+            'are tracked as baseline and show as a step in the rolling curve. A '
+            'wider window flags less spuriously and leaves a wider gap not judged '
+            'at each end (Theory-and-Equations-Guide §2.1.2).')
         # Two rows: the shared-k robust bands first, the unrelated smoother second.
         # Both rows would otherwise carry a control labelled 'window (pts)' meaning
         # two different things.
@@ -497,9 +444,10 @@ class UtilitiesModule(QtWidgets.QWidget):
         orow.addWidget(self.outlier_k)
         self.ov_whampel = QtWidgets.QCheckBox('Windowed Hampel')
         self.ov_whampel.setToolTip(
-            'Rolling median with its ±k·σ band, plus impulse markers on the '
-            'points that leave it. A gap in the band marks where the layer had '
-            'no verdict.')
+            'Rolling median with its ±k·σ band, plus markers on the points that '
+            'leave it. A gap in the band is a stretch not judged: no full window '
+            'fits there, or over half the window shares one value; the summary line '
+            'reports how much (Theory-and-Equations-Guide §2.1.2).')
         self.ov_whampel.toggled.connect(self._update_trace)
         orow.addWidget(self.ov_whampel)
         hw_lbl = QtWidgets.QLabel('Hampel window (pts):')
@@ -562,7 +510,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         top = QtWidgets.QWidget()
         tlay = QtWidgets.QVBoxLayout(top); tlay.setContentsMargins(0, 0, 0, 0)
         self.trace_fig = Figure(figsize=(5.2, 3.4))
-        self.trace_canvas = make_canvas_expanding(FigureCanvas(self.trace_fig))
+        self.trace_canvas = make_canvas_expanding(LazyCanvas(self.trace_fig))
         self.trace_ax = self.trace_fig.add_subplot(111)
         tlay.addWidget(themed_navtoolbar(self.trace_canvas, w, self.controller))
         set_plot_export_name(self.trace_canvas, 'count_rate_trace')
@@ -595,9 +543,9 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.diag_combo.setToolTip(
             'Secondary diagnostic plotted below the trace. The histogram and '
             'block variance describe the trace’s amplitudes; the Allan deviation '
-            'says how long it may usefully be averaged; the spectrum and '
-            'periodogram look for periodic contamination. See the '
-            'Theory-and-Equations-Guide.')
+            'says how long it can usefully be averaged; the spectrum and '
+            'periodogram look for periodic contamination '
+            '(Theory-and-Equations-Guide §2.1).')
         # Switching the sub-plot type reuses the cached diagnostics (or backgrounds
         # them for a long trace) rather than recomputing on the UI thread.
         self.diag_combo.currentIndexChanged.connect(self._on_diag_view_changed)
@@ -679,7 +627,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         blay.addLayout(drow)
         self._sync_diag_params()
         self.diag_fig = Figure(figsize=(5.2, 2.6))
-        self.diag_canvas = make_canvas_expanding(FigureCanvas(self.diag_fig), 130)
+        self.diag_canvas = make_canvas_expanding(LazyCanvas(self.diag_fig), 130)
         self.diag_ax = self.diag_fig.add_subplot(111)
         blay.addWidget(self.diag_canvas, 1)
 
@@ -699,8 +647,8 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.hampel_export_button = QtWidgets.QPushButton('Export decomposition…')
         self.hampel_export_button.setToolTip(
             'Export the windowed-Hampel decomposition of the focused trace: the '
-            'rolling median and scale, the impulse flags, and where the layer '
-            'abstained, with both bands’ settings in the header.')
+            'rolling median and scale, the impulse flags, and the stretches not '
+            'judged, with both bands’ settings in the header.')
         self.hampel_export_button.clicked.connect(self._export_focused_decomposition)
         erow.addWidget(self.hampel_export_button)
         right.addLayout(erow)
@@ -874,12 +822,12 @@ class UtilitiesModule(QtWidgets.QWidget):
         The auto rule is the engine's, not restated here, so the overlay and the
         export cannot disagree about what "auto" means."""
         w = int(self.runavg_window.value())
-        return resolve_running_average_window(n_points) if w == 0 else max(3, w)
+        return self.controller.running_average_window(n_points) if w == 0 else max(3, w)
 
     def _update_trace(self) -> None:
         # A refresh supersedes any in-flight backgrounded work (ADF, or a long
         # trace's diagnostics) from the previous view.
-        self._trace_epoch += 1
+        self._adf_slot.bump()
         self.trace_ax.clear()
         self._overlay_notes = []
         self.trace_overlay_note.clear()
@@ -1305,6 +1253,8 @@ class UtilitiesModule(QtWidgets.QWidget):
         else:
             # The worker is busy (a fit or ADF holds it): retry once it frees,
             # unless the view changed by then (parity with the ADF pending notice).
+            # Each busy call queues its own `then`, so this site dispatches on the
+            # gate directly: a RunSlot keeps one pending target and would drop one.
             self.trace_stats.setText('Computing trace diagnostics… (queued)')
             run_when_idle(lambda: self._ensure_focus_diag(tid, then)
                           if epoch == self._trace_epoch else None)
@@ -1358,34 +1308,49 @@ class UtilitiesModule(QtWidgets.QWidget):
 
     def _dispatch_adf(self, tid: str, base: str) -> None:
         """Run the ADF stationarity test in the background and append its verdict
-        to the stats line `base`. Superseded (epoch) if the view changes first."""
-        epoch = self._trace_epoch
+        to the stats line `base`. Superseded (epoch) if the view changes first.
+        A verdict is memoized in `_diag_cache` like the stats beside it, so a redraw
+        of the same trace writes it at once and submits nothing; a failure is not
+        stored, so the next redraw retries."""
         controller = self.controller
+        # The trace id alone keys the verdict: this call passes no significance, so every
+        # stored verdict is the stored trace's at the controller's default one. A
+        # user-settable significance would have to join this key.
+        key = (tid, 'adf')
 
         def verdict_text(adf) -> str:
             return (f"{'stationary' if adf.is_stationary else 'non-stationary'} "
                     f"(ADF p = {adf.p_value:.2g})")
 
-        def done(adf) -> None:
-            if epoch != self._trace_epoch:
+        if key in self._diag_cache:
+            self.trace_stats.setText(base + '   ·   ' + verdict_text(self._diag_cache[key]))
+            return
+
+        def done(adf, token) -> None:
+            self._diag_cache[key] = adf      # valid even if the view has moved on
+            if not self._adf_slot.current(token):
                 return
             self.trace_stats.setText(base + '   ·   ' + verdict_text(adf))
 
-        def fail(_exc) -> None:
-            if epoch != self._trace_epoch:
+        def fail(_exc, token) -> None:
+            if not self._adf_slot.current(token):
                 return
             self.trace_stats.setText(base + '   ·   ADF n/a')
 
-        if runner().try_submit(lambda: controller.trace_stationarity(tid),
-                               done, fail, description='trace stationarity (ADF)'):
+        # A fit (or another ADF) holding the worker queues the press: the fast line
+        # shows now and the ADF retries once the worker frees, unless the view changed
+        # by then. The dispatch reads the view's epoch and never moves it.
+        if self._adf_slot.submit(
+                lambda: controller.trace_stationarity(tid), done, fail,
+                target=(self._adf_slot.epoch, tid, base), queue=True,
+                notice=lambda: self.trace_stats.setText(base + '   ·   ADF: pending…'),
+                description='trace stationarity (ADF)', bump=False):
             self.trace_stats.setText(base + '   ·   ADF: computing…')
-        else:
-            # A fit (or another ADF) holds the worker: show the fast line now and
-            # retry the ADF once the worker frees, unless the view changed by then.
-            self.trace_stats.setText(base + '   ·   ADF: pending…')
-            run_when_idle(
-                lambda: self._dispatch_adf(tid, base)
-                if epoch == self._trace_epoch else None)
+
+    @property
+    def _trace_epoch(self) -> int:
+        """The trace view's staleness epoch, held by the ADF test's slot."""
+        return self._adf_slot.epoch
 
     def _update_diag(self) -> None:
         self.diag_ax.clear()
@@ -1421,41 +1386,10 @@ class UtilitiesModule(QtWidgets.QWidget):
         if not paths:
             return
         remember_open_dir(self.controller, paths[0])
-        last = None
-        unreadable = []
-        parse_notes = []                         # passive load-time ⓘ notices from parsers
-        malformed = []                           # recognised, but its data is unusable
-        for path in paths:
-            det = self._autodetect_trace(path)
-            if det is None:                      # a parser crashed; already reported
-                continue
-            previews = det.previews
-            if not previews:                     # no instrument matched
-                if det.malformed is not None:
-                    # Recognised as a trace, then diagnosed. Its message is the answer.
-                    malformed.append(det.reason(os.path.basename(path)))
-                    continue
-                previews = self._load_generic_trace(path)
-                if previews is None:             # user canceled the units prompt
-                    break                        # keep already-committed traces visible
-                if not previews:
-                    unreadable.append(os.path.basename(path))
-                    continue
-            collect_parse_notes(previews, path, parse_notes)
-            try:
-                for p in previews:
-                    last = self.controller.add_trace_from_preview(p, source_path=path)
-            except MalformedDataError as exc:
-                # THIS route validates LATE. Its two sibling fallbacks surface a bad
-                # column inside the guarded call -- the DLS one inside
-                # `apply_data_conversion`, the SLS one inside `parse()` -- but a
-                # GenericTraceFilePreview holds its raw columns and defers the unit
-                # conversion to `build()`, which the CONTROLLER calls. Without this arm the
-                # diagnosis arrives outside every `try` this loader has and leaves the Qt
-                # slot as an uncaught exception with no message box at all. Arm order: it
-                # must precede any `except ParseError`, and there is none here.
-                malformed.append(f'{os.path.basename(path)}: {exc}')
-                continue
+        report = load_trace_files(self.controller, paths, detect=self._autodetect_trace,
+                                  generic_fallback=self._load_generic_trace)
+        last, unreadable = report.last_trace_id, report.unreadable
+        parse_notes, malformed = report.parse_notes, report.malformed
         # The two reports are separate on purpose: see _finish_load's docstring in
         # gui/main_window.py. This tab does not go through _finish_load (different tab,
         # different dialog), so it renders its own -- the wording is deliberately parallel.
@@ -1483,19 +1417,15 @@ class UtilitiesModule(QtWidgets.QWidget):
         """Try each instrument trace parser. Returns a `Detection`, or None when a parser
         crashed unexpectedly and the user has already been told (skip this path).
 
-        The loop itself lives in `parsers/autodetect.py`. It used to be a hand-copy of the
+        The detection itself is `app/loading.detect_trace`, the shared loop in
+        `parsers/autodetect.py` over the trace roster. It used to be a hand-copy of the
         main window's, which is how one copy learned a new rule and the other did not,
         leaving a recognised trace file with a bad column reported as "unrecognised
-        format". This method survives only for
-        the Qt arm below, which the shared helper must not have.
-
-        `skip_missing_file=True` preserves this loop's long-standing swallow of
-        FileNotFoundError -- the DLS/SLS routes let it propagate. The divergence is
-        pre-existing and out of scope; it is now a DECLARED argument at one site rather
-        than an implicit difference between two `except` tuples nobody was comparing.
+        format". This method survives only for the Qt arm below, which the loader must
+        not have; the loader calls it back for each file.
         """
         try:
-            return autodetect(path, _TRACE_PARSERS, skip_missing_file=True)
+            return detect_trace(path)
         except Exception as exc:  # noqa: BLE001 — dialog catch, a real bug surfaced; not a ParseError -- a real bug
             QtWidgets.QMessageBox.critical(self, 'Could not load trace', str(exc))
             return None
@@ -1509,7 +1439,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             # Measured: GenericTraceParser.parse() builds its preview from _raw_ columns
             # only, so __post_init__'s require_finite_data never sees one and no
             # MalformedDataError is reachable HERE. It surfaces later, at build() --
-            # which is why load_traces_dialog guards the controller call instead. The
+            # which is why `app/loading.load_trace_files` guards the controller call. The
             # same one-line note its DLS sibling carries, so the next sweep does not have
             # to re-derive it (and does not conclude this route is simply unguarded).
             return []
@@ -1620,40 +1550,20 @@ class UtilitiesModule(QtWidgets.QWidget):
 
         # DLS sizes: populations + correlogram controls
         dls_box = QtWidgets.QGroupBox('DLS Sizes')
-        add_help_to_groupbox(dls_box, 'Sets the correlogram: what sizes are in the '
-                             'sample, and what the correlator does to them.', bullets=[
-            'One population row per mode — one row is monomodal, two are bimodal. '
-            '<b>Weight</b> is read according to the <b>Weight basis</b>; <b>Spread CV</b> '
-            'is the lognormal width (0 = a single exponential).',
-            '<b>Lag axis</b> — <i>Multi-τ</i> is the staircase every real instrument '
-            'emits (the sample time doubles every L channels), so it is the harder and '
-            'more realistic test. <i>Log</i> is evenly spaced and uses <b>Points</b>. '
-            'The choice reaches the <b>Correlogram</b> and <b>Multi-angle DLS</b> '
-            'artifacts; the others keep a uniform grid and still read <b>Points</b>.',
-            '<b>Noise model</b> — <i>Per-channel</i> varies the noise across the axis '
-            'the way a correlator does: quietest through the decay, noisiest in the '
-            'coarsest blocks. <i>Per-channel + shot noise</i> adds the photon-counting '
-            'noise a real count rate brings, read from <b>Mean count rate</b> (for a '
-            'multi-angle set — <b>Multi-angle DLS</b> or <b>Two-mode DLS</b> — the rate '
-            'at 90°; each angle takes its own from the 1/sin θ law, and its trace follows; '
-            'the <b>Mode-resolved</b> set draws at its own static intensities); with a '
-            'real file’s header value it reproduces that file’s replicate scatter. '
-            '<b>Noise level</b> then sets the first channel’s SD. '
-            'It is grounded on the multi-τ axis, where a block’s sample time is a real '
-            'accumulation time; on a <i>Log</i> axis it uses a sample time read off the '
-            'axis, the nearest one that divides each lag a whole number of times.',
-            '<b>Channel noise correlation</b> — 0 draws every channel’s noise '
-            'independently, which no correlator does; real correlograms sit near +0.3. '
-            'Set it to see how a distribution fit behaves under correlated noise. It '
-            'reproduces that one measured statistic, not the instrument’s full '
-            'structure.',
-            '<b>Baseline offset</b> — a flat shift of the whole g₂−1 curve, the '
-            'residual an imperfect correlator baseline leaves behind. Leave it at 0 for '
-            'a textbook correlogram; raise it to see what the floating-baseline cumulant '
-            'fit is for. It reaches the <b>Correlogram</b>, <b>Multi-angle DLS</b> and '
-            '<b>Depolarized (VV/VH)</b> artifacts (on both the VV and the VH channels).',
+        add_help_to_groupbox(dls_box, 'Sets the correlogram: the sizes in the sample '
+                             'and what the correlator does to them.', bullets=[
+            'One population row per mode; <b>Weight</b> is read by the <b>Weight '
+            'basis</b>, <b>Spread CV</b> is the lognormal width (0 = a single '
+            'exponential).',
+            '<b>Lag axis</b>: <i>Log</i> reads <b>Points</b>; <i>Multi-τ</i> reads '
+            'Δt₀, <b>Channels/octave</b> and <b>Blocks</b>.',
+            '<b>Noise level</b> sets the first channel’s SD; the shot-noise '
+            '<b>Noise model</b> also reads <b>Mean count rate</b>.',
+            '<b>Channel noise correlation</b> and <b>Baseline offset</b> each add one '
+            'imperfection of a real correlator; 0 turns it off.',
             'Recover what you put in by analyzing the generated data in the DLS tab; '
             'the ground truth is printed under the preview.',
+            'Every control in full: User-Manual §11.3.1.',
         ])
         dv = QtWidgets.QVBoxLayout(dls_box)
         dv.addWidget(QtWidgets.QLabel(
@@ -1679,7 +1589,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             'How the Weight column is read.\n'
             '• Intensity (default): the scattering amplitude, used directly.\n'
             '• Number / Volume / Surface: the weight is a composition; the intensity is '
-            'forward-modelled with the chosen scattering model so the generated correlogram’s '
+            'forward-modeled with the chosen scattering model so the generated correlogram’s '
             'intensity distribution reweights back to this composition — exercises the '
             'DLS Distribution weighting selector from known ground truth.')
         self.syn_weight_basis.currentIndexChanged.connect(self._on_weight_basis_changed)
@@ -1694,7 +1604,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             'Scattering model used to forward-model intensity from a Number/Volume/Surface '
             'composition. Rayleigh (R⁶) for very small particles; RDG for low contrast; Mie '
             'for the general high-contrast/large case (e.g. latex in water). RDG and Mie use '
-            'the solute refractive index below.')
+            'the solute refractive index in the Solute n field.')
         self.syn_comp_model.currentIndexChanged.connect(self._on_weight_basis_changed)
         self.syn_comp_model_label = QtWidgets.QLabel('Model:')
         brow.addWidget(self.syn_comp_model_label)
@@ -1726,12 +1636,12 @@ class UtilitiesModule(QtWidgets.QWidget):
             self.syn_dls[key] = e
             dform.addRow(f'{label}:', e)
         self.syn_dls['baseline'].setToolTip(
-            'A flat offset added to g₂−1 at every lag — the residual baseline a '
-            'correlator leaves when its measured baseline misses its calculated one. '
-            '0 (the default) is a perfectly baselined correlogram, which no instrument '
-            'gives. Reaches the Correlogram, Multi-angle DLS and Depolarized (VV/VH) '
-            'artifacts; see the Theory-and-Equations-Guide for what the '
-            'floating-baseline cumulant fit does with it.')
+            'A flat offset added to g₂−1 at every lag, the residual a correlator '
+            'leaves when its measured baseline misses its calculated one; 0 is a '
+            'perfect baseline, which no instrument gives. It reaches the Correlogram, '
+            'Multi-angle DLS and Depolarized (VV/VH) artifacts; what the Nonlinear '
+            'cumulant’s floating baseline does with it is '
+            'Theory-and-Equations-Guide §3.2.5.')
         # Lag axis + noise model. Every real instrument emits a multi-tau staircase, so
         # these two selectors decide whether the generated data is as hard to invert as
         # a measurement or systematically easier.
@@ -1741,12 +1651,11 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.syn_lag_axis.setToolTip(
             'Shape of the delay-time axis.\n'
             '• Log (uniform): evenly log-spaced, set by the Points field above.\n'
-            '• Multi-τ: the quasi-logarithmic staircase real correlators emit — the '
-            'sample time doubles every L channels, set by the fields below.\n'
-            'Applies to the Correlogram and Multi-angle DLS artifacts, which then '
-            'ignore Points. Every other artifact (Depolarized, the series batches) '
-            'keeps its uniform grid and still uses Points. '
-            'See the Theory-and-Equations-Guide (synthetic generator).')
+            '• Multi-τ: the staircase real correlators emit, the sample time doubling '
+            'every L channels, set by the fields below.\n'
+            'It reaches the Correlogram, Multi-angle, Two-mode and Mode-resolved '
+            'artifacts; the other DLS artifacts keep a uniform grid on Points '
+            '(Theory-and-Equations-Guide §7.1).')
         self.syn_lag_axis.currentIndexChanged.connect(self._on_lag_axis_changed)
         dform.addRow('Lag axis:', self.syn_lag_axis)
         # The per-channel models offered here are the exact-in-Γ Biganzoli–Ferri pair; the
@@ -1759,21 +1668,13 @@ class UtilitiesModule(QtWidgets.QWidget):
                           'biganzoli_full')):
             self.syn_noise_model.addItem(lbl, key)
         self.syn_noise_model.setToolTip(
-            'How the noise level varies across channels.\n'
-            '• Constant: one SD everywhere — simple, but no correlator behaves this way.\n'
-            '• Per-channel: the SD follows the Biganzoli–Ferri variance in its '
-            'classical limit, falling through the decay and turning up in the coarsest '
-            'blocks. The Noise level above then sets the FIRST channel’s SD.\n'
-            '• Per-channel + shot noise: the same shape plus the photon-counting terms '
-            'that vanish only at infinite count rate — needs the Mean count rate below '
-            '(for a multi-angle set — Multi-angle DLS or Two-mode DLS — the rate at 90°, '
-            'scaled to each angle by 1/sin θ; a Mode-resolved set draws at its own static '
-            'intensities). '
-            'With a real file’s header value it reproduces that file’s replicate scatter.\n'
-            'Both per-channel models draw at the run duration a multi-angle file states '
-            '(60 s), and under every model a multi-angle set’s lag axis must end before it; '
-            'a single correlogram carries none. '
-            'See the Theory-and-Equations-Guide §7.2.')
+            'How the noise SD varies across channels.\n'
+            '• Constant: the Noise level on every channel, which no correlator gives.\n'
+            '• Per-channel: the Biganzoli–Ferri variance’s classical limit; the Noise '
+            'level sets the first channel’s SD.\n'
+            '• Per-channel + shot noise: the same plus photon-counting terms at the '
+            'Mean count rate; a real file’s header rate sets those terms.\n'
+            'Theory-and-Equations-Guide §7.2.')
         self.syn_noise_model.currentIndexChanged.connect(self._on_lag_axis_changed)
         dform.addRow('Noise model:', self.syn_noise_model)
         self.syn_noise = {}
@@ -1782,24 +1683,16 @@ class UtilitiesModule(QtWidgets.QWidget):
             self.syn_noise[key] = e
             dform.addRow(f'{label}:', e)
         self.syn_noise['mean_count_rate_kcps'].setToolTip(
-            'Mean photon count rate of the run, in kcps — the value an instrument writes '
-            'in its file header (an ALV’s MeanCR, a Brookhaven .dat’s mean rate; the '
-            'committed real files carry 58–441 kcps). Read only by the Per-channel + shot '
-            'noise model, where it sets how much photon-counting noise the short lags '
-            'carry: the lower the count rate, the wider the per-channel spread. '
-            'For a multi-angle set (Multi-angle DLS, Two-mode DLS) this is the rate at 90°: '
-            'each angle’s rate follows 1/sin θ from it, its correlogram’s noise is drawn at '
-            'that rate and its trace’s mean matches it, so the committed rates and the '
-            'linked traces agree. A Mode-resolved set draws at its own static intensities '
-            'instead, so the value only selects the model there. '
-            'See the Theory-and-Equations-Guide §7.2.')
+            'Mean photon count rate in kcps, the value a file header states; read only '
+            'by Per-channel + shot noise, where a lower rate widens the short-lag noise. '
+            'For Multi-angle and Two-mode DLS it is the rate at 90°: each angle’s rate '
+            'follows 1/sin θ and its trace’s mean matches; a Mode-resolved set draws at '
+            'its own static intensities (Theory-and-Equations-Guide §7.2).')
         self.syn_noise['noise_correlation'].setToolTip(
-            'Lag-1 correlation between neighbouring channels’ noise, −1 to 1. 0 draws '
-            'every channel independently, which no correlator does; real correlograms '
-            'sit near +0.3. Applied as a first-order autoregression over the channel '
-            'index, which reproduces this one measured statistic and nothing else about '
-            'the covariance — see the Theory-and-Equations-Guide §7.3 before reading a '
-            'result as the instrument’s structure. Applies whatever the noise model.')
+            'Lag-1 correlation between neighboring channels’ noise, −1 to 1, under '
+            'every noise model. 0 draws each channel independently, which no correlator '
+            'does; real correlograms sit near +0.3. It reproduces this one statistic, '
+            'not the instrument’s covariance (Theory-and-Equations-Guide §7.3).')
         self.syn_multitau = {}
         for key, label, default in _SYNTH_MULTITAU:
             e = QtWidgets.QLineEdit(default)
@@ -1836,7 +1729,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             self.syn_sls[key] = e
             sform.addRow(f'{label}:', e)
         self.syn_sls['mw'].setToolTip(
-            'Weight-average molar mass the Zimm / Berry fit should recover from '
+            'Weight-average molecular weight the Zimm / Berry fit should recover from '
             'the generated SLS set.')
         self.syn_sls['rg_nm'].setToolTip(
             'Radius of gyration the Zimm / Berry fit should recover from the '
@@ -1852,24 +1745,19 @@ class UtilitiesModule(QtWidgets.QWidget):
         # Count-rate trace (feeds the "Count-rate trace" artifact)
         trace_box = QtWidgets.QGroupBox('Count-Rate Trace')
         add_help_to_groupbox(trace_box, 'Inputs for the <b>Count-rate trace</b> '
-                             'artifact, the ground truth for the Traces tab’s '
+                             'artifact, the ground truth for the Traces sub-tab’s '
                              'diagnostics.', bullets=[
-            '<b>CV</b> is a fixed relative scatter, not shot noise — a real trace is '
-            'often far noisier than photon statistics allow, which is what the Fano '
-            'factor measures.',
-            '<b>Dust spikes</b> are single-sample multiplicative hits: the impulses '
-            'both outlier overlays are built to find.',
-            'The <b>offset</b> trio plants a step that <i>persists</i> for its '
-            'duration. Make it much longer than the Hampel window and it is absorbed '
-            'into the rolling baseline with no flags at all; make it shorter than '
-            'half the window and it flags. That contrast is the window-sizing '
-            'lesson, reproducible from known ground truth.',
-            'Leave <b>Offset start</b> empty for no offset.',
-            'The <b>sine</b> pair plants a periodic component of known frequency '
-            '— the ground truth for the spectrum and the periodogram. Set a '
-            'frequency and an amplitude, and both should find it; above half the '
-            'sampling rate it aliases to a different frequency, exactly as it '
-            'would on a real instrument.',
+            '<b>CV</b> is a fixed relative scatter, not shot noise: the excess the '
+            'Fano factor measures.',
+            '<b>Dust spikes</b> are single-sample multiplicative hits, the impulses '
+            'both outlier overlays find.',
+            'The <b>offset</b> trio plants a step that <i>persists</i>: much longer '
+            'than the Hampel window it is absorbed into the rolling baseline with no '
+            'flags; shorter than half the window it flags. Leave <b>Offset start</b> '
+            'empty for none.',
+            'The <b>sine</b> pair plants a periodic component of known frequency for '
+            'the spectrum and the periodogram to find; above half the sampling rate '
+            'it aliases, as on a real instrument.',
         ])
         tform = QtWidgets.QFormLayout(trace_box)
         self.syn_trace = {}
@@ -1890,11 +1778,12 @@ class UtilitiesModule(QtWidgets.QWidget):
         add_help_to_groupbox(depol_box, 'Inputs for the <b>Depolarized (VV/VH)</b> artifact '
                              '(static Cabannes + dynamic DDLS).', bullets=[
             'ρ<sub>v</sub> sets the static VV/VH intensity pair (→ δ², Cabannes factor). '
-            'Copy the shown I<sub>VV</sub>/I<sub>VH</sub> into the SLS anisotropy panel.',
+            'Copy the shown I<sub>VV</sub>/I<sub>VH</sub> into the SLS '
+            '<b>Anisotropy correction</b> check.',
             'The <b>shape</b> (rod, ellipsoid or sphere) + its dimensions set the dynamic VV/VH '
             'correlograms with a true D<sub>t</sub> and D<sub>r</sub>, over the shared angle grid.',
             'Rod uses the rigid-rod model (valid 2 &lt; L/d &lt; 30); ellipsoid uses the '
-            'Perrin ellipsoid model. See the Theory-and-Equations-Guide (DPLS).',
+            'Perrin ellipsoid model (Theory-and-Equations-Guide §3.6 and §4.7).',
         ])
         pdform = QtWidgets.QFormLayout(depol_box)
         self.syn_depol = {}
@@ -1904,7 +1793,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             pdform.addRow(f'{label}:', e)
         self.syn_depol['rho_v'].setToolTip(
             'Depolarization ratio ρv = I_VH / I_VV (vertical incident). Physical range '
-            '[0, 3/4); δ² diverges at 3/4. See the Theory-and-Equations-Guide (DPLS).')
+            '[0, 3/4); δ² diverges at 3/4 (Theory-and-Equations-Guide §4.7.2).')
         self.syn_depol['vh_noise'].setToolTip(
             'g₂−1 noise added to the depolarized (VH) channel only — VH is intrinsically '
             'weak, so it is the noisy side. The VV channel is generated clean.')
@@ -1916,7 +1805,7 @@ class UtilitiesModule(QtWidgets.QWidget):
             'Rod → the rigid-rod D_t, D_r model (valid 2 < L/d < 30); ellipsoid → the '
             'Perrin ellipsoid model; sphere → the one-unknown Stokes–Einstein–Debye '
             'model, whose R from D_r and R from D_t must agree. Sets the dynamic VV/VH '
-            'decay rates; see the Theory-and-Equations-Guide.')
+            'decay rates (Theory-and-Equations-Guide §3.6.4–3.6.6).')
         pdform.addRow('Shape:', self.syn_shape_combo)
         self.syn_dim1 = QtWidgets.QLineEdit('60')
         self.syn_dim2 = QtWidgets.QLineEdit('6')
@@ -1973,12 +1862,11 @@ class UtilitiesModule(QtWidgets.QWidget):
         self.syn_dn_dc_in_files = QtWidgets.QCheckBox('Write dn/dc into the SLS file')
         self.syn_dn_dc_in_files.setChecked(True)
         self.syn_dn_dc_in_files.setToolTip(
-            'Untick to generate a dn/dc-less SLS set: the file (and an injected sample) '
-            'carries no dn/dc, so the SLS analysis runs on an arbitrary optical scale '
-            '(K = 1) with Mw and A₂ flagged unreliable while Rg and 2·A₂·Mw survive — '
-            'the same disclosure a real export without a dn/dc gets. The intensities are '
-            'still generated with the dn/dc entered above. See the '
-            'Theory-and-Equations-Guide on the optical constant K.')
+            'Unticked, the saved file and an injected sample carry no dn/dc, so the SLS '
+            'analysis runs on an arbitrary optical scale (K = 1): Mw and A₂ flagged '
+            'unreliable while Rg and 2·A₂·Mw survive, as for a real file with no dn/dc. '
+            'The intensities still use the dn/dc entered above '
+            '(Theory-and-Equations-Guide §1.5.1).')
         gform.addRow('dn/dc:', self.syn_dn_dc_in_files)
         left.addWidget(grid_box)
 
@@ -2069,7 +1957,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         shrow.addWidget(self.syn_show_combo, 1)
         right.addLayout(shrow)
         self.syn_fig = Figure(figsize=(4.3, 3.2))
-        self.syn_canvas = make_canvas_expanding(FigureCanvas(self.syn_fig))
+        self.syn_canvas = make_canvas_expanding(LazyCanvas(self.syn_fig))
         self.syn_ax = self.syn_fig.add_subplot(111)
         right.addWidget(themed_navtoolbar(self.syn_canvas, w, self.controller))
         set_plot_export_name(self.syn_canvas, 'synthetic_preview')
@@ -2134,9 +2022,10 @@ class UtilitiesModule(QtWidgets.QWidget):
         the user switches.
 
         `Points` deliberately stays ENABLED on a multi-tau axis. It is ignored by the
-        two artifacts that take the lag axis (Correlogram, Multi-angle DLS) but is still
-        read by every other DLS-emitting artifact — Depolarized (VV/VH), the
-        form-factor series, the full set — which build their own uniform grid. Greying
+        four artifacts that take the lag axis (Correlogram, Multi-angle DLS, Two-mode
+        DLS, the Mode-resolved linked set) but is still read by every other DLS-emitting
+        artifact — Depolarized (VV/VH), the form-factor series, the full set — which
+        build their own uniform grid. Greying
         it out while those artifacts consume it was the state a reviewer caught: a
         disabled control that still drives output is worse than a live one whose scope
         the help explains.
@@ -2261,7 +2150,8 @@ class UtilitiesModule(QtWidgets.QWidget):
     def _synth_generate(self) -> None:
         try:
             cond = {k: float(e.text()) for k, e in self.syn_cond.items()}
-            ctx = dict(
+            poly, solv = self._synth_identity()
+            request = synthetic.SynthRequest(
                 wl=cond['wavelength_nm'], n=cond['solvent_refractive_index'],
                 T=self._synth_temperature_K(), eta=self._synth_viscosity_Pa_s(),
                 angle=float(self.syn_dls['angle_deg'].text()),
@@ -2276,7 +2166,7 @@ class UtilitiesModule(QtWidgets.QWidget):
                 dn_dc=float(self.syn_sls['dn_dc'].text()),
                 angles=self._synth_floats(self.syn_angles.text()),
                 concs=[c * 1e-3 for c in self._synth_floats(self.syn_concs.text()) if c > 0],
-                calibrated=self.syn_cal_default.isChecked(),
+                with_calibration=self.syn_cal_default.isChecked(),
                 dn_dc_in_files=self.syn_dn_dc_in_files.isChecked(),
                 seed=(int(self.syn_seed.text().strip()) if self.syn_seed.text().strip() else None),
                 rho_v=float(self.syn_depol['rho_v'].text()),
@@ -2294,9 +2184,9 @@ class UtilitiesModule(QtWidgets.QWidget):
                 comp_solute_ri=(float(self.syn_comp_solute_ri.text())
                                 if self.syn_comp_solute_ri.text().strip() else None),
                 trace_kw=self._synth_trace_kw(),
+                specs=self._read_pop_specs(),
+                polymer=poly, solvent=solv,
             )
-            specs = self._read_pop_specs()
-            poly, solv = self._synth_identity()
         except Exception as exc:  # noqa: BLE001 — dialog catch
             QtWidgets.QMessageBox.warning(self, 'Check your inputs', str(exc))
             return
@@ -2318,7 +2208,7 @@ class UtilitiesModule(QtWidgets.QWidget):
         folder = self.syn_folder.text().strip()
         eta_cp = self._synth_viscosity_Pa_s() * 1e3
         do_inject = self.syn_ws_check.isChecked()
-        inj_conc0 = ctx['concs'][0] if ctx['concs'] else 0.6 * 1e-3
+        inj_conc0 = request.concs[0] if request.concs else 0.6 * 1e-3
         inj_T = self._synth_temperature_K()
         inj_eta = self._synth_viscosity_Pa_s()
         preview_keys = [k for k in active
@@ -2333,15 +2223,15 @@ class UtilitiesModule(QtWidgets.QWidget):
             for key in active:
                 if key == 'full_set':
                     continue            # written directly at save time
-                built[key] = self._synth_build_one(key, specs, ctx, poly, solv)
+                built[key] = synthetic.build(self.controller, key, request)
             out = {'built': built}
             try:
-                out['saved'] = self._synth_save(save_keys, built, folder, eta_cp)
+                out['saved'] = synthetic.save(self.controller, save_keys, built, folder, eta_cp)
             except Exception as exc:                         # noqa: BLE001 — carried to done() as save_exc
                 out['save_exc'] = exc
             return out
 
-        def done(out) -> None:
+        def done(out, _token) -> None:
             built = out['built']
             self._syn_built = built
             if 'save_exc' in out:
@@ -2352,14 +2242,14 @@ class UtilitiesModule(QtWidgets.QWidget):
                 parts = []
                 n_before = len(self.controller.workspace.measurements)
                 try:
-                    single = self._synth_inject(
-                        built, ctx['calibrated'], poly, solv,
+                    single = synthetic.inject(
+                        self.controller, built, request.with_calibration, poly, solv,
                         inj_conc0, inj_T, inj_eta)
                     if single:
                         parts.append(single)
                     # Architecture is a multi-sample batch — it injects a whole Linear +
                     # Branched series (each tagged Chain-type), NOT the single active
-                    # sample, so it runs its own path rather than through _synth_inject.
+                    # sample, so it runs its own path rather than through synthetic.inject.
                     if 'architecture' in active:
                         inj = self.controller.inject_architecture_series(solvent_name=solv)
                         parts.append(f'architecture series ({len(inj)} samples, '
@@ -2401,294 +2291,14 @@ class UtilitiesModule(QtWidgets.QWidget):
             if extra:
                 self.syn_truth.setText(self.syn_truth.text() + '   —   ' + '; '.join(extra))
 
-        def fail(exc: BaseException) -> None:
+        def fail(exc: BaseException, _token) -> None:
             QtWidgets.QMessageBox.warning(self, 'Generate failed', str(exc))
 
-        if not runner().try_submit(work, done, fail,
-                                   description='synthetic data generation',
-                                   busy_widgets=(self.syn_gen_button,)):
-            busy_notice(self)          # the status-bar notice every other tab gives
-
-    def _synth_build_one(self, key, specs, ctx, poly, solv):
-        c = self.controller
-        # A non-intensity weight basis (Number/Volume/Surface) treats the population
-        # weights as a composition: forward-model the intensity (Rayleigh, angle-
-        # independent) so a generated DLS set reweights back to this composition. Only the
-        # DLS correlogram artifacts consume the size populations, so convert just for them.
-        basis = ctx.get('weight_basis', 'intensity')
-        if key in ('correlogram', 'multi_dls') and basis != 'intensity' and specs:
-            angle = ctx['angle'] if key == 'correlogram' else (
-                ctx['angles'][0] if ctx['angles'] else 90.0)
-            comp_model = ctx.get('comp_model', 'rayleigh')
-            # RDG/Mie form the contrast m from the solute RI; Rayleigh ignores it. Distinguish
-            # "not entered" (None) from "entered a non-physical value" (0, negative, or a
-            # non-finite inf/nan) so the error is honest rather than reporting an entered 0
-            # as "missing".
-            n_sol = ctx.get('comp_solute_ri')
-            m = None
-            if comp_model in ('rdg', 'mie'):
-                if n_sol is None:
-                    raise ValueError(
-                        f"The {comp_model.upper()} composition model needs the solute refractive "
-                        "index (enter it next to the weight basis).")
-                if not (math.isfinite(n_sol) and n_sol > 0):
-                    raise ValueError(
-                        f"The solute refractive index must be a positive finite number, "
-                        f"got {n_sol:g}.")
-                m = n_sol / ctx['n']
-            specs = c.synth_composition_to_intensity_specs(
-                specs, basis, angle_deg=angle, wavelength_nm=ctx['wl'],
-                n_solvent=ctx['n'], model=comp_model, m=m)
-        if key == 'correlogram':
-            if not specs:
-                raise ValueError('Add at least one size population for the correlogram.')
-            return c.synth_correlogram(
-                specs, angle_deg=ctx['angle'], wavelength_nm=ctx['wl'],
-                solvent_refractive_index=ctx['n'], temperature_K=ctx['T'],
-                viscosity_Pa_s=ctx['eta'], beta=ctx['beta'], noise_level=ctx['noise'],
-                baseline=ctx['baseline'],
-                n_points=ctx['npts'], seed=ctx['seed'], **ctx['axis_kw'])
-        if key == 'trace':
-            return c.synth_trace(seed=ctx['seed'], label=f'{poly} / {solv}',
-                                 **ctx['trace_kw'])
-        if key == 'depolarized':
-            if not ctx['angles']:
-                raise ValueError('Enter at least one angle for the DDLS set.')
-            # Same concentration rule as 'multi_dls' below: the VV/VH correlograms are the
-            # sample's DLS side, so they carry the entered c rather than 0, and the Data
-            # tab shows one concentration across the sample's DLS and SLS rows.
-            return c.synth_depolarized(
-                rho_v=ctx['rho_v'], shape=ctx['shape'], dims_nm=ctx['dims_nm'],
-                angles_deg=ctx['angles'], wavelength_nm=ctx['wl'], n_solvent=ctx['n'],
-                temperature_K=ctx['T'], viscosity_Pa_s=ctx['eta'], beta=ctx['beta'],
-                vh_noise_level=ctx['vh_noise'], n_points=ctx['npts'], seed=ctx['seed'],
-                label=f'{poly} {solv} DDLS',
-                concentration_g_per_mL=(ctx['concs'][0] if ctx['concs'] else 6e-4),
-                baseline=ctx['baseline'])
-        if key == 'mode_resolved':
-            # The linked set (two-mode correlograms + exact-mean traces +
-            # per-angle static truth from ONE partition ground truth). The
-            # truth knobs are fixed (slow Rg 120 nm, fast fraction 0.3 at
-            # q -> 0, crossing at 82°) -- the linkage is the point, the same
-            # fixed-parameter idiom as 'two_mode' above.
-            if not ctx['angles']:
-                raise ValueError('Enter at least one angle.')
-            conc0 = ctx['concs'][0] if ctx['concs'] else 5e-3
-            return c.synth_mode_resolved_tuple(
-                angles_deg=ctx['angles'], wavelength_nm=ctx['wl'],
-                n_solvent=ctx['n'], temperature_K=ctx['T'],
-                viscosity_Pa_s=ctx['eta'], beta=ctx['beta'],
-                noise_level=ctx['noise'], n_points=ctx['npts'],
-                concentration_g_per_mL=conc0, seed=ctx['seed'],
-                polymer_name=poly, solvent_name=solv,
-                label=f'{poly} in {solv} (mode-resolved)', **ctx['axis_kw'])
-        if key == 'architecture':
-            # The ground-truth series spec (a small dict) — drives the preview + readout;
-            # the heavy per-sample build happens at save/inject time.
-            return c.synth_architecture_series()
-        if key == 'form_factor':
-            return c.synth_form_factor_series()
-        if key == 'multi_dls':
-            if not specs:
-                raise ValueError('Add at least one size population for the DLS set.')
-            if not ctx['angles']:
-                raise ValueError('Enter at least one angle.')
-            conc0 = ctx['concs'][0] if ctx['concs'] else 6e-4
-            return c.synth_multi_angle_dls(
-                specs, angles_deg=ctx['angles'], wavelength_nm=ctx['wl'],
-                solvent_refractive_index=ctx['n'], temperature_K=ctx['T'],
-                viscosity_Pa_s=ctx['eta'], beta=ctx['beta'], noise_level=ctx['noise'],
-                baseline=ctx['baseline'],
-                n_points=ctx['npts'], label=f'{poly} in {solv}',
-                concentration_g_per_mL=conc0, seed=ctx['seed'], **ctx['axis_kw'])
-        if key == 'two_mode':
-            # A diffusive fast mode (the entered β/noise apply) sweeping past a
-            # q-independent slow mode crossing at 82° with amplitudes 0.6/0.4 —
-            # fixed here rather than via new inputs (the crossing is the point;
-            # the same fixed-parameter idiom as the ellipsoid's axial ratio 3).
-            if not ctx['angles']:
-                raise ValueError('Enter at least one angle.')
-            conc0 = ctx['concs'][0] if ctx['concs'] else 6e-4
-            return c.synth_two_mode_dls(
-                angles_deg=ctx['angles'], wavelength_nm=ctx['wl'],
-                n_solvent=ctx['n'], temperature_K=ctx['T'],
-                viscosity_Pa_s=ctx['eta'], beta=ctx['beta'],
-                noise_level=ctx['noise'], n_points=ctx['npts'],
-                label=f'{poly} in {solv} (two-mode)',
-                concentration_g_per_mL=conc0, seed=ctx['seed'],
-                **ctx['axis_kw'])
-        if key.startswith('sls'):
-            if not ctx['angles']:
-                raise ValueError('Enter at least one angle.')
-            if not ctx['concs']:
-                raise ValueError('Enter at least one (non-zero) concentration.')
-            ff_model = 'guinier'
-            ax_ratio = 1.0
-            if key == 'sls_zimm':
-                a_list, c_list, kind = ctx['angles'], ctx['concs'], 'zimm'
-            elif key == 'sls_ff_sphere':
-                # A full Zimm grid whose intensities carry the FULL sphere P(q), so the
-                # Form factor P(q) fit is exercised end-to-end from in-app ground truth.
-                a_list, c_list, kind, ff_model = ctx['angles'], ctx['concs'], 'zimm', 'sphere'
-            elif key == 'sls_ff_debye':
-                a_list, c_list, kind, ff_model = ctx['angles'], ctx['concs'], 'zimm', 'debye'
-            elif key == 'sls_ff_ellipsoid':
-                # A prolate ellipsoid (axial ratio 3) so the Ellipsoid P(q) fit is exercised
-                # end-to-end and its prolate/oblate degeneracy is reachable from in-app ground
-                # truth. (Fixed here rather than via a new input — the shape is the point.)
-                a_list, c_list, kind, ff_model = ctx['angles'], ctx['concs'], 'zimm', 'ellipsoid'
-                ax_ratio = 3.0
-            elif key == 'sls_ff_mie':
-                # A latex-in-water-like high-contrast Mie sphere (relative index m ~ 1.19, a
-                # fixed representative solute RI 1.585 over the chosen solvent n), so the full-Mie
-                # P(q) fit is exercised end-to-end from in-app ground truth in the regime RDG and
-                # the analytic sphere cannot reach. (Fixed here rather than via a new input — the
-                # high contrast is the point; enter the solute RI 1.585 on the Data tab to fit it.)
-                a_list, c_list, kind, ff_model = ctx['angles'], ctx['concs'], 'zimm', 'mie'
-                mie_m = 1.585 / ctx['n']
-                return c.synth_sls_set(
-                    mw=ctx['mw'], rg_nm=ctx['rg'], a2_mol_mL_per_g2=ctx['a2'], angles_deg=a_list,
-                    concentrations_g_per_mL=c_list, wavelength_nm=ctx['wl'],
-                    temperature_K=ctx['T'], n_solvent=ctx['n'], dn_dc=ctx['dn_dc'],
-                    calibrated=ctx['calibrated'], dn_dc_in_files=ctx['dn_dc_in_files'],
-                    noise_level=ctx['noise'], seed=ctx['seed'],
-                    polymer_name=poly, solvent_name=solv, label=f'{poly} in {solv}',
-                    kind=kind, form_factor_model='mie', m=mie_m)
-            elif key == 'sls_ff_core_shell':
-                # A representative coated particle (silica-like core n ~ 1.45 in a polymer
-                # shell n ~ 1.40, R_core = 40 nm, R_outer = 70 nm) so the core-shell P(q) fit
-                # -- and its two-radius degeneracy -- is reachable end-to-end from in-app ground
-                # truth. (Fixed here rather than via new inputs -- the coated structure is the
-                # point; enter the core [solute] RI 1.45 and shell RI 1.40 on the Data tab to
-                # fit it. The best solution recovers R_core / R_outer exactly.)
-                n_core, n_shell = 1.45, 1.40
-                return c.synth_sls_set(
-                    mw=ctx['mw'], rg_nm=ctx['rg'], a2_mol_mL_per_g2=ctx['a2'],
-                    angles_deg=ctx['angles'], concentrations_g_per_mL=ctx['concs'],
-                    wavelength_nm=ctx['wl'], temperature_K=ctx['T'], n_solvent=ctx['n'],
-                    dn_dc=ctx['dn_dc'], calibrated=ctx['calibrated'],
-                    dn_dc_in_files=ctx['dn_dc_in_files'], noise_level=ctx['noise'],
-                    seed=ctx['seed'], polymer_name=poly, solvent_name=solv,
-                    label=f'{poly} in {solv}', kind='zimm', form_factor_model='core_shell',
-                    r_core_nm=40.0, r_outer_nm=70.0,
-                    m1=n_core / ctx['n'], m2=n_shell / ctx['n'])
-            elif key == 'sls_single_conc':
-                a_list, c_list, kind = ctx['angles'], [ctx['concs'][0]], 'single_concentration'
-            else:   # sls_single_angle: the angle nearest 90°
-                a_near = min(ctx['angles'], key=lambda x: abs(x - 90.0))
-                a_list, c_list, kind = [a_near], ctx['concs'], 'single_angle'
-            return c.synth_sls_set(
-                mw=ctx['mw'], rg_nm=ctx['rg'], a2_mol_mL_per_g2=ctx['a2'], angles_deg=a_list,
-                concentrations_g_per_mL=c_list, wavelength_nm=ctx['wl'], temperature_K=ctx['T'],
-                n_solvent=ctx['n'], dn_dc=ctx['dn_dc'], calibrated=ctx['calibrated'],
-                dn_dc_in_files=ctx['dn_dc_in_files'],
-                noise_level=ctx['noise'], seed=ctx['seed'], polymer_name=poly,
-                solvent_name=solv, label=f'{poly} in {solv}', kind=kind,
-                form_factor_model=ff_model, ellipsoid_axial_ratio=ax_ratio)
-        raise ValueError(f'Unknown artifact {key!r}.')
-
-    def _synth_save(self, save_keys, built, folder: str, eta_cp: float) -> List[str]:
-        """Write the save-ticked artifacts. Takes plain values (no widget reads) so
-        it can run on the worker thread; the caller hoists the folder/viscosity."""
-        if not save_keys:
-            return []
-        if not folder:
-            raise ValueError('Choose a "Save to" folder first.')
-        os.makedirs(folder, exist_ok=True)
-        c = self.controller
-        saved = []
-        for key in save_keys:
-            if key == 'full_set':
-                for prof in ('Synthetic Clean', 'Synthetic Messy'):
-                    c.generate_full_test_set(os.path.join(folder, prof), prof)
-                    saved.append(prof)
-                continue
-            if key == 'architecture':
-                c.save_synth_architecture(os.path.join(folder, 'Architecture'))
-                saved.append('Architecture/')
-                continue
-            if key == 'mode_resolved':
-                c.save_synth_mode_resolved(
-                    built['mode_resolved'],
-                    os.path.join(folder, 'Mode-Resolved'),
-                    viscosity_Pa_s=eta_cp / 1e3)
-                saved.append('Mode-Resolved/')
-                continue
-            if key == 'form_factor':
-                c.save_synth_form_factor(os.path.join(folder, 'Form-Factor'))
-                saved.append('Form-Factor/')
-                continue
-            if key == 'depolarized':
-                for p in c.save_synth_depolarized(built['depolarized'], folder,
-                                                  viscosity_cp=eta_cp):
-                    saved.append(os.path.basename(p))
-                continue
-            path = os.path.join(folder, _SYNTH_FILENAMES[key])
-            obj = built[key]
-            if key == 'correlogram':
-                c.export_synthetic(obj, path)
-            elif key == 'trace':
-                c.save_synth_trace(obj, path)
-            elif key == 'multi_dls':
-                c.save_synth_multi_angle_dls(obj, path, viscosity_cp=eta_cp)
-            elif key == 'two_mode':
-                # A TwoModeDLS wraps an ordinary MultiAngleDLS; the ground
-                # truth stays in-app (the preview names it), the file is a
-                # normal multi-angle .ASC any DLS loader reads.
-                c.save_synth_multi_angle_dls(obj.data, path, viscosity_cp=eta_cp)
-            else:    # sls_*
-                c.save_synth_sls_set(obj, path)
-            saved.append(os.path.basename(path))
-        return saved
-
-    def _synth_inject(self, built, calibrated, poly, solv, conc0, T, eta) -> str:
-        """Inject a coherent single sample: the primary DLS artifact (multi-angle
-        preferred), the primary SLS artifact (Zimm preferred), and any trace.
-        Injecting every SLS slice would pile duplicate concentrations into one
-        sample, so only the primary of each kind is added.
-
-        Takes plain values (no widget reads) so it runs on the worker; the caller
-        emits workspaceChanged + refreshes the trace list on the main thread once
-        this returns (mutating the workspace here is safe under the single-flight
-        guard)."""
-        c = self.controller
-        parts = []
-        if 'multi_dls' in built:
-            c.inject_multi_angle_dls(built['multi_dls'], polymer_name=poly, solvent_name=solv)
-            parts.append('multi-angle DLS')
-        elif 'two_mode' in built:
-            c.inject_multi_angle_dls(built['two_mode'].data, polymer_name=poly,
-                                     solvent_name=solv)
-            parts.append('two-mode DLS')
-        elif 'correlogram' in built:
-            c.inject_correlogram(built['correlogram'], polymer_name=poly, solvent_name=solv,
-                                 concentration_g_per_mL=conc0, temperature_K=T,
-                                 viscosity_Pa_s=eta)
-            parts.append('correlogram')
-        if 'depolarized' in built:
-            c.inject_depolarized(built['depolarized'], polymer_name=poly, solvent_name=solv)
-            parts.append('depolarized VV/VH (DDLS)')
-        if 'mode_resolved' in built:
-            n = len(c.inject_mode_resolved_tuple(
-                built['mode_resolved'], polymer_name=poly, solvent_name=solv))
-            parts.append(f'mode-resolved linked set ({n} DLS runs with '
-                         f'traces incl. the c = 0 blank, + calibrant trace)')
-        sls_added = False
-        for key in ('sls_zimm', 'sls_ff_sphere', 'sls_ff_debye', 'sls_ff_ellipsoid',
-                    'sls_ff_mie', 'sls_ff_core_shell', 'sls_single_conc', 'sls_single_angle'):
-            if key in built:
-                c.inject_sls_set(built[key], polymer_name=poly, solvent_name=solv,
-                                 prefill_calibration=calibrated)
-                parts.append(key.replace('sls_', 'SLS '))
-                sls_added = True
-                break
-        if 'trace' in built:
-            c.inject_trace(built['trace'], label=f'{poly} / {solv}')
-            parts.append('trace')
-        if not parts:
-            return ''
-        cal_note = ' (session calibration set)' if (calibrated and sls_added) else ''
-        return f'added to workspace as “{poly} / {solv}”: ' + ', '.join(parts) + cal_note
+        # A busy press is refused with the status-bar notice (`busy_notice`).
+        self._generate_slot.submit(work, done, fail, target=None, queue=False,
+                                   busy_widgets=(self.syn_gen_button,),
+                                   notice=lambda: busy_notice(self),
+                                   description='synthetic data generation', paint=False)
 
     # ---- preview ----
     def _synth_show_changed(self) -> None:

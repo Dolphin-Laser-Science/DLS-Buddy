@@ -17,29 +17,28 @@ module controls; Restore defaults resets to the factory `SettingsState` and appl
 
 from __future__ import annotations
 
-import math
-
 from PySide6 import QtCore, QtWidgets
 
-from app import units as U
-from app.controller import distribution_weighting_request
 from app.settings import SettingsState
+from core import units as U
 from gui.help import HelpBadge
 from gui.solvent_picker import index_of_solvent, populate_solvent_combo
-from gui.widgets import first_selectable_index
 from gui.theme import ThemedLabel
 from gui.worker import busy_notice, runner
+from gui.distribution_fit_fields import (  # noqa: F401 -- re-exported for importers
+    RESIDUAL_WEIGHTING_CHOICES, RESIDUAL_WEIGHTING_TOOLTIP, DISTRIBUTION_SEED_FIELDS,
+    ALPHA_SELECTION_CHOICES, DistributionFitFields, _seed_combo)
 
 # Calculation-nuance tooltips for the unit choices whose reach is easy to
-# misjudge (spec 04 stage 2 extended both to the SLS axes).
+# misjudge, both reaching the SLS axes as well as the DLS ones.
 _PLOT_UNIT_TIPS = {
     'scattering_q2':
-        'Applies to every q² axis: the DLS Γ-vs-q² and DDLS plots AND the SLS '
+        'Applies to every q² axis: the DLS Γ vs q² and DDLS plots AND the SLS '
         'plots (Rayleigh ratio, Debye, Guinier, form factors, Zimm — whose '
         'printed spacing constant k follows this unit). Fitted results are '
         'unaffected; only axes rescale.',
     'concentration':
-        'Applies to the concentration axes: the DLS D-vs-c plot and the SLS '
+        'Applies to the concentration axes: the DLS D vs c plot and the SLS '
         'calibration-free A₂ plot. Legend concentration labels always read '
         'mg/mL, whatever the axis unit.',
 }
@@ -54,7 +53,7 @@ _PLOT_UNIT_ROWS = [
     ('decay_rate', 'Decay rate Γ'),
     ('concentration', 'Concentration'),
     ('radius', 'Radius (R<sub>h</sub> / R<sub>g</sub>)'),
-    ('molar_mass', 'Molar mass M<sub>w</sub>'),
+    ('molar_mass', 'Molecular weight M<sub>w</sub>'),
 ]
 
 # The clear-and-warn prompt's words for the cumulant residual-weighting policy tokens; an
@@ -64,386 +63,6 @@ _WEIGHTING_PROMPT_LABELS = {'sourced': 'sourced', 'uniform': 'unweighted'}
 
 def _weighting_label(token) -> str:
     return _WEIGHTING_PROMPT_LABELS.get(token, str(token))
-
-
-# The residual-weighting forms the CONTIN / NNLS / lognormal distribution fits offer, as
-# (label, policy token) pairs. ONE roster: the seed combo below and the DLS Distribution
-# tab's per-run combo are both populated from it, so the same choice cannot be worded two
-# ways (style guide §9). The tokens are the keys of the controller's
-# DISTRIBUTION_WEIGHTING_POLICIES, which maps each to an engine request; a further form is
-# one row here plus one policy there, and nothing reads this roster by position or length.
-RESIDUAL_WEIGHTING_CHOICES = (
-    ('Sourced variance (default)', 'sourced'),
-    ('g₁² (older form)', 'g1-squared'),
-)
-
-# The calculation-nuance tooltip both those combos carry, in one place for the same reason
-# the roster is: two surfaces for one choice must say the same thing about it.
-RESIDUAL_WEIGHTING_TOOLTIP = (
-    'Which residual weight the distribution fits (CONTIN, NNLS, lognormal) measure their '
-    'fit error in.\n'
-    '• Sourced variance (default): weights each channel by the variance a correlator '
-    'actually has at that lag, and reads the weight’s signal factor from a first-pass '
-    'fit — so each fit runs twice and takes about twice as long.\n'
-    '• g₁² (older form): takes the noise as equal on every channel. Choose it to '
-    'reproduce a distribution reported before this version.\n'
-    'Without a committed mean count rate the sourced weight uses the '
-    'infinite-count-rate limit of its variance model; committing one adds the '
-    'photon-counting terms to the weight. See the Theory-and-Equations-Guide '
-    '(distribution methods).'
-)
-
-
-#: The distribution fits' seed fields, in `SettingsState`'s own names. `DistributionFitFields`
-#: carries values under these names on every surface, so a Settings collect, a reseed from
-#: Settings and a copy between two tabs are one operation with no renaming step between them.
-DISTRIBUTION_SEED_FIELDS = (
-    'rh_grid_min_nm', 'rh_grid_max_nm', 'rh_grid_points', 'distribution_weighting',
-    'lcurve_alpha_min', 'lcurve_alpha_max', 'contin_alpha_method',
-    'contin_ftest_prob_reject', 'contin_gcv_gamma')
-
-#: The CONTIN α selectors, as (label, token) pairs -- one roster for every surface that
-#: offers the choice.
-ALPHA_SELECTION_CHOICES = (
-    ('GCV (generalized cross-validation)', 'gcv'),
-    ('L-curve corner', 'lcurve'),
-    ('F-test (probability to reject)', 'ftest'),
-)
-
-
-class DistributionFitFields(QtCore.QObject):
-    """The distribution fits' input fields -- the Rh grid, the residual weighting, and
-    CONTIN's α selector, α range, robust-GCV γ and F-test level -- built in ONE place and
-    placed by each surface that holds them: the Settings tab (as the seeds), and the DLS
-    Distribution sub-tab and Mode Map (as per-run fields seeded from those seeds). One
-    set of widgets, ranges and tooltips, so the surfaces cannot drift apart.
-
-    Values travel under the `SettingsState` field names (`DISTRIBUTION_SEED_FIELDS`):
-    `values` reads them, `seed` writes them, and `fit_kwargs` maps them to the engine's
-    keywords for one method. Each numeric field keeps the exact value it was seeded with
-    until the user moves it -- a spin box clamps and rounds on `setValue`, and a seed
-    finer than its grid must run, and round-trip through Settings, unchanged (the Settings
-    tab's `_cumulant_cutoff_value` is the same rule).
-
-    ``seeds=True`` builds the Settings tab's copy: a value the roster does not offer (a
-    hand-edited settings.json) is kept as an extra entry so an untouched Update writes it
-    back, and every row stays shown, since each is a seed in its own right. A per-run copy
-    seeds such a token's first row instead -- the controller refuses the token by name on
-    any path this widget does not fill -- and shows only the selected α selector's own
-    control (owner: show/hide, not gray-out).
-    """
-
-    #: Any field moved -- by the user or by `seed`, which emits once per call.
-    changed = QtCore.Signal()
-
-    # key -> the default form-row label. `add_rows` places rows in this order.
-    _ROW_LABELS = {
-        'rh_grid': 'R<sub>h</sub> grid (min / max / pts):',
-        'weighting': 'Residual weighting:',
-        'alpha_method': 'CONTIN α selection:',
-        'alpha_range': 'CONTIN α (min / max):',
-        'gcv_gamma': 'GCV robustness γ:',
-        'ftest': 'F-test probability to reject:',
-    }
-    _CONTIN_ROWS = ('alpha_method', 'alpha_range', 'gcv_gamma', 'ftest')
-
-    def __init__(self, parent: QtWidgets.QWidget, *, seeds: bool = False) -> None:
-        super().__init__(parent)
-        self._seeds = seeds
-        self._seeding = False
-        self._contin_shown = True
-        self._loaded: dict = {}      # field -> the exact value last seeded
-        self._shown: dict = {}       # field -> what its widget showed right after seeding
-        self._rows: dict = {}        # key -> (label widget or None, field widget)
-
-        self.rh_min = QtWidgets.QDoubleSpinBox()
-        self.rh_min.setRange(0.01, 1.0e5); self.rh_min.setDecimals(2)
-        self.rh_max = QtWidgets.QDoubleSpinBox()
-        self.rh_max.setRange(0.01, 1.0e5); self.rh_max.setDecimals(1)
-        self.rh_points = QtWidgets.QSpinBox(); self.rh_points.setRange(10, 1000)
-        # A cost hint, not a cap: the range stays 10-1000 (owner-ruled 2026-08-26).
-        self.rh_points.setToolTip(
-            'Grid resolution of the inversion. CONTIN’s automatic α selection solves a '
-            'dense system of this size about 40 times, so the cost climbs steeply with '
-            'the point count — roughly half a second at 100 points, ~5 s at 300 and '
-            '~30 s at 1000 with the default GCV selector on a typical laptop (the '
-            'L-curve corner is cheaper but climbs the same way). The fit runs in the '
-            'background, so the window stays usable.')
-        self._grid_holder = QtWidgets.QWidget()
-        grow = QtWidgets.QHBoxLayout(self._grid_holder); grow.setContentsMargins(0, 0, 0, 0)
-        for w in (self.rh_min, self.rh_max, self.rh_points):
-            grow.addWidget(w)
-        # The residual weighting of the FIT: which noise model its error is measured in.
-        # All three methods take it, so it is never hidden with the CONTIN-only rows.
-        self.residual_weighting = QtWidgets.QComboBox()
-        for label, token in RESIDUAL_WEIGHTING_CHOICES:
-            self.residual_weighting.addItem(label, token)
-        self.residual_weighting.setToolTip(RESIDUAL_WEIGHTING_TOOLTIP)
-        self.alpha_method = QtWidgets.QComboBox()
-        for label, token in ALPHA_SELECTION_CHOICES:
-            self.alpha_method.addItem(label, token)
-        self.alpha_method.setToolTip(
-            'How CONTIN chooses its regularization α automatically.\n'
-            '• GCV (default): generalized cross-validation, robust by default (γ = 0.1, '
-            'built for correlated channel noise); γ = 1 is classical GCV.\n'
-            '• L-curve corner: the corner of the fit-vs-size trade-off curve, located by '
-            'adaptive pruning of the sampled sweep; insensitive to the α range as long '
-            'as the range spans the corner — the sweep-edge notes say when it does not.\n'
-            '• F-test: the smoothest solution whose fit is not significantly worse than '
-            'the best — for comparison against legacy CONTIN output.\n'
-            'See the Theory-and-Equations-Guide (CONTIN).')
-        self.alpha_min = QtWidgets.QLineEdit()
-        self.alpha_max = QtWidgets.QLineEdit()
-        self._alpha_range_holder = QtWidgets.QWidget()
-        arow = QtWidgets.QHBoxLayout(self._alpha_range_holder)
-        arow.setContentsMargins(0, 0, 0, 0)
-        for w in (self.alpha_min, self.alpha_max):
-            arow.addWidget(w)
-        # The range sits inside the engine's (0, 1] guard, so this control cannot ask for
-        # a refused γ.
-        self.gcv_gamma = QtWidgets.QDoubleSpinBox()
-        self.gcv_gamma.setRange(0.01, 1.00)
-        self.gcv_gamma.setSingleStep(0.01)
-        self.gcv_gamma.setDecimals(2)
-        self.gcv_gamma.setToolTip(
-            'Robustness parameter γ of robust GCV. 0.1, the default, is the value its '
-            'sources use; 1 is classical GCV. Below 1 the selector weighs the '
-            'solution’s variance and smooths more, the repair for correlated channel '
-            'noise. See the Theory-and-Equations-Guide (CONTIN, robust GCV).')
-        self.ftest_prob = QtWidgets.QDoubleSpinBox()
-        self.ftest_prob.setRange(0.01, 0.99)
-        self.ftest_prob.setSingleStep(0.05)
-        self.ftest_prob.setDecimals(2)
-        self.ftest_prob.setToolTip(
-            'F-test significance level (default 0.50). A HIGHER value '
-            'accepts more fit degradation and so selects a SMOOTHER, more parsimonious '
-            'distribution; a LOWER value keeps a rougher, more-detailed one.')
-        self._fields = {
-            'rh_grid': self._grid_holder, 'weighting': self.residual_weighting,
-            'alpha_method': self.alpha_method, 'alpha_range': self._alpha_range_holder,
-            'gcv_gamma': self.gcv_gamma, 'ftest': self.ftest_prob}
-
-        for box in (self.rh_min, self.rh_max, self.rh_points, self.gcv_gamma,
-                    self.ftest_prob):
-            box.valueChanged.connect(self._emit_changed)
-        for combo in (self.residual_weighting, self.alpha_method):
-            combo.currentIndexChanged.connect(self._emit_changed)
-        for edit in (self.alpha_min, self.alpha_max):
-            edit.textChanged.connect(self._emit_changed)
-            # Refused where it is typed: an α the engine would refuse reverts to the last
-            # accepted text when the edit finishes (the Correlogram region fields' house
-            # pattern), with the reason shown at the field.
-            edit.editingFinished.connect(lambda e=edit: self._check_alpha_edit(e))
-        self._accepted_alpha: dict = {}   # edit -> the last text it held that was valid
-        self.alpha_method.currentIndexChanged.connect(self._update_row_visibility)
-
-    # ---- placement ----
-    def add_rows(self, form: QtWidgets.QFormLayout, keys=None, labels=None) -> None:
-        """Add this group's rows for `keys` (default: all, in the group's order) to
-        `form`, each labelled from `labels` or the default. A surface may place its rows
-        in two batches, e.g. to set the weighting beside another row it reads against."""
-        labels = labels or {}
-        for key in (keys or self._ROW_LABELS):
-            form.addRow(labels.get(key, self._ROW_LABELS[key]), self._fields[key])
-            self._rows[key] = (form.labelForField(self._fields[key]), self._fields[key])
-        self._update_row_visibility()
-
-    def set_contin_rows_visible(self, visible: bool) -> None:
-        """Show or hide CONTIN's own rows -- for a surface running one method at a time,
-        where α means nothing to NNLS."""
-        self._contin_shown = bool(visible)
-        self._update_row_visibility()
-
-    def _set_row_visible(self, key: str, visible: bool) -> None:
-        label, field = self._rows.get(key, (None, None))
-        if field is not None:
-            field.setVisible(visible)
-        if label is not None:
-            label.setVisible(visible)
-
-    def _update_row_visibility(self) -> None:
-        """The α range stays visible under every selector: all three sweep it, and the
-        F-test's own reliability notes tell the user to move one of its ends. γ follows
-        GCV and the level follows the F-test, on a per-run copy; the Settings copy shows
-        both, since each seeds a per-run field whichever selector is the default."""
-        method = self.alpha_method.currentData()
-        for key in self._CONTIN_ROWS:
-            shown = self._contin_shown
-            if shown and not self._seeds:
-                if key == 'gcv_gamma':
-                    shown = method == 'gcv'
-                elif key == 'ftest':
-                    shown = method == 'ftest'
-            self._set_row_visible(key, shown)
-
-    def _emit_changed(self, *_args) -> None:
-        if not self._seeding:
-            self.changed.emit()
-
-    # ---- values ----
-    def _seed_token(self, combo: QtWidgets.QComboBox, token) -> None:
-        if self._seeds:
-            _seed_combo(combo, token, use_data=True)
-        else:
-            j = combo.findData(token)
-            combo.setCurrentIndex(j if j >= 0 else 0)
-
-    def seed(self, values: dict) -> None:
-        """Set every field from `values` (`DISTRIBUTION_SEED_FIELDS` names), remembering
-        each exact value so an untouched field reads back unchanged. Emits `changed` once."""
-        self._seeding = True
-        try:
-            for name, box in (('rh_grid_min_nm', self.rh_min),
-                              ('rh_grid_max_nm', self.rh_max),
-                              ('rh_grid_points', self.rh_points),
-                              ('contin_ftest_prob_reject', self.ftest_prob),
-                              ('contin_gcv_gamma', self.gcv_gamma)):
-                self._loaded[name] = values[name]
-                box.setValue(values[name])
-                self._shown[name] = box.value()
-            for name, edit in (('lcurve_alpha_min', self.alpha_min),
-                               ('lcurve_alpha_max', self.alpha_max)):
-                self._loaded[name] = float(values[name])
-                edit.setText(f'{float(values[name]):g}')
-                self._shown[name] = edit.text()
-                self._accepted_alpha[edit] = edit.text()
-            self._seed_token(self.residual_weighting, values['distribution_weighting'])
-            self._seed_token(self.alpha_method, values['contin_alpha_method'])
-        finally:
-            self._seeding = False
-        self._update_row_visibility()
-        self.changed.emit()
-
-    def seed_from_settings(self, settings) -> None:
-        self.seed({name: getattr(settings, name) for name in DISTRIBUTION_SEED_FIELDS})
-
-    def _number(self, name: str, box):
-        """The box's value, unless it still shows what the seed made it show -- then
-        the exact seed."""
-        if name in self._loaded and box.value() == self._shown.get(name):
-            return self._loaded[name]
-        return box.value()
-
-    def _alpha(self, name: str, edit: QtWidgets.QLineEdit) -> float:
-        """The typed α, or the exact seed while the text is what seeding wrote -- and
-        also when the text does not parse, so a half-typed entry never reaches a fit."""
-        loaded = self._loaded.get(name)
-        text = edit.text().strip()
-        if loaded is not None and text == self._shown.get(name):
-            return loaded
-        try:
-            return float(text)
-        except ValueError:
-            return loaded if loaded is not None else float('nan')
-
-    @staticmethod
-    def _alpha_text_problem(text: str) -> str:
-        """Why one typed α end cannot run, or '' -- `fit_contin`'s own refusal (finite and
-        above zero), stated in the field's words."""
-        try:
-            value = float(text.strip())
-        except ValueError:
-            return f'“{text.strip()}” is not a number'
-        if not (math.isfinite(value) and value > 0):
-            return 'α must be a finite number above zero'
-        return ''
-
-    def alpha_problem(self) -> str:
-        """Why the CONTIN α range as typed cannot run, or '' when it can: each end finite
-        and above zero, and the minimum not above the maximum -- the two refusals
-        `fit_contin` makes. ONE predicate for every surface holding this group, checked
-        before the Settings tab's Update and before a CONTIN Run, so a value the engine
-        refuses is never saved and never run. Read off the TEXT, not `values()`, which
-        falls back to the seed for an unparseable entry and would hide it."""
-        for label, edit in (('α min', self.alpha_min), ('α max', self.alpha_max)):
-            problem = self._alpha_text_problem(edit.text())
-            if problem:
-                return f'CONTIN {label}: {problem}.'
-        if float(self.alpha_min.text()) > float(self.alpha_max.text()):
-            return 'CONTIN α min is above α max; lower the minimum or raise the maximum.'
-        return ''
-
-    def _check_alpha_edit(self, edit: QtWidgets.QLineEdit) -> None:
-        """An α edit finished: keep it if the engine can run it, else put back the last
-        accepted text and say why at the field. The order of the two ends is left to the
-        Update / Run check, so a range can be widened one end at a time."""
-        problem = self._alpha_text_problem(edit.text())
-        if not problem:
-            self._accepted_alpha[edit] = edit.text()
-            return
-        previous = self._accepted_alpha.get(edit)
-        if previous is not None:
-            edit.setText(previous)
-        QtWidgets.QToolTip.showText(
-            edit.mapToGlobal(QtCore.QPoint(0, edit.height())),
-            f'{problem}; kept {previous or "the previous value"}.', edit)
-
-    def values(self) -> dict:
-        """Every field's current value under its `SettingsState` name."""
-        return {
-            'rh_grid_min_nm': float(self._number('rh_grid_min_nm', self.rh_min)),
-            'rh_grid_max_nm': float(self._number('rh_grid_max_nm', self.rh_max)),
-            'rh_grid_points': int(self._number('rh_grid_points', self.rh_points)),
-            'distribution_weighting': self.residual_weighting.currentData(),
-            'lcurve_alpha_min': self._alpha('lcurve_alpha_min', self.alpha_min),
-            'lcurve_alpha_max': self._alpha('lcurve_alpha_max', self.alpha_max),
-            'contin_alpha_method': self.alpha_method.currentData(),
-            'contin_ftest_prob_reject': float(
-                self._number('contin_ftest_prob_reject', self.ftest_prob)),
-            'contin_gcv_gamma': float(self._number('contin_gcv_gamma', self.gcv_gamma)),
-        }
-
-    def fit_kwargs(self, method: str) -> dict:
-        """The engine kwargs for one `method`: the Rh grid and the residual weighting for
-        every method, and for CONTIN its α range, selector, F-test level and γ.
-
-        The weighting is set for EVERY method, outside the CONTIN branch: all three arms
-        take it, and a weight that reached only CONTIN would give one measurement two
-        analyses depending on which method ran. It is mapped through the controller's own
-        policy-to-request function, so a widget and the Settings seed cannot disagree
-        about what a token means."""
-        v = self.values()
-        kw = dict(rh_min_nm=v['rh_grid_min_nm'], rh_max_nm=v['rh_grid_max_nm'],
-                  n_grid=v['rh_grid_points'],
-                  weighting=distribution_weighting_request(v['distribution_weighting']))
-        if method == 'contin':
-            kw.update(alpha_min=v['lcurve_alpha_min'], alpha_max=v['lcurve_alpha_max'],
-                      alpha_method=v['contin_alpha_method'],
-                      ftest_prob_reject=v['contin_ftest_prob_reject'],
-                      gcv_gamma=v['contin_gcv_gamma'])
-        return kw
-
-
-def _seed_combo(combo: QtWidgets.QComboBox, value, *, use_data: bool,
-                find=None) -> None:
-    """Select ``value`` in ``combo`` (by data or text). If it isn't a current item —
-    e.g. a hand-edited settings.json, or a solvent later dropped from the library —
-    insert it as an extra entry rather than silently falling back to a different one,
-    so an untouched Apply writes the same value back instead of replacing it.
-
-    ``find`` overrides how a row is located, for a field whose own matching rule is not
-    exact equality. The solvent field passes ``index_of_solvent`` so a hand-edited
-    ``"Water"`` snaps to the ``water`` row instead of adding a near-duplicate beside it —
-    one kind of value must not have two matching rules in one program.
-
-    The append below is only sound because the appended row is findable BY THE SAME RULE
-    on the next call. If it were not, every reload would append again: this runs on init,
-    on Restore defaults, and on a cancelled Apply's revert, so the list would grow without
-    bound. ``index_of_solvent`` casefolds both sides for exactly this reason.
-    """
-    if not value:
-        # Nothing to seed. Appending here would add a literal 'None'/'' row -- and, since
-        # no lookup would ever match it, one more on every reload.
-        combo.setCurrentIndex(max(0, first_selectable_index(combo)))
-        return
-    if find is not None:
-        idx = find(combo, value)
-    else:
-        idx = combo.findData(value) if use_data else combo.findText(value)
-    if idx < 0:
-        combo.addItem(str(value), value if use_data else None)
-        idx = combo.count() - 1
-    combo.setCurrentIndex(idx)
 
 
 class SettingsModule(QtWidgets.QWidget):
@@ -485,23 +104,22 @@ class SettingsModule(QtWidgets.QWidget):
         self.cumulant_method.addItem('Nonlinear', 'nonlinear')
         self.cumulant_method.addItem('Linear', 'linear')
         self.cumulant_method.setToolTip(
-            'Cumulant fitting method, applied to every cumulant-based DLS analysis '
-            '(per-measurement cumulant, Γ vs q², replicate averaging).\n'
-            '• Nonlinear (default): fits g₂−1 directly with a floating '
-            'baseline — more robust to drift and noisy/low-count data.\n'
-            '• Linear: weighted polynomial fit of ln(g₂−1).\n'
-            'Switching this clears existing cumulant-based results (you will be asked '
-            'to confirm).')
+            'Cumulant fitting method of every cumulant-based DLS analysis.\n'
+            '• Nonlinear (default): fits g₂−1 directly with a floating baseline; more '
+            'robust to a baseline slightly off unity, to the number of points fitted and '
+            'to poor starting values.\n'
+            '• Linear: polynomial fit of ln(g₂−1).\n'
+            'Switching clears cumulant-based results after you confirm. See '
+            'Theory-and-Equations-Guide §3.2.3 and §3.2.5.')
         form.addRow('Cumulant method:', self.cumulant_method)
         self.cumulant_order = QtWidgets.QSpinBox()
         self.cumulant_order.setRange(1, 4)
         self.cumulant_order.setToolTip(
-            'Cumulant expansion order that replicate averaging fits at, and the starting '
-            'value of the Correlogram sub-tab’s own order box (which you can still '
-            'change per run). Order 1 fits a single decay rate and gives no PDI.\n'
-            'Changing it clears the results fitted at the old order — Γ vs q², D vs c, '
-            'DDLS and replicate averages (you will be asked to confirm); the Correlogram '
-            'sub-tab’s own fits ran at its own order and are kept.')
+            'Cumulant expansion order of every fit with no order box of its own (Γ vs q², '
+            'D vs c, DDLS, replicate averaging); it also seeds the Correlogram sub-tab’s '
+            'order box. Order 1 fits a single decay rate and gives no PDI.\n'
+            'Changing it clears those results after you confirm; the Correlogram '
+            'sub-tab’s fits keep their own order.')
         form.addRow('Cumulant order:', self.cumulant_order)
         self.cumulant_weighting = QtWidgets.QComboBox()
         self.cumulant_weighting.addItem('Sourced variance (default)', 'sourced')
@@ -511,11 +129,9 @@ class SettingsModule(QtWidgets.QWidget):
             'D vs c, replicate averaging, DDLS and the Cross-Sample size candidates).\n'
             '• Sourced variance (default): each method’s own sourced weight.\n'
             '• Unweighted: plain least squares, for comparison with a fit made without a '
-            'noise model — it moves Rh and PDI wherever the noise is not uniform.\n'
-            'The choice is named in the correlogram-fit, Γ vs q² and D vs c exports (not in '
-            'the DDLS, replicate-average or summary results). Switching '
-            'clears existing cumulant-based results (you will be asked to confirm). See '
-            'the Theory-and-Equations-Guide §3.2.8.')
+            'noise model.\n'
+            'Switching clears cumulant-based results after you confirm. See '
+            'Theory-and-Equations-Guide §3.2.8 and §3.2.11.')
         form.addRow('Cumulant residual weighting:', self.cumulant_weighting)
         # The distribution seeds: the same field group the Distribution sub-tab and the
         # Mode Map hold per run. Its residual weighting sits here, beside the cumulant
@@ -528,13 +144,11 @@ class SettingsModule(QtWidgets.QWidget):
         self.skip_channels = QtWidgets.QSpinBox()
         self.skip_channels.setRange(0, 50)
         self.skip_channels.setToolTip(
-            'Drop this many leading correlator channels (shortest lags) from every DLS '
-            'fit to remove afterpulsing / dead-time artifacts; keep it small so a real '
-            'small-particle mode is not erased. Changing it asks first, then clears every '
-            'DLS result — the per-measurement fits, Γ vs q², D vs c, DDLS, the Mode Map '
-            'with its mode-family fits, and replicate averages; recorded mode sets and '
-            'their results, and the mode families you picked, are kept. See the '
-            'Theory-and-Equations-Guide.')
+            'Leading correlator channels (the shortest lags) dropped from every DLS fit, '
+            'for afterpulsing and dead-time artifacts; a large skip can erase a real '
+            'small-particle mode. Changing it clears every DLS result after you confirm, '
+            'but keeps recorded mode sets, their results and the mode families you picked. '
+            'See Theory-and-Equations-Guide §3.1.1.')
         form.addRow('Skip initial lag channels:', self.skip_channels)
         self.cumulant_cutoff = QtWidgets.QDoubleSpinBox()
         # Widened to the ENGINE's contract, not a comfortable subset of it: `_FIELD_RANGES`
@@ -547,30 +161,25 @@ class SettingsModule(QtWidgets.QWidget):
         self.cumulant_cutoff.setRange(1e-6, 0.999999)
         self.cumulant_cutoff.setSingleStep(0.01)
         self.cumulant_cutoff.setToolTip(
-            'Amplitude at which the linear cumulant’s fitted range stops, as a '
-            'fraction of the correlogram peak. ISO 22412 prescribes 0.01; this program '
-            'defaults to 0.1, a benchmarked deviation — see the '
-            'Theory-and-Equations-Guide for the measurement and for which of the '
-            'standard’s companion clauses are implemented.')
+            'Amplitude at which the Linear fit’s range stops, as a fraction of the '
+            'correlogram peak. The DLS standard prescribes 0.01; this program defaults '
+            'to 0.1, a benchmarked deviation — see the Theory-and-Equations-Guide §3.2.3 '
+            'for the measurement and for which of the standard’s companion clauses are '
+            'implemented.')
         cutoff_help = HelpBadge(
-            'The linear cumulant fits a contiguous run of channels around the '
-            'correlogram’s peak. This sets where that run stops — at the '
-            'first channel whose amplitude falls to this fraction of the peak.',
+            'The Linear fit reads a contiguous run of channels around the correlogram’s '
+            'peak, stopping at the first whose amplitude falls to this fraction of the '
+            'peak.',
             bullets=[
-                '<b>Lower</b> (towards ISO’s 0.01) fits further down the decay, '
-                'using more channels.',
+                '<b>Lower</b> (towards the DLS standard’s 0.01, '
+                'Theory-and-Equations-Guide §3.2.3) fits further down the decay; the PDI '
+                'can fall and clear the polydispersity warning (35 of 190 measurements of '
+                'the program’s test corpus, never the reverse).',
                 '<b>Higher</b> keeps only the strongest part of the decay.',
-                'It applies to the <b>Linear</b> cumulant method. Under '
-                '<b>Nonlinear</b>, which fits every live channel in the window, it still sets the range '
-                'the reported RMS error is measured over and the starting guess the fit '
-                'departs from.',
-                'Lowering it can make a run look <i>less</i> polydisperse than it is: '
-                'the extra channels are the noisiest, the fitted curve flattens, and the '
-                'reported PDI falls. Since PDI is what the polydispersity warning reads, '
-                'a run that was flagged can come back unflagged at a lower cutoff. On '
-                'this program’s own test corpus that happened to 35 of 190 runs, '
-                'and never the other way round.',
-                'Changing it marks any cumulant fit already on screen as out of date.',
+                'Under <b>Nonlinear</b>, which fits every live channel, it still sets the '
+                'range of the reported RMS error and the fit’s starting guess.',
+                'Changing it clears cumulant-based results after you confirm and marks a '
+                'cumulant fit on screen as out of date.',
             ])
         cutoff_row = QtWidgets.QWidget()
         cutoff_lay = QtWidgets.QHBoxLayout(cutoff_row)
@@ -589,8 +198,8 @@ class SettingsModule(QtWidgets.QWidget):
                 'They seed the <b>Distribution</b> sub-tab’s and the <b>Mode Map</b>’s '
                 'own fields, which you can still change per run there.',
                 'Replicate averaging of a distribution method (the sidebar’s '
-                '<b>Average derived results…</b>) has no fields of its own and runs on '
-                'these values.',
+                '<b>Average derived results…</b>) has no fields of its own: it runs on '
+                'these values unless its prompt copies the Distribution sub-tab’s.',
                 'The Rh grid applies to every method; the α rows are CONTIN’s alone.',
                 'Changing a value here does not touch a result already computed.',
             ]))
@@ -605,26 +214,22 @@ class SettingsModule(QtWidgets.QWidget):
         self.bh_dat_baseline.addItem('Measured', 'measured')
         self.bh_dat_baseline.setToolTip(
             'Baseline used to normalize a Brookhaven raw ASCII .dat correlogram, '
-            'whose channels hold raw counts: g₂−1 = counts/B − 1. Applies only when '
-            'the file itself does not name a baseline. See the '
-            'Theory-and-Equations-Guide.')
+            'whose channels hold raw counts: g₂−1 = counts/B − 1. See '
+            'Theory-and-Equations-Guide §3.1.2.')
         dat_help = HelpBadge(
-            'Brookhaven .dat files store raw correlator counts plus two baselines, '
-            'so one of them has to be chosen before the correlogram exists.',
+            'Which of a Brookhaven .dat file’s two baselines turns its raw counts into a '
+            'correlogram.',
             bullets=[
-                '<b>Calculated</b> — the default. Formed from the run totals '
-                '(counts A × counts B, over the number of samples), so it uses '
-                'the whole measurement.',
-                '<b>Measured</b> — the average of the baseline channels the acquiring '
-                'software set aside. Matches what Particle Explorer reports, but '
-                'depends on those channels lying past the decay.',
+                '<b>Calculated</b> (default) — formed from the run totals (counts A × '
+                'counts B, over the number of samples), so it uses the whole measurement.',
+                '<b>Measured</b> — the mean of the baseline channels the acquiring '
+                'software set aside, as Particle Explorer reports; it needs those '
+                'channels past the decay.',
                 'A file that names its own baseline overrides this setting.',
-                'The two typically differ by a few tenths of a percent. That makes '
-                'no difference to the default fits, which float or estimate a '
-                'baseline of their own and absorb it; it shifts the size by a few '
-                'percent for the linear cumulant method, which assumes none.',
-                'A large difference between the two baselines is itself a dust or '
-                'slow-drift warning, whichever you pick.',
+                'A few tenths of a percent between the two moves the Linear fit’s size by '
+                'a few percent and leaves the default fits unchanged (User-Manual §12.3).',
+                'A large difference between them signals dust or slow drift, whichever '
+                'you pick.',
             ])
         dat_row = QtWidgets.QWidget()
         dat_lay = QtWidgets.QHBoxLayout(dat_row)
@@ -638,15 +243,17 @@ class SettingsModule(QtWidgets.QWidget):
         self.geometry.addItems(['VU', 'VV', 'VH'])
         self.geometry.setToolTip(
             'Scattering geometry of the calibration standard: VV = polarized, '
-            'VH = depolarized, VU = no analyzer (a vertical laser with no analyzer). '
-            'See the Theory-and-Equations-Guide.')
+            'VH = depolarized, VU = a vertical laser with no analyzer. '
+            'See Theory-and-Equations-Guide §1.6.')
         form.addRow('Standard geometry:', self.geometry)
         self.qrg_max = QtWidgets.QDoubleSpinBox()
         self.qrg_max.setRange(0.5, 3.0)
         self.qrg_max.setSingleStep(0.1)
         self.qrg_max.setToolTip(
-            'Maximum qRg for a valid Guinier fit; above it the Guinier expansion '
-            'breaks down. See the Theory-and-Equations-Guide (Guinier).')
+            'Maximum qRg for every small-qRg fit: the Zimm, Debye, Guinier and Amplitude '
+            'Guinier Rg are flagged above it, and the Zimm, Debye and Guinier Mw with them; '
+            'a Berry fit is not, and its Rg and Mw labels say they are past the Zimm limit. '
+            'See Theory-and-Equations-Guide §4.4 and §4.6.')
         form.addRow('Guinier qRg validity limit:', self.qrg_max)
 
         form.addRow(self._header('Solvent Library'))
@@ -667,19 +274,17 @@ class SettingsModule(QtWidgets.QWidget):
             'scaling exponent). Switching clears existing ±-bearing results (you will '
             'be asked to confirm). See Theory-and-Equations-Guide §6.1.')
         est_help = HelpBadge(
-            'Which standard error the app reports for its straight-line and '
+            'Which standard error the program reports for its straight-line and '
             'multilinear fits.',
             bullets=[
-                '<b>HC3 (robust)</b> — the default. A heteroscedasticity-consistent '
-                'SE that never under-reports when point precision varies across '
-                'angles/concentrations. Use this unless you have a specific reason not to.',
-                '<b>Classical OLS</b> — the textbook s²(XᵀX)⁻¹ SE. Choose this only to '
-                'reproduce a result from classical software, a published table, or a '
-                'spreadsheet like-for-like. It can under-report (~10% low on a short, '
-                'high-leverage concentration ladder), which is why it is not the default.',
-                'The choice is global, persists across restart, and is recorded on '
-                'each result and written into the export (an OLS ± is labeled '
-                '“SE: classical OLS”). Point estimates (Mw, Rg, D, Rh) are unaffected.',
+                '<b>HC3 (robust)</b> — the default; it never under-reports when point '
+                'precision varies across angles or concentrations.',
+                '<b>Classical OLS</b> — the textbook SE, only to match classical '
+                'software, a published table or a spreadsheet like-for-like; it can '
+                'under-report.',
+                'The choice is global, recorded on each result and written into the '
+                'export, where an OLS ± reads “± from classical OLS, not HC3”. Point '
+                'estimates (Mw, Rg, D, Rh) are unaffected.',
                 'Detail and formulas: Theory-and-Equations-Guide §6.1.',
             ])
         est_row = QtWidgets.QWidget()
@@ -689,11 +294,9 @@ class SettingsModule(QtWidgets.QWidget):
         est_lay.addWidget(est_help)
         form.addRow('Regression SE estimator:', est_row)
 
-        # NB: the synthetic-generator (β/noise/points) and intensity-trace (outlier
-        # k, running-average window) defaults used to live here. They were
-        # moved into their own tabs (Utilities → Synthetic
-        # generator / Traces) as plain session fields, so they no longer clutter
-        # this global tab.
+        # The synthetic-generator (β/noise/points) and intensity-trace (outlier k,
+        # running-average window) defaults are plain session fields on their own
+        # Utilities tabs (Synthetic generator / Traces), not global settings.
 
         form.addRow(self._header('Display Units'))
         plot_note = ThemedLabel(
@@ -716,25 +319,21 @@ class SettingsModule(QtWidgets.QWidget):
         self.no_unc_sig_figs = QtWidgets.QSpinBox()
         self.no_unc_sig_figs.setRange(1, 4)
         self.no_unc_sig_figs.setToolTip(
-            'Significant figures for EVERY result that has no honest uncertainty — '
-            'a single correlogram, an NNLS/CONTIN distribution, and '
-            'derived numbers like Γ, PDI, R², and qRg. A value that HAS a ± is always '
-            'rounded to the place its ± supports — this never changes that.')
+            'Significant figures for every result that has no honest uncertainty. A '
+            'value that HAS a ± is rounded to the place its ± supports, since more '
+            'digits would claim a precision the data lack; only a ± so large it would '
+            'round the value to zero leaves the value at this precision, shown beside '
+            'its ±. See Theory-and-Equations-Guide §6.')
         sig_help = HelpBadge(
-            'How many digits to show for a result that carries no ±.',
+            'How many significant figures to show for a result that carries no ±.',
             bullets=[
-                'A value that <b>has</b> an uncertainty is shown to the precision that ± '
-                'supports (a ±1 nm SE is not reported to the tenths place — that would '
-                'imply confidence the data does not support). This setting does '
-                '<b>not</b> touch those.',
-                'A value with <b>no</b> uncertainty — a single-correlogram fit, an '
-                'NNLS/CONTIN peak, and every derived number that '
-                'carries no ± (Γ, PDI, R², qRg, …) — has no uncertainty to set its '
-                'precision, so a fixed number of significant figures is used instead. '
-                'This one knob controls all of them, uniformly.',
-                'Default 3. Lower it (e.g. to 2) for a more conservative look — note that '
-                'coarsens everything without a ±, including R²/qRg, so their trailing '
-                'digits are lost. The app never fabricates a ± to show more digits.',
+                'It sets every such value alike: a single-correlogram fit, an NNLS/CONTIN '
+                'peak, and every derived number without a ± (Γ, PDI, R², qRg, …).',
+                'A value that <b>has</b> a ± is shown to the place its ± supports, unless '
+                'the ± would round it to zero: then it takes this precision, beside its ±.',
+                'Default 3. Lowering it gives a more conservative look and drops the '
+                'trailing digits of everything without a ±, R² and qRg included.',
+                'The program never fabricates a ± to show more digits.',
             ])
         sig_row = QtWidgets.QWidget()
         sig_lay = QtWidgets.QHBoxLayout(sig_row)
@@ -778,19 +377,17 @@ class SettingsModule(QtWidgets.QWidget):
         form.addRow('Tooltips:', self.show_tooltips)
         self.reopen_last_session = QtWidgets.QCheckBox('Reopen last session on startup')
         self.reopen_last_session.setToolTip(
-            'When on, the current workspace is auto-saved when you close the program '
-            'and reopened the next time you launch it. If the saved session is missing '
-            'or damaged, the program starts empty. If it was saved by a different '
-            'version it cannot be opened, and you are asked at startup whether to keep '
-            'that file (nothing is auto-saved over it) or let this version replace it. '
-            'Off by default.')
+            'When on, the workspace is kept when you close the program and reopened at '
+            'the next launch; a missing or damaged file starts the program empty. A file '
+            'from a different version cannot be reopened: you are asked at startup '
+            'whether to keep it, with nothing written over it, or let this version '
+            'replace it. Off by default.')
         form.addRow('Session:', self.reopen_last_session)
         self.confirm_run_replaces_pick = QtWidgets.QCheckBox(
             'Ask before a Run replaces a picked value')
         self.confirm_run_replaces_pick.setToolTip(
             'An explicit Run replaces a value you picked in Cross-Sample, and the '
-            'run always reports the replacement afterwards. Turn this on to be '
-            'asked first instead; Cancel keeps the pick and runs nothing.')
+            'run always reports the replacement afterwards.')
         confirm_help = HelpBadge(
             'Whether pressing Run asks before replacing a value you explicitly '
             'picked in Cross-Sample.',
@@ -868,7 +465,7 @@ class SettingsModule(QtWidgets.QWidget):
                     find=index_of_solvent)
         _seed_combo(self.se_estimator, s.se_estimator, use_data=True)
         # _seed_combo, not setCurrentText: a stored value the list no longer offers
-        # (a hand-edited settings.json, a unit later dropped -- app/units.py records
+        # (a hand-edited settings.json, a unit later dropped -- core/units.py records
         # viscosity's 'cP') must round-trip through an untouched Apply, not be
         # silently replaced by the combo's first row. The plot layer already falls
         # back to its default for a unit it does not know (`plots.set_plot_units`).

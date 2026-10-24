@@ -128,6 +128,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from core.notes import Note, render
 from parsers.base_parser import (
     BaseDLSParser,
     DLSFilePreview,
@@ -137,6 +138,7 @@ from parsers.base_parser import (
     carried_run_duration,
     convert_delay_times,
     convert_viscosity,
+    read_text_lines,
 )
 
 # ---------------------------------------------------------------------------
@@ -233,22 +235,9 @@ _VISCOSITY_UNIT = 'cp'
 def _read_lines(file_path: str) -> List[str]:
     """Read all lines from a .dat file, stripping line endings.
 
-    Raises
-    ------
-    FileNotFoundError
-        If the file does not exist.
-    ParseError
-        If the file cannot be decoded.
+    Raises FileNotFoundError or ParseError as ``read_text_lines`` does.
     """
-    if not os.path.isfile(file_path):
-        raise FileNotFoundError(f"File not found: {file_path!r}")
-    try:
-        with open(file_path, encoding=_ENCODING, newline='') as fh:
-            return [line.rstrip('\r\n') for line in fh]
-    except (UnicodeDecodeError, OSError) as exc:
-        raise ParseError(
-            f"Could not read {file_path!r} with encoding {_ENCODING!r}: {exc}"
-        ) from exc
+    return read_text_lines(file_path, (_ENCODING,))
 
 
 def _scalar(lines: List[str], item: int) -> float:
@@ -384,8 +373,9 @@ _HS_DELAY_RTOL = 1e-6
 
 
 def _section_sample_times(header: Dict[int, float],
-                          delay_us: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    """Per-channel sample time (s) from the header's correlator sections, or (None, why).
+                          delay_us: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[Note]]:
+    """Per-channel sample time (s) from the header's correlator sections, or (None, why),
+    the why a record note naming the premise that failed.
 
     The TurboCorr de-couples the delay time from the sampling time (manual, Chapter
     IV p. IV-2): every channel of a section is accumulated over that SECTION's
@@ -406,29 +396,29 @@ def _section_sample_times(header: Dict[int, float],
     coarser sampling time is itself a multiple of the finer one, so a shift toward a FINER
     section fills silently with that channel's sampling time too small. The correlator
     writes the counts itself and no committed file mis-states them, so the one-sided case
-    is disclosed here rather than guarded. Otherwise nothing is filled and the reason is
-    returned for the preview's note: the engine then derives a stand-in from the delay
-    axis and records that it did. Nothing here is guessed or repaired.
+    is disclosed here rather than guarded. Otherwise nothing is filled and the failed
+    premise is returned for the preview's notes: the engine then derives a stand-in from
+    the delay axis and records that it did. Nothing here is guessed or repaired.
     """
     counts = []
     for item in (_ITEM_N_HS_CHANNELS, _ITEM_N_MS_CHANNELS, _ITEM_N_LS_CHANNELS):
         raw = header.get(item)
         if raw is None or not np.isfinite(raw) or raw < 0 or raw != int(raw):
-            return None, f'header item {item} (a section channel count) is {raw!r}'
+            return None, Note('parser.section_item_invalid', ('sample_times_s',),
+                              {'item': item, 'quantity': 'channel count'})
         counts.append(int(raw))
     n_hs, n_ms, n_ls = counts
     if n_hs + n_ms + n_ls != delay_us.size:
-        return None, (f'the sections sum to {n_hs + n_ms + n_ls} channels (items '
-                      f'{_ITEM_N_HS_CHANNELS} + {_ITEM_N_MS_CHANNELS} + '
-                      f'{_ITEM_N_LS_CHANNELS}) against {delay_us.size} data channels')
+        return None, Note('parser.sections_unsummed', ('sample_times_s',),
+                          {'n': n_hs + n_ms + n_ls, 'n_data': int(delay_us.size)})
     dt_us = np.empty(delay_us.size, dtype=float)
     for k in range(n_hs):
         d = float(delay_us[k])
         match = [v for key, v in _HS_SAMPLING_TIME_US.items()
                  if abs(d - key) <= _HS_DELAY_RTOL * key]
         if not match:
-            return None, (f'high-speed channel {k + 1} has delay {d!r} us, which is not a '
-                          f'Table IV-1 A delay')
+            return None, Note('parser.hs_delay_unknown', ('sample_times_s',),
+                              {'channel': k + 1})
         dt_us[k] = match[0]
     for item, n, start in ((_ITEM_MS_SAMPLING_TIME_US, n_ms, n_hs),
                            (_ITEM_LS_SAMPLING_TIME_US, n_ls, n_hs + n_ms)):
@@ -436,7 +426,8 @@ def _section_sample_times(header: Dict[int, float],
             continue
         val = header.get(item)
         if val is None or not np.isfinite(val) or val <= 0.0:
-            return None, f'header item {item} (a section sampling time) is {val!r} us'
+            return None, Note('parser.section_item_invalid', ('sample_times_s',),
+                              {'item': item, 'quantity': 'sampling time'})
         dt_us[start:start + n] = float(val)
     # The premise every section shares, checked on the channel rather than the count.
     k = np.asarray(delay_us, dtype=float) / dt_us
@@ -444,9 +435,8 @@ def _section_sample_times(header: Dict[int, float],
                          | (k < 1.0 - _HS_DELAY_RTOL))
     if off.size:
         i = int(off[0])
-        return None, (f'channel {i + 1} has delay {float(delay_us[i])!r} us, which is not an '
-                      f'integer multiple of its section\'s sampling time {float(dt_us[i])!r} us '
-                      f'(the correlator\'s own constraint, manual p. IV-5)')
+        return None, Note('parser.delay_not_multiple', ('sample_times_s',),
+                          {'channel': i + 1, 'dt': float(dt_us[i])})
     return dt_us * 1e-6, None
 
 
@@ -836,14 +826,13 @@ class BrookhavenDATParser(BaseDLSParser):
 
         # --- per-channel sample times from the correlator sections (items 27-31) ---
         sample_times_s, no_sections = _section_sample_times(header, delay_us)
-        notes: Tuple[str, ...] = ()
+        notes: Tuple[Note, ...] = ()
         if no_sections is not None:
-            notes = (
-                f'per-channel sample times were not taken from the header '
-                f'({no_sections}); the cumulant fit derives a stand-in from the delay '
-                f'axis and records that it did.',)
+            # Two facts: the sample times were not read, and which premise failed.
+            notes = (Note('parser.sample_times_unread', ('sample_times_s',)), no_sections)
             for note in notes:
-                warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+                warnings.warn(f"{file_path!r}: {render(note, surface='export')}",
+                              UserWarning, stacklevel=2)
 
         # --- run duration (header items 4 and 25) ---
         # The delay axis is converted once, here, and read by both the duration's
@@ -852,12 +841,14 @@ class BrookhavenDATParser(BaseDLSParser):
         vendor_duration_s = _vendor_run_duration_s(header)
         # The live mask is spelled on the raw channel counts, the quantity THIS layer
         # holds; `carried_run_duration` owns the rule both formats share.
+        # The header's run length is item 4 x item 25, the number of samples times the
+        # sampling time (`_vendor_run_duration_s`).
         duration_s, duration_note = carried_run_duration(
-            vendor_duration_s, delay_s, np.asarray(raw_counts, dtype=float) > 0.0,
-            'item 4 x item 25, the number of samples times the sampling time')
-        if duration_note:
+            vendor_duration_s, delay_s, np.asarray(raw_counts, dtype=float) > 0.0)
+        if duration_note is not None:
             notes = notes + (duration_note,)
-            warnings.warn(f"{file_path!r}: {duration_note}", UserWarning, stacklevel=2)
+            warnings.warn(f"{file_path!r}: {render(duration_note, surface='export')}",
+                          UserWarning, stacklevel=2)
 
         # --- baseline ---
         baseline_calculated = header[_ITEM_BASELINE_CALCULATED]

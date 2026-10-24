@@ -60,5 +60,10 @@ GROUND TRUTH (what the analyses should recover):
     value; a good-solvent coil sits nearer 1.78 -- the series pairs this rho
     with a good-solvent size exponent, and the two are not made consistent).
   Rg-Mw scaling exponent nu ~ 0.585; A2-Mw exponent ~ -0.2.
+    The SLS sets follow the Zimm form exactly, so a Zimm fit recovers the planted
+    Rg at any qRg while a Berry fit is biased past qRg ~ 1. Cross-Sample Scaling
+    fits Zimm and switches to Berry where the Zimm Rg is flagged past the qRg
+    limit, so on PEG 1M and 3M it reports the smaller Berry Rg and an exponent
+    near 0.5, not the planted 0.585.
   DLS shows a mild concentration dependence (kD ~ +30 mL/g), so the
   D-vs-c extrapolation has a small positive slope (PEG 1M has 3 concs).

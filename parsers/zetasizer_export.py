@@ -88,6 +88,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+from core.notes import Note, render
 from parsers.base_parser import (
     convert_delay_times,
     BaseDLSParser,
@@ -97,6 +98,7 @@ from parsers.base_parser import (
     convert_count_rate,
     convert_temperature,
     convert_viscosity,
+    read_text_lines,
 )
 
 
@@ -155,7 +157,7 @@ def _as_nm(value: float, unit: str) -> float:
 
 
 def _as_deg(value: float, unit: str) -> float:
-    """Scattering angle in degrees, on `_require_scattering_angle`'s range.
+    """Scattering angle in degrees, on `require_scattering_angle`'s range.
 
     Bounds-checked here so an out-of-range cell arrives blank for the user to enter,
     rather than reaching `DLSMeasurement` and raising at Update.
@@ -257,21 +259,7 @@ _COLUMNS = (
 
 def _read_lines(file_path: str) -> List[str]:
     """Read all lines, trying each supported encoding in turn."""
-    if not os.path.isfile(file_path):
-        raise FileNotFoundError(f"File not found: {file_path!r}")
-    last_exc = None
-    for encoding in _ENCODINGS:
-        try:
-            with open(file_path, encoding=encoding, newline='') as fh:
-                return [line.rstrip('\r\n') for line in fh]
-        except UnicodeDecodeError as exc:
-            last_exc = exc
-            continue
-        except OSError as exc:
-            raise ParseError(f"Could not read {file_path!r}: {exc}") from exc
-    raise ParseError(
-        f"Could not decode {file_path!r} with any of {_ENCODINGS}: {last_exc}"
-    ) from last_exc
+    return read_text_lines(file_path, _ENCODINGS)
 
 
 def _norm_header(cell: str) -> str:
@@ -434,16 +422,14 @@ class ZetasizerExportParser(BaseDLSParser):
         # will not; every surviving preview carries the file-level note (de-duplicated
         # by the load flow), and a headless caller hears it as a UserWarning.
         if n_bad:
-            note = (
-                f"{n_bad} data row(s) carried no readable correlation channel and were "
-                f"not loaded; {len(previews)} measurement(s) loaded. An empty row usually "
-                f"means the export was cut short -- re-export if those rows were meant "
-                f"to be included."
-            )
+            note = Note('parser.rows_skipped', ('delay_times_s', 'correlogram'),
+                        {'n_skipped': n_bad, 'n': n_bad + len(previews),
+                         'n_loaded': len(previews)})
             notes = (note,)
             for preview in previews:
                 preview.notes = notes
-            warnings.warn(f"{file_path!r}: {note}", UserWarning, stacklevel=2)
+            warnings.warn(f"{file_path!r}: {render(note, surface='export')}", UserWarning,
+                          stacklevel=2)
         return previews
 
     @staticmethod

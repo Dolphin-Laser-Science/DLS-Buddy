@@ -7,7 +7,7 @@ Cross-Sample Architecture tab: tag the linear samples Linear and a branched samp
 Branched (Chain type, Data tab), and g = (Rg_branched / Rg_linear)^2 is recovered.
 Its reading depends on the selected branching model:
   * regular star            -> f_eff  (arm number, from g = (3f-2)/f^2)
-  * random tri / tetra      -> n      (branch units/molecule, from Eqs. 47a/47b)
+  * random tri / tetra      -> n      (branch units/molecule; Theory-and-Equations-Guide §5.3.1)
 
 GLOBAL PARAMETERS (enter at the Data-tab confirmation step):
   Solvent                 : water

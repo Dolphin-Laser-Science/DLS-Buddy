@@ -67,6 +67,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 from scipy import optimize, signal, stats
 
 from core.data_models import IntensityTrace
+from core.notes import Note
 
 
 # ===========================================================================
@@ -101,6 +102,11 @@ HAMPEL_WINDOW_MAX_PTS = 101
 # test_chunked_and_single_pass_window_statistics_agree), so there is no boundary
 # here to mis-size. See flag_outliers_windowed.
 _HAMPEL_CHUNK_BYTES = 16 << 20
+
+# Elements per block of the point-window running average's interior rows: a tuning
+# constant for speed and memory. The per-slice pin named in running_average holds
+# the result bitwise at this size.
+_RUNNING_AVERAGE_BLOCK_ELEMENTS = 2 ** 16
 
 # Welch PSD segment bounds, in points. Neither is canonical: Welch (1967) treats
 # the segment length L purely as "a scale parameter" trading resolution against
@@ -331,9 +337,11 @@ class WelchPSDResult:
     The averaged-modified-periodogram estimator of Welch (1967): the record is
     cut into overlapping segments, each windowed and transformed, and the
     resulting periodograms averaged. Averaging is what makes the estimate
-    readable -- a single periodogram has 100% relative scatter at every
-    frequency no matter how long the record -- and `edf` is how much of that
-    scatter is left.
+    readable -- for a Gaussian process whose spectrum is flat across the
+    estimator's passband, Welch's stated conditions (p. 71), a single modified
+    periodogram has variance P^2, 100% relative scatter, no matter how long the
+    record, and twice that variance at zero frequency and Nyquist (p. 72) -- and
+    `edf` is how much of that scatter is left.
 
     The flat `shot_floor_psd` is where an ideal, dead-time-free Poisson detector
     would sit. Broadband power ABOVE it is excess fluctuation (the same excess
@@ -394,6 +402,9 @@ class PeriodogramResult:
     null_assumption_violated: bool
     variance_cps2: float           # sigma_0^2, the normalizer
     dt_s: float
+    # `null_not_white` when the null is violated, about the three readings computed
+    # under it (core.notes); () otherwise.
+    notes: Tuple[Note, ...] = ()
 
 
 # ===========================================================================
@@ -554,11 +565,12 @@ def flag_outliers(
     IMPLOSION, and why nothing is patched over it. When more than half the
     samples share one value -- a flat, stalled or heavily quantized trace --
     the MAD is exactly 0. Pearson et al. (2016) sec. 3 names this an *implosion
-    window* and proves the characterization; their treatment is to identify
-    such windows and set them aside (the rest of that paper's theory is stated
-    for *implosion-free* sequences, where min S_k > 0), not to floor or
-    substitute the scale. We do the same: the result flags NOTHING and reports
-    `scale_is_degenerate`.
+    window* and proves the characterization; in one, they note, the filter's
+    output stops depending on the threshold and reduces to the median filter
+    (p. 2). They prescribe no treatment for it, neither a scale floor nor a
+    substitute estimator, and name the *implosion-free* sequences (min S_k > 0)
+    as the ones of greatest interest. Abstaining is this program's own choice:
+    the result flags NOTHING and reports `scale_is_degenerate`.
 
     That has a real cost, and it is deliberate: a single dust spike on a
     PERFECTLY FLAT trace is not flagged either. With over half the samples tied
@@ -1029,7 +1041,24 @@ def running_average(
         # asymmetric by one sample); clamp each end at the trace boundary.
         w = window_points
         half = w // 2
-        for i in range(n):
+        # The unclamped windows are the rows of a sliding view, each row reduced
+        # with the slice's own .mean() / .std(ddof=1), in blocks of rows; the
+        # clamped edge windows, and every window when w > n, take the per-slice
+        # loop. Pinned to the per-slice values exactly by
+        # test_running_average_point_window_matches_the_per_slice_reference.
+        n_interior = max(0, n - w + 1)
+        if n_interior > 0:
+            rows = sliding_window_view(y, w)
+            step = max(1, _RUNNING_AVERAGE_BLOCK_ELEMENTS // w)
+            for start in range(0, n_interior, step):
+                block = rows[start:start + step]
+                out = slice(half + start, half + start + block.shape[0])
+                means[out] = block.mean(axis=1)
+                stds[out] = block.std(axis=1, ddof=1) if w > 1 else 0.0
+            edges = (*range(half), *range(half + n_interior, n))
+        else:
+            edges = range(n)
+        for i in edges:
             lo = max(0, i - half)
             hi = min(n, i - half + w)
             window = y[lo:hi]
@@ -1672,6 +1701,26 @@ def welch_edf(window: np.ndarray, hop: int, n_segments: int) -> float:
     return 2.0 * k_segments / (1.0 + 2.0 * correlation_sum)
 
 
+def _trace_sample_spacing_s(trace: IntensityTrace) -> float:
+    """The trace's median sample spacing dt in s, for a function that builds a frequency
+    axis from it.
+
+    Strict: raises ValueError when the time axis has fewer than two points or the
+    median spacing is not positive and finite, since no frequency axis exists then."""
+    if trace.times_s.size < 2:
+        raise ValueError(
+            "The trace has no readable sample spacing (fewer than two time "
+            "points), so no frequency axis can be built."
+        )
+    dt_s = float(np.median(np.diff(np.asarray(trace.times_s, dtype=float))))
+    if not (math.isfinite(dt_s) and dt_s > 0.0):
+        raise ValueError(
+            f"Sample spacing resolves to {dt_s!r}; a frequency axis needs a "
+            f"positive, finite dt."
+        )
+    return dt_s
+
+
 def welch_psd(
     trace: IntensityTrace,
     *,
@@ -1685,8 +1734,10 @@ def welch_psd(
     Implements Welch's (1967) averaged modified periodogram: cut the record into
     segments of `nperseg` points overlapping by `overlap`, window and transform
     each, and average the resulting periodograms. The averaging is the whole
-    point -- a single periodogram of ANY record length has 100% relative scatter
-    at every frequency, so an unaveraged spectrum cannot be read.
+    point -- under Welch's conditions (a Gaussian process, a spectrum flat across
+    the passband; p. 71) a single modified periodogram of ANY record length has
+    variance P^2, 100% relative scatter (the variance doubled at zero frequency and
+    Nyquist, p. 72), so an unaveraged spectrum cannot be read.
 
     THE DEFAULT OVERLAP IS WELCH'S OWN RECOMMENDATION for our situation. He notes
     (p. 72) that non-overlapping segments give the most variance reduction per
@@ -1754,17 +1805,7 @@ def welch_psd(
             f"{PSD_SEGMENT_MIN_PTS} (one segment at the floor width). Below "
             f"that the window's own shape dominates the result."
         )
-    if trace.times_s.size < 2:
-        raise ValueError(
-            "The trace has no readable sample spacing (fewer than two time "
-            "points), so no frequency axis can be built."
-        )
-    dt_s = float(np.median(np.diff(np.asarray(trace.times_s, dtype=float))))
-    if not (math.isfinite(dt_s) and dt_s > 0.0):
-        raise ValueError(
-            f"Sample spacing resolves to {dt_s!r}; a frequency axis needs a "
-            f"positive, finite dt."
-        )
+    dt_s = _trace_sample_spacing_s(trace)
     if not (math.isfinite(overlap) and 0.0 <= overlap < 1.0):
         raise ValueError(
             f"overlap must be a fraction in [0, 1), got {overlap!r}."
@@ -1927,7 +1968,7 @@ def periodogram_false_alarm(
     correlations_detected : bool
         The blocking analysis's verdict for this trace, passed in so this
         function stays pure and single-purpose. Recorded as
-        `null_assumption_violated`.
+        `null_assumption_violated`, and when True as the `null_not_white` note.
 
     Returns
     -------
@@ -1954,17 +1995,7 @@ def periodogram_false_alarm(
             f"Trace has only {n0} points; a periodogram needs at least 4 to "
             f"have any frequency below Nyquist to test."
         )
-    if trace.times_s.size < 2:
-        raise ValueError(
-            "The trace has no readable sample spacing (fewer than two time "
-            "points), so no frequency axis can be built."
-        )
-    dt_s = float(np.median(np.diff(np.asarray(trace.times_s, dtype=float))))
-    if not (math.isfinite(dt_s) and dt_s > 0.0):
-        raise ValueError(
-            f"Sample spacing resolves to {dt_s!r}; a frequency axis needs a "
-            f"positive, finite dt."
-        )
+    dt_s = _trace_sample_spacing_s(trace)
     if not (math.isfinite(false_alarm_probability)
             and 0.0 < false_alarm_probability < 1.0):
         raise ValueError(
@@ -2042,4 +2073,7 @@ def periodogram_false_alarm(
         null_assumption_violated=bool(correlations_detected),
         variance_cps2=variance_cps2,
         dt_s=dt_s,
+        notes=((Note('null_not_white', ('false_alarm_probability', 'significance_level',
+                                        'peak_is_significant')),)
+               if correlations_detected else ()),
     )

@@ -123,7 +123,9 @@ class SettingsState:
 
     # --- SLS defaults ---
     standard_geometry: str = 'VU'           # toluene Rayleigh geometry: VU / VV / VH
-    guinier_qrg_max: float = 1.3            # Guinier validity limit q*Rg
+    guinier_qrg_max: float = 1.0            # the q*Rg validity limit every qRg verdict reads;
+    #                                         equals analysis.sls.QRG_MAX_VALID_DEFAULT (pinned
+    #                                         in tests/test_sls.py)
 
     # --- solvent library ---
     default_solvent: str = 'water'          # preselects the Solvent Explorer combo

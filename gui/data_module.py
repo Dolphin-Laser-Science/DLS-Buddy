@@ -5,9 +5,9 @@ gui/data_module.py
 The Data tab: confirm and manage the physical parameters of the selected
 measurement. This is the home of the parser "confirmation step" (parse -> blanks
 -> user fills -> commit) and the place where shared per-sample parameters are
-entered once and propagated across the sample: `_on_cell_changed` routes shared
-keys to `controller.set_shared_param`, and `_apply_edits_to_selection` fans an
-edit across the highlighted measurements.
+entered once and propagated across the sample: `_on_cell_changed` hands each edit
+to `controller.edit_param`, and `_apply_edits_to_selection` carries the edits
+across the highlighted measurements through `controller.apply_pending_edits`.
 
 It owns the editable parameter table, the Update (commit) / Undo (revert to
 committed) buttons, the changed-since-commit highlighting, and a pending-update
@@ -25,13 +25,12 @@ from typing import Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from core import units as U
 from core.data_models import implausible_metadata_reasons
 from core.naming import measurement_display_name, measurement_hover_card
-from core.workspace import _DLS_PARAM_KEYS, _SLS_PARAM_KEYS, blank_label
-from app.controller import _SHARED_PARAM_KEYS
-from app import units as U
-from analysis.uncertainty import format_fixed_sig, format_value_at_uncertainty
-from gui.field_labels import PARAM_LABELS
+from core.workspace import DLS_PARAM_KEYS, SLS_PARAM_KEYS, blank_labels
+from core.formatting import format_fixed_sig, format_value_at_uncertainty
+from gui.field_labels import CHAIN_TYPE_LABELS, PARAM_LABELS
 from gui.help import section_header
 from gui.solvent_picker import OTHER_DATA, index_of_solvent, populate_solvent_combo
 from gui.theme import ThemedLabel, set_flag, color as theme_color, token as theme_token
@@ -59,9 +58,9 @@ _GEOMETRY_OPTIONS = (_GEOMETRY_BLANK, 'VV', 'VH', 'VU')
 # normal Update / dirty-highlight / Reset machinery.
 _CHAIN_TYPE_KEY = 'chain_type'
 _CHAIN_TYPE_BLANK = '—'
-_CHAIN_TYPE_OPTIONS = (_CHAIN_TYPE_BLANK, 'Linear', 'Branched')
-_CHAIN_TYPE_TO_STORED = {'Linear': 'linear', 'Branched': 'branched'}   # display -> stored
-_CHAIN_TYPE_TO_DISPLAY = {'linear': 'Linear', 'branched': 'Branched'}  # stored -> display
+_CHAIN_TYPE_TO_DISPLAY = CHAIN_TYPE_LABELS  # stored -> display
+_CHAIN_TYPE_OPTIONS = (_CHAIN_TYPE_BLANK, *CHAIN_TYPE_LABELS.values())
+_CHAIN_TYPE_TO_STORED = {shown: stored for stored, shown in CHAIN_TYPE_LABELS.items()}
 # Solvent blank: which c = 0 series THIS SLS series is referenced against. A dropdown
 # over the sample's blanks (stored as the blank's item_id, never a filename) whose
 # first entry is the automatic pairing -- the blank from this series' own source file,
@@ -77,8 +76,9 @@ _BLANK_AUTO = 'auto'
 _BLANK_I90_KEY = 'solvent_blank_intensity_90deg'
 # Solvent name: a CLOSED dropdown over all library solvents (gui/solvent_picker.py)
 # plus an "Other…" entry that reveals a text box for a solvent the library does not
-# carry. Picking one re-derives n and (for DLS) viscosity from the library; a name
-# entered through Other… is stored verbatim and auto-fills nothing.
+# carry. Picking one re-derives n and (for DLS) viscosity from the library, as does a library
+# name typed through Other… (matched ignoring case and surrounding spaces); any other typed
+# name auto-fills nothing.
 _SOLVENT_KEY = 'solvent_name'
 # Every row whose value cell is a combo widget (tinted, not the hidden item).
 _COMBO_KEYS = (_GEOMETRY_KEY, _CHAIN_TYPE_KEY, _SOLVENT_KEY, _BLANK_KEY)
@@ -92,7 +92,7 @@ _SOLVENT_SOURCE_KEYS = {
 }
 # The mean count rate and the sidecar recording where it came from (mirrors
 # app.controller._MEAN_CR_KEY / _MEAN_CR_SOURCE_KEY): 'trace:*', 'vendor', 'generator'
-# (a synthetic draw's own rate) or 'user'.
+# (a synthetic draw's own rate), 'replicate:mean' (a replicate average's) or 'user'.
 _MEAN_CR_KEY = 'mean_count_rate_cps'
 _MEAN_CR_SOURCE_KEY = 'mean_count_rate_cps_source'
 # Numeric params the user may enter in a choice of units (canonical value stored).
@@ -127,61 +127,42 @@ _FIXED_UNIT = {
 # global "Show tooltips" gate at render). Kept terse; how-to lives in the group ? badge.
 _ROW_TOOLTIPS = {
     'label': (
-        'A short name for this measurement, shown wherever it appears — the sidebar, '
-        'the plot legends, the results tables and the warning lines. It ADDS to the '
-        'sample and the angle rather than replacing them, so “3” is enough. Left blank, '
-        'the source file name is used, without its extension. Not part of the sample '
-        'identity: it changes no grouping and no analysis.'),
+        'A short name of your own, shown wherever the measurement appears and added to '
+        'its sample and angle rather than replacing them, so “3” is enough. Left blank, '
+        'the file name is used without its extension; the label changes no grouping '
+        'and no analysis.'),
     'solvent_blank_item_id': (
         'The c = 0 solvent measurement subtracted from this series to form its excess '
-        'Rayleigh ratio. "auto" pairs the blank recorded in this series\' own file, else '
-        'the sample\'s reference blank (the first one loaded). Pick a blank here when '
-        'the file carried none, or the automatic pairing is not the one you measured. '
-        'The dropdown tooltip says which blank is in use and why.'),
+        'Rayleigh ratio (Theory-and-Equations-Guide §1.7). “auto” takes the blank from '
+        'this series\' own file, else the sample\'s reference blank (the first loaded); '
+        'the dropdown\'s tooltip names the blank in use and why.'),
     'mean_count_rate_cps': (
-        'Average photon count rate for this run, in the unit chosen beside it. Proposed '
-        'from a linked count-rate trace (plain or outlier-clipped mean — the cell tooltip '
-        'says which), from the instrument file\'s own value, or, for a synthetic run, from '
-        'the generator\'s own draw; yours as soon as you type '
-        'one, and then never re-derived away. Read by the nonlinear cumulant fit as the '
-        'photon count rate in its residual weighting (so it moves the size and PDI a '
-        'little; the fit records whether a rate was available) and by the count-rate '
-        'diagnostics; not by the Mw fits. See the Theory-and-Equations-Guide.'),
+        'Average photon count rate of this run, in the unit beside it. The nonlinear '
+        'cumulant and distribution fits read it in their default residual weight '
+        '(Theory-and-Equations-Guide §3.2.9), and Derived Intensity builds static '
+        'points from it.'),
     'solvent_blank_intensity_90deg': (
-        'Scattered intensity of the PURE SOLVENT at 90°, used only when this sample has '
-        'no measured c = 0 blank. Hand-entered only — never proposed or guessed. Enter it '
-        'in the units of the loaded intensity column, as the instrument shows it, BEFORE '
-        'dark-count subtraction (the convention of the SLS tab dark count rate); for a '
-        'trace-derived series that means cps. It is NOT subtracted uniformly: it is the 90° '
-        'value and is scaled by 1/sin θ at each angle, so the blank at 30° is twice as '
-        'large. That assumes vertically polarized incident light, a scattering volume going '
-        'as 1/sin θ, and a solvent scattering like a simple liquid — weakest at low angles, '
-        'where flare and dust live. A measured blank always wins; leave this blank (or zero) '
-        'to subtract no solvent at all. Every result from it is flagged unreliable, Rg '
-        'included. See the Theory-and-Equations-Guide.'),
+        'The pure solvent\'s reading at 90°, in the loaded intensity column\'s units, '
+        'before dark-count subtraction; used only when the sample has no measured '
+        'c = 0 blank, and empty or zero subtracts no solvent. It is scaled by 1/sin θ '
+        'at each angle, not subtracted uniformly, and every result on it is flagged '
+        'unreliable, Rg included (Theory-and-Equations-Guide §1.7.2).'),
     'dn_dc_mL_per_g': (
-        'Refractive-index increment of THIS polymer in THIS solvent. Hand-entered '
-        'only — never proposed or guessed, because the optical constant K goes as '
-        '(dn/dc)², so an error enters Mw squared. May be left BLANK: no measured value '
-        'exists for some polymers, and for particle dispersions the quantity is not '
-        'defined. Blank runs every analysis and leaves Rg, the form-factor sizes and '
-        '2·A₂·Mw exact; only Mw and the absolute A₂ are then on an arbitrary optical '
-        'scale, and are flagged as such. Zero is refused — it would collapse the whole '
-        'Kc/ΔR ordinate. Negative is legal. See the Theory-and-Equations-Guide.'),
+        'Refractive-index increment of this solute in this solvent; the program never '
+        'computes or looks one up (a file that records one fills it), since the optical '
+        'constant goes as its square and an error enters Mw squared. Blank puts only Mw and the absolute A₂ on a flagged '
+        'arbitrary scale; zero is refused, a negative value accepted '
+        '(Theory-and-Equations-Guide §1.5).'),
     'solute_refractive_index': (
-        'Refractive index of the PARTICLE/solute itself (not the solvent, not dn/dc). '
-        'Optional and hand-entered — never guessed. Sets the contrast m = solute / solvent '
-        'index for the RDG and Mie sphere models: re-weighting a DLS distribution to '
-        'volume/number, and (on the SLS side) the full-Mie form-factor P(q) fit. For the '
-        'core-shell model it is the CORE index (paired with the shell refractive index). '
-        'Leave blank for ordinary DLS/SLS, the Rayleigh (very small particle) reweighting, or '
-        'the analytic sphere/coil/ellipsoid form factors. See the Theory-and-Equations-Guide.'),
+        'Refractive index of the particle or solute itself, not the solvent\'s and not '
+        'dn/dc; optional, never proposed. It sets the contrast m = solute / solvent '
+        'index for the DLS RDG and Mie weightings and the SLS Mie fit, and is the core '
+        'index of the core–shell fit (Theory-and-Equations-Guide §3.7, §4.10 and §4.11).'),
     'shell_refractive_index': (
-        'Refractive index of the coating/SHELL of a core-shell (coated) particle. Optional and '
-        'hand-entered — never guessed. Used only by the SLS core-shell form-factor P(q) fit, '
-        'which pairs it with the solute (core) index to form the two contrasts m1 = core / '
-        'solvent, m2 = shell / solvent. Leave blank for every other model. See the '
-        'Theory-and-Equations-Guide.'),
+        'Refractive index of the shell of a core–shell (coated) particle; optional, never '
+        'proposed. Only the SLS core–shell fit reads it, pairing it with the solute '
+        '(core) index into the contrasts m1 = core / solvent and m2 = shell / solvent '
+        '(Theory-and-Equations-Guide §4.11).'),
 }
 
 
@@ -251,71 +232,20 @@ class DataModule(QtWidgets.QWidget):
             'Physical Parameters — edit, then Update to apply',
             'Which parameters each analysis needs:',
             bullets=[
-                '<b>All:</b> solute &amp; solvent name, temperature, wavelength, '
+                '<b>All:</b> solute and solvent name, temperature, wavelength, '
                 'refractive index.',
-                '<b>DLS (size):</b> + viscosity, scattering angle.',
-                '<b>SLS (Mw, A₂):</b> + concentration, a calibration, and dn/dc. '
-                'Leave <b>dn/dc blank</b> if you do not have one (no published value, '
-                'or a particle dispersion): everything still runs, and only M<sub>w</sub> '
-                'and absolute A₂ are flagged as being on an arbitrary scale. '
-                'R<sub>g</sub> and the sizes are unaffected.',
-                'Identity &amp; optics are shared across the sample (enter once); '
-                'concentration and angle are per-measurement.',
-                '<b>Label:</b> a short name of your own, shown beside the angle and '
-                'concentration rather than instead of them — the file name is always '
-                'on hover. Highlight several measurements and type <b>one</b> label: '
-                'each gets that label plus a running number in sidebar order '
-                '(<b>batch</b> → <b>batch 1</b> … <b>batch 6</b>), zero-padded so twelve '
-                'sort correctly, so each run <i>in that selection</i> gets a distinct '
-                'name. Clear the label to go back to the file name. '
-                'Everything else you type with several highlighted applies to them all '
-                'unchanged.',
-                '<b>Solvent blank (SLS):</b> each series is referenced against the '
-                'c = 0 blank from its own file, else the sample\'s reference blank. '
-                'Pick a different one in the <b>Solvent blank</b> row when the file '
-                'carried none or the pairing is wrong; the dropdown tooltip says which '
-                'blank is in use.',
-                '<b>No blank at all?</b> Type the solvent\'s intensity at 90° in '
-                '<b>Solvent blank intensity at 90°</b> and the blank is computed from '
-                'it — <b>not</b> subtracted uniformly: it is the 90° value, scaled by '
-                '1/sin θ at each angle, so the blank at 30° is twice as large. Leave it '
-                'empty to subtract no solvent at all. The SLS tab asks before it runs, '
-                'and <b>every</b> result is flagged unreliable, R<sub>g</sub> included. '
-                'A measured blank always wins, and the field greys out when you have one.',
-                '<b>Solvent library:</b> pick a solvent under <b>Measured properties</b> '
-                'and the refractive index (and viscosity) auto-fill from temperature + '
-                'wavelength, rounded at the last digit the library can stand behind.',
-                'Solvents under <b>Estimated properties</b> are offered but <b>not</b> '
-                'auto-filled — their data is too weak to put a number into an analysis, '
-                'so you enter n (and viscosity) yourself. A note below the table says so '
-                'when you pick one; Utilities ▸ Solvent Explorer shows the estimates.',
-                'Library values re-derive when you change temperature or wavelength; '
-                'a value you type by hand is never overwritten.',
-                'A teal dot marks a value the program proposed — from the solvent '
-                'library, a linked count-rate trace, the file itself, or the synthetic '
-                'generator; no dot '
-                'means your own value. dn/dc is never proposed — enter it yourself '
-                'or leave it blank.',
-                '<b>Mean count rate</b> (DLS): offered from a linked count-rate '
-                'trace or from the file\'s own value, each labelled — and committed for '
-                'you at load when the file carries one, so the nonlinear cumulant can '
-                'weight its channels by it from the first Run; a value you type reaches '
-                'the fits when you press <b>Update</b>. A value you type is '
-                'never overwritten, and if it differs from the linked trace a note '
-                'below the table says so.',
-                'Values are used exactly as entered. If a temperature or refractive '
-                'index looks like a unit slip (e.g. 2980 K for 298 K, or n = 13.3 for '
-                '1.33) a note below the table flags it as implausible — double-check '
-                'it, then keep or correct it as you see fit.',
-                'For a solvent the library does not carry, choose <b>Other…</b> and '
-                'type its name. The name is stored exactly as you type it and nothing '
-                'is guessed from it — enter its refractive index (and viscosity) '
-                'yourself. Only capitalisation is ignored when matching measurements '
-                'into one sample, so <i>H2O</i> and <i>water</i> are two samples.',
-                '<b>Chain type</b> (optional): tag a sample <b>Linear</b> (a reference '
-                'for the Cross-Sample branching laws) or <b>Branched</b> (gets the '
-                'contraction factors g and h); shared across the sample.',
-                'Tip: press <b>Enter</b> in a value to jump to the next field.',
+                '<b>DLS:</b> + viscosity and scattering angle. <b>SLS:</b> + '
+                'concentration, a calibration and dn/dc, which can stay blank '
+                '(User-Manual §6.5).',
+                'Identity and optics are shared across the sample; concentration and '
+                'angle are per measurement.',
+                'With several measurements highlighted, one typed <b>Label</b> is '
+                'numbered in sidebar order (<b>batch 1</b>, <b>batch 2</b> …, '
+                'zero-padded past nine); other edits apply to all.',
+                '<b>Mean count rate</b> (DLS): applied at load when the file carries '
+                'one; <b>From…</b> offers the other sources, for this run only.',
+                '<b>Enter</b> in a value jumps to the next field.',
+                'Each row, the solvent library and a missing blank: User-Manual §6.1–6.6.',
             ]))
         self.table = QtWidgets.QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(['Parameter', 'Value', 'Unit'])
@@ -410,8 +340,9 @@ class DataModule(QtWidgets.QWidget):
         self.undo_button.clicked.connect(self._on_undo)
         self.reset_button = QtWidgets.QPushButton('Reset')
         self.reset_button.setToolTip(
-            'Clear all entered parameters for this sample (the scattering angle is '
-            'kept). Press Update to apply, or Undo to restore.')
+            'Clear every entered parameter of the highlighted measurements (a sample '
+            'heading highlights all of them), keeping the scattering angle; nothing is '
+            'applied until Update, and Undo restores them.')
         self.reset_button.clicked.connect(self._on_reset)
         row.addWidget(self.update_button)
         row.addWidget(self.undo_button)
@@ -453,7 +384,7 @@ class DataModule(QtWidgets.QWidget):
             return
 
         lm = self.controller.workspace.measurements[item_id]
-        self.keys = _DLS_PARAM_KEYS if lm.kind == 'dls' else _SLS_PARAM_KEYS
+        self.keys = DLS_PARAM_KEYS if lm.kind == 'dls' else SLS_PARAM_KEYS
         self.legend.show()
         self._build_rows()
         self._populate()
@@ -516,11 +447,11 @@ class DataModule(QtWidgets.QWidget):
         combo = QtWidgets.QComboBox()
         combo.addItems(_GEOMETRY_OPTIONS)
         combo.setToolTip(
-            'Polarization/analyzer geometry of this correlogram (incident, '
-            'analyzer): VV = polarized, VH = depolarized, VU = no analyzer, '
-            '— = unspecified. The DDLS sub-tab pairs a VV with a VH '
-            'at each angle to extract rotational diffusion. Leave — for ordinary '
-            'polarized DLS.')
+            'Polarization geometry of this correlogram, as (incident, analyzer): '
+            'VV = polarized, VH = depolarized, VU = no analyzer, — = unspecified, '
+            'as for ordinary polarized DLS (Theory-and-Equations-Guide §1.6.1). The '
+            'DDLS sub-tab pairs a VV with a VH at each angle to extract rotational '
+            'diffusion.')
         combo.currentTextChanged.connect(self._on_geometry_changed)
         self.table.setCellWidget(row, 1, combo)
 
@@ -530,11 +461,11 @@ class DataModule(QtWidgets.QWidget):
         combo = QtWidgets.QComboBox()
         combo.addItems(_CHAIN_TYPE_OPTIONS)
         combo.setToolTip(
-            'Polymer architecture of this sample, for the Cross-Sample branching '
+            'Chain architecture of this sample, for the Cross-Sample branching '
             'contraction factors: Linear = a reference that defines the linear Rg–Mw '
             'and Rh–Mw laws; Branched = a target that gets g (from Rg) and/or h (from '
-            'Rh); — = untagged. Entered once and shared across the sample’s '
-            'measurements. See the Theory-and-Equations-Guide.')
+            'Rh); — = untagged. Shared across the sample’s measurements '
+            '(Theory-and-Equations-Guide §5.3–5.4).')
         combo.currentTextChanged.connect(self._on_chain_type_changed)
         self.table.setCellWidget(row, 1, combo)
 
@@ -555,18 +486,19 @@ class DataModule(QtWidgets.QWidget):
         combo = QtWidgets.QComboBox()
         populate_solvent_combo(combo, include_blank=True, include_other=True)
         combo.setToolTip(
-            'Solvent for this sample. Choosing a library solvent auto-fills the '
-            'refractive index (and, for DLS, the viscosity) from the temperature and '
-            'wavelength. Choose Other… to name a solvent the library does not carry — '
-            'the name is then used exactly as you type it, and you enter its '
-            'refractive index (and viscosity) yourself.')
+            'Solvent of this sample, part of its identity. A solvent under Measured '
+            'properties fills the refractive index (and, for DLS, the viscosity) from '
+            'the temperature and wavelength; one under Estimated properties, or a name '
+            'typed through Other… that the library does not carry, fills nothing '
+            '(User-Manual §6.3).')
         combo.activated.connect(self._on_solvent_picked)
 
         other = QtWidgets.QLineEdit()
         other.setPlaceholderText('Solvent name')
         other.setToolTip(
-            'Name of a solvent not in the library. Stored exactly as typed and used '
-            'as-is to match this measurement to its sample.')
+            'Name of a solvent the library does not carry, stored exactly as typed. '
+            'Measurements match into one sample by it, ignoring only capitalization '
+            'and surrounding spaces, so H2O and water are two samples.')
         other.hide()
         other.editingFinished.connect(self._on_solvent_typed)
         # Enter in the solvent field advances to the next field, matching every other
@@ -780,37 +712,18 @@ class DataModule(QtWidgets.QWidget):
                     self, 'Solvent blank intensity cannot be used', problem)
                 self._revert_cell(item.row(), key)
                 return
-        # A direct edit of n or viscosity claims that field as user-owned (sample-wide)
-        # BEFORE the write, so library autofill never overwrites it. Only a real typed
-        # value claims it. Clearing a library-filled cell instead drops its
-        # 'library:primary' tag, so the provenance dot never keeps claiming a library
-        # value on an EMPTY safety-critical cell; a later solvent/T/λ change
-        # still re-derives it (autofill is blocked only by a 'user' tag).
-        if key in _SOLVENT_VALUE_KEYS:
-            if value is not None:
-                self.controller.mark_solvent_field_user(self.item_id, key)
-            else:
-                self.controller.clear_library_solvent_field(self.item_id, key)
-        # Sample-shared params are entered once and propagate to every
-        # measurement in the sample; per-measurement axes stay local.
-        if key in _SHARED_PARAM_KEYS:
-            self.controller.set_shared_param(self.item_id, key, value)
-            # A temperature/wavelength change re-derives any library-sourced n/viscosity
-            # at the new condition; repopulate so the freshly derived values show.
-            # _populate already runs _refresh_dirty + _refresh_provenance, so return
-            # after it rather than repeat both in the shared tail below.
-            if key in ('temperature_K', 'wavelength_nm'):
-                status = self.controller.reautofill_after(self.item_id, key)
-                self._populate()
-                self._apply_autofill_status(status)
-                self._refresh_pending()
-                return
-        else:
-            # The Mw fraction is a per-measurement axis like angle/concentration:
-            # set it only on the edited row (and any other highlighted rows), with
-            # no propagate-and-commit popup — applying it is now consistent with
-            # every other per-measurement parameter.
-            self.controller.set_param(self.item_id, key, value)
+        # The edit rules (claim a typed n or viscosity, clear a library one, write a
+        # shared key sample-wide, re-derive after a condition change) are the
+        # controller's: `Controller.edit_param`.
+        status = self.controller.edit_param(self.item_id, key, value)
+        if status is not None:
+            # The library n and viscosity were re-derived at the new condition;
+            # repopulate so the fresh values show. _populate already runs
+            # _refresh_dirty + _refresh_provenance, so return after it.
+            self._populate()
+            self._apply_autofill_status(status)
+            self._refresh_pending()
+            return
         self._refresh_dirty()
         self._refresh_provenance()
         self._refresh_pending()
@@ -867,9 +780,13 @@ class DataModule(QtWidgets.QWidget):
             return
         combo.clear()
         combo.addItem(_BLANK_AUTO, None)
+        labels = blank_labels(blanks)
         for b in blanks:
-            # The same folder/file name the tooltip and the export use.
-            combo.addItem(f'{blank_label(b)}  [{b.item_id}]', b.item_id)
+            # The same folder/file name the tooltip and the export use; a label that
+            # already ends in the id (blanks only the id tells apart) is not suffixed twice.
+            label, suffix = labels[b.item_id], f'[{b.item_id}]'
+            combo.addItem(label if label.endswith(suffix) else f'{label}  {suffix}',
+                          b.item_id)
         wanted = working.get(_BLANK_KEY)
         idx = combo.findData(wanted) if wanted else 0
         combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -1078,8 +995,7 @@ class DataModule(QtWidgets.QWidget):
         if working.get(_SOLVENT_KEY) == value:
             self._show_solvent(value)     # unchanged, but the widget pair may not be
             return
-        self.controller.set_shared_param(self.item_id, _SOLVENT_KEY, value)
-        status = self.controller.reautofill_after(self.item_id, _SOLVENT_KEY)
+        status = self.controller.edit_param(self.item_id, _SOLVENT_KEY, value)
         self._populate()
         self._apply_autofill_status(status)
         self._refresh_pending()
@@ -1093,12 +1009,12 @@ class DataModule(QtWidgets.QWidget):
 
     # ---------------------------------------------------------- commit/undo ---
     def _apply_edits_to_selection(self) -> None:
-        """Copy the focused measurement's pending edits to the other highlighted
+        """Carry the focused measurement's pending edits to the other highlighted
         measurements before committing. No-op unless several are highlighted.
 
-        Every key fans out VERBATIM except `label`, which is numbered -- see
-        `_fan_out_numbered_label`. The shared physical parameters are quantities that
-        SHOULD be identical across a selection; a label is the one key whose whole job
+        What travels, and what each sample derives for itself, is the controller's
+        rule (`Controller.apply_pending_edits`). The `label` is numbered here instead
+        -- see `_fan_out_numbered_label` -- because it is the one key whose whole job
         is to tell two runs apart.
         """
         if self.item_id is None:
@@ -1114,12 +1030,10 @@ class DataModule(QtWidgets.QWidget):
         others = [i for i in selected if i != self.item_id]
         if not others:
             return
-        working = self.controller.workspace.measurements[self.item_id].working_params
-        for key in self.controller.dirty_keys(self.item_id):
-            if key == 'label':
-                self._fan_out_numbered_label(selected, working.get(key))
-            else:
-                self.controller.apply_value_to_items(others, key, working.get(key))
+        if 'label' in self.controller.dirty_keys(self.item_id):
+            working = self.controller.workspace.measurements[self.item_id].working_params
+            self._fan_out_numbered_label(selected, working.get('label'))
+        self.controller.apply_pending_edits(self.item_id, others, skip=('label',))
 
     def _fan_out_numbered_label(self, selected, typed) -> None:
         """A label typed with SEVERAL measurements highlighted lands on each as that
@@ -1338,6 +1252,14 @@ class DataModule(QtWidgets.QWidget):
             return 'lib_primary', (
                 "From the synthetic generator: the mean count rate its noise model drew "
                 "this correlogram at. Editable; a value you type is never overwritten.")
+        if family == 'replicate':
+            n = len(working.get('replicate_count_rates_cps') or ())
+            spread = working.get('replicate_count_rate_spread')
+            apart = ('' if spread is None else
+                     f", which lie {format_fixed_sig(100.0 * float(spread), 2)} % apart")
+            return 'lib_primary', (
+                f"The mean of the {n} averaged runs' committed count rates{apart}. "
+                f"Editable; a value you type is never overwritten.")
         return None, (f'Your value — used exactly as entered.{extra}'
                       if working.get(key) is not None else '')
 
@@ -1408,8 +1330,8 @@ class DataModule(QtWidgets.QWidget):
         teal = theme_token(self, 'lib_primary')
         self.legend.setText(
             f'<span style="color:{teal}">●</span> proposed value (the solvent '
-            'library, or a mean count rate from a linked trace, the file, or the '
-            'synthetic generator)'
+            'library, or a mean count rate from a linked trace, the file, the '
+            'synthetic generator, or an average\'s runs)'
             ' &nbsp;·&nbsp; no dot = your value &nbsp;·&nbsp; '
             'a value you type is never overwritten')
 

@@ -67,8 +67,8 @@ regression above.
       a committed mean count rate (Eq. (9)'s two shot-noise brackets enter) and
       'biganzoli-classical' when it does not (the classical infinite-count-rate limit):
       the weight never REQUIRES a count rate, on any instrument. A fit that ran in that
-      limit carries `NO_COUNT_RATE_NOTE`, the one passive sentence saying which input was
-      absent and what committing it would buy.
+      limit says so through that recorded form, which `core.notes.qualifiers` reads as
+      the fit's weighting qualifier.
 
     * g1 is the fitted field correlation A x0 of a FIRST PASS by the same arm under the
       'g1-squared' weight, at the same selector or the same fixed alpha -- where Maier,
@@ -100,9 +100,9 @@ a hand-set alpha means a different amount of smoothing under a weight of a diffe
 SHAPE. A WEIGHT THAT CANNOT BE FORMED falls back rather than refusing: if Eq. (9)
 refuses an input, the order-1 fit does not fit, or a first pass leaves the anchor
 nothing to match, the fit runs under the 'g1-squared' weight, records that form and
-carries a passive note naming the refusal; a fit whose SOLVER fails after the weight
-was formed is an ordinary fit failure, unchanged. The weight is a precision map that
-improves the FIT only; no statistical +/- is ever
+carries a `weight_fallback_g1` record naming the cause; a fit whose SOLVER fails after
+the weight was formed is an ordinary fit failure, unchanged. The weight is a precision
+map that improves the FIT only; no statistical +/- is ever
 reported from a single correlogram (invariant 8) -- Schätzel 1990 (the correlated,
 non-uniform correlator noise this diagonal approximates) is exactly why a single-shot ±
 is still deferred to replicate averaging.
@@ -130,25 +130,38 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 import numpy as np
 from scipy import optimize, special
 
 from core.data_models import DLSMeasurement
 from analysis.dls._common import (
-    _apply_tau_window,
+    _all_notes,
+    apply_tau_window,
     _apply_tau_window_live,
     _build_rh_gamma_grid,
+    _decay_completeness,
+    _decay_completeness_check,
     _estimate_baseline,
     _estimate_beta,
+    _fitted_tau_span,
+    _grid_end_check,
+    _lowest_observed_acf_ratio,
     _measurement_q_m,
+    _observed_decay_check,
     _require_viscosity,
     _result_flags,
     _rms_error,
+    _WeightNotFormed,
     channel_sample_times,
+    MAX_RETAINED_ACF_RATIO,
+    MIN_DECAY_COMPLETENESS,
 )
-from analysis.dls.cumulants import _dead_channel_note, _sourced_sigma, fit_cumulants
+from analysis.dls.cumulants import (
+    CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM, _dead_channel_note, size_range_check,
+    _sourced_sigma, fit_cumulants)
+from core.notes import Note, RefusedInputs
 
 
 # The residual weightings a caller may REQUEST on any of the three distribution fits, each
@@ -191,18 +204,21 @@ DEFAULT_RECORDED_DISTRIBUTION_WEIGHTINGS = frozenset({
     'biganzoli-full', 'biganzoli-classical',
 })
 
-# The one passive sentence a fit carries when it ran under the sourced weight with no
-# committed mean count rate. It names the ABSENT INPUT and what committing it buys
-# (invariant 4 clause 1: the precondition, never a proxy), and it is UI-neutral -- the
-# panel, the per-fit export and the summary export all show this same string. Not a
-# refusal and not a reliability verdict: the classical limit is a documented form of the
-# variance, so the weight is sourced either way and the fit is reported either way.
-NO_COUNT_RATE_NOTE = (
-    'No mean count rate was committed for this run, so the sourced residual weight was '
-    'built from the infinite-count-rate limit of its variance model; committing one adds '
-    'the photon-counting terms to the weight.'
-)
-
+# The words the `weight_fallback_g1` record prints for why the sourced weight was not
+# formed, by the key its refusal carries (`_WeightNotFormed.cause`): Eq. (9)'s
+# refusals, keyed as `cumulants._WEIGHT_CAUSES` keys them, then this arm's own -- the first
+# pass the weight is evaluated on, and the anchor (`_anchor_weight`).
+_WEIGHT_CAUSES = {
+    'decay_per_sample_time': 'decay per sample time ≤ 0 or not finite',
+    'lag_index': 'a sample time contradicts its lag',
+    'run_duration': 'the run duration not past the last lag',
+    'count_rate': 'a count rate unusable for shot noise',
+    'channel_sd': 'a per-channel SD ≤ 0 or not finite',
+    'first_pass': 'the first pass did not fit',
+    'weight_entry': 'a weight entry < 0 or not finite',
+    'spectrum_zero': 'a first-pass spectrum of zeros',
+    'scale_anchor': 'a scale anchor outside the float range',
+}
 
 @dataclass
 class DistributionResult:
@@ -235,11 +251,13 @@ class DistributionResult:
     # their solution, so they leave the default. Consumers must never present the
     # summary values, peaks, or a rho source from a success=False result as fitted.
     success: bool = True
-    # Passive notes, the shape CumulantResult carries and the GUI/export read generically:
-    # the dead-channel note when the live-channel mask dropped a channel from the inversion
+    # Every note of the fit: the preconditions first -- a summary withheld because the
+    # solution could not be normalized (`_distribution_summary`), a lognormal fit that did
+    # not converge -- then the records, about the whole fit: the dead-channel note when
+    # the live-channel mask dropped a channel from the inversion
     # (`_prepare_distribution_inputs`), and the note a weight that could not be formed
     # carries (`_weight_fallback_note`).
-    notes: tuple = ()
+    notes: Tuple[Note, ...] = ()
     # WHICH WEIGHT BUILT THIS FIT'S RESIDUALS, one of `RECORDED_DISTRIBUTION_WEIGHTINGS`
     # (the `CumulantResult.weighting` pattern): a weight moves the recovered distribution,
     # the selected alpha and the sweep's diagnostic arrays, so a result says which form
@@ -265,6 +283,17 @@ class DistributionResult:
     # pins it). Both fields are `CumulantResult`'s, in its vocabulary, and both
     # default to '' -- a record written before they existed read neither input either.
     run_duration_form: str = ''
+    # The lognormal arm's FITTED median, exp(mu); NaN for NNLS and CONTIN, which fit no
+    # parameter. It is the geometric mean of a lognormal, the arm's own parameter, so the
+    # arm's one peak reports it as `DistributionPeak.mean_rh_nm`. Not exact for a population
+    # that runs past either end of the grid: the model is normalised on the grid, so the fit
+    # moves mu outward to stand in for the weight it cannot place (measured on a planted
+    # 500 nm population of log-width 0.6: about +0.47 in ln).
+    median_rh_nm: float = float('nan')
+    # The geometric mean of the lobe that holds `peak_rh_nm`'s node, the lobe delimited by
+    # `scan_distribution_peaks` with no floor (`peak_lobe_geometric_mean_nm`); the
+    # lognormal's fitted median for that arm. NaN where `peak_rh_nm` is.
+    peak_mean_rh_nm: float = float('nan')
 
 
 @dataclass
@@ -338,20 +367,19 @@ class ContinResult:
     is no sweep). Both flag, neither withholds: the distribution is always returned
     (CLAUDE.md invariant 4, flag-not-refuse).
 
-    `alpha_reliable` / `reliability_note` are the family pair every parametric result
-    carries (CumulantResult's shape): the end state gives its note through
-    `_ALPHA_STATE_NOTES`, the selector's own preconditions give theirs, and the two roll
-    up through `_result_flags` into the ONE string every surface shows -- so the flag and
-    the sentence come from one call and cannot disagree. The states: ALPHA_FLOOR_NOTE,
-    ALPHA_CEILING_NOTE, ALPHA_NO_CORNER_NOTE (the L-curve found no corner in the window,
-    so neither edge flag fires and the note says so rather than naming a proxy),
-    ALPHA_ONE_POINT_NOTE on a one-point sweep under GCV or the F-test. The preconditions,
-    under the F-test only: FTEST_REFERENCE_NOTE and FTEST_BAND_NOTE_TEMPLATE, the two
-    checks that criterion's own manual prescribes (`fit_contin`'s
+    `alpha_reliable` and its precondition notes are the family pair every parametric
+    result carries (CumulantResult's shape): the end state gives its note through
+    `_alpha_state_note`, the selector's own preconditions give theirs, and the two roll
+    up through `_result_flags` -- so the flag and the notes come from one call and cannot
+    disagree. The states: `alpha_at_floor`, `alpha_at_ceiling`, `alpha_no_corner` (the
+    L-curve found no corner in the window, so neither edge flag fires and the note says
+    so rather than naming a proxy), `alpha_one_point` on a one-point sweep under GCV or
+    the F-test. The preconditions, under the F-test only: `ftest_reference` and
+    `ftest_band`, the two checks that criterion's own manual prescribes (`fit_contin`'s
     `ftest_reference_agreement` and `ftest_prob_band`). Every live note is kept, in that
-    order, and the string is '' when the selection is interior, every precondition held,
-    or the alpha was user-fixed. Every surface reads this string (pinned by
-    tests/test_workspace.py::test_contin_edge_note_is_one_string_on_every_surface).
+    order, and there is none when the selection is interior, every precondition held, or
+    the alpha was user-fixed. `notes` holds them first, then the chosen distribution's
+    records.
     """
     distribution: DistributionResult
     lcurve: LCurveResult
@@ -362,59 +390,31 @@ class ContinResult:
     alpha_at_ceiling: bool = False
     alpha_at_floor: bool = False
     alpha_reliable: bool = True
-    reliability_note: str = ''
-    notes: tuple = ()                 # the chosen distribution's notes, lifted for readers
+    notes: Tuple[Note, ...] = ()      # the alpha preconditions, then the distribution's
 
 
-# The sweep-edge wording, in its one home. Both phrases are sized to the predicate: the
-# index says only that the selector wanted past the bound, so each names the direction
-# and nothing more, and what the solution then IS (unregularized at the default floor,
-# not at alpha = 30; the range's smoothest fit at the ceiling) lives in the how-to help,
-# conditioned on the bound's value. The ceiling phrase no longer hedges "possible
-# over-regularization": that is GCV's flat-minimum reading (Hansen 1998 p. 185) and the
-# opposite of the L-curve's ceiling state, whose corner lies ABOVE the window -- a
-# proxy for the failed precondition (CLAUDE.md invariant 4, clause 1).
-ALPHA_FLOOR_NOTE = ('CONTIN α at the sweep floor — the selector wanted a smaller α than '
-                    'the range allows')
-ALPHA_CEILING_NOTE = ('CONTIN α at the sweep ceiling — the selector wanted a larger α than '
-                      'the range allows')
-# The L-curve's two further states. "No corner" is not an edge and must not borrow the
-# floor's phrase: the window's points carry no L shape at all (too few distinct points,
-# or no horizontal leg AND no vertical branch around the pick), so the fit reports the
-# least-regularized alpha of the range and says exactly that. The one-point wording
-# replaces joining the floor and ceiling phrases: a single-point sweep has no interior
-# for any selector to choose in, which is one fact about the range, not two edge hits.
-ALPHA_NO_CORNER_NOTE = ('CONTIN α by L-curve: the sweep shows no corner — the '
-                        'least-regularized α of the range is reported')
-ALPHA_ONE_POINT_NOTE = ('CONTIN α on a one-point sweep — the range has no interior, so '
-                        'the selector had no choice')
+def _alpha_state_note(state: str, alpha: float) -> Optional[Note]:
+    """The selected alpha's END STATE as the one precondition note it carries, or None.
 
-# The F-test's OWN two preconditions, which its manual prescribes checking on every run
-# (CONTIN Users Manual §3.6.5 points 1 and 3, printed p. 17). They are statements about
-# the sweep the test ran on, not about where the pick landed, so they are stated BESIDE
-# the end state's note rather than instead of it: independently failed preconditions are
-# each named (CLAUDE.md invariant 4, clause 1). Point (1) reads on the reference solution
-# -- the least-squares end every F-statistic is measured against -- and a floor too high
-# for it is a different fact from the pick sitting on that floor. Point (3)'s numbers are
-# formatted from the band that produced them, so a non-default band prints no stale pair.
-FTEST_REFERENCE_NOTE = ('CONTIN α by F-test: the sweep floor is not small enough for the '
-                        'reference solution — its penalty is not negligible beside its '
-                        'residual')
-FTEST_BAND_NOTE_TEMPLATE = ('CONTIN α by F-test: the chosen solution\'s probability to '
-                            'reject lies outside {lo:g}–{hi:g} — the sweep does not '
-                            'bracket the test\'s transition')
-
-# Selected-alpha END STATE -> the one reliability note it carries. 'interior' is absent
-# on purpose: an interior pick is the healthy case and carries no note, so a lookup that
-# misses is the empty string. Every selector reduces its outcome to one of these states
-# (`_lcurve_corner`, `_end_state_of_index`), and `fit_contin` derives both edge flags and
-# the note/flag pair from it -- one source, so the two can never disagree.
-_ALPHA_STATE_NOTES = {
-    'floor': ALPHA_FLOOR_NOTE,
-    'ceiling': ALPHA_CEILING_NOTE,
-    'no-corner': ALPHA_NO_CORNER_NOTE,
-    'both': ALPHA_ONE_POINT_NOTE,
-}
+    'interior' carries none on purpose: an interior pick is the healthy case. Every
+    selector reduces its outcome to one state (`_lcurve_corner`, `_end_state_of_index`),
+    and `fit_contin` derives both edge flags and the note/flag pair from it -- one source,
+    so the two can never disagree. Each note is sized to its predicate: the index says only
+    that the selector wanted past the bound, so floor and ceiling name the direction and
+    nothing more (what the solution then IS lives in the how-to help, conditioned on the
+    bound's value). "No corner" is not an edge and does not borrow the floor's code: the
+    window's points carry no L shape at all, so the fit reports the least-regularized alpha
+    of the range. A one-point sweep has no interior for any selector to choose in, which is
+    one fact about the range, not two edge hits."""
+    if state == 'floor':
+        return Note('alpha_at_floor', (), {'alpha': alpha})
+    if state == 'ceiling':
+        return Note('alpha_at_ceiling', (), {'alpha': alpha})
+    if state == 'no-corner':
+        return Note('alpha_no_corner', (), {'alpha': alpha})
+    if state == 'both':
+        return Note('alpha_one_point', ())
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +503,7 @@ def _distribution_summary(
     weighting: str,
     sample_time_provenance: str,
     run_duration_form: str,
+    median_rh_nm: float = float('nan'),
 ) -> DistributionResult:
     """Assemble a DistributionResult from a raw solver solution x.
 
@@ -512,7 +513,12 @@ def _distribution_summary(
     `sample_time_provenance` and `run_duration_form` say what that weight READ, resolved
     from the recorded form by `_distribution_weight_disclosure`. All three are keyword-only
     with NO default, so a return path that forgets one fails loudly here rather than
-    recording a fit as having read something it did not.
+    recording a fit as having read something it did not. `median_rh_nm` is the lognormal
+    arm's fitted exp(mu), the only arm with one; where it is finite it is also the
+    result's `peak_mean_rh_nm`.
+
+    A summary withheld below carries `summary_withheld`, a precondition of the summary
+    values that fails no flag, ahead of `notes`: `success` stays as the inversion set it.
     """
     total = x.sum()
     # When the solution cannot be normalized, WITHHOLD the whole summary rather than
@@ -523,7 +529,8 @@ def _distribution_summary(
     # is UNCHANGED by any guard on the mean, so an all-equal degenerate vector still
     # reports the smallest grid point as "the peak", a perfectly plausible small size.
     # Guarding the divisor alone fixed the mean and left the peak lying (spec-03 review).
-    if math.isfinite(total) and total > 0:
+    withheld = not (math.isfinite(total) and total > 0)
+    if not withheld:
         weights = x / total
     else:
         weights = np.full_like(np.asarray(x, dtype=float), np.nan)
@@ -532,6 +539,14 @@ def _distribution_summary(
     mean_rh = float(np.sum(weights * rh_grid_nm))
     peak_rh = (float(rh_grid_nm[int(np.nanargmax(weights))])
                if weights.size and np.any(np.isfinite(weights)) else float('nan'))
+    median_rh = float(median_rh_nm)
+    peak_mean_rh = (median_rh if math.isfinite(median_rh)
+                    else peak_lobe_geometric_mean_nm(rh_grid_nm, weights))
+    if withheld:
+        # About the whole fit, as every note of this class is: its summary is most of it,
+        # and a relay that carries a fit's notes onward (a CONTIN result, a mode
+        # extraction) then never names an attribute its own class lacks.
+        notes = (Note('summary_withheld', ()), *notes)
     # A x is the recovered field ACF g1; map back to measured space via the Siegert
     # relation g2 - 1 = beta |g1|^2 (+ residual baseline).
     g1_fit = A @ x
@@ -557,6 +572,8 @@ def _distribution_summary(
         weighting=weighting,
         sample_time_provenance=sample_time_provenance,
         run_duration_form=run_duration_form,
+        median_rh_nm=median_rh,
+        peak_mean_rh_nm=peak_mean_rh,
     )
 
 
@@ -567,11 +584,21 @@ def _prepare_distribution_inputs(
     """Shared setup for NNLS/CONTIN/lognormal: window, live channels, baseline, beta,
     grid, A, y -- and the dead-channel note (or '') as the last element.
 
-    The inversion works on the LIVE channels only (`_common._live_channels`, one rule for
+    The inversion works on the LIVE channels only (`_common.live_channels`, one rule for
     every fitter): a dead channel at g2-1 = -1 sits exactly where the tail statistics read
     the baseline and beta, and it pulled NNLS on the committed dead-tail correlogram to a
     baseline of -0.67, a beta of 1.4 and a tenfold-wrong size, green. The returned `tau`
     and `g2m1` are therefore the live channels; the note counts what was dropped.
+
+    A baseline the CALLER supplied at or above the peak of those channels is refused, as
+    the linear cumulant refuses it: the subtraction leaves no positive signal to invert,
+    so it is an input error the user can act on (move the baseline region onto the tail),
+    raised as a `RefusedInputs` carrying `baseline_above_data`. Asked of the raw supplied
+    value against the same channels the subtraction runs on, so every `u` below is <= 0
+    exactly when it fires. An ESTIMATED baseline is never refused: it is measured on the
+    data, so a tail mean at the peak is a property of the correlogram, not a misplaced
+    input. Not extended to a supplied baseline just below the peak: placing the region
+    there is misuse, not a condition to judge (the owner's decision, 2026-10-16).
     """
     tau, g2m1, alive = _apply_tau_window_live(
         measurement.delay_times_s, measurement.correlogram,
@@ -581,8 +608,16 @@ def _prepare_distribution_inputs(
     dead_note = _dead_channel_note(int(np.count_nonzero(~alive)), int(g2m1.size))
     tau, g2m1 = tau[alive], g2m1[alive]
     baseline_estimated = baseline is None
+    if not baseline_estimated:
+        peak = float(np.max(g2m1))
+        if float(baseline) >= peak:
+            raise RefusedInputs(
+                (Note('baseline_above_data', (), {'baseline': float(baseline), 'peak': peak}),),
+                f"The supplied baseline ({float(baseline):.3g}) is at or above the windowed "
+                f"correlogram's peak ({peak:.3g}), so no point survives the subtraction: "
+                f"move the baseline region onto the tail.")
     if baseline is None:
-        baseline = _estimate_baseline(tau, g2m1)
+        baseline = _estimate_baseline(g2m1)
     beta_estimated = beta is None
     if beta is None:
         beta = _estimate_beta(tau, g2m1, baseline)
@@ -660,46 +695,39 @@ def _recorded_distribution_weighting(resolved: str, measurement: DLSMeasurement)
 def _distribution_weight_disclosure(recorded: str,
                                     measurement: DLSMeasurement) -> tuple:
     """What the fit's residual weight READ, for a RECORDED form:
-    `(sample_time_provenance, run_duration_form, count-rate note or '')`.
+    `(sample_time_provenance, run_duration_form)`.
 
     Resolved from the FINAL recorded form -- the one the fit actually ran under -- so the
     fallback is covered by construction: 'g1-squared' reads no sample time, no duration and
-    no count rate whether it was asked for or fallen back to, and records ('', '') with no
-    note. Under either sourced form the variance is evaluated on the instrument's own
-    per-channel sample time when the parser recorded one and on the delay-axis stand-in
-    otherwise, and on the finite-duration form of Eq. (9)'s 1/(M - k) when the measurement
-    carries a duration and on its T -> infinity form otherwise.
-
-    The count-rate note rides here rather than at each arm because it is the same question
-    asked of the same string: 'biganzoli-classical' IS "the sourced weight ran without a
-    committed count rate", so one predicate serves all three arms instead of three that
-    have to agree (rule 12 -- guard and operation from one computation).
+    no count rate whether it was asked for or fallen back to, and records ('', ''). Under
+    either sourced form the variance is evaluated on the instrument's own per-channel
+    sample time when the parser recorded one and on the delay-axis stand-in otherwise, and
+    on the finite-duration form of Eq. (9)'s 1/(M - k) when the measurement carries a
+    duration and on its T -> infinity form otherwise. Whether a count rate entered is the
+    recorded form itself ('biganzoli-full' / 'biganzoli-classical'), the fit's weighting
+    qualifier.
     """
     if recorded == 'g1-squared':
-        return '', '', ''
+        return '', ''
     return (('instrument' if measurement.sample_times_s is not None else 'axis'),
-            ('finite' if measurement.duration_s is not None else 'infinite'),
-            (NO_COUNT_RATE_NOTE if recorded == 'biganzoli-classical' else ''))
+            ('finite' if measurement.duration_s is not None else 'infinite'))
 
 
-def _weight_fallback_note(arm: str, refusal: str) -> str:
-    """The passive note a fit carries when its sourced weight could not be FORMED.
+def _weight_fallback_note(cause: Optional[str] = None) -> Note:
+    """The `weight_fallback_g1` record a fit carries when its sourced weight could not be
+    FORMED, about the whole fit; `cause` is the key of why (`_WEIGHT_CAUSES`), and a key
+    the table lacks, or None, names no cause.
 
     The cumulant arm's house pattern (`cumulants._fit_cumulants_nonlinear`, "A weight that
-    cannot be formed"): the fit runs, under the form it fell back to, and the note names
-    the refused input rather than a proxy (invariant 4 clause 1). It is a NOTE and not a
-    reliability verdict. The distribution family has no reliability flag: a fallback is
-    disclosed by the recorded form (`DistributionResult.weighting`) and by this note. The
-    cumulant arm also turns `rh_reliable` off on its own fallback; that flag predates this
-    form and is not extended here (owner-ruled 2026-09-20, this docstring its home; it
-    describes what the two arms do and chooses no reading of invariant 4 between them).
+    cannot be formed"): the fit runs, under the form it fell back to, and the record says
+    so and why. A fallback weight is a RECORD at every level and on every arm, never a
+    failed precondition, and no verdict reads it (a recommendation the owner accepted,
+    2026-10-16, this docstring the distribution arms' home of it): the fallback IS the
+    'g1-squared' fit, and that fit asked for by name carries the same verdicts. It is
+    disclosed by the recorded form (`DistributionResult.weighting`) and by this note.
     """
-    return (
-        f'The {arm} fit could not form its residual weight, so it ran under the '
-        f'g1-squared weight (w = g1^2, which takes the g2-1 noise as constant across '
-        f'channels) instead of the sourced variance: {refusal} The distribution is '
-        f'reported, fitted under the older weight rather than withheld.'
-    )
+    values = {'cause': _WEIGHT_CAUSES[cause]} if cause in _WEIGHT_CAUSES else {}
+    return Note('weight_fallback_g1', (), values)
 
 
 def _fitted_sample_times(measurement: DLSMeasurement, tau_min_s, tau_max_s,
@@ -719,7 +747,7 @@ def _fitted_sample_times(measurement: DLSMeasurement, tau_min_s, tau_max_s,
         tau_min_s, tau_max_s, min_points=4,
         skip_initial_channels=skip_initial_channels,
     )
-    _tau_dt, dt = _apply_tau_window(
+    _tau_dt, dt = apply_tau_window(
         measurement.delay_times_s, np.asarray(dt_full, dtype=float),
         tau_min_s, tau_max_s, min_points=4,
         skip_initial_channels=skip_initial_channels,
@@ -736,19 +764,22 @@ def _sourced_distribution_sigma(measurement: DLSMeasurement, tau: np.ndarray,
     Koppel's evaluation point (1972, the prose after Eq. 26, printed p. 4818) is an order-1
     fit under uniform weights, and `cumulants._sourced_sigma` -- called, never copied -- is
     the wrapper both fitters read it through, so the cumulant and distribution arms evaluate
-    ONE variance implementation at ONE point. Raises ValueError naming what failed: an
-    order-1 first pass that did not fit or returned a non-finite Gamma or beta, or an input
-    Eq. (9) refuses.
+    ONE variance implementation at ONE point. Raises `_WeightNotFormed` naming what failed,
+    its `cause` the key of the fallback's cause: an order-1 first pass that did not fit or
+    returned a non-finite Gamma or beta ('first_pass'), or an input Eq. (9) refuses (the
+    key `_sourced_sigma` read off the refusal).
     """
     first = fit_cumulants(measurement, order=1, method='nonlinear', weighting='uniform',
                           tau_min_s=tau_min_s, tau_max_s=tau_max_s,
                           skip_initial_channels=skip_initial_channels)
     if not (first.success and math.isfinite(first.gamma_s_inv)
             and math.isfinite(first.beta)):
-        raise ValueError(
+        raise _WeightNotFormed(
+            'first_pass',
             f"the order-1 uniform cumulant first pass the variance is evaluated on did "
             f"not fit this correlogram (Gamma = {first.gamma_s_inv!r} 1/s, "
-            f"beta = {first.beta!r}), so Eq. (9) has no evaluation point."
+            f"beta = {first.beta!r}), so the Biganzoli–Ferri variance has no evaluation "
+            f"point (Theory-and-Equations-Guide §3.4.2)."
         )
     dt = _fitted_sample_times(measurement, tau_min_s, tau_max_s, skip_initial_channels)
     return _sourced_sigma(tau, dt, first.gamma_s_inv, first.beta,
@@ -770,17 +801,20 @@ def _anchor_weight(w_raw: np.ndarray, w_ref: np.ndarray, A: np.ndarray) -> np.nd
     weight, the lognormal arm included: its objective is scale-free but `curve_fit` stops
     on an absolute gradient norm, so an unanchored rescale moves where it stops.
 
-    Raises ValueError naming why when the raw weight has a non-finite or negative entry,
-    when either trace is not finite, when the scale is not finite and strictly positive
-    (it overflowed, or underflowed to zero), when the raw trace is not strictly positive
-    (nothing to match against), or when the anchored weight is not finite. The
-    guards are on the COMPUTED quantities as well as the inputs (rule 12): the trace is a
-    sum of products, and saturation is a property of the product, not of any one entry.
+    Raises `_WeightNotFormed` naming why, its `cause` the key of the fallback's cause:
+    a raw weight with a non-finite or negative entry ('weight_entry'); a raw trace of zero,
+    a first pass that left the anchor nothing to match ('spectrum_zero'); and, each
+    'scale_anchor', a trace that overflows, a scale that is not finite and strictly
+    positive (it overflowed, or underflowed to zero), or an anchored weight that is not
+    finite. The guards are on the COMPUTED quantities as well as the inputs (rule 12): the
+    trace is a sum of products, and saturation is a property of the product, not of any
+    one entry.
     """
     raw = np.asarray(w_raw, dtype=float)
     ref = np.asarray(w_ref, dtype=float)
     if raw.size == 0 or not np.all(np.isfinite(raw)) or bool(np.any(raw < 0.0)):
-        raise ValueError(
+        raise _WeightNotFormed(
+            'weight_entry',
             f"the sourced residual weight cannot be scale-anchored: of its {raw.size} "
             f"channels {int(np.count_nonzero(~np.isfinite(raw)))} are non-finite and "
             f"{int(np.count_nonzero(raw < 0.0))} negative, and a weight must be finite and "
@@ -793,14 +827,18 @@ def _anchor_weight(w_raw: np.ndarray, w_ref: np.ndarray, A: np.ndarray) -> np.nd
         trace_raw = float(np.sum(raw * row_sq))
         trace_ref = float(np.sum(ref * row_sq))
     if not (math.isfinite(trace_raw) and trace_raw > 0.0):
-        raise ValueError(
+        # One predicate, two causes: every entry is finite and >= 0 here, so a trace that
+        # is not > 0 is a weight of zeros and one that is not finite overflowed.
+        raise _WeightNotFormed(
+            'spectrum_zero' if math.isfinite(trace_raw) else 'scale_anchor',
             f"the sourced residual weight cannot be scale-anchored: its "
             f"tr(A^T W A) = sum_k w_k sum_j A[k,j]^2 is {trace_raw!r}, and only a finite "
             f"strictly positive trace can be scaled onto another. A first-pass spectrum "
             f"that is zero on every channel leaves the anchor nothing to match."
         )
     if not math.isfinite(trace_ref):
-        raise ValueError(
+        raise _WeightNotFormed(
+            'scale_anchor',
             f"the sourced residual weight cannot be scale-anchored: the reference "
             f"tr(A^T W A) of the g1-squared weight is {trace_ref!r}."
         )
@@ -808,7 +846,8 @@ def _anchor_weight(w_raw: np.ndarray, w_ref: np.ndarray, A: np.ndarray) -> np.nd
     # Both tails (rule 12): a scale that OVERFLOWS is non-finite, one that UNDERFLOWS is
     # 0.0 -- finite, and it would hand back a weight that is zero on every channel.
     if not (math.isfinite(scale) and scale > 0.0):
-        raise ValueError(
+        raise _WeightNotFormed(
+            'scale_anchor',
             f"the sourced residual weight cannot be scale-anchored: matching "
             f"tr(A^T W A) = {trace_raw!r} onto {trace_ref!r} needs a scale of {scale!r}, "
             f"which is zero or outside the floating-point range."
@@ -816,7 +855,8 @@ def _anchor_weight(w_raw: np.ndarray, w_ref: np.ndarray, A: np.ndarray) -> np.nd
     with np.errstate(over='ignore', invalid='ignore'):
         anchored = raw * scale
     if not np.all(np.isfinite(anchored)):
-        raise ValueError(
+        raise _WeightNotFormed(
+            'scale_anchor',
             f"the sourced residual weight cannot be scale-anchored: scaling it by "
             f"{scale!r} leaves "
             f"{int(np.count_nonzero(~np.isfinite(anchored)))} of {anchored.size} channels "
@@ -843,21 +883,21 @@ def _sourced_weight(A: np.ndarray, x0: np.ndarray, sd: np.ndarray,
 
 def _sourced_sigma_or_fallback(resolved: str, measurement: DLSMeasurement,
                                tau: np.ndarray, tau_min_s, tau_max_s,
-                               skip_initial_channels, arm: str) -> tuple:
-    """`(recorded form, sd or None, fallback note)` for a resolved weighting request.
+                               skip_initial_channels) -> tuple:
+    """`(recorded form, sd or None, fallback note or None)` for a resolved weighting request.
 
     `sd is None` means the fit runs under the g1-squared weight -- because that is what was
-    asked for (no note), or because the variance could not be formed (the note names the
-    refusal). Shared by all three arms so one request resolves one way everywhere.
+    asked for (no note), or because the variance could not be formed (the fallback record).
+    Shared by all three arms so one request resolves one way everywhere.
     """
     if resolved != 'biganzoli':
-        return resolved, None, ''
+        return resolved, None, None
     try:
         sd = _sourced_distribution_sigma(measurement, tau, tau_min_s, tau_max_s,
                                          skip_initial_channels)
     except (RuntimeError, ValueError, TypeError) as exc:
-        return 'g1-squared', None, _weight_fallback_note(arm, str(exc))
-    return _recorded_distribution_weighting(resolved, measurement), sd, ''
+        return 'g1-squared', None, _weight_fallback_note(getattr(exc, 'cause', None))
+    return _recorded_distribution_weighting(resolved, measurement), sd, None
 
 
 # ---------------------------------------------------------------------------
@@ -866,6 +906,7 @@ def _sourced_sigma_or_fallback(resolved: str, measurement: DLSMeasurement,
 
 def fit_nnls(
     measurement: DLSMeasurement,
+    *,
     rh_min_nm: float = 1.0,
     rh_max_nm: float = 1000.0,
     n_grid: int = 100,
@@ -915,7 +956,7 @@ def fit_nnls(
         rh_min_nm, rh_max_nm, n_grid,
         skip_initial_channels=skip_initial_channels)
     recorded, sd, weight_note = _sourced_sigma_or_fallback(
-        resolved, measurement, tau, tau_min_s, tau_max_s, skip_initial_channels, 'NNLS')
+        resolved, measurement, tau, tau_min_s, tau_max_s, skip_initial_channels)
 
     x = _solve_distribution(A, y, w, alpha=0.0, L=None)
     if sd is not None:
@@ -926,16 +967,17 @@ def fit_nnls(
         try:
             w = _sourced_weight(A, x, sd, w)
         except ValueError as exc:
-            recorded, weight_note = 'g1-squared', _weight_fallback_note('NNLS', str(exc))
+            recorded = 'g1-squared'
+            weight_note = _weight_fallback_note(getattr(exc, 'cause', None))
         else:
             x = _solve_distribution(A, y, w, alpha=0.0, L=None)
-    st_prov, dur_form, rate_note = _distribution_weight_disclosure(recorded, measurement)
+    st_prov, dur_form = _distribution_weight_disclosure(recorded, measurement)
     return _distribution_summary(
         x, A, y, w, rh_grid, gamma_grid, beta, baseline, g2m1, tau, q,
         method='nnls', alpha=None,
         beta_estimated=beta_est, baseline_estimated=baseline_est,
         n_skipped=skip_initial_channels,
-        notes=tuple(n for n in (dead_note, weight_note, rate_note) if n),
+        notes=_all_notes(dead_note, weight_note),
         weighting=recorded,
         sample_time_provenance=st_prov, run_duration_form=dur_form)
 
@@ -946,6 +988,7 @@ def fit_nnls(
 
 def fit_lognormal(
     measurement: DLSMeasurement,
+    *,
     rh_min_nm: float = 1.0,
     rh_max_nm: float = 1000.0,
     n_grid: int = 100,
@@ -985,8 +1028,7 @@ def fit_lognormal(
         rh_min_nm, rh_max_nm, n_grid,
         skip_initial_channels=skip_initial_channels)
     recorded, sd, weight_note = _sourced_sigma_or_fallback(
-        resolved, measurement, tau, tau_min_s, tau_max_s, skip_initial_channels,
-        'lognormal')
+        resolved, measurement, tau, tau_min_s, tau_max_s, skip_initial_channels)
 
     ln_rh = np.log(rh_grid)
 
@@ -1043,30 +1085,33 @@ def fit_lognormal(
         # IS the g1-squared fit. Both passes are seeded from the same p0: what the second
         # pass changes is the precision map, not where the search starts.
         if not converged:
+            # The lognormal first pass the weight is evaluated on did not converge, so
+            # there is no fitted spectrum to read its g1 factor from.
             recorded = 'g1-squared'
-            weight_note = _weight_fallback_note(
-                'lognormal',
-                'the lognormal first pass the weight is evaluated on did not converge, '
-                'so there is no fitted spectrum to read its g1 factor from.')
+            weight_note = _weight_fallback_note('first_pass')
         else:
             try:
                 w = _sourced_weight(A, amp * _weights(mu, sigma), sd, w)
             except ValueError as exc:
                 recorded = 'g1-squared'
-                weight_note = _weight_fallback_note('lognormal', str(exc))
+                weight_note = _weight_fallback_note(getattr(exc, 'cause', None))
             else:
                 amp, mu, sigma, converged = _pass(w)
 
     x = amp * _weights(mu, sigma)
-    st_prov, dur_form, rate_note = _distribution_weight_disclosure(recorded, measurement)
+    st_prov, dur_form = _distribution_weight_disclosure(recorded, measurement)
     return _distribution_summary(
         x, A, y, w, rh_grid, gamma_grid, beta, baseline, g2m1, tau, q,
         method='lognormal', alpha=None,
         beta_estimated=beta_est, baseline_estimated=baseline_est,
         n_skipped=skip_initial_channels, success=converged,
-        notes=tuple(n for n in (dead_note, weight_note, rate_note) if n),
+        # The optimiser's own failure, the one precondition this arm's fit can fail; the
+        # seed shape then stands in, and `success` False keeps it from reading as a fit.
+        notes=_all_notes(None if converged else Note('fit_not_converged', ()),
+                         dead_note, weight_note),
         weighting=recorded,
-        sample_time_provenance=st_prov, run_duration_form=dur_form)
+        sample_time_provenance=st_prov, run_duration_form=dur_form,
+        median_rh_nm=math.exp(mu))
 
 
 # ---------------------------------------------------------------------------
@@ -1454,8 +1499,11 @@ def _gcv_corner(residual_norms, dof_eff, n_data: int, *,
     (Lukas 2010 Eq. (1.4), printed p. 521; its origin is Lukas 2006, Inverse Problems 22,
     1883). mu_2 = n^-1 tr H^2 is the influence measure `_tikhonov_influence_mu2` computes,
     and gamma is a robustness parameter on (0, 1): as it falls, the selector weighs the
-    solution's variance more and is less likely than GCV to under-smooth, which is GCV's
-    failure under correlated errors. mu_2 is a trace divided by n, so no scaling of lambda
+    solution's variance more and is less likely than GCV to under-smooth. Lukas 2006
+    proposes it under UNcorrelated errors, where GCV is unreliable at small or medium n
+    (printed p. 1885); that GCV fails the same way when the data are correlated, and RGCV
+    as the method studied for that case, is Lukas 2010 (printed p. 520). mu_2 is a trace
+    divided by n, so no scaling of lambda
     enters it and gamma needs no normalization of its own (what that does and does not
     make invariant is in `_tikhonov_influence_mu2`). The printed value is 0.1 in all three
     papers (Lukas 2006, printed pp. 1885-1886;
@@ -1624,8 +1672,12 @@ def _tikhonov_effective_dof(basis: Optional[_TikhonovFilterBasis],
 
     The regularized least-squares solution has the linear "hat" (influence) matrix
     H = A (A^T A + alpha^2 L^T L)^+ A^T; its trace is the effective number of free
-    parameters -- the honest degrees of freedom, NOT the raw grid size (Hansen 1998; the
-    number of grid points is "to a large extent arbitrary", Provencher 1982). It is the
+    parameters -- the honest degrees of freedom, NOT the raw grid size (Hansen 1998;
+    Provencher 1982a sec. 3.5, printed p. 219: a solution "typically has 40 or more
+    components", yet "40 independent parameters could never be reliably determined in
+    practice", and NDF is the count that replaces them. Scotti et al. 2015, p. 234905-9,
+    put it as the grid size being "to a large extent arbitrary", which is their sentence
+    about Provencher and is in neither of his 1982 papers). It is the
     sum of the filter factors, so it decreases smoothly from rank(A_w) toward 0 as alpha
     grows (more smoothing = fewer effective parameters) and is NON-INCREASING in alpha by
     construction: each f_i is. For the ill-conditioned Laplace-inversion kernel it stays
@@ -1711,8 +1763,11 @@ def _ftest_reference_index(residual_norms, dof_eff) -> int:
 def _ftest_precondition_notes(alphas, residual_norms, solution_norms, dof_eff, fc,
                               opt_idx: int, *, agreement: float, band,
                               level: float = 0.5) -> tuple:
-    """The F-test's two manual preconditions as `(reference note, band note)`, '' each
-    where the precondition held.
+    """The F-test's two manual preconditions as `(ftest_reference note, ftest_band note)`,
+    None each where the precondition held. They are statements about the sweep the test
+    ran on, not about where the pick landed, so they are stated BESIDE the end state's
+    note rather than instead of it (independently failed preconditions are each named,
+    CLAUDE.md invariant 4 clause 1).
 
     Both come from the CONTIN Users Manual's own checklist for a CONTIN run (§3.6.5,
     printed p. 17), on quantities the sweep already holds -- neither costs a solve.
@@ -1774,8 +1829,9 @@ def _ftest_precondition_notes(alphas, residual_norms, solution_norms, dof_eff, f
     level_inside = lo < float(level) < hi
     chosen_inside = bool(lo <= chosen <= hi)
     band_failed = level_inside and not chosen_inside
-    return (FTEST_REFERENCE_NOTE if not (ratio <= agreement) else '',
-            FTEST_BAND_NOTE_TEMPLATE.format(lo=lo, hi=hi) if band_failed else '')
+    return ((Note('ftest_reference', (), {'ratio': ratio, 'limit': float(agreement)})
+             if not (ratio <= agreement) else None),
+            Note('ftest_band', (), {'lo': lo, 'hi': hi}) if band_failed else None)
 
 
 def _ftest_corner(residual_norms, dof_eff, n_data: int,
@@ -1790,7 +1846,14 @@ def _ftest_corner(residual_norms, dof_eff, n_data: int,
 
         F(alpha) = [ (V(alpha) - V0) / V0 ] * (Ny - NDF0) / NDF0             (Eq. 3.24)
 
-    with V(alpha) = ||A x - y||^2, and V0 the MINIMUM residual over the sweep, at the
+    in which V is read here as the weighted RESIDUAL sum of squares alone,
+    ||M^.5 (A x - y)||^2. Provencher prints Eq. 3.24 with the bare symbol V(alpha), which
+    his Eq. 3.10 (printed p. 217) defines as that residual PLUS alpha^2 ||r - R x||^2. The
+    residual reading is the one his prose points at (alpha_0 is "the alpha for which the
+    weighted sum of squared residuals ... is minimum", p. 221) and the one the CONTIN
+    Users Manual prints: F1 = (VAR - VARZ)/VARZ * (Ny - NDFZ)/NDFZ, sec. 4.1.6.5 Eq. (2),
+    VAR being the weighted residual its VARIANCE column reports (see
+    `_ftest_precondition_notes`). V0 is the MINIMUM residual over the sweep, at the
     reference alpha_0 (the least-regularized / least-squares end). Ny is the number of
     data points and NDF0 = NDF(alpha_0) the effective degrees of freedom AT that
     reference -- Provencher's NDF = sum_j s_j^2/(s_j^2 + alpha^2) (Eqs. 3.15-3.16),
@@ -1920,6 +1983,7 @@ def _contin_sweep_and_select(A: np.ndarray, y: np.ndarray, w: np.ndarray,
 
 def fit_contin(
     measurement: DLSMeasurement,
+    *,
     rh_min_nm: float = 1.0,
     rh_max_nm: float = 1000.0,
     n_grid: int = 100,
@@ -1953,10 +2017,11 @@ def fit_contin(
 
     Three automatic selectors share the same sweep (only the selection differs):
       * 'gcv' (default): the Generalized Cross-Validation family. At the default
-        `gcv_gamma` = 0.1 it is Lukas's ROBUST GCV (RGCV; Lukas 2006, Lukas 2010
-        Eq. (1.4)): GCV's functional times a factor that weighs the solution's variance,
-        the literature's repair for GCV's under-smoothing when the errors are correlated,
-        as a correlogram's lag channels are. At `gcv_gamma` = 1 it is classical GCV
+        `gcv_gamma` = 0.1 it is Lukas's ROBUST GCV (RGCV; proposed in Lukas 2006 under
+        uncorrelated errors, the functional as printed in Lukas 2010 Eq. (1.4)): GCV's
+        functional times a factor that weighs the solution's variance. Lukas 2010
+        studies it as the repair for GCV's under-smoothing when the data are correlated
+        (printed p. 520), as a correlogram's lag channels are. At `gcv_gamma` = 1 it is classical GCV
         (Golub, Heath & Wahba 1979), minimizing n V(alpha)/(n - dof(alpha))^2. The
         selector is recorded as 'gcv' either way, with its gamma beside it.
       * 'lcurve': the L-curve corner = point of maximum curvature of the log-log
@@ -2051,9 +2116,9 @@ def fit_contin(
         alpha than the range allows);
         .alpha_at_floor flags a low-alpha-end pick (the selector wanted a smaller
         alpha than the range allows); .alpha_reliable is False whenever the selector's
-        end state or one of its own preconditions carries a note, and .reliability_note
-        is those sentences -- the end state's first, then each failed precondition -- the
-        one string every surface shows. The two edge flags follow the end state alone: a
+        end state or one of its own preconditions carries a note, and .notes holds those
+        notes -- the end state's first, then each failed precondition -- before the
+        distribution's records. The two edge flags follow the end state alone: a
         failed F-test precondition is a statement about the sweep, not about which end
         of it the pick sits on.
     """
@@ -2099,7 +2164,7 @@ def fit_contin(
         rh_min_nm, rh_max_nm, n_grid,
         skip_initial_channels=skip_initial_channels)
     recorded, sd, weight_note = _sourced_sigma_or_fallback(
-        resolved, measurement, tau, tau_min_s, tau_max_s, skip_initial_channels, 'CONTIN')
+        resolved, measurement, tau, tau_min_s, tau_max_s, skip_initial_channels)
 
     L = _second_difference_operator(n_grid)
 
@@ -2113,17 +2178,16 @@ def fit_contin(
                 w = _sourced_weight(A, x, sd, w)
             except ValueError as exc:
                 recorded = 'g1-squared'
-                weight_note = _weight_fallback_note('CONTIN', str(exc))
+                weight_note = _weight_fallback_note(getattr(exc, 'cause', None))
             else:
                 x = _solve_distribution(A, y, w, alpha=alpha, L=L)
-        st_prov, dur_form, rate_note = _distribution_weight_disclosure(
-            recorded, measurement)
+        st_prov, dur_form = _distribution_weight_disclosure(recorded, measurement)
         dist = _distribution_summary(
             x, A, y, w, rh_grid, gamma_grid, beta, baseline, g2m1, tau, q,
             method='contin', alpha=alpha,
             beta_estimated=beta_est, baseline_estimated=baseline_est,
             n_skipped=skip_initial_channels,
-            notes=tuple(n for n in (dead_note, weight_note, rate_note) if n),
+            notes=_all_notes(dead_note, weight_note),
             weighting=recorded,
             sample_time_provenance=st_prov, run_duration_form=dur_form)
         lcurve = LCurveResult(
@@ -2169,7 +2233,7 @@ def fit_contin(
             w = _sourced_weight(A, solutions[opt_idx], sd, w)
         except ValueError as exc:
             recorded = 'g1-squared'
-            weight_note = _weight_fallback_note('CONTIN', str(exc))
+            weight_note = _weight_fallback_note(getattr(exc, 'cause', None))
         else:
             (solutions, residual_norms, solution_norms, x_norms, dof_eff, ftest_fc,
              gcv_curve, opt_idx, state,
@@ -2185,23 +2249,23 @@ def fit_contin(
     # Floor: essentially unregularized NNLS at the default floor (see the fit_contin
     # docstring on alpha_min for what reaches it), whose extra peaks are inversion
     # noise. The note comes from the same state through the family's own assembler, so
-    # flag and sentence are one call.
+    # flag and note are one call.
     alpha_at_floor = state in ('floor', 'both')
     alpha_at_ceiling = state in ('ceiling', 'both')
     # The end state's note first, then each of the selector's own failed preconditions:
     # independently failed preconditions are each stated, and neither implies the other
     # (CLAUDE.md invariant 4, clause 1). The two edge FLAGS above stay the end state's
     # alone -- a precondition is about the sweep, not about which end the pick sits on.
-    alpha_reliable, reliability_note = _result_flags(
-        _ALPHA_STATE_NOTES.get(state, ''), *precondition_notes)
+    alpha_reliable, preconditions = _result_flags(
+        _alpha_state_note(state, opt_alpha), precondition_notes)
 
-    st_prov, dur_form, rate_note = _distribution_weight_disclosure(recorded, measurement)
+    st_prov, dur_form = _distribution_weight_disclosure(recorded, measurement)
     dist = _distribution_summary(
         x_opt, A, y, w, rh_grid, gamma_grid, beta, baseline, g2m1, tau, q,
         method='contin', alpha=opt_alpha,
         beta_estimated=beta_est, baseline_estimated=baseline_est,
         n_skipped=skip_initial_channels,
-        notes=tuple(n for n in (dead_note, weight_note, rate_note) if n),
+        notes=_all_notes(dead_note, weight_note),
         weighting=recorded,
         sample_time_provenance=st_prov, run_duration_form=dur_form)
     lcurve = LCurveResult(
@@ -2218,8 +2282,7 @@ def fit_contin(
                         alpha_at_ceiling=alpha_at_ceiling,
                         alpha_at_floor=alpha_at_floor,
                         alpha_reliable=alpha_reliable,
-                        reliability_note=reliability_note,
-                        notes=dist.notes)
+                        notes=_all_notes(preconditions, dist.notes))
 
 
 # ---------------------------------------------------------------------------
@@ -2265,7 +2328,8 @@ class DistributionPeak:
     """One resolved population in a CONTIN/NNLS size distribution.
 
     `weight_fraction` is the fraction of the total (intensity-weighted) area under
-    that peak's lobe -- so the peaks of a distribution sum to ~1. It is an
+    that peak's lobe -- so the reported peaks sum to at most 1, short of it by any lobe
+    below `min_weight_fraction`, which is dropped with its weight. It is an
     intensity fraction, not a number or mass fraction (large particles scatter far
     more). `is_dominant` marks the largest-area peak.
 
@@ -2273,6 +2337,23 @@ class DistributionPeak:
     the peak's lobe (the integration bounds the fraction was summed over --
     inclusive on both ends). NaN when the producing path predates the bounds
     (additive fields, defaulted).
+
+    `mean_rh_nm` / `mean_gamma_s_inv` are the peak's POSITION: the lobe's geometric mean,
+    the first cumulant of its weight on the ln Gamma (ln Rh) grid (`lobe_geometric_mean`),
+    which is the statistic every surface reports a peak by; the lognormal arm's one peak
+    reports its fitted median instead, the parameter that arm fits (biased, like the lobe
+    mean, for a population that runs past an end of the grid; see `median_rh_nm`).
+    `rh_nm` / `gamma_s_inv` stay the node with the most weight, the plot's own top and the
+    mode-pick key. `n_weighted_nodes` counts the lobe's nodes that carry weight: a mean over
+    one node IS that node, a quantized reading, and the replicate ± then carries the grid's
+    resolution (`one_node_resolution_log_step`). NaN, NaN and 0 when the producing path
+    predates them (additive fields, defaulted, as the bounds were).
+
+    `rh_reliable` and `notes` are the size verdict every DLS Rh carries, the pair
+    `_result_flags` returns, so the flag and its notes come from one call: the lobe's
+    maximum on the grid's first or last node (`grid_end`), the technique's size range on
+    the peak's position, and decay completeness on its decay rate (`find_distribution_peaks`
+    has the rules). True and () when the producing path predates them (additive, defaulted).
     """
     rh_nm: float                      # Rh at the peak maximum
     gamma_s_inv: float                # decay rate at the peak maximum
@@ -2280,6 +2361,132 @@ class DistributionPeak:
     is_dominant: bool
     rh_lo_nm: float = float('nan')    # Rh at the lobe's first grid point
     rh_hi_nm: float = float('nan')    # Rh at the lobe's last grid point
+    mean_rh_nm: float = float('nan')          # the lobe's geometric-mean Rh
+    mean_gamma_s_inv: float = float('nan')    # the lobe's geometric-mean decay rate
+    n_weighted_nodes: int = 0                 # the lobe's weight-carrying nodes
+    rh_reliable: bool = True                  # the peak's preconditions held
+    notes: Tuple[Note, ...] = ()              # the precondition notes behind the flag
+
+
+class LobeMean(NamedTuple):
+    """A lobe's geometric mean (`lobe_geometric_mean`): Rh, Gamma, and how many nodes
+    carry its weight."""
+    rh_nm: float
+    gamma_s_inv: float
+    n_weighted_nodes: int
+
+
+def lobe_geometric_mean(rh_sorted, w_sorted, lo: int, hi: int,
+                        gamma_sorted=None) -> LobeMean:
+    """The geometric mean of a lobe, the half-open slice ``[lo, hi)`` of Rh-ascending arrays.
+
+    The ONE computation of a peak's position, for the scan's automatic lobes and for the
+    manual intervals of `integrate_between` alike (both return these indices), and for the
+    reweighted views:
+
+        ln R_bar = sum_i w_i ln R_i / sum_i w_i,   over the lobe's nodes with w_i > 0,
+
+    and the same in ln Gamma. A CONTIN peak is reported by its cumulants on the z = ln Gamma
+    grid, the first of which is this mean (Provencher 1992 pp. 94, 96 and 100, Eq. 4),
+    and the logarithmic moments are the stable ones (Jakes 1995 p. 1787). CONTIN's program
+    paper prints moments optionally computed for each peak, with the arithmetic ratios
+    M_j / M_(j-1) (Provencher 1982 p. 237, Eq. 7), not this mean. The grid is log-spaced,
+    so the mean is continuous where the node with the most weight is not.
+
+    Two-sided by construction (rule 12): the weights are divided by their own largest
+    value before they are summed, so the normalizer is at least 1 and no lobe's weights,
+    however near 1e-300 or 1e+300, underflow or overflow the ratio. A lobe that carries its
+    weight on ONE node returns that node's values exactly, not their exp-log round trip, so
+    a one-node mean is bit-identical to the node it sits on. A lobe with no positive weight
+    returns NaN, NaN and 0. `gamma_sorted` None returns a NaN Gamma (the reweighted views
+    carry no decay-rate grid).
+
+    Inputs not prescribed by the source: the lobe's boundary node, which `scan_distribution_
+    peaks` gives whole to the right-hand lobe where Jakes 1995 p. 1787 splits a non-zero
+    minimum between the two; the weights are this program's normalized solution, so a node
+    the solver set to zero carries none.
+    """
+    rh = np.asarray(rh_sorted, dtype=float)[lo:hi]
+    w = np.asarray(w_sorted, dtype=float)[lo:hi]
+    g = (np.asarray(gamma_sorted, dtype=float)[lo:hi] if gamma_sorted is not None
+         else None)
+    carries = np.isfinite(w) & (w > 0)
+    n = int(carries.sum())
+    if n == 0:
+        return LobeMean(float('nan'), float('nan'), 0)
+    if n == 1:
+        i = int(np.flatnonzero(carries)[0])
+        return LobeMean(float(rh[i]), float(g[i]) if g is not None else float('nan'), 1)
+    wc = w[carries]
+    wn = wc / float(wc.max())
+    norm = float(wn.sum())
+
+    def _log_mean(x: np.ndarray) -> float:
+        return float(np.exp(float(np.sum(wn * np.log(x[carries]))) / norm))
+
+    return LobeMean(_log_mean(rh), _log_mean(g) if g is not None else float('nan'), n)
+
+
+def peak_lobe_geometric_mean_nm(rh_grid_nm, weights) -> float:
+    """The geometric mean of the lobe holding the largest-weight grid point, in nm.
+
+    The lobe is the one `scan_distribution_peaks` delimits with NO floor, so a lobe the
+    peak table's floor would drop is still the lobe its maximum sits in; the node is the
+    one `DistributionResult.peak_rh_nm` reports (the first of equal maxima in the grid's
+    own order). NaN when the weights are degenerate, exactly where the peak node is.
+    """
+    w_in = np.asarray(weights, dtype=float)
+    if w_in.size == 0 or not np.any(np.isfinite(w_in)):
+        return float('nan')
+    scanned, rh, w = scan_distribution_peaks(rh_grid_nm, w_in, 0.0)
+    if not scanned:
+        return float('nan')
+    order = np.argsort(np.asarray(rh_grid_nm, dtype=float))
+    top = int(np.flatnonzero(order == int(np.nanargmax(w_in)))[0])   # its sorted index
+    for _i, _frac, lo, hi in scanned:
+        if lo <= top < hi:
+            return lobe_geometric_mean(rh, w, lo, hi).rh_nm
+    return float('nan')       # unreachable: a floor-free scan's lobes tile the grid
+
+
+def log_grid_step(rh_grid_nm) -> float:
+    """One step of a log-spaced Rh grid, in ln Rh: ln(R_max / R_min) / (n - 1). NaN for a
+    grid of fewer than two positive points."""
+    rh = np.asarray(rh_grid_nm, dtype=float)
+    if rh.size < 2:
+        return float('nan')
+    lo, hi = float(np.min(rh)), float(np.max(rh))
+    if not (math.isfinite(lo) and math.isfinite(hi) and 0.0 < lo < hi):
+        return float('nan')
+    return math.log(hi / lo) / (rh.size - 1)
+
+
+def one_node_resolution_log_step(distribution, peak) -> Optional[float]:
+    """The grid step h (in ln Rh) when `peak` is a quantized reading, else None.
+
+    A peak is a quantized reading when its lobe carries weight on ONE node and that node is
+    interior to the grid: its position is then the node, and the true position lies
+    anywhere within half a step either side, which is the premise of the rectangular
+    resolution term (GUM F.2.2.1, p. 64). A sparse inversion lands there because a peak
+    falling close to a grid point comes back as a singlet and one between points as a
+    doublet (Jakes 1995 pp. 1791-1792). On the grid's first or last node the premise
+    fails, since the true position may lie beyond the grid, so no step is returned there; a
+    multi-node lobe's mean is continuous and gets none either. The caller turns h into the
+    step in nm at its own value, delta_R = R (e^h - 1).
+
+    Inputs not prescribed by the source: the one-node condition itself, this program's
+    reading of the GUM's premise for a grid inversion's peak.
+    """
+    if getattr(peak, 'n_weighted_nodes', 0) != 1:
+        return None
+    rh = np.asarray(distribution.rh_grid_nm, dtype=float)
+    h = log_grid_step(rh)
+    if not math.isfinite(h):
+        return None
+    node = float(peak.mean_rh_nm)
+    if not math.isfinite(node) or node <= float(np.min(rh)) or node >= float(np.max(rh)):
+        return None
+    return h
 
 
 def scan_distribution_peaks(rh_grid_nm, weights, min_weight_fraction: float = 0.05):
@@ -2297,6 +2504,17 @@ def scan_distribution_peaks(rh_grid_nm, weights, min_weight_fraction: float = 0.
     Returns ``(peaks, rh_sorted, w_sorted)``: peaks is ``[(idx, frac, lo, hi), ...]``
     (empty if the distribution is degenerate), rh_sorted / w_sorted the ascending-Rh
     arrays the indices refer to.
+
+    Inputs not prescribed by the source: the noise floor ``min_weight_fraction`` (default
+    0.05; Jakes 1995 lists every peak and prints no floor, pp. 1787-1788), the boundary
+    bin given whole to the right-hand lobe (Jakes 1995 p. 1787 splits a non-zero minimum
+    between the two neighbouring peaks in inverse ratio to the rises toward them), the
+    plateau rule (a run of equal heights is one maximum, at its centre), the tie rule (the
+    first of equal minima bounds the lobe), endpoint maxima (a grid end that rises above
+    its neighbour is a peak), and the fallback to the global maximum when no strict maximum
+    exists; prescribed: a lobe running from a local minimum through a maximum to the next
+    local minimum (Jakes 1995 p. 1787). The peak's POSITION is not the maximum's index this
+    returns but the lobe's geometric mean (`lobe_geometric_mean`).
     """
     rh = np.asarray(rh_grid_nm, dtype=float)
     w = np.asarray(weights, dtype=float)
@@ -2423,9 +2641,36 @@ def integrate_between(rh_grid_nm, weights, bounds_nm):
     return intervals, rh, w
 
 
+def _fit_decay_check(distribution: DistributionResult,
+                     max_ratio: float = MAX_RETAINED_ACF_RATIO,
+                     about: Tuple[str, ...] = ('mean_rh_nm',)) -> Tuple[bool, Optional[Note]]:
+    """(decay observed, the `decay_incomplete` note or None) for a whole inversion: the
+    ISO 22412:2017 Annex A.1.2 retained-range criterion in its DATA form
+    (`_common._observed_decay_check` on `_lowest_observed_acf_ratio`), asked of the g2-1
+    the fit saw -- the live channels of its window, rebuilt as the reconstruction plus its
+    residual, which `_distribution_summary` defines as data minus reconstruction.
+
+    The cumulant's and the stretched exponential's form, for the same reason: an inversion
+    under an estimated baseline places its lobes where the remainder decays inside the
+    window, so a lobe's own rate test passes on a correlogram that never decayed
+    (`cumulants._cumulant_flags` gives the measurement). It is a fact about the
+    correlogram, so it fails every lobe of the fit alike. Unflagged when there is no
+    ratio to take (fewer than two points, arrays of unequal length), the shared
+    "unanswerable" reading. One computation for the automatic peaks and the mode
+    extraction's points."""
+    fitted = np.asarray(getattr(distribution, 'fitted_g2m1', ()), dtype=float)
+    resid = np.asarray(getattr(distribution, 'residuals', ()), dtype=float)
+    ratio = (_lowest_observed_acf_ratio(fitted + resid) if fitted.shape == resid.shape
+             else float('nan'))
+    return _observed_decay_check(ratio, max_ratio, about)
+
+
 def find_distribution_peaks(
     distribution: DistributionResult,
     min_weight_fraction: float = 0.05,
+    *,
+    min_decay_completeness: float = MIN_DECAY_COMPLETENESS,
+    max_retained_acf_ratio: float = MAX_RETAINED_ACF_RATIO,
 ) -> List[DistributionPeak]:
     """Resolve the distinct populations (peaks) in a size distribution.
 
@@ -2443,6 +2688,32 @@ def find_distribution_peaks(
     of a failed fit is a fit-like number no caller may present. The refusal lives
     here, in the one scan every consumer routes through, so no call site needs its
     own gate.
+
+    Each peak's position is its lobe's geometric mean (`mean_rh_nm`, `mean_gamma_s_inv`,
+    `lobe_geometric_mean`), the lognormal arm's its fitted median; `rh_nm` stays the
+    node with the most weight.
+
+    Each peak carries the size verdict every DLS Rh carries (`rh_reliable`, its notes
+    about `mean_rh_nm`), on every arm alike, flagging and never withholding (invariant 4):
+    the lobe's maximum on the grid's first or last node (`_grid_end_check`, ISO
+    22412:2017 sec. 10.2.1 c)); the decay complete inside the window, asked two ways and
+    stated once -- the peak's own decay rate across the lag span the fit saw
+    (`_decay_completeness_check` at `min_decay_completeness`, the mode map's threshold
+    when it calls this), and the correlogram's own decay (`_fit_decay_check` at
+    `max_retained_acf_ratio`), which fails every lobe of a fit whose correlogram never
+    decayed; and the technique's size range on the peak's position (`size_range_check`),
+    asked only of a decay both tests observed. A distribution never lacks a viscosity:
+    every inversion refuses without one (its grid needs it). The grid end reads the node,
+    the size range the position; neither stands in for the other.
+
+    Inputs not prescribed by the source: the noise floor ``min_weight_fraction`` (default
+    0.05; Jakes 1995 lists every peak and prints no floor, pp. 1787-1788), the dominant
+    peak taken as the largest lobe area, and the scan's own rules, which
+    `scan_distribution_peaks` lists (the boundary bin given whole to one lobe among them,
+    where Jakes 1995 p. 1787 splits it); prescribed: a lobe running from a local minimum
+    through a maximum to the next local minimum (Jakes 1995 p. 1787), and its position
+    reported as its logarithmic mean (Provencher 1992 pp. 94, 96 and 100; Jakes 1995
+    p. 1787).
     """
     if getattr(distribution, 'success', True) is False:
         return []
@@ -2454,18 +2725,50 @@ def find_distribution_peaks(
     # surface a NaN-decay-rate population in the table or as a rho source.
     if gamma.size != rh_in.size:
         return []
-    scanned, rh, _w = scan_distribution_peaks(
+    scanned, rh, w = scan_distribution_peaks(
         rh_in, distribution.weights, min_weight_fraction)
     if not scanned:
         return []
     # Re-sort gamma to match the Rh-ascending arrays the scan returned.
     gamma = gamma[np.argsort(rh_in)]
+    # The lognormal arm fitted its median, the geometric mean of a lognormal and the arm's
+    # own parameter, and its curve is one lobe: that median is its peak's position. Every
+    # other arm's position is its lobe's mean. Neither is exact for a population that runs
+    # past an end of the grid (`DistributionResult.median_rh_nm`).
+    median = float(getattr(distribution, 'median_rh_nm', float('nan')))
+    use_median = math.isfinite(median) and median > 0 and len(scanned) == 1
+    tau_span = _fitted_tau_span(getattr(distribution, 'fit_tau_s', ()))
+    about = ('mean_rh_nm',)
+    # The correlogram's own decay, asked once of the fit: an undecayed correlogram fails
+    # every lobe (a recommendation the owner accepted, 2026-10-17; `_fit_decay_check`).
+    _data_ok, data_note = _fit_decay_check(distribution, max_retained_acf_ratio, about)
     peaks: List[DistributionPeak] = []
     for peak_i, frac, lo, hi in scanned:
+        mean = lobe_geometric_mean(rh, w, lo, hi, gamma)
+        mean_rh, mean_gamma = mean.rh_nm, mean.gamma_s_inv
+        if use_median:
+            # Gamma * Rh is one constant over the grid (Gamma = q^2 kT / (6 pi eta Rh)), so
+            # the median's decay rate is that constant over the median.
+            mean_rh = median
+            mean_gamma = float(gamma[peak_i]) * float(rh[peak_i]) / median
+        # One decay precondition, so one note: the lobe's own rate test when it fails,
+        # else the fit's data test. The size is asked only of an observed decay (the one
+        # precedence of `cumulants._cumulant_flags`): an undecayed lobe's size is no size.
+        rate_note = _decay_completeness_check(_decay_completeness(mean_gamma, tau_span),
+                                              min_decay_completeness, about)[1]
+        decay_note = rate_note or data_note
+        rh_reliable, notes = _result_flags(
+            decay_note,
+            _grid_end_check(peak_i, rh.size, float(rh[peak_i]), about)[1],
+            None if decay_note else
+            size_range_check(mean_rh, CUMULANT_MAX_RH_NM, CUMULANT_MIN_RH_NM, about)[1])
         peaks.append(DistributionPeak(
             rh_nm=float(rh[peak_i]), gamma_s_inv=float(gamma[peak_i]),
             weight_fraction=frac, is_dominant=False,
-            rh_lo_nm=float(rh[lo]), rh_hi_nm=float(rh[hi - 1])))
+            rh_lo_nm=float(rh[lo]), rh_hi_nm=float(rh[hi - 1]),
+            mean_rh_nm=mean_rh, mean_gamma_s_inv=mean_gamma,
+            n_weighted_nodes=mean.n_weighted_nodes,
+            rh_reliable=rh_reliable, notes=notes))
     if not peaks:
         return []
     dominant = max(range(len(peaks)), key=lambda j: peaks[j].weight_fraction)
